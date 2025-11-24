@@ -21,5 +21,5 @@ class Visualizer:
         y = 60
         cv2.putText(frame, "Counts:", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
         for label, count in counts.items():
-            y += 60
+            y += 70
             cv2.putText(frame, f"{label}: {count}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)

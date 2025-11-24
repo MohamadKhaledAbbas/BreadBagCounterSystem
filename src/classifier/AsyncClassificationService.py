@@ -1,29 +1,35 @@
 import queue
 import threading
 from collections import defaultdict
+from typing import Callable, List
 
 from src.classifier.BaseClassifier import BaseClassifier
+from src.logging.Database import DatabaseManager
 
+ResultCallback = Callable[[int, str], None]
 
 class AsyncClassificationService:
-    """Handles the second model in a separate thread."""
-    def __init__(self, classifier: BaseClassifier):
+    """
+    Handles the second model in a separate thread AND logs to Database.
+    """
+
+    def __init__(self, classifier: BaseClassifier, db_manager: DatabaseManager):
         self.classifier = classifier
+        self.db = db_manager  # Injected Dependency
         self.queue = queue.Queue()
-        self.counts = defaultdict(int)
-        self.lock = threading.Lock()
+        self.callbacks: List[ResultCallback] = []
         self.running = True
 
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
-    def process(self, roi_image):
-        if self.running:
-            self.queue.put(roi_image)
+    def register_callback(self, callback: ResultCallback):
+        """Add a function to be called when a classification is complete."""
+        self.callbacks.append(callback)
 
-    def get_counts(self):
-        with self.lock:
-            return dict(self.counts)
+    def process(self, track_id: int, roi_image):
+        if self.running:
+            self.queue.put((track_id, roi_image))
 
     def stop(self):
         self.running = False
@@ -35,9 +41,17 @@ class AsyncClassificationService:
             item = self.queue.get()
             if item is None: break
 
-            label = self.classifier.predict(item)
+            track_id, image = item
 
-            with self.lock:
-                self.counts[label] += 1
+            # 1. Predict
+            label = self.classifier.predict(image)
+
+            # 2. Notify all listeners (Decoupled)
+            for callback in self.callbacks:
+                try:
+                    callback(track_id, label)
+                except Exception as e:
+                    print(f"Error in callback: {e}")
+
 
             self.queue.task_done()
