@@ -1,16 +1,12 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict
-from src.detection.DetectionResult import DetectionResult
-
 
 class BaseDetector(ABC):
     """Abstract base class for detection/tracking models."""
-    @abstractmethod
-    def load(self, model_path: str):
-        pass
 
     @abstractmethod
-    def track(self, frame, config=None) -> List[DetectionResult]:
+    def predict(self, frame):
+        """Returns raw detections (boxes, conf, classes)"""
         pass
 
     @property

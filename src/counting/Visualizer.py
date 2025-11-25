@@ -2,7 +2,7 @@ from typing import Dict, List
 
 import cv2
 
-from src.detection.DetectionResult import DetectionResult
+from src.detection.TrackedObject import TrackedObject
 
 
 class Visualizer:
@@ -10,8 +10,8 @@ class Visualizer:
     def __init__(self, class_names: Dict[int, str]):
         self.names = class_names
 
-    def draw_detections(self, frame, detections: List[DetectionResult]):
-        for det in detections:
+    def draw_detections(self, frame, tracks: List[TrackedObject]):
+        for det in tracks:
             x1, y1, x2, y2 = map(int, det.box)
             label = f"{det.track_id}: {self.names.get(det.class_id, 'Unknown')}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)

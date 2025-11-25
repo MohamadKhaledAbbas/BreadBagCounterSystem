@@ -1,4 +1,5 @@
 from abc import abstractmethod, ABC
+from typing import Any
 
 
 class BaseClassifier(ABC):
@@ -8,6 +9,6 @@ class BaseClassifier(ABC):
         pass
 
     @abstractmethod
-    def predict(self, image) -> str:
+    def predict(self, image) -> tuple[str | Any, float]:
         """Returns the predicted class label as a string."""
         pass
