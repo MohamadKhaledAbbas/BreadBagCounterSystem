@@ -1,3 +1,4 @@
+import time
 from typing import Dict, Any
 
 import cv2
@@ -9,6 +10,8 @@ from src.counting.BagStateMonitor import BagStateMonitor
 from src.detection.BaseDetection import BaseDetector
 from src.logging.Database import DatabaseManager
 from src.tracking.BaseTracker import BaseTracker
+from src.utils.PerformanceChecker import run_with_timing
+from src.utils.ThreadedCamera import ThreadedCamera
 
 
 class BagCounterApp:
@@ -17,18 +20,18 @@ class BagCounterApp:
                  detector_engine: BaseDetector,
                  tracker: BaseTracker,
                  classifier_engine: BaseClassifier,
-                 db_manager: DatabaseManager,
-                 tracker_config: str):
+                 db_manager: DatabaseManager):
 
         self.db_manager = db_manager
         self.video_path = video_path
         self.detector = detector_engine
         self.tracker = tracker
         self.classifier_service = AsyncClassificationService(classifier_engine)
-        self.tracker_config = tracker_config
 
+        self.show_ui_screen = False
         # ... (Rest of init remains the same) ...
         names = self.detector.class_names
+        print(f'Found names: {names}')
         name_to_id = {v: k for k, v in names.items()}
         try:
             open_id = name_to_id['bread-bag-opened']
@@ -38,6 +41,7 @@ class BagCounterApp:
 
         self.monitor = BagStateMonitor(open_id, closed_id)
         self.visualizer = Visualizer(names)
+
         # 3. CONNECT THEM via Callback
         # "When classification finishes, call self.handle_classification_result"
         self.classifier_service.register_callback(self.on_classification_result)
@@ -67,12 +71,15 @@ class BagCounterApp:
 
     def run(self):
         # ... (Run loop logic remains largely the same) ...
-        cap = cv2.VideoCapture(self.video_path)
+
+        cap = run_with_timing("VideoCapture", ThreadedCamera,self.video_path)
+
         while cap.isOpened():
+            t1 = cv2.getTickCount()
             success, frame = cap.read()
             if not success: break
 
-            detections = self.detector.predict(frame)
+            detections = run_with_timing("detector_predict", self.detector.predict, frame)
 
             if len(detections[0].boxes) > 0:
                 xyxy = detections[0].boxes.xyxy.cpu().numpy()
@@ -80,7 +87,7 @@ class BagCounterApp:
                 cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
 
                 # B. TRACK
-                tracks = self.tracker.update(xyxy, conf, cls_ids)
+                tracks = run_with_timing("Tracker", self.tracker.update, xyxy, conf, cls_ids)
 
                 active_ids = set()
                 for det in tracks:
@@ -96,14 +103,27 @@ class BagCounterApp:
                         if x2 > x1 and y2 > y1:
                             roi = frame[y1:y2, x1:x2].copy()
                             # Pass track_id so we can log it in DB
-                            self.classifier_service.process(det.track_id, roi)
+                            run_with_timing("Classify", self.classifier_service.process,det.track_id, roi)
 
                 self.monitor.cleanup(active_ids)
-                self.visualizer.draw_detections(frame, tracks)
-            self.visualizer.draw_stats(frame, self.ui_counts)
+                if self.show_ui_screen:
+                    run_with_timing("draw_detection", self.visualizer.draw_detections, frame, tracks)
+                    run_with_timing("draw_stats", self.visualizer.draw_stats, frame, self.ui_counts)
 
-            frame = cv2.resize(frame, (1280, 720))
-            cv2.imshow("Bag Counter with DB", frame)
+
+            t2 = cv2.getTickCount()
+            latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
+            fps = 1000 / latency if latency else 0
+            print(f"FPS: {fps:.2f} ,  time_diff: {latency:.2f} ms")
+
+            # Draw FPS on frame
+            if self.show_ui_screen:
+                cv2.putText(frame, f"FPS: {int(fps)}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            if self.show_ui_screen:
+                frame = cv2.resize(frame, (1280, 720))
+                cv2.imshow("Bag Counter with DB", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 

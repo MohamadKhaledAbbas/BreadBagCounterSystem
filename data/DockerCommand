@@ -1,0 +1,4 @@
+docker run -it --rm `
+  -v "C:\Users\Khaled\PyCharmMiscProject\data:/data" `
+  openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8 `
+  /bin/bash

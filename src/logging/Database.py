@@ -111,10 +111,10 @@ class DatabaseManager:
         Example Return: {'bag_type_A': 10, 'bag_type_B': 5}
         """
         query = """
-            SELECT class_name, COUNT(*) 
-            FROM bag_logs 
+            SELECT bag_type_id, COUNT(*) 
+            FROM bag_events 
             WHERE timestamp BETWEEN ? AND ?
-            GROUP BY class_name
+            GROUP BY bag_type_id
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
