@@ -8,7 +8,7 @@ from src.tracking.Tracker import ObjectTracker
 
 if __name__ == "__main__":
     # Configuration
-    VIDEO_PATH = "output2.mp4"
+    VIDEO_PATH = "output3.mp4"
     DETECTION_MODEL = "data/model/best_detect_bayese_640x640_nv12.bin"
     CLASS_MODEL = "data/model/best_classify_bayese_224x224_nv12.bin"
 
@@ -27,5 +27,6 @@ if __name__ == "__main__":
         tracker=tracker,
         classifier_engine=classifier,
         db_manager=db_manager,
+        show_ui_screen=True
     )
     app.run()

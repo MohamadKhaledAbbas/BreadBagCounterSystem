@@ -63,7 +63,11 @@ class BpuDetector(BaseDetector):
         input_tensor, x_scale, y_scale, x_shift, y_shift = run_with_timing("detection pre-process", self._preprocess, frame)
 
         # 2. Forward
+        t1 = cv2.getTickCount()
         outputs = run_with_timing("forward", self.quantize_model[0].forward, input_tensor)
+        t2 = cv2.getTickCount()
+        latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
+        print(f"BPU Detect Inference Time: {latency:.2f} ms")
 
         # 3. Convert to Numpy
         output_arrays = [out.buffer for out in outputs]

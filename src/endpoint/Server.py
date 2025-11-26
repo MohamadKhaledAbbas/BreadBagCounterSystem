@@ -4,7 +4,7 @@ from datetime import datetime
 from src.logging.Database import DatabaseManager
 
 app = FastAPI(title="Bag Counting Analytics API")
-db = DatabaseManager("bag_events.db")  # Connects to the same file
+db = DatabaseManager("data/db/bag_events.db")  # Connects to the same file
 
 @app.get("/analytics/counts")
 def get_bag_counts(
