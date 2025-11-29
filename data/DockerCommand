@@ -2,3 +2,27 @@ docker run -it --rm `
   -v "C:\Users\Khaled\PyCharmMiscProject\data:/data" `
   openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8 `
   /bin/bash
+
+
+python3 model_converter/mapper.py --onnx model/best_classify.onnx --cal-images model_converter/calibration_bread_type
+
+
+// ROS2 export commands
+source /opt/tros/humble/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/tros/humble/lib/hobot_shm/config/shm_fastdds.xml
+export RMW_FASTRTPS_USE_QOS_FROM_XML=1
+export ROS_DISABLE_LOANED_MESSAGES=0
+
+
+
+
+
+
+
+
+
+ros2 run hobot_codec hobot_codec_republish --ros-args -p in_format:=h264 -p out_mode:=shared_mem -p out_format:=nv12  -p sub_topic:=/rtsp_image_ch_0 -p dump_output:=False -p pub_topic:=/images
+
+
+ros2 run hobot_codec hobot_codec_republish --ros-args -p in_mode:=shared_mem -p in_format:=h264 -p out_mode:=shared_mem -p out_format:=nv12 -p sub_topic:=/rtsp_image_ch_0 -p dump_output:=False
