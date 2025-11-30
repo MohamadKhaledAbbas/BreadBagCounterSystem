@@ -6,9 +6,8 @@ import cv2
 
 from src.frame_source.FrameSource import FrameSource
 
-
 class OpenCVFrameSource(FrameSource):
-    def __init__(self, source, queue_size=10):
+    def __init__(self, source, queue_size=1):
         self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened():
             raise ValueError(f"Could not open video source: {source}")
@@ -27,18 +26,18 @@ class OpenCVFrameSource(FrameSource):
             if not ret:
                 self.running = False
                 break
+            # Always keep only the latest frame: leaky queue
+            if self.queue.full():
+                try:
+                    self.queue.get(block=False)
+                except queue.Empty:
+                    pass
             try:
                 self.queue.put((bgr, latency_ms), timeout=1)
             except queue.Full:
-                # Drop oldest frame, or skip, depending on your needs
-                try:
-                    self.queue.get(block=False)  # Remove one
-                    self.queue.put((bgr, latency_ms), timeout=1)
-                except queue.Empty:
-                    pass  # Ignore if queue suddenly emptied
-            time.sleep(0.05)
+                pass  # Should not happen now
 
-        self.cleanup()
+            time.sleep(0.01)  # Faster polling for UI
 
     def frames(self):
         while self.running or not self.queue.empty():
@@ -49,9 +48,7 @@ class OpenCVFrameSource(FrameSource):
                 continue
 
     def cleanup(self):
-        # Call this to gracefully stop the reading thread (if needed)
         self.running = False
-        self.queue.join()
         if self.read_thread.is_alive():
             self.read_thread.join()
         self.cap.release()

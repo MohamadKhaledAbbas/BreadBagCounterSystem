@@ -105,21 +105,43 @@ class DatabaseManager:
                 VALUES (?, ?, ?)
             """, (bag_type_id, track_id, confidence))
 
-    def get_aggregated_stats(self, start_time: datetime, end_time: datetime) -> Dict[str, int]:
-        """
-        Returns counts per class within the specific time range.
-        Example Return: {'bag_type_A': 10, 'bag_type_B': 5}
-        """
-        query = """
-            SELECT bag_type_id, COUNT(*) 
-            FROM bag_events 
-            WHERE timestamp BETWEEN ? AND ?
-            GROUP BY bag_type_id
-        """
+    def get_aggregated_stats(self, start_time, end_time):
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            # SQLite stores datetimes as strings, so we convert parameters to string
-            cursor.execute(query, (start_time, end_time))
-            rows = cursor.fetchall()
+            conn.row_factory = sqlite3.Row
+            bag_type_stats = conn.execute("""
+                SELECT
+                    bt.id,
+                    bt.name AS bag_type,
+                    bt.image_path,
+                    bt.is_known,
+                    COUNT(be.id) AS count
+                FROM bag_types bt
+                LEFT JOIN bag_events be
+                    ON bt.id = be.bag_type_id AND be.timestamp BETWEEN ? AND ?
+                GROUP BY bt.id, bt.name, bt.image_path, bt.is_known
+                ORDER BY count DESC
+            """, (start_time, end_time)).fetchall()
 
-        return {row[0]: row[1] for row in rows}
+            total_count = conn.execute("""
+                SELECT COUNT(*) FROM bag_events
+                WHERE timestamp BETWEEN ? AND ?
+            """, (start_time, end_time)).fetchone()[0]
+
+        # Adapt this for your return structure (dict/list suitable for template)
+        stats = {
+            "total": {
+                "count": total_count,
+                # "weight": ... if you ever add that
+            },
+            "classifications": [
+                {
+                    "id": row["id"],
+                    "name": row["bag_type"],
+                    "thumb": row["image_path"],
+                    "is_known": bool(row["is_known"]),
+                    "count": row["count"],
+                    # "weight": ... if/when you store one for each event or type
+                } for row in bag_type_stats
+            ]
+        }
+        return stats

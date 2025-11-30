@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Select Analytics Time Range</title>
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:400,700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(120deg,#f3f3f3,#e7f0fa 80%);
+            font-family: 'Montserrat', Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            margin: 70px auto;
+            background: white;
+            max-width: 480px;
+            border-radius: 22px;
+            box-shadow: 0 4px 32px #aac2e6a2;
+            padding: 38px 35px 22px 35px;
+        }
+        h1 {
+            text-align: center;
+            font-size: 2rem;
+            font-weight: 700;
+            color: #337de8;
+            margin-bottom: 38px;
+            letter-spacing: 1px;
+            text-shadow: 1px 1px 7px #d6eef8;
+        }
+        label {
+            font-size: 1.08rem;
+            font-weight: 500;
+            color: #456;
+            margin-bottom: 6px;
+            display: block;
+            margin-top: 16px;
+        }
+        input[type="datetime-local"] {
+            border: 1px solid #d2e3f0;
+            border-radius: 9px;
+            padding: 8px 14px;
+            font-size: 1.06rem;
+            font-family: inherit;
+            margin-bottom: 10px;
+            width: 100%;
+            box-sizing: border-box;
+            transition: border-color 0.15s;
+        }
+        input[type="datetime-local"]:focus {
+            border-color: #337de8;
+            outline: none;
+        }
+        button[type="submit"] {
+            background: linear-gradient(90deg,#337de8 80%,#72c7ff 100%);
+            color: white;
+            font-size: 1.08rem;
+            font-weight: bold;
+            border: none;
+            border-radius: 12px;
+            padding: 12px 24px;
+            margin-top: 28px;
+            cursor: pointer;
+            box-shadow: 0 2px 12px rgba(51,125,232,0.15);
+            width: 100%;
+            transition: background 0.13s;
+        }
+        button[type="submit"]:hover {
+            background: linear-gradient(90deg,#2562b9 70%,#55aee6 100%);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Select Time Range for Analytics</h1>
+        <form action="/analytics" method="get">
+            <label for="start_time">Start Time (ISO):</label>
+            <input type="datetime-local" id="start_time" name="start_time" required>
+            <label for="end_time">End Time (ISO):</label>
+            <input type="datetime-local" id="end_time" name="end_time" required>
+            <button type="submit">Show Analytics</button>
+        </form>
+    </div>
+</body>
+</html>

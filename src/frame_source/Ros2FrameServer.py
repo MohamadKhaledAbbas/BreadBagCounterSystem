@@ -21,7 +21,8 @@ class FrameServer(Node, FrameSource):
             topic,
             self.listener_callback,
             qos_profile_sensor_data)
-        self.frame_queue = queue.Queue(maxsize=10)
+        # Only keep the latest frame
+        self.frame_queue = queue.Queue(maxsize=1)
         self.last_frame_time = time.time()
 
         self._ros_spin_thread = threading.Thread(target=rclpy.spin, args=(self,), daemon=True)
@@ -38,6 +39,12 @@ class FrameServer(Node, FrameSource):
             return
         latency_ms = (now - self.last_frame_time) * 1000
         self.last_frame_time = now
+        # Leaky queue: drop oldest if full
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
         self.frame_queue.put((bgr, latency_ms))
 
     def frames(self):
@@ -49,7 +56,6 @@ class FrameServer(Node, FrameSource):
                 continue
 
     def cleanup(self):
+        rclpy.shutdown()
         if self._ros_spin_thread.is_alive():
             self._ros_spin_thread.join()
-        self.frame_queue.join()
-        rclpy.shutdown()

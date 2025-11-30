@@ -202,9 +202,7 @@ class BagCounterApp:
             print("[RUN] Cleaning up...")
             self.is_running = False
             self.frame_source.cleanup()
-            self.input_queue.join()
-            self.result_queue.join()
+            cv2.destroyAllWindows()
             if logic_thread.is_alive():
                 logic_thread.join()
-            cv2.destroyAllWindows()
             print("[RUN] App Closed.")
