@@ -2,177 +2,78 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Analytics Dashboard</title>
-    <link href="https://fonts.googleapis.com/css?family=Montserrat:400,700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            background: linear-gradient(110deg,#f3f7fa 70%, #eef2fa 100%);
-            font-family: 'Montserrat', Helvetica, Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            min-height: 100vh;
-        }
-        .stats-header {
-            text-align: center;
-            padding: 44px 0 0 0;
-        }
-        .stats-title {
-            font-size: 2.3rem;
-            font-weight: bold;
-            color: #133455;
-            letter-spacing: 1.2px;
-            margin-bottom: 6px;
-        }
-        .date-range {
-            font-size: 1.01rem;
-            color: #6195c6;
-            margin-bottom: 10px;
-        }
-        /* Total card */
-        .total-card {
-            background: linear-gradient(90deg, #eaf6ff 70%, #fcfdff 100%);
-            border-radius: 16px;
-            box-shadow: 0 4px 18px #acd0e6a2;
-            max-width: 380px;
-            margin: 28px auto 22px auto;
-            padding: 30px 28px 18px 28px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        .total-thumb {
-            width: 140px;
-            height: 140px;
-            border-radius: 18px;
-            background: #edf6fe;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 6px 20px rgba(59,120,195,0.12);
-            margin-bottom: 16px;
-            overflow: hidden;
-        }
-        .total-label {
-            font-size: 1.2rem;
-            font-weight: bold;
-            letter-spacing: 1px;
-            color: #2562b9;
-            margin-bottom: 7px;
-        }
-        .total-count {
-            font-size: 2.3rem;
-            font-weight: 800;
-            color: #1d3357;
-            margin-bottom: 6px;
-        }
-        .total-weight {
-            font-size: 1.01rem;
-            color: #54a3e8;
-            margin-bottom: 2px;
-        }
-        /* Cards */
-        .card-container {
-            display: flex;
-            justify-content: center;
-            flex-wrap: wrap;
-            gap: 30px;
-            margin: 24px auto 0 auto;
-            max-width: 1080px;
-        }
-        .stat-card {
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 2px 12px rgba(60,60,120,0.12);
-            width: 215px;
-            min-height: 285px;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            transition: box-shadow 0.16s, transform 0.13s;
-            position: relative;
-        }
-        .stat-card:hover {
-            box-shadow: 0 8px 28px #b4d7f6a1;
-            transform: scale(1.024);
-        }
-        .card-thumb {
-            width: calc(100% - 8px);
-            height: 140px;
-            object-fit: cover;
-            border-radius: 12px;
-            margin-bottom: 14px;
-            box-shadow: 0 4px 16px #cfe8fc54;
-            border: 1.5px solid #e8ecff;
-            background: #edf6fe;
-            display: block;
-        }
-        .card-label {
-            font-size: 1.09rem;
-            font-weight: bold;
-            color: #296fa2;
-            letter-spacing: 1px;
-            margin-bottom: 6px;
-            text-align: center;
-        }
-        .card-count {
-            font-size: 1.68rem;
-            font-weight: 700;
-            color: #3B4352;
-            margin-bottom: 5px;
-        }
-        .card-weight {
-            font-size: 0.98rem;
-            color: #7cc1f5;
-            margin-bottom: 6px;
-        }
-
-        /* Responsive */
-        @media (max-width: 1080px) {
-            .card-container { max-width: 97vw; gap: 20px;}
-        }
-        @media (max-width: 750px) {
-            .card-container {
-                flex-direction: column;
-                align-items: center;
-                gap: 17px;
-            }
-            .stat-card, .total-card {width: 92vw; max-width: 340px;}
-            .card-thumb {height: 120px;}
-            .total-thumb {width: 110px; height: 110px;}
-        }
-    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="/static/css/analytics.css?v=5" rel="stylesheet">
 </head>
-<body>
-    <div class="stats-header">
-        <div class="stats-title">Bag Analytics Overview</div>
-        {% if meta and meta.start and meta.end %}
-        <div class="date-range">From
-            <span style="font-weight:bold;">{{ meta.start.strftime('%Y-%m-%d %H:%M') }}</span>
-            to
-            <span style="font-weight:bold;">{{ meta.end.strftime('%Y-%m-%d %H:%M') }}</span>
-        </div>
-        {% endif %}
-    </div>
-    <div class="total-card">
-        <div class="total-thumb">
-            <img alt="Total count" src="https://img.icons8.com/ios-filled/150/stack-of-books.png"
-                 style="width:124px; height:124px;">
-        </div>
-        <div class="total-label">Total Bags</div>
-        <div class="total-count">{{ total.count or 'N/A' }}</div>
-        <div class="total-weight">Total Weight: {{ total.weight or 'N/A' }} kg</div>
-    </div>
 
-    <div class="card-container">
+<body>
+
+<main>
+    <header class="stats-header">
+        <h1 class="stats-title">Data Insights Dashboard</h1>
+    </header>
+
+    {% if meta and meta.start and meta.end %}
+    <section class="time-stage-container">
+        <div class="time-stage">
+            <div class="time-label">
+                <i class="fa-regular fa-calendar-check"></i> Analysis Window
+            </div>
+
+            <div class="time-display">
+                <span>{{ meta.start.strftime('%Y-%m-%d %H:%M') }}</span>
+                <span class="time-divider">&mdash;</span>
+                <span>{{ meta.end.strftime('%Y-%m-%d %H:%M') }}</span>
+            </div>
+
+            <a href="/analytics" class="edit-time-btn" title="Change Time Range">
+                <i class="fa-solid fa-pen-to-square"></i>
+            </a>
+        </div>
+    </section>
+    {% endif %}
+
+    <section class="hero-section">
+        <div class="hero-card">
+            <div class="hero-metric primary">
+                <div class="hero-label">Total Classified Items</div>
+                <div class="hero-value">{{ total.count or 0 }}</div>
+            </div>
+
+            <div class="hero-metric">
+                <div class="hero-label">Total Processed Weight</div>
+                <div class="hero-value">
+                    {{ total.weight or 0 }}<span style="font-size: 1.5rem; opacity: 0.7; margin-left: 5px;">kg</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="grid-container">
         {% for c in classifications %}
         <div class="stat-card">
-            <img src="{{ c.thumb }}" alt="{{ c.name }}" class="card-thumb">
-            <div class="card-label" title="{{ c.name }}">{{ c.name }}</div>
-            <div class="card-count">{{ c.count }}</div>
-            <div class="card-weight">Weight: {{ c.weight or 'N/A' }} kg</div>
+            <div class="card-header">
+                <div>
+                    <div class="card-title">{{ c.name }}</div>
+                </div>
+                <div class="thumb-container">
+                    <img src="{{ c.thumb }}" alt="{{ c.name }}" onerror="this.src='https://placehold.co/100x100/1e293b/FFF?text={{c.name[:1]}}'">
+                </div>
+            </div>
+
+            <div class="card-metric-large">{{ c.count }}</div>
+
+            <div class="card-footer">
+                <span>Weight</span>
+                <span class="weight-tag">{{ c.weight or 0 }} kg</span>
+            </div>
         </div>
         {% endfor %}
-    </div>
+    </section>
+</main>
+
 </body>
 </html>

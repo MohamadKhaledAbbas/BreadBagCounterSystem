@@ -11,3 +11,5 @@ app.mount("/unknown_classes", StaticFiles(directory="data/unknown/"), name="unkn
 
 os.makedirs("data/classes/", exist_ok=True)  # Creates the directory if it doesn't exist
 app.mount("/known_classes", StaticFiles(directory="data/classes/"), name="known_classes")
+
+app.mount("/static", StaticFiles(directory="src/endpoint/static"), name="static")
