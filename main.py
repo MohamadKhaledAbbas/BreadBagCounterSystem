@@ -17,8 +17,8 @@ if __name__ == "__main__":
     SHOW_UI_SCREEN = args.show_ui_screen.lower() == "true"
 
     # Configuration
-    VIDEO_PATH = "output2.mp4"
-    DETECTION_MODEL = "data/model/best_detect_bayese_640x640_nv12.bin"
+    VIDEO_PATH = "output.mp4"
+    DETECTION_MODEL = "data/model/best_yolo_small_bayese_640x640_nv12.bin"
     CLASS_MODEL = "data/model/best_classify_bayese_224x224_nv12.bin"
     db_manager = DatabaseManager("data/db/bag_events.db")
     detector = BpuDetector(DETECTION_MODEL, {0: 'bread-bag-closed', 1: 'bread-bag-opened'})

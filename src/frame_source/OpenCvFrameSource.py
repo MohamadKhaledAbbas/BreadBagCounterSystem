@@ -37,7 +37,7 @@ class OpenCVFrameSource(FrameSource):
             except queue.Full:
                 pass  # Should not happen now
 
-            time.sleep(0.01)  # Faster polling for UI
+            time.sleep(0.1)  # Faster polling for UI
 
     def frames(self):
         while self.running or not self.queue.empty():

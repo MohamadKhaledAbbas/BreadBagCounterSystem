@@ -57,10 +57,16 @@ async def analytics(
     if start_dt > end_dt:
         raise HTTPException(status_code=422, detail="Start time must be before end time")
     try:
+        start_dt = start_dt - timedelta(hours=3)
+        end_dt = end_dt - timedelta(hours=3)
         stats = get_stats(start_dt, end_dt)
         print(f"stats: {stats}")
         for c in stats["data"]["classifications"]:
             c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
+
+        # Adjusting timezone for preview +3
+        stats["meta"]["start"] = start_dt + timedelta(hours=3)
+        stats["meta"]["end"] = end_dt + timedelta(hours=3)
 
         return templates.TemplateResponse("analytics.html", {
             "request": request,
@@ -88,6 +94,6 @@ async def get_daily_analytics(
     # Time (ISO Format), e.g. 2025-11-24T08:00:00
     start_time = start_time.replace(hour=16, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
     end_time = end_time.replace(hour=11, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
-    return analytics(request=request, start_time=start_time, end_time=end_time)
+    return await analytics(request=request, start_time=start_time, end_time=end_time)
 
 # To run: uvicorn server:app --reload

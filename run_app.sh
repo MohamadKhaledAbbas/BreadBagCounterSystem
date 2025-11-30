@@ -27,7 +27,7 @@ RUN_TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
 PROCESS1_CMD="source /opt/tros/humble/setup.bash && ros2 launch /home/sunrise/BreadCounting/src/ros2/Ros2PipelineLauncher.py"
 PROCESS2_CMD="source /opt/tros/humble/setup.bash && python /home/sunrise/BreadCounting/main.py"
 MAIN_PY_ARGS="--is_production=$IS_PRODUCTION --show_ui_screen=$SHOW_UI_SCREEN"
-UVICORN_CMD="uvicorn src.endpoint.server:app --host 192.168.1.206"
+UVICORN_CMD="uvicorn src.endpoint.Server:app --host 192.168.1.206"
 
 if [ "$IS_PRODUCTION" = "true" ]; then
     # Check for Ros2PipelineLauncher.py
@@ -47,7 +47,7 @@ if [ "$IS_PRODUCTION" = "true" ]; then
     fi
 
     # Check for uvicorn
-    if pgrep -f "uvicorn src.endpoint.server:app --host 192.168.1.206" > /dev/null; then
+    if pgrep -f "uvicorn src.endpoint.Server:app --host 192.168.1.206" > /dev/null; then
         echo "[WARN] Uvicorn is already running! Skipping launch."
     else
         nohup bash -c "$UVICORN_CMD" > "$LOG_DIR/uvicorn_$RUN_TIMESTAMP.log" 2>&1 &
@@ -65,7 +65,7 @@ else
     fi
 
     # Check for uvicorn
-    if pgrep -f "uvicorn src.endpoint.server:app --host 192.168.1.206" > /dev/null; then
+    if pgrep -f "uvicorn src.endpoint.Server:app --host 192.168.1.206" > /dev/null; then
         echo "[WARN] Uvicorn is already running! Skipping launch."
     else
         nohup bash -c "$UVICORN_CMD" > "$LOG_DIR/uvicorn_dev_$RUN_TIMESTAMP.log" 2>&1 &
