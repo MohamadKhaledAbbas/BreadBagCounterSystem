@@ -3,6 +3,8 @@ import imagehash
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 
+from src.constants import CONFIG_KEYS
+
 
 class DatabaseManager:
     def __init__(self, db_path="bag_data.db"):
@@ -19,9 +21,12 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS bag_types (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE,
+                    arabic_name TEXT,
                     is_known BOOLEAN,
                     phash TEXT,
                     image_path TEXT,
+                    number_of_breads INTEGER,
+                    weight REAL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -37,6 +42,19 @@ class DatabaseManager:
                     FOREIGN KEY(bag_type_id) REFERENCES bag_types(id)
                 )
             """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
+            for config_key in CONFIG_KEYS:
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO config (key, value) VALUES ('{config_key}', '0');
+                """)
+
             conn.commit()
 
     def get_or_create_bag_type(self, label: str, phash_obj, image_path: str = None) -> int:
@@ -114,6 +132,9 @@ class DatabaseManager:
                     bt.name AS bag_type,
                     bt.image_path,
                     bt.is_known,
+                    bt.arabic_name,
+                    bt.number_of_breads,
+                    bt.weight,
                     COUNT(be.id) AS count
                 FROM bag_types bt
                 LEFT JOIN bag_events be
@@ -127,21 +148,42 @@ class DatabaseManager:
                 WHERE timestamp BETWEEN ? AND ?
             """, (start_time, end_time)).fetchone()[0]
 
+            total_weight = conn.execute("""
+                SELECT SUM(COALESCE(bt.weight, 0)) AS total_weight
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?;
+            """, (start_time, end_time)).fetchone()[0]
         # Adapt this for your return structure (dict/list suitable for template)
         stats = {
             "total": {
                 "count": total_count,
-                # "weight": ... if you ever add that
+                "weight": total_weight / 1000
             },
             "classifications": [
                 {
                     "id": row["id"],
                     "name": row["bag_type"],
+                    "arabic_name": row["arabic_name"],
+                    "number_of_breads": row["number_of_breads"],
+                    "weight": row["weight"] / 1000,
                     "thumb": row["image_path"],
                     "is_known": bool(row["is_known"]),
                     "count": row["count"],
-                    # "weight": ... if/when you store one for each event or type
                 } for row in bag_type_stats
             ]
         }
         return stats
+
+    def get_config_value(self, key):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM config WHERE key=?", (key,))
+                row = cur.fetchone()
+                if row is not None:
+                    return row[0]  # row = (value,), so row[0] is the value
+        except Exception as e:
+            print("[ERROR] get_config_value:", e)
+
+        return None

@@ -68,6 +68,7 @@ async def analytics(
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
         stats["meta"]["end"] = end_dt + timedelta(hours=3)
 
+        print(f"stats: {stats}")
         return templates.TemplateResponse("analytics.html", {
             "request": request,
             "meta": stats["meta"],

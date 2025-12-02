@@ -54,11 +54,9 @@
 
     <section class="grid-container">
         {% for c in classifications %}
-        <div class="stat-card">
-            <div class="card-header">
-                <div>
-                    <div class="card-title">{{ c.name }}</div>
-                </div>
+            <div class="stat-card">
+                <div class="card-header stacked">
+                <div class="card-title">{{ c.arabic_name }}</div>
                 <div class="thumb-container">
                     <img src="{{ c.thumb }}" alt="{{ c.name }}" onerror="this.src='https://placehold.co/100x100/1e293b/FFF?text={{c.name[:1]}}'">
                 </div>
@@ -68,7 +66,7 @@
 
             <div class="card-footer">
                 <span>Weight</span>
-                <span class="weight-tag">{{ c.weight or 0 }} kg</span>
+                <span class="weight-tag">{{ (c.weight * c.count) or 0 }} kg</span>
             </div>
         </div>
         {% endfor %}

@@ -1,0 +1,16 @@
+[Unit]
+Description=ROS2 Pipeline Launcher
+After=network.target
+
+[Service]
+Type=simple
+User=sunrise
+WorkingDirectory=/home/sunrise/BreadCounting/
+ExecStart=bash -c 'source /opt/tros/humble/setup.bash && ros2 launch /home/sunrise/BreadCounting/src/ros2/Ros2PipelineLauncher.py'
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
