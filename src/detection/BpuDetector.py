@@ -5,6 +5,8 @@ from scipy.special import softmax
 from src.detection.BaseDetection import BaseDetector
 from src.utils.PerformanceChecker import run_with_timing
 
+from src.utils.AppLogging import logger
+
 # Import BPU Library
 try:
     from hobot_dnn import pyeasy_dnn as dnn
@@ -67,7 +69,7 @@ class BpuDetector(BaseDetector):
         outputs = run_with_timing("forward", self.quantize_model[0].forward, input_tensor)
         t2 = cv2.getTickCount()
         latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-        print(f"BPU Detect Inference Time: {latency:.2f} ms")
+        logger.debug(f"BPU Detect Inference Time: {latency:.2f} ms")
 
         # 3. Convert to Numpy
         output_arrays = [out.buffer for out in outputs]

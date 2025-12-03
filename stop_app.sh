@@ -1,59 +1,36 @@
-#!/bin/sh
+#!/bin/bash
 
-echo "[INFO] Checking process [Ros2PipelineLauncher.py] ..."
-if pgrep -f "Ros2PipelineLauncher.py" > /dev/null; then
-    pkill -f Ros2PipelineLauncher.py
-    echo "[INFO] Ros2PipelineLauncher.py stop signal sent."
-else
-    echo "[INFO] Ros2PipelineLauncher.py is NOT running."
-fi
+CONFIG_PY="./config.py"
 
-echo "\n"
+# Show current config
+echo "=== Current Config ==="
+python3 "$CONFIG_PY" --get_all
+echo "====================="
 
-echo "[INFO] Checking child process [hobot_codec_republish] of Ros2PipelineLauncher.py ..."
-if pgrep -f hobot_codec_republish > /dev/null; then
-    pkill -f hobot_codec_republish
-    echo "[INFO] hobot_codec_republish stop signal sent.."
-else
-    echo "[INFO] hobot_codec_republish is NOT running."
-fi
+# Stop services safely using supervisorctl
+echo "[INFO] Stopping all breadcount services via Supervisor..."
+# Stopping the services in one command is generally fastest
+sudo supervisorctl stop breadcount-uvicorn breadcount-main breadcount-ros2
 
-echo "\n"
+# Check status using supervisorctl
+echo "[INFO] Checking service status..."
 
-echo "[INFO] Checking child process [hobot_rtsp_client] of Ros2PipelineLauncher.py ..."
-if pgrep -f hobot_rtsp_client > /dev/null; then
-    pkill -f hobot_rtsp_client
-    echo "[INFO] hobot_rtsp_client stop signal sent.."
-else
-    echo "[INFO] hobot_rtsp_client is NOT running."
-fi
+# Retrieve the full status report
+SERVICE_STATUS=$(sudo supervisorctl status breadcount-ros2 breadcount-main breadcount-uvicorn)
 
-echo "\n"
+# Define the list of services to check
+SERVICES=("breadcount-ros2" "breadcount-main" "breadcount-uvicorn")
 
-echo "[INFO] Checking process [main.py] ..."
-if pgrep -f "main.py" > /dev/null; then
-    pkill -f main.py
-    echo "[INFO] main.py stop signal sent."
-else
-    echo "[INFO] main.py is NOT running."
-fi
-
-echo "\n"
-
-echo "[INFO] Checking process [uvicorn] ..."
-if pgrep -f "uvicorn" > /dev/null; then
-    pkill -f "uvicorn"
-    echo "[INFO] Uvicorn server stop signal sent."
-else
-    echo "[INFO] Uvicorn server is NOT running."
-fi
-
-echo "\n"
-
-echo "[INFO] Stop sequence complete. You can check with
-'ps aux | grep Ros2PipelineLauncher.py'
-'ps aux | grep hobot_rtsp_client.py'
-'ps aux | grep hobot_codec_republish.py'
-'ps aux | grep main.py'
-'ps aux | grep uvicorn'
-for any remaining processes."
+# Check status for each service
+for service in "${SERVICES[@]}"; do
+    # Look for the service name followed by "STOPPED"
+    if echo "$SERVICE_STATUS" | grep -q "$service.*STOPPED"; then
+        echo "[INFO] $service stopped successfully."
+    else
+        # If it's not STOPPED, it might be FATAL or RUNNING (indicating a failure to stop)
+        # Use grep to capture the actual status line for better reporting
+        STATUS_LINE=$(echo "$SERVICE_STATUS" | grep "$service")
+        echo "[WARN] $service is still active or failed to stop!"
+        echo "       Status: $STATUS_LINE"
+    fi
+done

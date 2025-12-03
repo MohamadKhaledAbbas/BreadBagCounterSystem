@@ -1,7 +1,8 @@
+import os
+
 import cv2
-import time
-import threading
 import queue
+import threading
 from typing import Dict, Any
 
 from src.counting.Visualizer import Visualizer
@@ -10,15 +11,21 @@ from src.classifier.BaseClassifier import BaseClassifier
 from src.counting.BagStateMonitor import BagStateMonitor
 from src.detection.BaseDetection import BaseDetector
 from src.logging.Database import DatabaseManager
-from src.frame_source.FrameSourceFactory import FrameSource
+from src.frame_source.FrameSourceFactory import FrameSource, FrameSourceFactory
 from src.tracking.BaseTracker import BaseTracker
 from src import constants
 
 from src.logging.ConfigWatcher import ConfigWatcher
-import logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+
+from src.utils.AppLogging import logger
+
+# --- ROS 2 Check Imports ---
+from rclpy.node import Node
+# ---------------------------
+# Import the ROS 2 helper functions from IPC.py
+from src.counting.IPC import ExecutorThread, init_ros2_context, shutdown_ros2_context
+from src.counting.FramePublisherNode import FramePublisher
+# -------------------
 
 def on_is_recording_changed(new_value):
     if new_value == "1":
@@ -34,27 +41,24 @@ class BagCounterApp:
                  tracker: BaseTracker,
                  classifier_engine: BaseClassifier,
                  db: DatabaseManager,
-                 frame_source: FrameSource,
-                 show_ui_screen: bool,
+                 is_development: bool
                  ):
 
         logger.debug("[INIT] BagCounterApp initializing...")
         self.db = db
-        self.show_ui_screen = show_ui_screen
-        self.video_path = video_path
         self.detector = detector_engine
         self.tracker = tracker
         self.classifier_service = ClassifierService(classifier_engine)
-        self.frame_source = frame_source
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
+        # Point to the modified handler
         self.config_watcher.add_watch(constants.show_ui_screen_key, self.on_show_ui_changed)
         self.config_watcher.add_watch(constants.is_recording_key, on_is_recording_changed)
 
         self.is_running = False
 
         self.input_queue = queue.Queue(maxsize=1)
-        self.result_queue = queue.Queue(maxsize=1)
+        # Result queue removed: we publish directly from logic thread
 
         names = self.detector.class_names
         logger.info(f'[INIT] Found detector class names: {names}')
@@ -70,27 +74,50 @@ class BagCounterApp:
         self.visualizer = Visualizer(names)
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
-        self.ui_should_destroy = False
+
+        # --- IPC SETUP (ROS 2 - Executor Pattern) ---
+        # 1. Initialize ROS 2 context and get the Executor instance
+        self.ros_executor = init_ros2_context()
+
+        self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
+
+        # 2. Create the ROS 2 Publisher Node
+        self.ipc_publisher = FramePublisher(publish_rate_hz=30.0)
+
+        # 3. Add necessary nodes to the shared Executor
+        self.ros_executor.add_node(self.ipc_publisher)
+
+        if is_development:
+            self.frame_source = FrameSourceFactory.create("opencv", source=video_path)
+            logger.info("[INFO] running in development mode, reading from Video file...")
+            logger.info("[INFO] loading video from {}".format(video_path))
+        else:
+            os.environ["HOME"] = "/home/sunrise"
+            self.frame_source = FrameSourceFactory.create("ros2")
+            logger.info("[INFO] running in production mode, reading from RTSP stream...")
+
+        # Conditional check: If the FrameSource passed is a ROS 2 Node, add it to the executor.
+        if isinstance(self.frame_source, Node):
+            self.ros_executor.add_node(self.frame_source)
+            logger.info("[INIT] FrameSource is a ROS 2 Node and has been added to the shared Executor.")
+
+        # 4. Start the dedicated thread for the ROS 2 executor's spin
+        self.ros_thread = ExecutorThread(self.ros_executor)
+        self.ros_thread.start()
+
+        logger.info("[INIT] ROS 2 Executor Thread initialized. All ROS nodes are spinning.")
+
 
         logger.info("[INIT] Initialization complete")
 
     def on_show_ui_changed(self, new_value):
-        # expect new_value as string, e.g. "1" or "0"
+        # Instead of opening windows, we just toggle the publishing flag
         if new_value == "1":
-            self.show_ui_screen = True
-            logger.debug("[ConfigStateMonitor] UI enabled → showing window allowed.")
+            self.is_publishing = True
+            logger.info("[ConfigStateMonitor] UI flag set: IPC Publishing ENABLED")
         else:
-            logger.debug("[ConfigStateMonitor] UI disabled → closing OpenCV windows...")
-            self.show_ui_screen = False
-            self.ui_should_destroy = True
-            while not self.result_queue.empty():
-                try:
-                    self.result_queue.get_nowait()
-                except queue.Empty:
-                    break
-            # Destroy windows in main loop
-
-
+            self.is_publishing = False
+            logger.info("[ConfigStateMonitor] UI flag unset: IPC Publishing DISABLED")
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
         logger.debug(f"[CALLBACK] on_classification_result called for Track {track_id}")
@@ -98,146 +125,112 @@ class BagCounterApp:
         phash = data['phash']
         image_path = data['image_path']
         conf = data.get('confidence', 1.0)
-        logger.debug(f"[CALLBACK] Received result: label={label}, phash={phash}, image_path={image_path}, conf={conf}")
+
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
-        logger.debug(f"[CALLBACK] Bag type id got: {bag_type_id}")
         self.db.log_event(bag_type_id, track_id, conf)
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
 
     def _logic_thread_loop(self):
         logger.debug("[THREAD] ✅ Logic Thread Started")
+
+        # Define SimpleTrack class here or at module level
+        class SimpleTrack:
+            def __init__(self, tid, box, cid):
+                self.track_id = tid
+                self.box = box
+                self.class_id = cid
+
         while self.is_running:
             try:
-                logger.debug("[THREAD] Trying to get frame from input_queue...")
                 frame = self.input_queue.get(timeout=1.0)
-                logger.debug("[THREAD] Logic thread got frame")
             except queue.Empty:
-                logger.debug("[THREAD] input_queue empty, retrying...")
-                if not self.is_running:
-                    logger.debug("[THREAD] Detected is_running=False, exiting logic thread!")
-                    break
+                if not self.is_running: break
                 continue
             except Exception as e:
-                logger.error(f"[THREAD ERROR] Exception on input_queue.get: {e}")
+                logger.error(f"[THREAD] Input Queue Error: {e}")
                 continue
 
             try:
                 t1 = cv2.getTickCount()
-                logger.debug("[THREAD] Running detector.predict...")
+
+                # 1. Run Detector
                 detections = self.detector.predict(frame)
-                logger.debug(f"[THREAD] Detector returned {len(detections)} detection batches.")
-                tracks = []
+                current_frame_detections = []
 
                 if len(detections) > 0 and hasattr(detections[0], 'boxes') and len(detections[0].boxes) > 0:
-                    logger.debug(f"[THREAD] Detector boxes found: {len(detections[0].boxes)}")
                     xyxy = detections[0].boxes.xyxy.cpu().numpy()
-                    conf = detections[0].boxes.conf.cpu().numpy()
                     cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
+                    confidences = detections[0].boxes.conf.cpu().numpy()
 
-                    logger.debug(f"[THREAD] Calling tracker.update...")
-                    tracks = self.tracker.update(xyxy, conf, cls_ids)
-                    logger.debug(f"[THREAD] Tracker returned {len(tracks)} tracks")
+                    for i in range(len(cls_ids)):
+                        current_frame_detections.append({
+                            'box': xyxy[i],
+                            'class_id': cls_ids[i],
+                            'conf': confidences[i]
+                        })
 
-                    active_ids = set()
-                    for det in tracks:
-                        active_ids.add(det.track_id)
-                        logger.debug(f"[THREAD] Monitor.update for track_id {det.track_id}, class_id {det.class_id}")
-                        event = self.monitor.update(det.track_id, det.class_id)
+                # 2. Update Monitor
+                ready_events = self.monitor.update(current_frame_detections, frame)
 
-                        if event == 'READY_TO_CLASSIFY':
-                            logger.debug("[THREAD] READY_TO_CLASSIFY event is True")
-                            h, w = frame.shape[:2]
-                            x1, y1, x2, y2 = map(int, det.box)
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(w, x2), min(h, y2)
-                            logger.debug(f"[THREAD] ROI coords: ({x1},{y1})-({x2},{y2})")
-                            if x2 > x1 and y2 > y1:
-                                roi = frame[y1:y2, x1:x2].copy()
-                                logger.debug("[THREAD] Calling classifier_service.process...")
-                                self.classifier_service.process(det.track_id, roi)
-                    logger.debug(f"[THREAD] Calling monitor.cleanup...")
-                    self.monitor.cleanup(active_ids)
-                else:
-                    logger.debug("[THREAD] No boxes found by detector.")
+                # 3. Process Ready Events
+                for event_id, best_roi in ready_events:
+                    self.classifier_service.process(event_id, best_roi)
 
-                t2 = cv2.getTickCount()
-                latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-                fps = 1000 / latency if latency else 0
+                # --- 4. PUBLISHING LOGIC (Only if enabled) ---
+                if self.is_publishing:
+                    # Prepare data for visualization
+                    tracks_for_ui = []
+                    for event in self.monitor.active_events:
+                        t = SimpleTrack(event.id, event.box,
+                                        event.open_id if event.state == 'detecting_open' else event.closed_id)
+                        tracks_for_ui.append(t)
 
-                # Send to Display (Leaky Bucket)
-                if self.show_ui_screen:
-                    logger.debug("[THREAD] In show_ui_screen block")
-                    if self.result_queue.full():
-                        logger.debug("[THREAD] result_queue is full, popping one item")
-                        try:
-                            self.result_queue.get_nowait()
-                        except queue.Empty:
-                            logger.debug("[THREAD] result_queue unexpectedly empty")
-                            pass
-                    logger.debug("[THREAD] Logic thread putting result to result_queue")
-                    self.result_queue.put((frame, tracks, fps, self.ui_counts.copy()))
-                else:
-                    logger.debug(f"[THREAD] Not in UI mode: fps: {int(fps)} , latency: {latency:.2f} ms")
+                    # Calculate FPS
+                    t2 = cv2.getTickCount()
+                    latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
+                    fps = 1000 / latency if latency else 0
+
+                    # Draw on a COPY of the frame (so we don't mess up next logic steps if any)
+                    annotated_frame = frame.copy()
+
+                    # Use Visualizer to draw boxes/text
+                    self.visualizer.draw_detections(annotated_frame, tracks_for_ui)
+                    self.visualizer.draw_stats(annotated_frame, self.ui_counts)
+                    cv2.putText(annotated_frame, f"FPS: {int(fps)}", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    annotated_frame = cv2.resize(annotated_frame, (1280, 720))
+                    # Send to Shared Memory
+                    self.ipc_publisher.publish(annotated_frame)
+                    logger.debug(f"[LOGIC-THREAD] Frame sent to IPC buffer. Publishing: {self.is_publishing}")
+                # ---------------------------------------------
+
             except Exception as e:
                 logger.error(f"[THREAD ERROR] Exception in logic: {e}")
+                import traceback
+                traceback.print_exc()
 
     def run(self):
-        logger.info("[RUN] Starting BagCounterApp.run()")
+        logger.info("[RUN] Starting BagCounterApp.run() [HEADLESS MODE]")
         self.is_running = True
 
         logic_thread = threading.Thread(target=self._logic_thread_loop, daemon=True)
         logic_thread.start()
-        logger.info("[RUN] Logic thread started.")
 
-        logger.info("[RUN] ✅ Main Loop Started (Display & Input)")
         self.config_watcher.start()
-        try:
-            for frame, latencyMs in self.frame_source.frames():
-                logger.info(f"[RUN] Main loop got frame, latency: {latencyMs:.2f} ms")
 
+        try:
+            # Main loop now ONLY handles ingestion. No UI.
+            for frame, latencyMs in self.frame_source.frames():
                 if self.input_queue.full():
-                    logger.debug("[RUN] input_queue full, popping one frame")
                     try:
                         self.input_queue.get_nowait()
                     except queue.Empty:
-                        logger.debug("[RUN] input_queue unexpectedly empty")
                         pass
-                logger.debug("[RUN] Putting frame into input_queue")
                 self.input_queue.put(frame)
 
-                if self.ui_should_destroy:
-                    self.ui_should_destroy = False
-                    logger.debug("[RUN] UI should_destroy is True, destroying UI screen...")
-                    cv2.destroyAllWindows()
+                # Small sleep to prevent CPU hogging if source is faster than processing
+                # but usually frame_source.frames() controls timing.
 
-                if self.show_ui_screen:
-                    logger.debug("[RUN] In UI path.")
-                    try:
-                        logger.debug("[RUN] Waiting for result_queue.get()")
-                        r_frame, r_tracks, r_fps, r_counts = self.result_queue.get(timeout=0.2)
-                        logger.debug("[RUN] Got result from logic thread! Drawing and displaying...")
-                        self.visualizer.draw_detections(r_frame, r_tracks)
-                        self.visualizer.draw_stats(r_frame, r_counts)
-
-                        cv2.putText(r_frame, f"FPS: {int(r_fps)}", (20, 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                        logger.debug("[RUN] Calling cv2.imshow")
-                        r_frame = cv2.resize(r_frame, (1280, 720))
-                        cv2.imshow("Bag Counter with DB", r_frame)
-
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            logger.debug("[RUN] Quit key pressed, breaking.")
-                            self.is_running = False  # Stop logic thread too!
-                            cv2.destroyAllWindows()  # Ensure window closes right away
-                            break
-                    except queue.Empty:
-                        logger.debug("[RUN] Result queue empty, skipping display")
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            logger.debug("[RUN] Quit key pressed, breaking from empty loop.")
-                            break
-                else:
-                    time.sleep(0.1)
         except Exception as e:
             logger.error(f"[RUN ERROR] Exception in main loop: {e}")
         finally:
@@ -245,7 +238,25 @@ class BagCounterApp:
             self.is_running = False
             self.frame_source.cleanup()
             self.config_watcher.stop()
-            cv2.destroyAllWindows()
+            # --- ROS 2 CLEANUP (Executor Pattern) ---
+            # 1. Remove Publisher node from the executor
+            self.ros_executor.remove_node(self.ipc_publisher)
+
+            # 2. Remove FrameSource node if it was a ROS 2 Node
+            if isinstance(self.frame_source, Node):
+                self.ros_executor.remove_node(self.frame_source)
+
+            # 3. Destroy the node instances and cleanup the source
+            self.ipc_publisher.close_node()
+            self.frame_source.cleanup()  # Calls cleanup (which calls destroy_node for FrameServer)
+
+            # 4. Stop the ROS 2 execution context and shut down the executor
+            shutdown_ros2_context()
+
+            if self.ros_thread.is_alive():
+                self.ros_thread.join(timeout=3)
+            # ---------------------
             if logic_thread.is_alive():
                 logic_thread.join()
+
             logger.info("[RUN] App Closed.")

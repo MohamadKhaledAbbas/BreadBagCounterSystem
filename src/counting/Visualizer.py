@@ -15,7 +15,14 @@ class Visualizer:
             x1, y1, x2, y2 = map(int, det.box)
             label = f"{det.track_id}: {self.names.get(det.class_id, 'Unknown')}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
+            if det.class_id == 0:
+                color = (255, 0, 0)
+            elif det.class_id == 1:
+                color = (0, 255, 0)
+            else:
+                color = (0, 0, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 2)
 
     def draw_stats(self, frame, counts: Dict[str, int]):
         y = 60

@@ -11,6 +11,7 @@ def generate_launch_description():
         SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', '/opt/tros/humble/lib/hobot_shm/config/shm_fastdds.xml'),
         SetEnvironmentVariable('RMW_FASTRTPS_USE_QOS_FROM_XML', '1'),
         SetEnvironmentVariable('ROS_DISABLE_LOANED_MESSAGES', '0'),
+        SetEnvironmentVariable('HOME', '/home/sunrise')
         # If you source setup.bash manually before running launch, it's fine. Otherwise, see below for shell script notes.
     ]
 

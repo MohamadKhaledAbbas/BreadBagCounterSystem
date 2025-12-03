@@ -1,76 +1,53 @@
-#!/bin/sh
+#!/bin/bash
 
-# Usage:
-#   ./run_app.sh --is_production true --show_ui_screen true
+# Configuration file path
+CONFIG_PY="./config.py"
 
-IS_PRODUCTION=""
-SHOW_UI_SCREEN=""
+# --- Configuration Retrieval ---
+echo "=== Current Config ==="
+python3 "$CONFIG_PY" --get_all
+echo "====================="
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --is_production) IS_PRODUCTION="$2"; shift 2;;
-        --show_ui_screen) SHOW_UI_SCREEN="$2"; shift 2;;
-        *) echo "Unknown option: $1"; exit 1;;
-    esac
-done
+# Get flags, ensuring we handle spaces/output correctly
+# Using tail -n 1 to specifically get the last line of output if --get outputs multiple lines
+IS_PRODUCTION=$(python3 "$CONFIG_PY" --get --key is_production | tail -n 1 | awk -F' = ' '{print $2}' | tr -d '[:space:]')
+SHOW_UI_SCREEN=$(python3 "$CONFIG_PY" --get --key show_ui_screen | tail -n 1 | awk -F' = ' '{print $2}' | tr -d '[:space:]')
 
-if [ "$IS_PRODUCTION" = "" ] || [ "$SHOW_UI_SCREEN" = "" ]; then
-    echo "Usage: $0 --is_production [true|false] --show_ui_screen [true|false]"
-    exit 1
+# --- Set Defaults if Not Set ---
+# Note: When checking for defaults, we should check against an empty string or null.
+if [ -z "$IS_PRODUCTION" ]; then
+    python3 "$CONFIG_PY" --key is_production --value 0
+    IS_PRODUCTION=0
 fi
 
-LOG_DIR="./logs"
-mkdir -p "$LOG_DIR"
+if [ -z "$SHOW_UI_SCREEN" ]; then
+    python3 "$CONFIG_PY" --key show_ui_screen --value 1
+    SHOW_UI_SCREEN=1
+fi
 
-RUN_TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+echo "[INFO] is_production=$IS_PRODUCTION, show_ui_screen=$SHOW_UI_SCREEN"
 
-PROCESS1_CMD="source /opt/tros/humble/setup.bash && ros2 launch /home/sunrise/BreadCounting/src/ros2/Ros2PipelineLauncher.py"
-PROCESS2_CMD="source /opt/tros/humble/setup.bash && python /home/sunrise/BreadCounting/main.py"
-MAIN_PY_ARGS=""
-UVICORN_CMD="uvicorn src.endpoint.Server:app --host 192.168.1.206"
+# --- Stop all services first for a clean restart/selection ---
+echo "[INFO] Stopping all breadcount services for controlled startup..."
+sudo supervisorctl stop breadcount-ros2 breadcount-main breadcount-uvicorn > /dev/null
 
-if [ "$IS_PRODUCTION" = "true" ]; then
-    # Check for Ros2PipelineLauncher.py
-    if pgrep -f "Ros2PipelineLauncher.py" > /dev/null; then
-        echo "[WARN] Ros2PipelineLauncher.py is already running! Skipping launch."
-    else
-        nohup bash -c "$PROCESS1_CMD" > "$LOG_DIR/ros2_$RUN_TIMESTAMP.log" 2>&1 &
-        echo "[INFO] Process 1 started (ros2.launch), log: $LOG_DIR/ros2_$RUN_TIMESTAMP.log"
-    fi
+# --- Start services based on is_production ---
+if [ "$IS_PRODUCTION" = "1" ]; then
+    echo "[INFO] Starting PRODUCTION services (ROS2, MAIN, UVICORN)..."
+    # In production, we assume UI is off (show_ui_screen should be set to 0 in your config utility)
+    sudo supervisorctl start breadcount-ros2 breadcount-main breadcount-uvicorn
 
-    # Check for main.py
-    if pgrep -f "main.py" > /dev/null; then
-        echo "[WARN] main.py is already running! Skipping launch."
-    else
-        nohup bash -c "$PROCESS2_CMD $MAIN_PY_ARGS" > "$LOG_DIR/mainpy_$RUN_TIMESTAMP.log" 2>&1 &
-        echo "[INFO] Process 2 started (main.py), log: $LOG_DIR/mainpy_$RUN_TIMESTAMP.log"
-    fi
+    # You might want to explicitly set the UI flag to 0 in production mode if you rely on the script for configuration
+    python3 "$CONFIG_PY" --key show_ui_screen --value 0
 
-    # Check for uvicorn
-    if pgrep -f "uvicorn src.endpoint.Server:app --host 192.168.1.206" > /dev/null; then
-        echo "[WARN] Uvicorn is already running! Skipping launch."
-    else
-        nohup bash -c "$UVICORN_CMD" > "$LOG_DIR/uvicorn_$RUN_TIMESTAMP.log" 2>&1 &
-        echo "[INFO] Uvicorn server started, log: $LOG_DIR/uvicorn_$RUN_TIMESTAMP.log"
-    fi
-
-    echo "[INFO] Process check/launch done."
 else
-    # Check for main.py
-    if pgrep -f "main.py" > /dev/null; then
-        echo "[WARN] main.py is already running! Skipping launch."
-    else
-        nohup bash -c "$PROCESS2_CMD $MAIN_PY_ARGS" > "$LOG_DIR/mainpy_dev_$RUN_TIMESTAMP.log" 2>&1 &
-        echo "[INFO] Process 2 started (main.py development mode), log: $LOG_DIR/mainpy_dev_$RUN_TIMESTAMP.log"
-    fi
+    echo "[INFO] Starting DEVELOPMENT services (MAIN, UVICORN)..."
+    # Only start the core services needed for testing/API access
+    sudo supervisorctl start breadcount-main breadcount-uvicorn
 
-    # Check for uvicorn
-    if pgrep -f "uvicorn src.endpoint.Server:app --host 192.168.1.206" > /dev/null; then
-        echo "[WARN] Uvicorn is already running! Skipping launch."
-    else
-        nohup bash -c "$UVICORN_CMD" > "$LOG_DIR/uvicorn_dev_$RUN_TIMESTAMP.log" 2>&1 &
-        echo "[INFO] Uvicorn server started (development), log: $LOG_DIR/uvicorn_dev_$RUN_TIMESTAMP.log"
-    fi
-
-    echo "[INFO] Process check/launch done."
+    # ROS2 is excluded, allowing main/uvicorn to run simpler if ROS isn't needed.
 fi
+
+echo "=== Current Service Status ==="
+sudo supervisorctl status breadcount-ros2 breadcount-main breadcount-uvicorn
+echo "=============================="

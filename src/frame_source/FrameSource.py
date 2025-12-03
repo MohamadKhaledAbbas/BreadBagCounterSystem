@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 
 
 class FrameSource(ABC):
+
     @abstractmethod
     def frames(self):
         """
