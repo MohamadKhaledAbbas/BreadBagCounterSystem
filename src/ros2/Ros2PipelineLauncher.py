@@ -1,9 +1,19 @@
+import sys
+sys.path.append("/home/sunrise/BreadCounting")
+
 import os
 from launch import LaunchDescription
 from launch.actions import SetEnvironmentVariable
 from launch_ros.actions import Node
 
+
+from src.logging.Database import DatabaseManager
+import src.constants as constants
+
 def generate_launch_description():
+    import sys
+    print("\n".join(sys.path))
+
     # Environment setup actions
     env_setup = [
         # These work for processes started in this launch file
@@ -15,8 +25,15 @@ def generate_launch_description():
         # If you source setup.bash manually before running launch, it's fine. Otherwise, see below for shell script notes.
     ]
 
-    PRODUCTION_RTSP = 'rtsp://admin:a12345678@192.168.2.108:554/cam/realmonitor?channel=1&subtype=0'
-    TEST_RTSP = 'rtsp://192.168.1.188:8554/test_cam'
+    db = DatabaseManager("/home/sunrise/BreadCounting/data/db/bag_events.db")
+    rtsp_username = db.get_config_value(constants.rtsp_username)
+    rtsp_password = db.get_config_value(constants.rtsp_password)
+    rtsp_host = db.get_config_value(constants.rtsp_host)
+    rtsp_port = db.get_config_value(constants.rtsp_port)
+
+    PRODUCTION_RTSP = "rtsp://"+rtsp_username+":"+rtsp_password+"@"+rtsp_host+":"+rtsp_port+"/cam/realmonitor?channel=1&subtype=0"
+
+    # PRODUCTION_RTSP = "rtsp://" + rtsp_username + ":a12345678@192.168.2.108:554/cam/realmonitor?channel=1&subtype=0"
 
     CURRENT_RTSP = PRODUCTION_RTSP
 
