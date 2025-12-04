@@ -21,7 +21,7 @@ class FrameServer(Node, FrameSource):
     to be added to an external SingleThreadedExecutor.
     """
 
-    def __init__(self, topic='/nv12_images'):
+    def __init__(self, topic='/nv12_images', target_fps=10.0):
         # IMPORTANT: rclpy.init() must be called externally before this class is instantiated.
         super().__init__('frame_server')
         self.subscription = self.create_subscription(
@@ -33,6 +33,17 @@ class FrameServer(Node, FrameSource):
         # Only keep the latest frame
         self.frame_queue = queue.Queue(maxsize=1)
         self.last_frame_time = time.time()
+        
+        # Frame rate limiting
+        self.target_fps = target_fps
+        self.min_frame_interval = 1.0 / target_fps  # e.g., 0.1s for 10 FPS
+        self.last_processed_time = 0.0
+        
+        # Stats for debugging
+        self.frames_received = 0
+        self.frames_processed = 0
+        
+        logger.info(f"[Ros2FrameServer] Initialized with target_fps={target_fps}")
 
         # --- REMOVED ---
         # Removed the internal _ros_spin_thread logic.
@@ -41,6 +52,24 @@ class FrameServer(Node, FrameSource):
 
     def listener_callback(self, msg):
         now = time.time()
+        self.frames_received += 1
+        
+        # Frame rate limiting: skip if too soon after last processed frame
+        time_since_last = now - self.last_processed_time
+        if time_since_last < self.min_frame_interval:
+            return  # Skip this frame
+        
+        self.last_processed_time = now
+        self.frames_processed += 1
+        
+        # Log stats periodically (every 100 received frames)
+        if self.frames_received % 100 == 0 and self.frames_received > 0:
+            skip_rate = 100 * (1 - self.frames_processed / self.frames_received)
+            logger.debug(
+                f"[Ros2FrameServer] Stats: received={self.frames_received}, "
+                f"processed={self.frames_processed}, skip_rate={skip_rate:.1f}%"
+            )
+        
         img = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
         try:
             # NV12 conversion logic
