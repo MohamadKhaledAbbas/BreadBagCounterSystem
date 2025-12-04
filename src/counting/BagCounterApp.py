@@ -204,16 +204,15 @@ class BagCounterApp:
                         f"[LogicThread] Frame {frame_count}: "
                         f"{len(ready_events)} events ready for classification"
                     )
-
-                classify_start = cv2.getTickCount()
-                for event_id, candidates in ready_events:
-                    logger.debug(
-                        f"[LogicThread] Sending event {event_id} to classifier "
-                        f"({len(candidates)} candidates)"
-                    )
-                    self.classifier_service.process(event_id, candidates)
-                classify_end = cv2.getTickCount()
-                if ready_events:
+                    
+                    classify_start = cv2.getTickCount()
+                    for event_id, candidates in ready_events:
+                        logger.debug(
+                            f"[LogicThread] Sending event {event_id} to classifier "
+                            f"({len(candidates)} candidates)"
+                        )
+                        self.classifier_service.process(event_id, candidates)
+                    classify_end = cv2.getTickCount()
                     classify_time = (classify_end - classify_start) * 1000 / cv2.getTickFrequency()
 
                 # --- 4. PUBLISHING LOGIC ---
@@ -230,16 +229,17 @@ class BagCounterApp:
                         )
                         tracks_for_ui.append(t)
 
+                    # Calculate total frame time for FPS display
+                    frame_end_for_display = cv2.getTickCount()
+                    total_time_for_display = (frame_end_for_display - frame_start) * 1000 / cv2.getTickFrequency()
+                    fps_for_display = 1000 / total_time_for_display if total_time_for_display > 0 else 0
+
                     annotated_frame = frame.copy()
                     self.visualizer.draw_detections(annotated_frame, tracks_for_ui)
                     self.visualizer.draw_stats(annotated_frame, self.ui_counts)
                     
-                    frame_end = cv2.getTickCount()
-                    total_time = (frame_end - frame_start) * 1000 / cv2.getTickFrequency()
-                    fps = 1000 / total_time if total_time > 0 else 0
-                    
                     cv2.putText(
-                        annotated_frame, f"FPS: {int(fps)}", (20, 40),
+                        annotated_frame, f"FPS: {int(fps_for_display)}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
                     )
                     annotated_frame = cv2.resize(annotated_frame, (1280, 720))
@@ -249,7 +249,7 @@ class BagCounterApp:
                     publish_end = cv2.getTickCount()
                     publish_time = (publish_end - publish_start) * 1000 / cv2.getTickFrequency()
                 
-                # Calculate total frame time
+                # Calculate final total frame time (after all processing)
                 frame_end = cv2.getTickCount()
                 total_time = (frame_end - frame_start) * 1000 / cv2.getTickFrequency()
                 fps = 1000 / total_time if total_time > 0 else 0

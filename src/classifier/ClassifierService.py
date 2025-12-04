@@ -1,5 +1,6 @@
 import os
 import time
+import cv2
 from collections import Counter
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
@@ -39,7 +40,6 @@ class ClassifierService:
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
-            import cv2
             t1 = cv2.getTickCount()
             label, conf = self.classifier.predict(roi_image)
             t2 = cv2.getTickCount()
@@ -60,7 +60,6 @@ class ClassifierService:
 
         results = []
 
-        import cv2
         classify_start = cv2.getTickCount()
         logger.info(f"[ClassifierService] Classifying {len(candidates)} candidates...")
 
