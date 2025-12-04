@@ -9,13 +9,14 @@ class FrameSourceFactory:
     def create(source_type, **kwargs) -> FrameSource:
         """
         source_type: 'ros2' or 'opencv'
-        kwargs for ROS2: topic, rclpy_init (should rclpy.init be called)
+        kwargs for ROS2: topic, target_fps
         kwargs for OpenCV: source
         """
         if source_type.lower() == 'ros2':
             # Start rclpy only if not already initialized
             topic = kwargs.get('topic', '/nv12_images')
-            node = FrameServer(topic=topic)
+            target_fps = kwargs.get('target_fps', 10.0)
+            node = FrameServer(topic=topic, target_fps=target_fps)
             return node
         elif source_type.lower() == 'opencv':
             source = kwargs.get('source', 0)  # 0 for webcam, or path/string for file/camera URL
