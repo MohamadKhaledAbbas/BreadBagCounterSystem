@@ -37,7 +37,7 @@ class OpenCVFrameSource(FrameSource):
 
             # Block if consumer is slower (no frame skipping)
             self.queue.put((frame, latency_ms))
-            time.sleep(0.2)
+            time.sleep(0.1)
 
         self.cap.release()
 

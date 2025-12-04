@@ -21,7 +21,7 @@ class TrackingConfig:
     # IoU Matching Parameters
     # ============================================================================
     
-    iou_threshold: float = 0.35
+    iou_threshold: float = 0.20
     """
     IoU (Intersection over Union) threshold for matching detections to existing events.
     
@@ -36,7 +36,7 @@ class TrackingConfig:
     # State Transition Thresholds
     # ============================================================================
     
-    min_open_frames: int = 5
+    min_open_frames: int = 4
     """
     Minimum consecutive frames a bag must be detected as "open" before allowing 
     transition to "closed" state.
@@ -93,7 +93,7 @@ class TrackingConfig:
     # State-Aware Expiry Timeouts
     # ============================================================================
     
-    expiry_detecting_open: int = 12
+    expiry_detecting_open: int = 20
     """
     Frames without update before expiring an event in 'detecting_open' state.
     
@@ -104,7 +104,7 @@ class TrackingConfig:
     Default: 12 (relaxed from 8 to handle temporary occlusions better)
     """
     
-    expiry_detecting_closed: int = 18
+    expiry_detecting_closed: int = 15
     """
     Frames without update before expiring an event in 'detecting_closed' state.
     

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class AppConfig:
     video_path: str = os.getenv("VIDEO_PATH", "/media/72E436DAE436A071/Wheatberry_Green20251128080005_20251128090005.mp4")
-    detection_model: str = os.getenv("DETECTION_MODEL", "data/model/detect_yolo_small_v2_bayese_640x640_nv12.bin")
+    detection_model: str = os.getenv("DETECTION_MODEL", "data/model/detect_yolo_small_v3_bayese_640x640_nv12.bin")
     classification_model: str = os.getenv("CLASS_MODEL", "data/model/classify_yolo_small_v4_bayese_224x224_nv12.bin")
     db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
     
