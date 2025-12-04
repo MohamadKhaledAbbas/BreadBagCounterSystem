@@ -19,8 +19,13 @@ class UltralyticsClassifier(BaseClassifier):
         self._class_names = class_names
 
     def load(self, model_path: str):
-        """Load a new model (for compatibility with BaseClassifier interface)."""
+        """Load a new model (for compatibility with BaseClassifier interface).
+        
+        Note: This resets class_names to use the model's built-in names.
+        """
         self.model = YOLO(model_path)
+        # Reset class names to None so the new model's names are used
+        self._class_names = None
 
     def predict(self, image) -> Tuple[str, float]:
         """Predict class label and confidence for the given image.

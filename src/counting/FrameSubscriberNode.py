@@ -65,15 +65,14 @@ if IS_RDK:
             self.get_logger().debug(f'Received Frame {self.frame_counter}. Shape: {np_frame.shape}')
 
         def get_latest_frame(self):
-            """Public method for the main application loop to retrieve the frame."""
-            # Returns the NumPy array and consumes the stored frame (optional, for safety)
+            """Public method for the main application loop to retrieve the frame.
+            
+            Returns a copy to ensure the frame isn't modified by both the callback and the app loop.
+            No need for connect/close_shm; connection is managed by ROS 2/DDS.
+            """
             if self.latest_frame is None:
                 return None
-
-            # Optional: return a copy to ensure the frame isn't modified by both the callback and the app loop
             return self.latest_frame.copy()
-
-            # No need for connect/close_shm; connection is managed by ROS 2/DDS
 
         def close_node(self):
             self.destroy_node()
