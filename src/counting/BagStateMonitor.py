@@ -3,6 +3,7 @@ import uuid
 from typing import List, Tuple
 
 from src.utils.AppLogging import logger
+from src.config.tracking_config import tracking_config
 
 
 class BagEvent:
@@ -19,9 +20,9 @@ class BagEvent:
 
         self.frames_since_update = 0
 
-        # Buffer settings
-        self.max_open_samples = 8  # Max ROIs during open phase
-        self.max_closed_samples = 4  # Max ROIs during closed phase
+        # Buffer settings (from centralized config)
+        self.max_open_samples = tracking_config.max_open_samples
+        self.max_closed_samples = tracking_config.max_closed_samples
 
         self.open_id = open_id
         self.closed_id = closed_id
@@ -50,7 +51,7 @@ class BagEvent:
 
         # Quality check
         sharpness = self._is_valid_roi(roi)
-        if not sharpness >= 50:
+        if not sharpness >= tracking_config.min_roi_sharpness:
             return False
 
         if is_open:
@@ -88,8 +89,14 @@ class BagEvent:
         self.frames_since_update = 0
         self._add_roi(box, frame_img, is_open=False)
 
-    def _is_valid_roi(self, roi, min_size=80, min_sharpness=50):
+    def _is_valid_roi(self, roi, min_size=None, min_sharpness=None):
         """Basic quality gate."""
+        # Use config values if not explicitly provided
+        if min_size is None:
+            min_size = tracking_config.min_roi_size
+        if min_sharpness is None:
+            min_sharpness = tracking_config.min_roi_sharpness
+        
         h, w = roi.shape[:2]
         if h < min_size or w < min_size:
             return False
@@ -129,23 +136,24 @@ class BagEvent:
 
 class BagStateMonitor:
     def __init__(self, open_cls_id, closed_cls_id,
-                 iou_threshold=0.45,
-                 min_open_frames=5,
-                 min_closed_frames=2):
+                 iou_threshold=None,
+                 min_open_frames=None,
+                 min_closed_frames=None):
 
         self.open_id = open_cls_id
         self.closed_id = closed_cls_id
-        self.iou_threshold = iou_threshold
-
-        self.min_open_frames = min_open_frames
-        self.min_closed_frames = min_closed_frames
+        
+        # Use config values if not explicitly provided
+        self.iou_threshold = iou_threshold if iou_threshold is not None else tracking_config.iou_threshold
+        self.min_open_frames = min_open_frames if min_open_frames is not None else tracking_config.min_open_frames
+        self.min_closed_frames = min_closed_frames if min_closed_frames is not None else tracking_config.min_closed_frames
 
         self.active_events = []
 
         logger.info(
             f"[BagStateMonitor] Initialized: open_id={open_cls_id}, "
-            f"closed_id={closed_cls_id}, iou={iou_threshold}, "
-            f"min_open={min_open_frames}, min_closed={min_closed_frames}"
+            f"closed_id={closed_cls_id}, iou={self.iou_threshold}, "
+            f"min_open={self.min_open_frames}, min_closed={self.min_closed_frames}"
         )
 
     def compute_iou(self, boxA, boxB):
@@ -249,22 +257,20 @@ class BagStateMonitor:
         # ---------------------------------------------------
         # 3.  Create NEW events for unmatched open detections
         # ---------------------------------------------------
-        MAX_ACTIVE_EVENTS = 50  # Prevent memory issues
         for i, det in enumerate(open_dets):
             if i not in used_open_indices:
                 # Add minimum confidence threshold for creating new events
-                min_conf_threshold = 0.3
-                if det.get('conf', 1.0) < min_conf_threshold:
+                if det.get('conf', 1.0) < tracking_config.min_conf_threshold:
                     logger.debug(
                         f"[BagStateMonitor] Skipping low confidence detection: "
-                        f"conf={det.get('conf', 1.0):.3f} < {min_conf_threshold}"
+                        f"conf={det.get('conf', 1.0):.3f} < {tracking_config.min_conf_threshold}"
                     )
                     continue
                 
                 # Prevent memory issues with too many events
-                if len(self.active_events) >= MAX_ACTIVE_EVENTS:
+                if len(self.active_events) >= tracking_config.max_active_events:
                     logger.warning(
-                        f"[BagStateMonitor] Max active events reached ({MAX_ACTIVE_EVENTS}), "
+                        f"[BagStateMonitor] Max active events reached ({tracking_config.max_active_events}), "
                         f"skipping new event creation"
                     )
                     break
@@ -308,13 +314,13 @@ class BagStateMonitor:
                 event.state = 'counted'
                 logger.debug(f"[BagStateMonitor] Event {event.id} state -> counted")
 
-            # State-aware expiry: different timeouts based on state
+            # State-aware expiry: different timeouts based on state (from centralized config)
             if event.state == 'detecting_open':
-                expiry_threshold = 8
+                expiry_threshold = tracking_config.expiry_detecting_open
             elif event.state == 'detecting_closed':
-                expiry_threshold = 15
+                expiry_threshold = tracking_config.expiry_detecting_closed
             else:  # 'counted'
-                expiry_threshold = 5
+                expiry_threshold = tracking_config.expiry_counted
 
             # Keep event alive if recently updated
             if event.frames_since_update < expiry_threshold:
