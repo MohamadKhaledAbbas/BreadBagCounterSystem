@@ -2,6 +2,7 @@ import os
 import cv2
 import queue
 import threading
+import time
 from typing import Dict, Any
 
 from src.counting.Visualizer import Visualizer
@@ -164,14 +165,14 @@ class BagCounterApp:
             try:
                 frame_count += 1
                 
-                # Frame timing metrics
-                frame_start = cv2.getTickCount()
+                # Frame timing metrics (using time.perf_counter for precision)
+                frame_start = time.perf_counter()
 
                 # 1. Run Detector
-                detect_start = cv2.getTickCount()
+                detect_start = time.perf_counter()
                 detections = self.detector.predict(frame)
-                detect_end = cv2.getTickCount()
-                detect_time = (detect_end - detect_start) * 1000 / cv2.getTickFrequency()
+                detect_end = time.perf_counter()
+                detect_time = (detect_end - detect_start) * 1000  # Convert to ms
                 
                 current_frame_detections = []
 
@@ -193,10 +194,10 @@ class BagCounterApp:
                     )
 
                 # 2. Update Monitor
-                monitor_start = cv2.getTickCount()
+                monitor_start = time.perf_counter()
                 ready_events = self.monitor.update(current_frame_detections, frame)
-                monitor_end = cv2.getTickCount()
-                monitor_time = (monitor_end - monitor_start) * 1000 / cv2.getTickFrequency()
+                monitor_end = time.perf_counter()
+                monitor_time = (monitor_end - monitor_start) * 1000  # Convert to ms
 
                 # 3. Process Ready Events
                 classify_time = 0.0
@@ -206,26 +207,21 @@ class BagCounterApp:
                         f"{len(ready_events)} events ready for classification"
                     )
                     
-                    classify_start = cv2.getTickCount()
+                    classify_start = time.perf_counter()
                     for event_id, candidates in ready_events:
                         logger.debug(
                             f"[LogicThread] Sending event {event_id} to classifier "
                             f"({len(candidates)} candidates)"
                         )
                         self.classifier_service.process(event_id, candidates)
-                    classify_end = cv2.getTickCount()
-                    classify_time = (classify_end - classify_start) * 1000 / cv2.getTickFrequency()
+                    classify_end = time.perf_counter()
+                    classify_time = (classify_end - classify_start) * 1000  # Convert to ms
 
                 # --- 4. PUBLISHING LOGIC ---
                 publish_time = 0.0
                 
-                # Calculate processing time (detection + monitor + classification)
-                # This excludes publishing overhead for core performance measurement
-                processing_end = cv2.getTickCount()
-                processing_time = (processing_end - frame_start) * 1000 / cv2.getTickFrequency()
-                
                 if self.is_publishing:
-                    publish_start = cv2.getTickCount()
+                    publish_start = time.perf_counter()
                     
                     tracks_for_ui = []
                     for event in self.monitor.active_events:
@@ -236,26 +232,29 @@ class BagCounterApp:
                         )
                         tracks_for_ui.append(t)
 
+                    # Calculate total time so far for FPS display
+                    frame_mid = time.perf_counter()
+                    mid_time = (frame_mid - frame_start) * 1000  # Convert to ms
+                    fps_display = 1000 / mid_time if mid_time > 0 else 0
+
                     annotated_frame = frame.copy()
                     self.visualizer.draw_detections(annotated_frame, tracks_for_ui)
                     self.visualizer.draw_stats(annotated_frame, self.ui_counts)
                     
-                    # Calculate FPS based on processing time (for display)
-                    fps = 1000 / processing_time if processing_time > 0 else 0
                     cv2.putText(
-                        annotated_frame, f"FPS: {int(fps)}", (20, 40),
+                        annotated_frame, f"FPS: {int(fps_display)}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
                     )
                     annotated_frame = cv2.resize(annotated_frame, (1280, 720))
 
                     self.ipc_publisher.publish(annotated_frame)
                     
-                    publish_end = cv2.getTickCount()
-                    publish_time = (publish_end - publish_start) * 1000 / cv2.getTickFrequency()
+                    publish_end = time.perf_counter()
+                    publish_time = (publish_end - publish_start) * 1000  # Convert to ms
 
                 # Calculate total frame time including all operations
-                frame_end = cv2.getTickCount()
-                total_time = (frame_end - frame_start) * 1000 / cv2.getTickFrequency()
+                frame_end = time.perf_counter()
+                total_time = (frame_end - frame_start) * 1000  # Convert to ms
                 fps = 1000 / total_time if total_time > 0 else 0
 
                 # Log frame timing breakdown (at configured interval or when classification occurs)
