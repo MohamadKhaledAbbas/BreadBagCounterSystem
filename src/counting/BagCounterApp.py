@@ -179,15 +179,6 @@ class BagCounterApp:
                     cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
                     confidences = detections[0].boxes.conf.cpu().numpy()
 
-                    if current_frame_detections:
-                        for det in current_frame_detections:
-                            logger.info(
-                                f"[RAW DETECTION] class={det['class_id']}, "
-                                f"conf={det['conf']:.3f}, box={det['box']}"
-                            )
-                    else:
-                        logger.warning("[RAW DETECTION] No detections this frame!")
-
                     for i in range(len(cls_ids)):
                         current_frame_detections.append({
                             'box': xyxy[i],
@@ -195,10 +186,22 @@ class BagCounterApp:
                             'conf': confidences[i]
                         })
 
+                    # Log detection confidence for debugging
                     logger.debug(
                         f"[LogicThread] Frame {frame_count}: "
                         f"{len(current_frame_detections)} detections"
                     )
+                    
+                    if len(current_frame_detections) > 0:
+                        for det in current_frame_detections:
+                            class_name = self.detector.class_names.get(det['class_id'], 'Unknown')
+                            logger.debug(
+                                f"[RAW DETECTION] class={class_name} (id={det['class_id']}), "
+                                f"conf={det['conf']:.3f}, box=[{det['box'][0]:.1f}, {det['box'][1]:.1f}, "
+                                f"{det['box'][2]:.1f}, {det['box'][3]:.1f}]"
+                            )
+                else:
+                    logger.debug(f"[LogicThread] Frame {frame_count}: No detections")
 
                 # 2. Update Monitor
                 monitor_start = time.perf_counter()
@@ -230,22 +233,38 @@ class BagCounterApp:
                 if self.is_publishing:
                     publish_start = time.perf_counter()
                     
-                    tracks_for_ui = []
+                    annotated_frame = frame.copy()
+                    
+                    # Draw RAW detections immediately for instant feedback
+                    for det in current_frame_detections:
+                        x1, y1, x2, y2 = map(int, det['box'])
+                        class_id = det['class_id']
+                        conf = det['conf']
+                        
+                        if class_id == self.monitor.closed_id:  # closed
+                            color = (255, 0, 0)  # Blue
+                            label = f"Closed {conf:.2f}"
+                        else:  # open
+                            color = (0, 255, 0)  # Green
+                            label = f"Open {conf:.2f}"
+                        
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated_frame, label, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    
+                    # Then draw event tracking info
                     for event in self.monitor.active_events:
-                        t = SimpleTrack(
-                            event.id,
-                            event.box,
-                            event.open_id if event.state == 'detecting_open' else event.closed_id
-                        )
-                        tracks_for_ui.append(t)
+                        x1, y1, x2, y2 = map(int, event.box)
+                        # Draw event ID and state
+                        event_label = f"ID:{event.id} {event.state}"
+                        cv2.putText(annotated_frame, event_label, (x1, y2 + 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
                     # Calculate total time so far for FPS display
                     frame_mid = time.perf_counter()
                     mid_time = (frame_mid - frame_start) * 1000  # Convert to ms
                     fps_display = 1000 / mid_time if mid_time > 0 else 0
 
-                    annotated_frame = frame.copy()
-                    self.visualizer.draw_detections(annotated_frame, tracks_for_ui)
                     self.visualizer.draw_stats(annotated_frame, self.ui_counts)
                     
                     cv2.putText(
