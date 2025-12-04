@@ -39,8 +39,11 @@ class ClassifierService:
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
+            t1 = time.perf_counter()
             label, conf = self.classifier.predict(roi_image)
-            logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f})")
+            t2 = time.perf_counter()
+            processing_time = (t2 - t1) * 1000  # Convert to milliseconds
+            logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f}) - {processing_time:.1f}ms")
             return label, conf
         except Exception as e:
             logger.error(f"[ClassifierService] Classification error: {e}")
@@ -56,6 +59,7 @@ class ClassifierService:
 
         results = []
 
+        batch_start = time.perf_counter()
         logger.info(f"[ClassifierService] Classifying {len(candidates)} candidates...")
 
         # Classify all candidates
@@ -66,6 +70,9 @@ class ClassifierService:
                 'label': label,
                 'conf': conf
             })
+        
+        batch_end = time.perf_counter()
+        total_batch_time = (batch_end - batch_start) * 1000  # Convert to milliseconds
 
         # Filter out unknowns for voting
         valid_results = [r for r in results if r['label'] != "Unknown"]
@@ -94,12 +101,12 @@ class ClassifierService:
         logger.info(
             f"[ClassifierService] Voting result: {winning_label} "
             f"({vote_count}/{len(top_k)} votes, conf={best_result['conf']:.3f}, "
-            f"voting_conf={voting_confidence:.2f})"
+            f"voting_conf={voting_confidence:.2f}, time={total_batch_time:.1f}ms)"
         )
 
         # Log vote distribution
-        for label, count in label_votes.items():
-            logger.debug(f"  - {label}: {count} votes")
+        vote_dist = ", ".join([f"{label}: {count}" for label, count in label_votes.items()])
+        logger.debug(f"[ClassifierService] Vote distribution: {vote_dist}")
 
         return best_result['roi'], winning_label, best_result['conf']
 

@@ -79,21 +79,18 @@ class BpuClassifier(BaseClassifier):
             t2 = cv2.getTickCount()
 
             latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-            logger.debug(f"[BpuClassifier] Inference time: {latency:.2f} ms")
+            logger.debug(f"[BpuClassifier] Inference time: {latency:.2f}ms")
 
             # 3. Post-Process
             probs = outputs[0].buffer.flatten()
 
-            logger.debug(f"[BpuClassifier] Raw probs shape: {probs.shape}")
-            logger.debug(f"[BpuClassifier] Raw probs: {probs}")
-            logger.debug(f"[BpuClassifier] Raw probs range: [{probs.min():.4f}, {probs.max():.4f}]")
+            logger.debug(f"[BpuClassifier] Raw probs shape: {probs.shape}, range: [{probs.min():.4f}, {probs.max():.4f}]")
 
             # Apply softmax if needed (raw logits instead of probabilities)
             if probs.max() > 1.0 or probs.min() < 0.0:
                 logger.debug("[BpuClassifier] Applying softmax")
                 exp_scores = np.exp(probs - np.max(probs))
                 probs = exp_scores / np.sum(exp_scores)
-                logger.debug(f"[BpuClassifier] After softmax: {probs}")
 
             # Find max
             top_id = int(np.argmax(probs))

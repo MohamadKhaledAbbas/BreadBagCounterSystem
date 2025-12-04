@@ -14,7 +14,7 @@ except ImportError:
     try:
         from hobot_dnn_rdkx5 import pyeasy_dnn as dnn
     except ImportError:
-        print("⚠️ Warning: hobot_dnn not found. This will fail on RDK X5.")
+        logger.warning("[BpuDetector] hobot_dnn not found. This will fail on RDK X5.")
         dnn = None
 
 
@@ -28,7 +28,7 @@ class BpuDetector(BaseDetector):
         self.area = self.input_h * self.input_w
 
         if dnn:
-            print(f"Loading BPU model: {model_path}")
+            logger.info(f"[BpuDetector] Loading BPU model: {model_path}")
             self.quantize_model = dnn.load(model_path)
         else:
             self.quantize_model = None
@@ -65,11 +65,7 @@ class BpuDetector(BaseDetector):
         input_tensor, x_scale, y_scale, x_shift, y_shift = run_with_timing("detection pre-process", self._preprocess, frame)
 
         # 2. Forward
-        t1 = cv2.getTickCount()
-        outputs = run_with_timing("forward", self.quantize_model[0].forward, input_tensor)
-        t2 = cv2.getTickCount()
-        latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-        logger.debug(f"BPU Detect Inference Time: {latency:.2f} ms")
+        outputs = run_with_timing("[BpuDetector] Inference", self.quantize_model[0].forward, input_tensor)
 
         # 3. Convert to Numpy
         output_arrays = [out.buffer for out in outputs]
@@ -222,70 +218,3 @@ class TensorAdapter:
 
     def __len__(self):
         return len(self.data)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def _postprocess(self, outputs, x_scale, y_scale, x_shift, y_shift, orig_shape):
-        # YOLOv8 Headless Decoding Logic
-        clses = [outputs[0].reshape(-1, self.classes_num), outputs[2].reshape(-1, self.classes_num),
-                 outputs[4].reshape(-1, self.classes_num)]
-        bboxes = [outputs[1].reshape(-1, self.reg * 4), outputs[3].reshape(-1, self.reg * 4),
-                  outputs[5].reshape(-1, self.reg * 4)]
-
-        dbboxes, ids, scores = [], [], []
-
-        for cls, bbox, stride, grid in zip(clses, bboxes, self.strides, self.grids):
-            max_scores = np.max(cls, axis=1)
-            valid_mask = max_scores >= self.conf_thres_raw
-            if not np.any(valid_mask): continue
-
-            ids.append(np.argmax(cls[valid_mask, :], axis=1))
-            scores.append(1 / (1 + np.exp(-max_scores[valid_mask])))
-
-            pred_dist = softmax(bbox[valid_mask].reshape(-1, 4, self.reg), axis=2)
-            ltrb = np.sum(pred_dist * self.weights_static, axis=2)
-
-            grid_val = grid[valid_mask]
-            x1y1 = grid_val - ltrb[:, 0:2]
-            x2y2 = grid_val + ltrb[:, 2:4]
-            dbboxes.append(np.hstack([x1y1, x2y2]) * stride)
-
-        if not dbboxes: return []
-
-        dbboxes = np.concatenate(dbboxes, axis=0)
-        scores = np.concatenate(scores, axis=0)
-        ids = np.concatenate(ids, axis=0)
-
-        # NMS
-        xywh = dbboxes.copy()
-        xywh[:, 2:4] = xywh[:, 2:4] - xywh[:, 0:2]
-
-        final_results = []
-        for i in range(self.classes_num):
-            mask = ids == i
-            if not np.any(mask): continue
-            indices = cv2.dnn.NMSBoxes(xywh[mask].tolist(), scores[mask].tolist(), self.score_thres, self.nms_thres)
-            if len(indices) > 0:
-                indices = indices.flatten()
-                selected_boxes = dbboxes[mask][indices]
-                selected_scores = scores[mask][indices]
-
-                for box, score in zip(selected_boxes, selected_scores):
-                    x1, y1, x2, y2 = box
-                    x1 = max(0, min(orig_shape[1], (x1 - x_shift) / x_scale))
-                    y1 = max(0, min(orig_shape[0], (y1 - y_shift) / y_scale))
-                    x2 = max(0, min(orig_shape[1], (x2 - x_shift) / x_scale))
-                    y2 = max(0, min(orig_shape[0], (y2 - y_shift) / y_scale))
-                    final_results.append((i, score, x1, y1, x2, y2))
-        return final_results
