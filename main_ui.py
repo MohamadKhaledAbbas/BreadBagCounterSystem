@@ -1,19 +1,28 @@
-# File: main_ui.py (Refactored for ROS 2)
+# File: main_ui.py (Platform-aware UI for RDK with ROS2 and Windows with OpenCV)
 
 import cv2
 import time
-import rclpy
-from rclpy.executors import SingleThreadedExecutor
 import threading
+from src.utils.platform import IS_RDK
+from src.utils.AppLogging import logger
 
-# --- NEW IMPORTS ---
-# Assuming you update src/counting/IPC.py to include the needed imports
-# (rclpy, Node, Image, CvBridge, etc.)
-from src.counting.FrameSubscriberNode import FrameSubscriber
-from src.counting.IPC import init_ros2_context, shutdown_ros2_context
-# -------------------
+# Conditional imports based on platform
+if IS_RDK:
+    import rclpy
+    from rclpy.executors import SingleThreadedExecutor
+    from src.counting.FrameSubscriberNode import FrameSubscriber
+    from src.counting.IPC import init_ros2_context, shutdown_ros2_context
+else:
+    logger.info("[UI] Running on non-RDK platform - ROS2 UI not available")
+    logger.info("[UI] For Windows, use direct OpenCV display from BagCounterApp instead")
 
 def main():
+    if not IS_RDK:
+        print("ERROR: UI Monitor requires ROS2, which is only available on RDK platform.")
+        print("For Windows/non-RDK platforms, the BagCounterApp displays frames directly.")
+        print("Run main.py instead, which will show output via cv2.imshow when is_publishing is enabled.")
+        return
+    
     print("Starting UI Monitor (ROS 2 Subscriber)...")
 
     # 1. Initialize ROS 2 Context
