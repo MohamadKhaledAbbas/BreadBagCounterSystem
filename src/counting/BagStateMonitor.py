@@ -1,6 +1,6 @@
 import cv2
-import numpy as np
 import uuid
+from typing import List, Tuple
 
 from src.utils.AppLogging import logger
 
@@ -18,88 +18,116 @@ class BagEvent:
         self.closed_hits = 0
 
         self.frames_since_update = 0
-        self.max_buffer_size = 15
+
+        # Buffer settings
+        self.max_open_samples = 10  # Max ROIs during open phase
+        self.max_closed_samples = 5  # Max ROIs during closed phase
 
         self.open_id = open_id
         self.closed_id = closed_id
 
-        # Buffer: Stores all candidate ROI images
-        self.candidate_rois = []
-        self.add_frame(box, frame_img)
+        # Separate buffers for open and closed ROIs
+        self.open_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
+        self.closed_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
 
-        logger.debug(f"[BagEvent] Created new event ID={self.id}, box={box}")
+        # Add first frame
+        self._add_roi(box, frame_img, is_open=True)
 
-    def add_frame(self, box, frame_img):
-        """Extract ROI and add to candidates buffer."""
+        logger.debug(f"[BagEvent] Created event ID={self.id}")
+
+    def _add_roi(self, box, frame_img, is_open: bool):
+        """Extract ROI and add to appropriate buffer."""
+        h, w = frame_img.shape[:2]
+        x1, y1, x2, y2 = map(int, box)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            logger.debug(f"[BagEvent:{self.id}] Invalid ROI dimensions")
+            return False
+
+        roi = frame_img[y1:y2, x1:x2].copy()
+
+        # Quality check
+        if not self._is_valid_roi(roi):
+            return False
+
+        # Calculate sharpness for sorting
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        if is_open:
+            self.open_rois.append((sharpness, roi))
+            # Keep top N sharpest
+            self.open_rois.sort(key=lambda x: x[0], reverse=True)
+            if len(self.open_rois) > self.max_open_samples:
+                self.open_rois = self.open_rois[:self.max_open_samples]
+            logger.debug(
+                f"[BagEvent:{self.id}] Added OPEN ROI "
+                f"(sharpness={sharpness:.1f}, total={len(self.open_rois)})"
+            )
+        else:
+            self.closed_rois.append((sharpness, roi))
+            # Keep top N sharpest
+            self.closed_rois.sort(key=lambda x: x[0], reverse=True)
+            if len(self.closed_rois) > self.max_closed_samples:
+                self.closed_rois = self.closed_rois[:self.max_closed_samples]
+            logger.debug(
+                f"[BagEvent:{self.id}] Added CLOSED ROI "
+                f"(sharpness={sharpness:.1f}, total={len(self.closed_rois)})"
+            )
+
+        return True
+
+    def add_open_frame(self, box, frame_img):
+        """Add ROI from open detection."""
         self.box = box
         self.frames_since_update = 0
+        self._add_roi(box, frame_img, is_open=True)
 
-        if self.state == 'detecting_open':
-            h, w = frame_img.shape[:2]
-            x1, y1, x2, y2 = map(int, box)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-
-            if x2 > x1 and y2 > y1:
-                roi = frame_img[y1:y2, x1:x2].copy()
-
-                if self._is_valid_roi(roi):
-                    self.candidate_rois.append(roi)
-                    logger.debug(
-                        f"[BagEvent:{self.id}] Added candidate ROI "
-                        f"(total: {len(self.candidate_rois)})"
-                    )
-
-                    if len(self.candidate_rois) > self.max_buffer_size:
-                        self.candidate_rois.pop(0)
-                        logger.debug(
-                            f"[BagEvent:{self.id}] Buffer full, removed oldest candidate"
-                        )
-                else:
-                    logger.debug(
-                        f"[BagEvent:{self.id}] Rejected ROI (failed quality check)"
-                    )
-            else:
-                logger.debug(
-                    f"[BagEvent:{self.id}] Invalid ROI dimensions: "
-                    f"x1={x1}, y1={y1}, x2={x2}, y2={y2}"
-                )
+    def add_closed_frame(self, box, frame_img):
+        """Add ROI from closed detection."""
+        self.box = box
+        self.frames_since_update = 0
+        self._add_roi(box, frame_img, is_open=False)
 
     def _is_valid_roi(self, roi, min_size=30, min_sharpness=50):
-        """
-        Basic quality gate - reject obviously bad frames.
-        """
+        """Basic quality gate."""
         h, w = roi.shape[:2]
         if h < min_size or w < min_size:
-            logger.debug(
-                f"[BagEvent:{self.id}] ROI too small: {w}x{h} (min: {min_size})"
-            )
             return False
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return sharpness >= min_sharpness
 
-        if sharpness < min_sharpness:
-            logger.debug(
-                f"[BagEvent:{self.id}] ROI too blurry: {sharpness:.1f} (min: {min_sharpness})"
-            )
-            return False
+    def get_all_candidates(self) -> List:
+        """
+        Return all collected ROIs (both open and closed),
+        sorted by sharpness (best first).
+        """
+        # Combine both buffers
+        all_rois = self.open_rois + self.closed_rois
 
-        return True
+        # Sort by sharpness (highest first)
+        all_rois.sort(key=lambda x: x[0], reverse=True)
 
-    def get_all_candidates(self):
-        """Return all collected candidate ROIs for classifier evaluation."""
+        # Return just the images (not the sharpness scores)
+        candidates = [roi for _, roi in all_rois]
+
         logger.debug(
-            f"[BagEvent:{self.id}] Returning {len(self.candidate_rois)} candidates"
+            f"[BagEvent:{self.id}] Returning {len(candidates)} candidates "
+            f"({len(self.open_rois)} open, {len(self.closed_rois)} closed)"
         )
-        return self.candidate_rois.copy()
+        return candidates
 
-    def get_best_roi(self):
-        """Fallback: Return first candidate if needed."""
-        if not self.candidate_rois:
-            logger.warning(f"[BagEvent:{self.id}] No candidates available")
-            return None
-        return self.candidate_rois[0]
+    def get_stats(self) -> dict:
+        """Return stats about collected ROIs."""
+        return {
+            "open_count": len(self.open_rois),
+            "closed_count": len(self.closed_rois),
+            "total": len(self.open_rois) + len(self.closed_rois)
+        }
 
 
 class BagStateMonitor:
@@ -118,8 +146,8 @@ class BagStateMonitor:
         self.active_events = []
 
         logger.info(
-            f"[BagStateMonitor] Initialized with open_id={open_cls_id}, "
-            f"closed_id={closed_cls_id}, iou_threshold={iou_threshold}, "
+            f"[BagStateMonitor] Initialized: open_id={open_cls_id}, "
+            f"closed_id={closed_cls_id}, iou={iou_threshold}, "
             f"min_open={min_open_frames}, min_closed={min_closed_frames}"
         )
 
@@ -140,14 +168,14 @@ class BagStateMonitor:
         closed_dets = [d for d in detections if d['class_id'] == self.closed_id]
 
         logger.debug(
-            f"[BagStateMonitor] Frame update: {len(open_dets)} open, "
-            f"{len(closed_dets)} closed, {len(self.active_events)} active events"
+            f"[BagStateMonitor] Frame: {len(open_dets)} open, "
+            f"{len(closed_dets)} closed, {len(self.active_events)} active"
         )
 
         used_open_indices = set()
 
         # ---------------------------------------------------
-        # 1. Update existing events (Match Open detections)
+        # 1. Match OPEN detections to existing events
         # ---------------------------------------------------
         for i, det in enumerate(open_dets):
             best_iou = 0
@@ -159,14 +187,18 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                best_event.add_frame(det['box'], frame_img)
+                # Collect OPEN ROI
+                best_event.add_open_frame(det['box'], frame_img)
                 used_open_indices.add(i)
+
                 if best_event.state != 'counted':
                     best_event.open_hits += 1
                     logger.debug(
                         f"[BagStateMonitor] Event {best_event.id}: "
                         f"open_hits={best_event.open_hits} (IoU={best_iou:.2f})"
                     )
+
+                    # If was detecting closed but reopened, reset
                     if best_event.state == 'detecting_closed':
                         logger.debug(
                             f"[BagStateMonitor] Event {best_event.id}: "
@@ -176,7 +208,7 @@ class BagStateMonitor:
                         best_event.state = 'detecting_open'
 
         # ---------------------------------------------------
-        # 2.  Update existing events (Match Closed detections)
+        # 2.  Match CLOSED detections to existing events
         # ---------------------------------------------------
         for det in closed_dets:
             best_iou = 0
@@ -188,7 +220,8 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                best_event.add_frame(det['box'], frame_img)
+                # Collect CLOSED ROI (NEW!)
+                best_event.add_closed_frame(det['box'], frame_img)
 
                 if best_event.state != 'counted':
                     if best_event.open_hits >= self.min_open_frames:
@@ -200,18 +233,16 @@ class BagStateMonitor:
                         )
 
         # ---------------------------------------------------
-        # 3.  Create NEW events
+        # 3.  Create NEW events for unmatched open detections
         # ---------------------------------------------------
         for i, det in enumerate(open_dets):
             if i not in used_open_indices:
                 new_event = BagEvent(det['box'], frame_img, self.open_id, self.closed_id)
                 self.active_events.append(new_event)
-                logger.info(
-                    f"[BagStateMonitor] New event created: ID={new_event.id}"
-                )
+                logger.info(f"[BagStateMonitor] New event: ID={new_event.id}")
 
         # ---------------------------------------------------
-        # 4. Check Triggers & Cleanup
+        # 4. Check triggers & cleanup
         # ---------------------------------------------------
         active_next_frame = []
         expired_count = 0
@@ -219,33 +250,34 @@ class BagStateMonitor:
         for event in self.active_events:
             event.frames_since_update += 1
 
+            # Trigger classification when closed threshold reached
             if (event.state == 'detecting_closed' and
                     event.closed_hits >= self.min_closed_frames and
                     event.state != 'counted'):
 
                 candidates = event.get_all_candidates()
+                stats = event.get_stats()
+
                 if candidates:
                     ready_to_classify.append((event.id, candidates))
                     logger.info(
-                        f"[BagStateMonitor] Event {event.id} READY for classification "
-                        f"({len(candidates)} candidates, "
-                        f"open_hits={event.open_hits}, closed_hits={event.closed_hits})"
+                        f"[BagStateMonitor] Event {event.id} READY: "
+                        f"{stats['total']} candidates "
+                        f"({stats['open_count']} open, {stats['closed_count']} closed)"
                     )
                 else:
                     logger.warning(
-                        f"[BagStateMonitor] Event {event.id} triggered but no candidates"
+                        f"[BagStateMonitor] Event {event.id} triggered but no candidates!"
                     )
 
                 event.state = 'counted'
 
+            # Keep event alive if recently updated
             if event.frames_since_update < 10:
                 active_next_frame.append(event)
             else:
                 expired_count += 1
-                logger.debug(
-                    f"[BagStateMonitor] Event {event.id} expired "
-                    f"(state={event.state}, frames_since_update={event.frames_since_update})"
-                )
+                logger.debug(f"[BagStateMonitor] Event {event.id} expired")
 
         if expired_count > 0:
             logger.debug(f"[BagStateMonitor] Expired {expired_count} events")
