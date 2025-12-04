@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request, HTTPException, Query
 from datetime import datetime, timedelta
 from src.endpoint.Shared import templates
 from src.endpoint.Shared import db
+from src.utils.AppLogging import logger
 
 router = APIRouter()
 
@@ -47,12 +48,12 @@ async def analytics(
     """
     Get accumulated counts of bags per class within a specific time range.
     """
-    print(f"start_time: {start_time}, end_time: {end_time}")
+    logger.debug(f"[Analytics] Request: start_time={start_time}, end_time={end_time}")
 
     start_dt = parse_datetime(start_time)
     end_dt = parse_datetime(end_time)
 
-    print(f"start_dt: {start_dt}, end_dt: {end_dt}")
+    logger.debug(f"[Analytics] Parsed: start_dt={start_dt}, end_dt={end_dt}")
 
     if start_dt > end_dt:
         raise HTTPException(status_code=422, detail="Start time must be before end time")
@@ -60,7 +61,7 @@ async def analytics(
         start_dt = start_dt - timedelta(hours=3)
         end_dt = end_dt - timedelta(hours=3)
         stats = get_stats(start_dt, end_dt)
-        print(f"stats: {stats}")
+        logger.debug(f"[Analytics] Stats retrieved: {stats}")
         for c in stats["data"]["classifications"]:
             c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
 
@@ -68,7 +69,7 @@ async def analytics(
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
         stats["meta"]["end"] = end_dt + timedelta(hours=3)
 
-        print(f"stats: {stats}")
+        logger.info(f"[Analytics] Serving analytics: total={stats['data']['total']}, classes={len(stats['data']['classifications'])}")
         return templates.TemplateResponse("analytics.html", {
             "request": request,
             "meta": stats["meta"],
@@ -76,7 +77,7 @@ async def analytics(
             "classifications":  stats["data"]["classifications"],
         })
     except Exception as e:
-        print(e)
+        logger.error(f"[Analytics] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/analytics/daily", response_class=HTMLResponse)

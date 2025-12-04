@@ -9,10 +9,11 @@ from launch_ros.actions import Node
 
 from src.logging.Database import DatabaseManager
 import src.constants as constants
+from src.utils.AppLogging import logger
 
 def generate_launch_description():
     import sys
-    print("\n".join(sys.path))
+    logger.debug("[Ros2PipelineLauncher] System paths:\n" + "\n".join(sys.path))
 
     # Environment setup actions
     env_setup = [

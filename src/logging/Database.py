@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 
 from src.constants import CONFIG_KEYS
+from src.utils.AppLogging import logger
 
 
 class DatabaseManager:
@@ -186,6 +187,6 @@ class DatabaseManager:
                 if row is not None:
                     return row[0]  # row = (value,), so row[0] is the value
         except Exception as e:
-            print("[ERROR] get_config_value:", e)
+            logger.error(f"[DatabaseManager] get_config_value error: {e}")
 
         return None

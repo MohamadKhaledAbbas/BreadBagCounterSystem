@@ -39,8 +39,12 @@ class ClassifierService:
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
+            import cv2
+            t1 = cv2.getTickCount()
             label, conf = self.classifier.predict(roi_image)
-            logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f})")
+            t2 = cv2.getTickCount()
+            latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
+            logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f}) - {latency:.1f}ms")
             return label, conf
         except Exception as e:
             logger.error(f"[ClassifierService] Classification error: {e}")
@@ -56,6 +60,8 @@ class ClassifierService:
 
         results = []
 
+        import cv2
+        classify_start = cv2.getTickCount()
         logger.info(f"[ClassifierService] Classifying {len(candidates)} candidates...")
 
         # Classify all candidates
@@ -66,6 +72,9 @@ class ClassifierService:
                 'label': label,
                 'conf': conf
             })
+        
+        classify_end = cv2.getTickCount()
+        total_classify_time = (classify_end - classify_start) * 1000 / cv2.getTickFrequency()
 
         # Filter out unknowns for voting
         valid_results = [r for r in results if r['label'] != "Unknown"]
@@ -94,12 +103,12 @@ class ClassifierService:
         logger.info(
             f"[ClassifierService] Voting result: {winning_label} "
             f"({vote_count}/{len(top_k)} votes, conf={best_result['conf']:.3f}, "
-            f"voting_conf={voting_confidence:.2f})"
+            f"voting_conf={voting_confidence:.2f}, time={total_classify_time:.1f}ms)"
         )
 
         # Log vote distribution
-        for label, count in label_votes.items():
-            logger.debug(f"  - {label}: {count} votes")
+        vote_dist = ", ".join([f"{label}: {count}" for label, count in label_votes.items()])
+        logger.debug(f"[ClassifierService] Vote distribution: {vote_dist}")
 
         return best_result['roi'], winning_label, best_result['conf']
 
