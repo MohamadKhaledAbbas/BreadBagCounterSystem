@@ -126,6 +126,7 @@ class DatabaseManager:
     def get_aggregated_stats(self, start_time, end_time):
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
+
             bag_type_stats = conn.execute("""
                 SELECT
                     bt.id,
@@ -145,20 +146,20 @@ class DatabaseManager:
 
             total_count = conn.execute("""
                 SELECT COUNT(*) FROM bag_events
-                WHERE timestamp BETWEEN ? AND ?
+                WHERE timestamp BETWEEN ? AND ?;
             """, (start_time, end_time)).fetchone()[0]
 
             total_weight = conn.execute("""
-                SELECT SUM(COALESCE(bt.weight, 0)) AS total_weight
+                SELECT SUM(COALESCE(bt.weight, 0))
                 FROM bag_events be
                 JOIN bag_types bt ON be.bag_type_id = bt.id
                 WHERE be.timestamp BETWEEN ? AND ?;
             """, (start_time, end_time)).fetchone()[0]
-        # Adapt this for your return structure (dict/list suitable for template)
+
         stats = {
             "total": {
                 "count": total_count,
-                "weight": total_weight / 1000
+                "weight": (total_weight or 0) / 1000
             },
             "classifications": [
                 {
@@ -166,13 +167,14 @@ class DatabaseManager:
                     "name": row["bag_type"],
                     "arabic_name": row["arabic_name"],
                     "number_of_breads": row["number_of_breads"],
-                    "weight": row["weight"] / 1000,
+                    "weight": ((row["weight"] or 0) / 1000),
                     "thumb": row["image_path"],
                     "is_known": bool(row["is_known"]),
                     "count": row["count"],
                 } for row in bag_type_stats
             ]
         }
+
         return stats
 
     def get_config_value(self, key):
