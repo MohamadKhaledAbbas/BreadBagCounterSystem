@@ -152,8 +152,8 @@ class BagStateMonitor:
 
         logger.info(
             f"[BagStateMonitor] Initialized: open_id={open_cls_id}, "
-            f"closed_id={closed_cls_id}, iou={iou_threshold}, "
-            f"min_open={min_open_frames}, min_closed={min_closed_frames}"
+            f"closed_id={closed_cls_id}, iou={self.iou_threshold}, "
+            f"min_open={self.min_open_frames}, min_closed={self.min_closed_frames}"
         )
 
     def compute_iou(self, boxA, boxB):

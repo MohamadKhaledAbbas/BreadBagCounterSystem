@@ -171,7 +171,7 @@ class TrackingConfig:
     - Lower values: Accept more blurry images, more samples
     - Higher values: Only sharp images, fewer samples but better quality
     
-    Default: 30.0 (relaxed from 50.0 to accept more samples)
+    Default: 30.0 (relaxed from 50 to accept more samples; changed to float for precision)
     """
 
 
