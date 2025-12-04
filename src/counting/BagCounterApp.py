@@ -225,7 +225,7 @@ class BagCounterApp:
                     annotated_frame = cv2.resize(annotated_frame, (1280, 720))
 
                     self.ipc_publisher.publish(annotated_frame)
-                    logger.debug(f"[LogicThread] Frame {frame_count}: Published (FPS={fps:. 1f})")
+                    logger.debug(f"[LogicThread] Frame {frame_count}: Published (FPS={fps:.1f})")
 
             except Exception as e:
                 logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")

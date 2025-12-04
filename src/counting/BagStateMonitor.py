@@ -81,7 +81,7 @@ class BagEvent:
 
         if sharpness < min_sharpness:
             logger.debug(
-                f"[BagEvent:{self.id}] ROI too blurry: {sharpness:. 1f} (min: {min_sharpness})"
+                f"[BagEvent:{self.id}] ROI too blurry: {sharpness:.1f} (min: {min_sharpness})"
             )
             return False
 
