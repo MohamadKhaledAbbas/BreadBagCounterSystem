@@ -63,7 +63,7 @@ class FrameServer(Node, FrameSource):
         self.frames_processed += 1
         
         # Log stats periodically (every 100 received frames)
-        if self.frames_received % 100 == 0:
+        if self.frames_received % 100 == 0 and self.frames_received > 0:
             skip_rate = 100 * (1 - self.frames_processed / self.frames_received)
             logger.debug(
                 f"[Ros2FrameServer] Stats: received={self.frames_received}, "
