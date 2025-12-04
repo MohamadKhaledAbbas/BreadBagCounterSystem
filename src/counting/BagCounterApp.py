@@ -40,7 +40,6 @@ class BagCounterApp:
     def __init__(self,
                  video_path: str,
                  detector_engine: BaseDetector,
-                 tracker: BaseTracker,
                  classifier_engine: BaseClassifier,
                  db: DatabaseManager,
                  is_development: bool
@@ -49,7 +48,6 @@ class BagCounterApp:
         logger.info("[BagCounterApp] Initializing...")
         self.db = db
         self.detector = detector_engine
-        self.tracker = tracker
         self.classifier_service = ClassifierService(classifier_engine)
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)

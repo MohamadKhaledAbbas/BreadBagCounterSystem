@@ -2,6 +2,7 @@ import sqlite3
 import imagehash
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
+from contextlib import contextmanager
 
 from src.constants import CONFIG_KEYS
 from src.utils.AppLogging import logger
@@ -10,11 +11,29 @@ from src.utils.AppLogging import logger
 class DatabaseManager:
     def __init__(self, db_path="bag_data.db"):
         self.db_path = db_path
+        self._connection = None
         self._init_db()
 
+    @contextmanager
+    def get_connection(self):
+        """Get a database connection, reusing existing one if available."""
+        if self._connection is None:
+            self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._connection.execute("PRAGMA journal_mode=WAL;")
+        try:
+            yield self._connection
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def close(self):
+        """Close the database connection."""
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
+        with self.get_connection() as conn:
 
             # Table 1: Defined Bag Types (Known and Unknowns)
             # phash is stored as a hex string
@@ -52,9 +71,10 @@ class DatabaseManager:
             """)
 
             for config_key in CONFIG_KEYS:
-                conn.execute(f"""
-                    INSERT OR IGNORE INTO config (key, value) VALUES ('{config_key}', '0');
-                """)
+                conn.execute(
+                    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                    (config_key, '0')
+                )
 
             conn.commit()
 
@@ -66,7 +86,7 @@ class DatabaseManager:
         """
         phash_str = str(phash_obj) if phash_obj else None
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
 
             # 1. Handle KNOWN classes
@@ -118,14 +138,15 @@ class DatabaseManager:
             return cursor.lastrowid
 
     def log_event(self, bag_type_id: int, track_id: int, confidence: float = 1.0):
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             conn.execute("""
                 INSERT INTO bag_events (bag_type_id, track_id, confidence)
                 VALUES (?, ?, ?)
             """, (bag_type_id, track_id, confidence))
+            conn.commit()
 
     def get_aggregated_stats(self, start_time, end_time):
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             conn.row_factory = sqlite3.Row
 
             bag_type_stats = conn.execute("""
@@ -180,7 +201,7 @@ class DatabaseManager:
 
     def get_config_value(self, key):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT value FROM config WHERE key=?", (key,))
                 row = cur.fetchone()
