@@ -10,3 +10,13 @@ __pycache__/
 # IDE
 .idea/
 *.iml
+
+# Model files (large binaries)
+*.pt
+*.onnx
+*.engine
+*.bin
+data/model/*.pt
+data/model/*.onnx
+data/model/*.engine
+data/model/*.bin
