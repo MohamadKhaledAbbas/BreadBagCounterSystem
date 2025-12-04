@@ -78,8 +78,6 @@ class DatabaseManager:
                     (config_key, '0')
                 )
 
-            conn.commit()
-
     def get_or_create_bag_type(self, label: str, phash_obj, image_path: str = None) -> int:
         """
         If label is 'Unknown', tries to find a matching pHash.
