@@ -40,7 +40,6 @@ class BagCounterApp:
     def __init__(self,
                  video_path: str,
                  detector_engine: BaseDetector,
-                 tracker: BaseTracker,
                  classifier_engine: BaseClassifier,
                  db: DatabaseManager,
                  is_development: bool
@@ -49,7 +48,6 @@ class BagCounterApp:
         logger.info("[BagCounterApp] Initializing...")
         self.db = db
         self.detector = detector_engine
-        self.tracker = tracker
         self.classifier_service = ClassifierService(classifier_engine)
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
@@ -339,5 +337,9 @@ class BagCounterApp:
             if logic_thread.is_alive():
                 logic_thread.join()
                 logger.debug("[BagCounterApp] Logic thread joined")
+
+            # Close database connection
+            self.db.close()
+            logger.debug("[BagCounterApp] Database connection closed")
 
             logger.info("[BagCounterApp] Shutdown complete")
