@@ -1,7 +1,7 @@
 
 from src.frame_source.FrameSource import FrameSource
 from src.frame_source.OpenCvFrameSource import OpenCVFrameSource
-from src.frame_source.Ros2FrameServer import FrameServer
+from src.utils.platform import IS_RDK
 
 
 class FrameSourceFactory:
@@ -13,7 +13,13 @@ class FrameSourceFactory:
         kwargs for OpenCV: source
         """
         if source_type.lower() == 'ros2':
-            # Start rclpy only if not already initialized
+            if not IS_RDK:
+                raise ValueError(
+                    "ROS2 frame source only available on RDK platform. "
+                    "Use 'opencv' source type on Windows/other platforms."
+                )
+            # Import ROS2 frame server only when needed (RDK platform)
+            from src.frame_source.Ros2FrameServer import FrameServer
             topic = kwargs.get('topic', '/nv12_images')
             target_fps = kwargs.get('target_fps', 10.0)
             node = FrameServer(topic=topic, target_fps=target_fps)

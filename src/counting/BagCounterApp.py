@@ -17,13 +17,19 @@ from src import constants
 
 from src.logging.ConfigWatcher import ConfigWatcher
 from src.utils.AppLogging import logger
+from src.utils.platform import IS_RDK
 
-# --- ROS 2 Check Imports ---
-from rclpy.node import Node
-# ---------------------------
-# Import the ROS 2 helper functions from IPC. py
+# Import the ROS 2 helper functions from IPC.py (these handle platform detection internally)
 from src.counting.IPC import ExecutorThread, init_ros2_context, shutdown_ros2_context
 from src.counting.FramePublisherNode import FramePublisher
+
+# Conditional ROS2 Node import
+if IS_RDK:
+    from rclpy.node import Node
+else:
+    # Stub Node class for isinstance checks on non-RDK platforms
+    class Node:
+        pass
 
 
 # -------------------
