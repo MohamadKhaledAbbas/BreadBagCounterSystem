@@ -7,7 +7,7 @@ from datetime import datetime
 app = FastAPI()
 app.include_router(Analytics.router)
 
-@app.route('/health')
+@app.get('/health')
 def health():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 

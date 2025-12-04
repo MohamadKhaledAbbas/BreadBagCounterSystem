@@ -3,6 +3,7 @@ import imagehash
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
+import threading
 
 from src.constants import CONFIG_KEYS
 from src.utils.AppLogging import logger
@@ -11,26 +12,27 @@ from src.utils.AppLogging import logger
 class DatabaseManager:
     def __init__(self, db_path="bag_data.db"):
         self.db_path = db_path
-        self._connection = None
+        self._local = threading.local()
         self._init_db()
 
     @contextmanager
     def get_connection(self):
-        """Get a database connection, reusing existing one if available."""
-        if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._connection.execute("PRAGMA journal_mode=WAL;")
+        """Get a thread-local database connection, creating one if needed."""
+        if not hasattr(self._local, 'connection') or self._local.connection is None:
+            self._local.connection = sqlite3.connect(self.db_path)
+            self._local.connection.execute("PRAGMA journal_mode=WAL;")
         try:
-            yield self._connection
+            yield self._local.connection
+            self._local.connection.commit()
         except Exception:
-            self._connection.rollback()
+            self._local.connection.rollback()
             raise
 
     def close(self):
-        """Close the database connection."""
-        if self._connection:
-            self._connection.close()
-            self._connection = None
+        """Close the thread-local database connection."""
+        if hasattr(self._local, 'connection') and self._local.connection:
+            self._local.connection.close()
+            self._local.connection = None
 
     def _init_db(self):
         with self.get_connection() as conn:
@@ -143,7 +145,6 @@ class DatabaseManager:
                 INSERT INTO bag_events (bag_type_id, track_id, confidence)
                 VALUES (?, ?, ?)
             """, (bag_type_id, track_id, confidence))
-            conn.commit()
 
     def get_aggregated_stats(self, start_time, end_time):
         with self.get_connection() as conn:
