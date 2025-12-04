@@ -48,10 +48,15 @@ class BpuDetector(BaseDetector):
         self.grids = []
         for stride in self.strides:
             grid_h, grid_w = self.input_h // stride, self.input_w // stride
-            self.grids.append(np.stack([
-                np.tile(np.linspace(0.5, grid_h - 0.5, grid_h), reps=grid_h),
-                np.repeat(np.arange(0.5, grid_w + 0.5, 1), grid_w)
-            ], axis=0).transpose(1, 0))
+
+            # Create meshgrid for anchor centers
+            yv, xv = np.meshgrid(
+                np.arange(0.5, grid_h + 0.5),
+                np.arange(0.5, grid_w + 0.5),
+                indexing = 'ij'
+            )
+            grid = np.stack([xv.flatten(), yv.flatten()], axis=1)
+            self.grids.append(grid)
 
     @property
     def class_names(self) -> Dict[int, str]:

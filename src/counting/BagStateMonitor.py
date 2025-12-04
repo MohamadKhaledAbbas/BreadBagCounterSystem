@@ -20,8 +20,8 @@ class BagEvent:
         self.frames_since_update = 0
 
         # Buffer settings
-        self.max_open_samples = 10  # Max ROIs during open phase
-        self.max_closed_samples = 5  # Max ROIs during closed phase
+        self.max_open_samples = 8  # Max ROIs during open phase
+        self.max_closed_samples = 4  # Max ROIs during closed phase
 
         self.open_id = open_id
         self.closed_id = closed_id
@@ -49,12 +49,9 @@ class BagEvent:
         roi = frame_img[y1:y2, x1:x2].copy()
 
         # Quality check
-        if not self._is_valid_roi(roi):
+        sharpness = self._is_valid_roi(roi)
+        if not sharpness >= 50:
             return False
-
-        # Calculate sharpness for sorting
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
         if is_open:
             self.open_rois.append((sharpness, roi))
@@ -91,7 +88,7 @@ class BagEvent:
         self.frames_since_update = 0
         self._add_roi(box, frame_img, is_open=False)
 
-    def _is_valid_roi(self, roi, min_size=30, min_sharpness=50):
+    def _is_valid_roi(self, roi, min_size=80, min_sharpness=50):
         """Basic quality gate."""
         h, w = roi.shape[:2]
         if h < min_size or w < min_size:
@@ -99,7 +96,7 @@ class BagEvent:
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return sharpness >= min_sharpness
+        return sharpness
 
     def get_all_candidates(self) -> List:
         """
@@ -132,9 +129,9 @@ class BagEvent:
 
 class BagStateMonitor:
     def __init__(self, open_cls_id, closed_cls_id,
-                 iou_threshold=0.25,
-                 min_open_frames=3,
-                 min_closed_frames=3):
+                 iou_threshold=0.40,
+                 min_open_frames=5,
+                 min_closed_frames=2):
 
         self.open_id = open_cls_id
         self.closed_id = closed_cls_id

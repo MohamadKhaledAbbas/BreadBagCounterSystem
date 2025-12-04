@@ -179,6 +179,15 @@ class BagCounterApp:
                     cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
                     confidences = detections[0].boxes.conf.cpu().numpy()
 
+                    if current_frame_detections:
+                        for det in current_frame_detections:
+                            logger.info(
+                                f"[RAW DETECTION] class={det['class_id']}, "
+                                f"conf={det['conf']:.3f}, box={det['box']}"
+                            )
+                    else:
+                        logger.warning("[RAW DETECTION] No detections this frame!")
+
                     for i in range(len(cls_ids)):
                         current_frame_detections.append({
                             'box': xyxy[i],
