@@ -338,4 +338,8 @@ class BagCounterApp:
                 logic_thread.join()
                 logger.debug("[BagCounterApp] Logic thread joined")
 
+            # Close database connection
+            self.db.close()
+            logger.debug("[BagCounterApp] Database connection closed")
+
             logger.info("[BagCounterApp] Shutdown complete")

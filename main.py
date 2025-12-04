@@ -24,7 +24,7 @@ if __name__ == "__main__":
         logger.info("HOME environment variable not set, using default: /home/sunrise")
 
     app = BagCounterApp(
-        video_path = config.video_path or "/media/72E436DAE436A071/Wheatberry_Green20251128080005_20251128090005.mp4",
+        video_path = config.video_path,
         detector_engine=detector,
         classifier_engine=classifier,
         db=db_manager,
