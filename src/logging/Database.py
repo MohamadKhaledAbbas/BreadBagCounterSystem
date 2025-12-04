@@ -31,8 +31,12 @@ class DatabaseManager:
     def close(self):
         """Close the thread-local database connection."""
         if hasattr(self._local, 'connection') and self._local.connection:
-            self._local.connection.close()
-            self._local.connection = None
+            try:
+                self._local.connection.close()
+            except Exception as e:
+                logger.debug(f"[DatabaseManager] Error closing connection: {e}")
+            finally:
+                self._local.connection = None
 
     def _init_db(self):
         with self.get_connection() as conn:
