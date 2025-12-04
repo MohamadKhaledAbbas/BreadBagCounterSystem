@@ -129,7 +129,7 @@ class BagEvent:
 
 class BagStateMonitor:
     def __init__(self, open_cls_id, closed_cls_id,
-                 iou_threshold=0.40,
+                 iou_threshold=0.45,
                  min_open_frames=5,
                  min_closed_frames=2):
 
@@ -149,6 +149,12 @@ class BagStateMonitor:
         )
 
     def compute_iou(self, boxA, boxB):
+        # Sanity checks for box coordinates
+        if (boxA[2] <= boxA[0] or boxA[3] <= boxA[1] or
+            boxB[2] <= boxB[0] or boxB[3] <= boxB[1]):
+            logger.debug("[BagStateMonitor] Invalid box coordinates in IoU computation")
+            return 0.0
+        
         xA = max(boxA[0], boxB[0])
         yA = max(boxA[1], boxB[1])
         xB = min(boxA[2], boxB[2])
@@ -170,6 +176,8 @@ class BagStateMonitor:
         )
 
         used_open_indices = set()
+        used_closed_indices = set()
+        matched_event_ids = set()  # Prevent same event matching twice
 
         # ---------------------------------------------------
         # 1. Match OPEN detections to existing events
@@ -178,6 +186,9 @@ class BagStateMonitor:
             best_iou = 0
             best_event = None
             for event in self.active_events:
+                # Skip if event already matched in this frame
+                if event.id in matched_event_ids:
+                    continue
                 iou = self.compute_iou(event.box, det['box'])
                 if iou > self.iou_threshold and iou > best_iou:
                     best_iou = iou
@@ -187,6 +198,7 @@ class BagStateMonitor:
                 # Collect OPEN ROI
                 best_event.add_open_frame(det['box'], frame_img)
                 used_open_indices.add(i)
+                matched_event_ids.add(best_event.id)  # Mark as matched
 
                 if best_event.state != 'counted':
                     best_event.open_hits += 1
@@ -207,18 +219,23 @@ class BagStateMonitor:
         # ---------------------------------------------------
         # 2.  Match CLOSED detections to existing events
         # ---------------------------------------------------
-        for det in closed_dets:
+        for j, det in enumerate(closed_dets):
             best_iou = 0
             best_event = None
             for event in self.active_events:
+                # Skip if event already matched in this frame
+                if event.id in matched_event_ids:
+                    continue
                 iou = self.compute_iou(event.box, det['box'])
                 if iou > self.iou_threshold and iou > best_iou:
                     best_iou = iou
                     best_event = event
 
             if best_event:
-                # Collect CLOSED ROI (NEW!)
+                # Collect CLOSED ROI
                 best_event.add_closed_frame(det['box'], frame_img)
+                used_closed_indices.add(j)
+                matched_event_ids.add(best_event.id)  # Mark as matched
 
                 if best_event.state != 'counted':
                     if best_event.open_hits >= self.min_open_frames:
@@ -232,11 +249,32 @@ class BagStateMonitor:
         # ---------------------------------------------------
         # 3.  Create NEW events for unmatched open detections
         # ---------------------------------------------------
+        MAX_ACTIVE_EVENTS = 50  # Prevent memory issues
         for i, det in enumerate(open_dets):
             if i not in used_open_indices:
+                # Add minimum confidence threshold for creating new events
+                min_conf_threshold = 0.3
+                if det.get('conf', 1.0) < min_conf_threshold:
+                    logger.debug(
+                        f"[BagStateMonitor] Skipping low confidence detection: "
+                        f"conf={det.get('conf', 1.0):.3f} < {min_conf_threshold}"
+                    )
+                    continue
+                
+                # Prevent memory issues with too many events
+                if len(self.active_events) >= MAX_ACTIVE_EVENTS:
+                    logger.warning(
+                        f"[BagStateMonitor] Max active events reached ({MAX_ACTIVE_EVENTS}), "
+                        f"skipping new event creation"
+                    )
+                    break
+                
                 new_event = BagEvent(det['box'], frame_img, self.open_id, self.closed_id)
                 self.active_events.append(new_event)
-                logger.info(f"[BagStateMonitor] New event: ID={new_event.id}")
+                logger.info(
+                    f"[BagStateMonitor] New event: ID={new_event.id}, "
+                    f"conf={det.get('conf', 1.0):.3f}"
+                )
 
         # ---------------------------------------------------
         # 4. Check triggers & cleanup
@@ -268,13 +306,25 @@ class BagStateMonitor:
                     )
 
                 event.state = 'counted'
+                logger.debug(f"[BagStateMonitor] Event {event.id} state -> counted")
+
+            # State-aware expiry: different timeouts based on state
+            if event.state == 'detecting_open':
+                expiry_threshold = 8
+            elif event.state == 'detecting_closed':
+                expiry_threshold = 15
+            else:  # 'counted'
+                expiry_threshold = 5
 
             # Keep event alive if recently updated
-            if event.frames_since_update < 10:
+            if event.frames_since_update < expiry_threshold:
                 active_next_frame.append(event)
             else:
                 expired_count += 1
-                logger.debug(f"[BagStateMonitor] Event {event.id} expired")
+                logger.debug(
+                    f"[BagStateMonitor] Event {event.id} expired "
+                    f"(state={event.state}, frames_since_update={event.frames_since_update})"
+                )
 
         if expired_count > 0:
             logger.debug(f"[BagStateMonitor] Expired {expired_count} events")

@@ -89,8 +89,26 @@ class ClassifierService:
 
         # Voting: count label occurrences among top K
         label_votes = Counter(r['label'] for r in top_k)
-        winning_label, vote_count = label_votes.most_common(1)[0]
+        max_votes = label_votes.most_common(1)[0][1]
+        tied_labels = [label for label, count in label_votes.items() if count == max_votes]
 
+        if len(tied_labels) == 1:
+            winning_label = tied_labels[0]
+        else:
+            # Tiebreaker: highest average confidence
+            logger.debug(f"[ClassifierService] Tie detected between {tied_labels}")
+            label_confs = {}
+            for label in tied_labels:
+                confs = [r['conf'] for r in top_k if r['label'] == label]
+                label_confs[label] = sum(confs) / len(confs)
+            winning_label = max(label_confs, key=label_confs.get)
+            logger.debug(
+                f"[ClassifierService] Tiebreaker resolved: {winning_label} "
+                f"(avg_conf={label_confs[winning_label]:.3f})"
+            )
+
+        vote_count = label_votes[winning_label]
+        
         # Get the highest confidence ROI with the winning label
         winning_results = [r for r in top_k if r['label'] == winning_label]
         best_result = max(winning_results, key=lambda x: x['conf'])
