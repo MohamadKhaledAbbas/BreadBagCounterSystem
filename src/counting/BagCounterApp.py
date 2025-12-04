@@ -83,30 +83,40 @@ class BagCounterApp:
         self.ui_counts = {}
 
         # --- IPC SETUP (ROS 2 - Executor Pattern) ---
+        from src.utils.platform import IS_RDK
+
         logger.debug("[BagCounterApp] Initializing ROS 2 context...")
         self.ros_executor = init_ros2_context()
 
         self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
 
-        self.ipc_publisher = FramePublisher(publish_rate_hz=30.0)
-        self.ros_executor.add_node(self.ipc_publisher)
+        self.ipc_publisher = FramePublisher(publish_rate_hz=10.0)
+
+        if IS_RDK and self.ros_executor is not None:
+            self.ros_executor.add_node(self.ipc_publisher)
 
         if is_development:
             self.frame_source = FrameSourceFactory.create("opencv", source=video_path)
             logger.info(f"[BagCounterApp] Development mode: reading from {video_path}")
         else:
-            os.environ["HOME"] = "/home/sunrise"
-            self.frame_source = FrameSourceFactory.create("ros2")
-            logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
+            if IS_RDK:
+                os.environ["HOME"] = "/home/sunrise"
+                self.frame_source = FrameSourceFactory.create("ros2")
+                logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
+            else:
+                # On Windows, fall back to OpenCV even in production mode
+                self.frame_source = FrameSourceFactory.create("opencv", source=video_path)
+                logger.info(f"[BagCounterApp] Windows mode: reading from {video_path}")
 
-        if isinstance(self.frame_source, Node):
+        if IS_RDK and self.ros_executor is not None and isinstance(self.frame_source, Node):
             self.ros_executor.add_node(self.frame_source)
             logger.debug("[BagCounterApp] FrameSource added to ROS 2 executor")
 
         self.ros_thread = ExecutorThread(self.ros_executor)
         self.ros_thread.start()
-        logger.debug("[BagCounterApp] ROS 2 executor thread started")
+        if IS_RDK:
+            logger.debug("[BagCounterApp] ROS 2 executor thread started")
 
         logger.info("[BagCounterApp] Initialization complete")
 
@@ -353,7 +363,19 @@ class BagCounterApp:
             logger.debug("[BagCounterApp] Config watcher stopped")
 
             # --- ROS 2 CLEANUP ---
-            self.ros_executor.remove_node(self.ipc_publisher)
+            if IS_RDK and self.ros_executor is not None:
+                self.ros_executor.remove_node(self.ipc_publisher)
+
+                if isinstance(self.frame_source, Node):
+                    self.ros_executor.remove_node(self.frame_source)
+
+                self.ipc_publisher.close_node()
+
+            self.frame_source.cleanup()
+
+            shutdown_ros2_context()
+            if IS_RDK:
+                logger.debug("[BagCounterApp] ROS 2 context shutdown")
 
             if isinstance(self.frame_source, Node):
                 self.ros_executor.remove_node(self.frame_source)

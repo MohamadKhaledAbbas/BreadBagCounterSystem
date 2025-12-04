@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import threading
 from src.counting.IPC import FRAME_TOPIC
@@ -110,8 +111,11 @@ else:
         
         def publish(self, frame):
             """Stub publish method that does nothing."""
-            pass
-        
+            if frame is None:
+                return
+            cv2.imshow("Annotated Frame", frame)
+            key = cv2.waitKey(1) & 0xFF
+
         def close_node(self):
             """Stub close method."""
             pass

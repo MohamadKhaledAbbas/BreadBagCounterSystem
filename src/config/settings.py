@@ -4,7 +4,7 @@ from src.utils.platform import IS_RDK
 
 @dataclass
 class AppConfig:
-    video_path: str = os.getenv("VIDEO_PATH", "/media/72E436DAE436A071/Wheatberry_Green20251128080005_20251128090005.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\RED.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
