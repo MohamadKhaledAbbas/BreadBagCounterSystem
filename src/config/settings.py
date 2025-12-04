@@ -1,11 +1,24 @@
 import os
 from dataclasses import dataclass
+from src.utils.platform import IS_RDK
 
 @dataclass
 class AppConfig:
     video_path: str = os.getenv("VIDEO_PATH", "/media/72E436DAE436A071/Wheatberry_Green20251128080005_20251128090005.mp4")
-    detection_model: str = os.getenv("DETECTION_MODEL", "data/model/detect_yolo_small_v3_bayese_640x640_nv12.bin")
-    classification_model: str = os.getenv("CLASS_MODEL", "data/model/classify_yolo_small_v4_bayese_224x224_nv12.bin")
+
+    # Platform-specific model paths
+    # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
+    detection_model: str = os.getenv(
+        "DETECTION_MODEL",
+        "data/model/detect_yolo_small_v2_bayese_640x640_nv12.bin" if IS_RDK
+        else "data/model/detect_yolo_small_v3.pt"
+    )
+    classification_model: str = os.getenv(
+        "CLASS_MODEL",
+        "data/model/classify_yolo_small_v4_bayese_224x224_nv12.bin" if IS_RDK
+        else "data/model/classify_yolo_small_v4.pt"
+    )
+
     db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
     
     # Classifier class names
