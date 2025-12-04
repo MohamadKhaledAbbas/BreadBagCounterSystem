@@ -1,6 +1,5 @@
 import os
 import time
-import cv2
 from collections import Counter
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
@@ -40,10 +39,10 @@ class ClassifierService:
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
-            t1 = cv2.getTickCount()
+            t1 = time.perf_counter()
             label, conf = self.classifier.predict(roi_image)
-            t2 = cv2.getTickCount()
-            latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
+            t2 = time.perf_counter()
+            latency = (t2 - t1) * 1000  # Convert to milliseconds
             logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f}) - {latency:.1f}ms")
             return label, conf
         except Exception as e:
@@ -60,7 +59,7 @@ class ClassifierService:
 
         results = []
 
-        classify_start = cv2.getTickCount()
+        classify_start = time.perf_counter()
         logger.info(f"[ClassifierService] Classifying {len(candidates)} candidates...")
 
         # Classify all candidates
@@ -72,8 +71,8 @@ class ClassifierService:
                 'conf': conf
             })
         
-        classify_end = cv2.getTickCount()
-        total_classify_time = (classify_end - classify_start) * 1000 / cv2.getTickFrequency()
+        classify_end = time.perf_counter()
+        total_classify_time = (classify_end - classify_start) * 1000  # Convert to milliseconds
 
         # Filter out unknowns for voting
         valid_results = [r for r in results if r['label'] != "Unknown"]

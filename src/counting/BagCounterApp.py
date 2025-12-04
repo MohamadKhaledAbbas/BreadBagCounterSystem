@@ -144,6 +144,9 @@ class BagCounterApp:
                 self.box = box
                 self.class_id = cid
 
+        # Configuration constants
+        TIMING_LOG_INTERVAL = 30  # Log timing every N frames to reduce log spam
+        
         frame_count = 0
 
         while self.is_running:
@@ -216,10 +219,10 @@ class BagCounterApp:
                 # --- 4. PUBLISHING LOGIC ---
                 publish_time = 0.0
                 
-                # Calculate total frame time (before publishing for accurate timing)
-                frame_end = cv2.getTickCount()
-                total_time = (frame_end - frame_start) * 1000 / cv2.getTickFrequency()
-                fps = 1000 / total_time if total_time > 0 else 0
+                # Calculate processing time (detection + monitor + classification)
+                # This excludes publishing overhead for core performance measurement
+                processing_end = cv2.getTickCount()
+                processing_time = (processing_end - frame_start) * 1000 / cv2.getTickFrequency()
                 
                 if self.is_publishing:
                     publish_start = cv2.getTickCount()
@@ -237,6 +240,8 @@ class BagCounterApp:
                     self.visualizer.draw_detections(annotated_frame, tracks_for_ui)
                     self.visualizer.draw_stats(annotated_frame, self.ui_counts)
                     
+                    # Calculate FPS based on processing time (for display)
+                    fps = 1000 / processing_time if processing_time > 0 else 0
                     cv2.putText(
                         annotated_frame, f"FPS: {int(fps)}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
@@ -248,8 +253,13 @@ class BagCounterApp:
                     publish_end = cv2.getTickCount()
                     publish_time = (publish_end - publish_start) * 1000 / cv2.getTickFrequency()
 
-                # Log frame timing breakdown (only every 30 frames to avoid spam)
-                if frame_count % 30 == 0 or classify_time > 0:
+                # Calculate total frame time including all operations
+                frame_end = cv2.getTickCount()
+                total_time = (frame_end - frame_start) * 1000 / cv2.getTickFrequency()
+                fps = 1000 / total_time if total_time > 0 else 0
+
+                # Log frame timing breakdown (at configured interval or when classification occurs)
+                if frame_count % TIMING_LOG_INTERVAL == 0 or classify_time > 0:
                     timing_msg = (
                         f"[Frame {frame_count}] Total: {total_time:.1f}ms | "
                         f"Detect: {detect_time:.1f}ms | "

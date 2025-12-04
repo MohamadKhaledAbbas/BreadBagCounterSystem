@@ -57,7 +57,9 @@ console_handler.setFormatter(console_formatter)
 root_logger.addHandler(console_handler)
 
 # File handler with rotation (10MB max, 3 backup files)
-log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs")
+# Project root is 3 levels up from this file: src/utils/AppLogging.py
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+log_dir = os.path.join(project_root, "logs")
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "breadcounter.log")
 
