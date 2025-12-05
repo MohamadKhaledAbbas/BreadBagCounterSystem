@@ -250,45 +250,23 @@ class BagCounterApp:
                     publish_start = time.perf_counter()
                     
                     annotated_frame = frame.copy()
-                    
-                    # Draw RAW detections immediately for instant feedback
-                    for det in current_frame_detections:
-                        x1, y1, x2, y2 = map(int, det['box'])
-                        class_id = det['class_id']
-                        conf = det['conf']
-                        
-                        if class_id == self.monitor.closed_id:  # closed
-                            color = (255, 0, 0)  # Blue
-                            label = f"Closed {conf:.2f}"
-                        else:  # open
-                            color = (0, 255, 0)  # Green
-                            label = f"Open {conf:.2f}"
-                        
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(annotated_frame, label, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                    
-                    # Then draw event tracking info
-                    for event in self.monitor.active_events:
-                        x1, y1, x2, y2 = map(int, event.box)
-                        # Draw event ID and state
-                        event_label = f"ID:{event.id} {event.state}"
-                        cv2.putText(annotated_frame, event_label, (x1, y2 + 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
                     # Calculate total time so far for FPS display
                     frame_mid = time.perf_counter()
                     mid_time = (frame_mid - frame_start) * 1000  # Convert to ms
                     fps_display = 1000 / mid_time if mid_time > 0 else 0
 
-                    self.visualizer.draw_stats(annotated_frame, self.ui_counts)
-                    
-                    cv2.putText(
-                        annotated_frame, f"FPS: {int(fps_display)}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+                    self.visualizer.render_all(
+                        annotated_frame,
+                        # raw detection dicts or tracked objects:
+                        current_frame_detections,
+                        # event objects with .id, .state, .box
+                        self.monitor.active_events,
+                        counts=self.ui_counts,
+                        fps=fps_display
                     )
-                    annotated_frame = cv2.resize(annotated_frame, (1280, 720))
 
+                    annotated_frame = cv2.resize(annotated_frame, (1280, 720))
                     self.ipc_publisher.publish(annotated_frame)
                     
                     publish_end = time.perf_counter()
