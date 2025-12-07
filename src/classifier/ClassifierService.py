@@ -215,7 +215,7 @@ class ClassifierService:
             image_path = None
             if should_save:
                 timestamp = int(time.time())
-                filename = f"{timestamp}_{track_id}. jpg"
+                filename = f"{timestamp}_{track_id}.jpg"
                 save_path = os.path.join(target_dir, filename)
 
                 import cv2

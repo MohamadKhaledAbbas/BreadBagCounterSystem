@@ -34,20 +34,15 @@ else:
         pass
 
 
-# -------------------
-
-
-
-
-
 class BagCounterApp:
-    def __init__(self,
-                 video_path: str,
-                 detector_engine: BaseDetector,
-                 classifier_engine: BaseClassifier,
-                 db: DatabaseManager,
-                 is_development: bool
-                 ):
+    def __init__(
+        self,
+        video_path: str,
+        detector_engine: BaseDetector,
+        classifier_engine: BaseClassifier,
+        db: DatabaseManager,
+        is_development: bool,
+    ):
 
         logger.info("[BagCounterApp] Initializing...")
         self.db = db
@@ -59,13 +54,30 @@ class BagCounterApp:
         self.config_watcher.add_watch(constants.is_recording_key, self.on_is_recording_changed)
 
         self.is_running = False
-        
+
         # Recording state
         self.is_recording = db.get_config_value(constants.is_recording_key) == "1"
         self.video_writer = None
-        self.recording_dir = config.recording_dir
+        # Use DB-configured path if present, else fall back to config
+        self.recording_dir = db.get_config_value(constants.recording_dir) or config.recording_dir
+        # Segment length (seconds). Default 600 (10 minutes) if not provided in config/env.
+
+        self.recording_segment_seconds = db.get_config_value(constants.recording_seconds)
+        try:
+            self.recording_segment_seconds = int(self.recording_segment_seconds)
+        except Exception:
+            logger.error(
+                f"[BagCounterApp] Invalid RECORDING_SEGMENT_SECONDS={self.recording_segment_seconds}; "
+                "falling back to 600"
+            )
+            self.recording_segment_seconds = 600
+
+        self.segment_start_time = None
+        self.segment_counter = 0
+
         logger.info(f"[BagCounterApp] Video Recording: {'ENABLED' if self.is_recording else 'DISABLED'}")
         logger.info(f"[BagCounterApp] Recording directory: {self.recording_dir}")
+        logger.info(f"[BagCounterApp] Recording segment length: {self.recording_segment_seconds}s")
 
         self.input_queue = queue.Queue(maxsize=1)
 
@@ -74,8 +86,8 @@ class BagCounterApp:
         name_to_id = {v: k for k, v in names.items()}
 
         try:
-            open_id = name_to_id['bread-bag-opened']
-            closed_id = name_to_id['bread-bag-closed']
+            open_id = name_to_id["bread-bag-opened"]
+            closed_id = name_to_id["bread-bag-closed"]
             logger.debug(f"[BagCounterApp] open_id={open_id}, closed_id={closed_id}")
         except KeyError as e:
             logger.error(f"[BagCounterApp] Model missing required class: {e}")
@@ -132,7 +144,7 @@ class BagCounterApp:
         else:
             self.is_publishing = False
             logger.info("[BagCounterApp] IPC Publishing DISABLED")
-    
+
     def on_is_recording_changed(self, new_value):
         if new_value == "1":
             self.is_recording = True
@@ -140,13 +152,43 @@ class BagCounterApp:
         else:
             self.is_recording = False
             logger.info("[BagCounterApp] Video Recording DISABLED")
+            # Reset segment metadata so next start begins fresh
+            self.segment_counter = 0
+            self.segment_start_time = None
+
+    def _open_video_writer(self, frame):
+        """Open a new video writer and return (writer, filename) or (None, None) on failure."""
+        try:
+            os.makedirs(self.recording_dir, exist_ok=True)
+            if not os.access(self.recording_dir, os.W_OK):
+                logger.error(f"[Recording] Directory not writable: {self.recording_dir}")
+                return None, None
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            video_filename = os.path.join(self.recording_dir, f"{timestamp}_p{self.segment_counter:03d}.mp4")
+
+            height, width = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            fps = 30.0
+            writer = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
+
+            if writer.isOpened():
+                self.segment_start_time = time.perf_counter()
+                self.segment_counter += 1
+                return writer, video_filename
+            else:
+                logger.error(f"[Recording] Failed to open video writer: {video_filename}")
+                return None, None
+        except Exception as e:
+            logger.error(f"[Recording] Error starting recording: {e}")
+            return None, None
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
-        label = data['label']
-        phash = data['phash']
-        image_path = data['image_path']
-        conf = data.get('confidence', 1.0)
-        candidates_count = data.get('candidates_evaluated', 1)
+        label = data["label"]
+        phash = data["phash"]
+        image_path = data["image_path"]
+        conf = data.get("confidence", 1.0)
+        candidates_count = data.get("candidates_evaluated", 1)
 
         logger.info(
             f"[BagCounterApp] Classification result: track={track_id}, "
@@ -174,7 +216,7 @@ class BagCounterApp:
 
         # Configuration constants
         TIMING_LOG_INTERVAL = 30  # Log timing every N frames to reduce log spam
-        
+
         frame_count = 0
 
         while self.is_running:
@@ -191,7 +233,7 @@ class BagCounterApp:
 
             try:
                 frame_count += 1
-                
+
                 # Frame timing metrics (using time.perf_counter for precision)
                 frame_start = time.perf_counter()
 
@@ -200,30 +242,25 @@ class BagCounterApp:
                 detections = self.detector.predict(frame)
                 detect_end = time.perf_counter()
                 detect_time = (detect_end - detect_start) * 1000  # Convert to ms
-                
+
                 current_frame_detections = []
 
-                if len(detections) > 0 and hasattr(detections[0], 'boxes') and len(detections[0].boxes) > 0:
+                if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
                     xyxy = detections[0].boxes.xyxy.cpu().numpy()
                     cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
                     confidences = detections[0].boxes.conf.cpu().numpy()
 
                     for i in range(len(cls_ids)):
-                        current_frame_detections.append({
-                            'box': xyxy[i],
-                            'class_id': cls_ids[i],
-                            'conf': confidences[i]
-                        })
+                        current_frame_detections.append(
+                            {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
+                        )
 
                     # Log detection confidence for debugging
-                    logger.debug(
-                        f"[LogicThread] Frame {frame_count}: "
-                        f"{len(current_frame_detections)} detections"
-                    )
-                    
+                    logger.debug(f"[LogicThread] Frame {frame_count}: {len(current_frame_detections)} detections")
+
                     if len(current_frame_detections) > 0:
                         for det in current_frame_detections:
-                            class_name = self.detector.class_names.get(det['class_id'], 'Unknown')
+                            class_name = self.detector.class_names.get(det["class_id"], "Unknown")
                             logger.debug(
                                 f"[RAW DETECTION] class={class_name} (id={det['class_id']}), "
                                 f"conf={det['conf']:.3f}, box=[{det['box'][0]:.1f}, {det['box'][1]:.1f}, "
@@ -245,7 +282,7 @@ class BagCounterApp:
                         f"[LogicThread] Frame {frame_count}: "
                         f"{len(ready_events)} events ready for classification"
                     )
-                    
+
                     classify_start = time.perf_counter()
                     for event_id, candidates in ready_events:
                         logger.debug(
@@ -258,53 +295,45 @@ class BagCounterApp:
 
                 # --- 4. RECORDING LOGIC (Independent from publishing) ---
                 record_time = 0.0
-                
+
                 # Handle recording state transitions and write frames
                 if self.is_recording:
                     record_start = time.perf_counter()
-                    
-                    # Rising edge: Start recording
+
+                    # Start writer if needed
                     if self.video_writer is None:
+                        self.video_writer, opened_filename = self._open_video_writer(frame)
+                        if opened_filename:
+                            logger.info(f"[Recording] Started recording to: {opened_filename}")
+
+                    # Rotate segment if duration exceeded
+                    if (
+                        self.video_writer is not None
+                        and self.video_writer.isOpened()
+                        and self.segment_start_time is not None
+                        and (time.perf_counter() - self.segment_start_time) >= self.recording_segment_seconds
+                    ):
                         try:
-                            # Ensure recording directory exists
-                            os.makedirs(self.recording_dir, exist_ok=True)
-                            
-                            # Check if directory is writable
-                            if not os.access(self.recording_dir, os.W_OK):
-                                logger.error(f"[Recording] Directory not writable: {self.recording_dir}")
-                                # Skip recording initialization if directory is not writable
-                            else:
-                                # Generate timestamped filename with milliseconds to avoid collisions
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
-                                video_filename = os.path.join(self.recording_dir, f"{timestamp}.mp4")
-                                
-                                # Get frame dimensions
-                                height, width = frame.shape[:2]
-                                
-                                # Open video writer with mp4v codec
-                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                # FPS set to 30.0 by default; can be made configurable via env var if needed
-                                fps = 30.0
-                                self.video_writer = cv2.VideoWriter(
-                                    video_filename, fourcc, fps, (width, height)
-                                )
-                                
-                                if self.video_writer.isOpened():
-                                    logger.info(f"[Recording] Started recording to: {video_filename}")
-                                else:
-                                    logger.error(f"[Recording] Failed to open video writer: {video_filename}")
-                                    self.video_writer = None
+                            self.video_writer.release()
+                            logger.info("[Recording] Closed segment (time limit reached)")
                         except Exception as e:
-                            logger.error(f"[Recording] Error starting recording: {e}")
+                            logger.error(f"[Recording] Error closing segment: {e}")
+                        finally:
                             self.video_writer = None
-                    
+                            self.segment_start_time = None
+
+                        # Open next segment immediately
+                        self.video_writer, opened_filename = self._open_video_writer(frame)
+                        if opened_filename:
+                            logger.info(f"[Recording] Started new segment: {opened_filename}")
+
                     # Write frame if writer is open
                     if self.video_writer is not None and self.video_writer.isOpened():
                         try:
                             self.video_writer.write(frame)
                         except Exception as e:
                             logger.error(f"[Recording] Error writing frame: {e}")
-                    
+
                     record_end = time.perf_counter()
                     record_time = (record_end - record_start) * 1000  # Convert to ms
                 else:
@@ -317,13 +346,15 @@ class BagCounterApp:
                             logger.error(f"[Recording] Error releasing video writer: {e}")
                         finally:
                             self.video_writer = None
+                            self.segment_start_time = None
+                            self.segment_counter = 0
 
                 # --- 5. PUBLISHING LOGIC ---
                 publish_time = 0.0
-                
+
                 if self.is_publishing:
                     publish_start = time.perf_counter()
-                    
+
                     annotated_frame = frame.copy()
 
                     # Calculate total time so far for FPS display
@@ -338,12 +369,12 @@ class BagCounterApp:
                         # event objects with .id, .state, .box
                         self.monitor.active_events,
                         counts=self.ui_counts,
-                        fps=fps_display
+                        fps=fps_display,
                     )
 
                     annotated_frame = cv2.resize(annotated_frame, (1280, 720))
                     self.ipc_publisher.publish(annotated_frame)
-                    
+
                     publish_end = time.perf_counter()
                     publish_time = (publish_end - publish_start) * 1000  # Convert to ms
 
@@ -366,12 +397,13 @@ class BagCounterApp:
                     if publish_time > 0:
                         timing_msg += f" | Publish: {publish_time:.1f}ms"
                     timing_msg += f" | FPS: {fps:.1f}"
-                    
+
                     logger.info(timing_msg)
 
             except Exception as e:
                 logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
                 import traceback
+
                 logger.debug(f"[LogicThread] Traceback:\n{traceback.format_exc()}")
 
         logger.info("[LogicThread] Stopped")
@@ -406,11 +438,12 @@ class BagCounterApp:
         except Exception as e:
             logger.error(f"[BagCounterApp] Error in main loop: {e}")
             import traceback
+
             logger.debug(f"[BagCounterApp] Traceback:\n{traceback.format_exc()}")
         finally:
             logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
             self.is_running = False
-            
+
             # Release video writer if recording
             if self.video_writer is not None:
                 try:
@@ -420,6 +453,8 @@ class BagCounterApp:
                     logger.error(f"[BagCounterApp] Error releasing video writer: {e}")
                 finally:
                     self.video_writer = None
+                    self.segment_start_time = None
+                    self.segment_counter = 0
 
             self.frame_source.cleanup()
             logger.debug("[BagCounterApp] Frame source cleaned up")
