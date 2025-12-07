@@ -202,6 +202,104 @@ class DatabaseManager:
 
         return stats
 
+    def get_ordered_bag_events(self, start_time, end_time):
+        """
+        Retrieve time-ordered bag events with bag type information.
+        Returns list of events with timestamp, class name, arabic_name, thumb, weight, and count (1 per event).
+        """
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            
+            events = conn.execute("""
+                SELECT
+                    be.id,
+                    be.timestamp,
+                    bt.id as bag_type_id,
+                    bt.name AS class_name,
+                    bt.arabic_name,
+                    bt.image_path AS thumb,
+                    bt.weight,
+                    1 as count
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?
+                ORDER BY be.timestamp ASC
+            """, (start_time, end_time)).fetchall()
+            
+            return [
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "bag_type_id": row["bag_type_id"],
+                    "class_name": row["class_name"],
+                    "arabic_name": row["arabic_name"],
+                    "thumb": row["thumb"],
+                    "weight": (row["weight"] or 0) / 1000,  # Convert to kg
+                    "count": row["count"]
+                } for row in events
+            ]
+
+    def get_per_class_time_windows(self, start_time, end_time):
+        """
+        Get first_seen and last_seen timestamps for each bag class within the time window.
+        Also returns per-class event lists.
+        """
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            
+            class_windows = conn.execute("""
+                SELECT
+                    bt.id,
+                    bt.name AS class_name,
+                    bt.arabic_name,
+                    bt.image_path AS thumb,
+                    bt.weight,
+                    MIN(be.timestamp) as first_seen,
+                    MAX(be.timestamp) as last_seen,
+                    COUNT(be.id) as event_count
+                FROM bag_types bt
+                JOIN bag_events be ON bt.id = be.bag_type_id
+                WHERE be.timestamp BETWEEN ? AND ?
+                GROUP BY bt.id, bt.name, bt.arabic_name, bt.image_path, bt.weight
+            """, (start_time, end_time)).fetchall()
+            
+            result = {}
+            for row in class_windows:
+                bag_type_id = row["id"]
+                
+                # Get individual events for this class
+                events = conn.execute("""
+                    SELECT
+                        be.id,
+                        be.timestamp,
+                        bt.weight,
+                        1 as count
+                    FROM bag_events be
+                    JOIN bag_types bt ON be.bag_type_id = bt.id
+                    WHERE bt.id = ? AND be.timestamp BETWEEN ? AND ?
+                    ORDER BY be.timestamp ASC
+                """, (bag_type_id, start_time, end_time)).fetchall()
+                
+                result[bag_type_id] = {
+                    "class_name": row["class_name"],
+                    "arabic_name": row["arabic_name"],
+                    "thumb": row["thumb"],
+                    "weight": (row["weight"] or 0) / 1000,  # Convert to kg
+                    "first_seen": row["first_seen"],
+                    "last_seen": row["last_seen"],
+                    "event_count": row["event_count"],
+                    "events": [
+                        {
+                            "id": e["id"],
+                            "timestamp": e["timestamp"],
+                            "weight": (e["weight"] or 0) / 1000,
+                            "count": e["count"]
+                        } for e in events
+                    ]
+                }
+            
+            return result
+
     def get_config_value(self, key):
         try:
             with self.get_connection() as conn:

@@ -29,12 +29,21 @@ def parse_datetime(val: Optional[str]):
 
 def get_stats(start_time: datetime, end_time: datetime):
     stats = db.get_aggregated_stats(start_time, end_time)
+    
+    # Get timeline data
+    ordered_events = db.get_ordered_bag_events(start_time, end_time)
+    per_class_windows = db.get_per_class_time_windows(start_time, end_time)
+    
     return {
         "meta": {
             "start": start_time,
             "end": end_time
         },
-        "data": stats
+        "data": stats,
+        "timeline": {
+            "ordered_events": ordered_events,
+            "per_class_windows": per_class_windows
+        }
     }
 
 @router.get("/analytics", response_class=HTMLResponse)
@@ -65,6 +74,14 @@ async def analytics(
         for c in stats["data"]["classifications"]:
             c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
 
+        # Fix image paths for timeline events
+        for event in stats["timeline"]["ordered_events"]:
+            event["thumb"] = event["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
+        
+        # Fix image paths for per-class windows
+        for class_id, class_data in stats["timeline"]["per_class_windows"].items():
+            class_data["thumb"] = class_data["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
+
         # Adjusting timezone for preview +3
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
         stats["meta"]["end"] = end_dt + timedelta(hours=3)
@@ -75,6 +92,7 @@ async def analytics(
             "meta": stats["meta"],
             "total": stats["data"]["total"],
             "classifications":  stats["data"]["classifications"],
+            "timeline": stats["timeline"],
         })
     except Exception as e:
         logger.error(f"[Analytics] Error: {e}")
