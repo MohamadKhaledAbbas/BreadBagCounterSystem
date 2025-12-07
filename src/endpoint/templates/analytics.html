@@ -52,26 +52,207 @@
         </div>
     </section>
 
-    <section class="grid-container">
-        {% for c in classifications %}
-            <div class="stat-card">
-                <div class="card-header stacked">
-                <div class="card-title">{{ c.arabic_name }}</div>
-                <div class="thumb-container">
-                    <img src="{{ c.thumb }}" alt="{{ c.name }}" onerror="this.src='https://placehold.co/100x100/1e293b/FFF?text={{c.name[:1]}}'">
+    <!-- Global Timeline Section -->
+    {% if timeline and timeline.ordered_events %}
+    <section class="timeline-section">
+        <div class="timeline-header">
+            <h2 class="timeline-title">
+                <i class="fa-solid fa-clock-rotate-left"></i> Event Timeline
+            </h2>
+            <div class="timeline-controls">
+                <div class="toggle-group">
+                    <button class="toggle-btn active" data-density="compact">
+                        <i class="fa-solid fa-compress"></i> Compact
+                    </button>
+                    <button class="toggle-btn" data-density="comfort">
+                        <i class="fa-solid fa-expand"></i> Comfort
+                    </button>
+                </div>
+                <div class="toggle-group">
+                    <button class="toggle-btn active" data-order="desc">
+                        <i class="fa-solid fa-arrow-down-wide-short"></i> Newest First
+                    </button>
+                    <button class="toggle-btn" data-order="asc">
+                        <i class="fa-solid fa-arrow-up-wide-short"></i> Oldest First
+                    </button>
                 </div>
             </div>
-
-            <div class="card-metric-large">{{ c.count }}</div>
-
-            <div class="card-footer">
-                <span>Weight</span>
-                <span class="weight-tag">{{ (c.weight * c.count) or 0 }} kg</span>
-            </div>
         </div>
+
+        <div class="timeline-container" id="timelineContainer" data-density="compact" data-order="desc">
+            {% set events_desc = timeline.ordered_events[::-1] %}
+            {% set events = events_desc %}
+            {% set last_date = namespace(value='') %}
+            
+            {% for event in events %}
+                {% set event_date = event.timestamp[:10] %}
+                {% if event_date != last_date.value %}
+                    <div class="day-separator" data-date="{{ event_date }}">
+                        <span class="day-label">{{ event_date }}</span>
+                    </div>
+                    {% set last_date.value = event_date %}
+                {% endif %}
+                
+                <div class="timeline-event" data-timestamp="{{ event.timestamp }}" data-class-id="{{ event.bag_type_id }}">
+                    <div class="event-time">{{ event.timestamp[11:16] }}</div>
+                    <div class="event-thumb">
+                        <img src="{{ event.thumb }}" alt="{{ event.class_name }}" onerror="this.src='https://placehold.co/40x40/1e293b/FFF?text={{ event.class_name[:1] }}'">
+                    </div>
+                    <div class="event-info">
+                        <div class="event-name">{{ event.arabic_name or event.class_name }}</div>
+                        <div class="event-meta">
+                            <span class="event-weight">{{ event.weight }} kg</span>
+                        </div>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% elif timeline %}
+    <section class="timeline-section">
+        <div class="empty-timeline">
+            <i class="fa-solid fa-inbox"></i>
+            <p>No events recorded in this time window</p>
+        </div>
+    </section>
+    {% endif %}
+
+    <section class="grid-container">
+        {% for c in classifications %}
+            <div class="stat-card" data-class-id="{{ c.id }}">
+                <div class="card-header stacked">
+                    <div class="card-title">{{ c.arabic_name }}</div>
+                    <div class="thumb-container">
+                        <img src="{{ c.thumb }}" alt="{{ c.name }}" onerror="this.src='https://placehold.co/100x100/1e293b/FFF?text={{c.name[:1]}}'">
+                    </div>
+                </div>
+
+                <div class="card-metric-large">{{ c.count }}</div>
+
+                <div class="card-footer">
+                    <span>Weight</span>
+                    <span class="weight-tag">{{ (c.weight * c.count) or 0 }} kg</span>
+                </div>
+
+                {% if timeline and timeline.per_class_windows and c.id in timeline.per_class_windows %}
+                    {% set class_timeline = timeline.per_class_windows[c.id] %}
+                    <button class="expand-btn" onclick="toggleExpansion({{ c.id }})">
+                        <i class="fa-solid fa-chevron-down"></i> Show Details
+                    </button>
+
+                    <div class="card-expansion" id="expansion-{{ c.id }}">
+                        <div class="expansion-summary">
+                            <div class="summary-item">
+                                <span class="summary-label">First Seen</span>
+                                <span class="summary-value">{{ class_timeline.first_seen[11:16] }}</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="summary-label">Last Seen</span>
+                                <span class="summary-value">{{ class_timeline.last_seen[11:16] }}</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="summary-label">Events</span>
+                                <span class="summary-value">{{ class_timeline.event_count }}</span>
+                            </div>
+                        </div>
+
+                        <div class="mini-timeline">
+                            <div class="mini-timeline-title">Event History</div>
+                            {% for event in class_timeline.events %}
+                                <div class="mini-event">
+                                    <span class="mini-event-time">{{ event.timestamp[11:16] }}</span>
+                                    <span class="mini-event-weight">{{ event.weight }} kg</span>
+                                </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                {% endif %}
+            </div>
         {% endfor %}
     </section>
 </main>
+
+<script>
+// Toggle timeline density
+document.querySelectorAll('[data-density]').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const density = this.dataset.density;
+        const container = document.getElementById('timelineContainer');
+        if (container) {
+            container.dataset.density = density;
+            document.querySelectorAll('[data-density]').forEach(b => b.classList.remove('active'));
+            this.classList.add('active');
+        }
+    });
+});
+
+// Toggle timeline order
+document.querySelectorAll('[data-order]').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const order = this.dataset.order;
+        const container = document.getElementById('timelineContainer');
+        if (container) {
+            const events = Array.from(container.querySelectorAll('.timeline-event, .day-separator'));
+            
+            // Group events by day
+            const dayGroups = {};
+            let currentDay = null;
+            
+            events.forEach(el => {
+                if (el.classList.contains('day-separator')) {
+                    currentDay = el.dataset.date;
+                    if (!dayGroups[currentDay]) {
+                        dayGroups[currentDay] = { separator: el, events: [] };
+                    }
+                } else if (currentDay && el.classList.contains('timeline-event')) {
+                    dayGroups[currentDay].events.push(el);
+                }
+            });
+            
+            // Clear container
+            container.innerHTML = '';
+            
+            // Re-add in correct order
+            const days = Object.keys(dayGroups).sort((a, b) => order === 'desc' ? b.localeCompare(a) : a.localeCompare(b));
+            
+            days.forEach(day => {
+                const group = dayGroups[day];
+                container.appendChild(group.separator);
+                
+                const sortedEvents = group.events.sort((a, b) => {
+                    const timeA = a.dataset.timestamp;
+                    const timeB = b.dataset.timestamp;
+                    return order === 'desc' ? timeB.localeCompare(timeA) : timeA.localeCompare(timeB);
+                });
+                
+                sortedEvents.forEach(event => container.appendChild(event));
+            });
+            
+            document.querySelectorAll('[data-order]').forEach(b => b.classList.remove('active'));
+            this.classList.add('active');
+        }
+    });
+});
+
+// Toggle card expansion
+function toggleExpansion(classId) {
+    const expansion = document.getElementById('expansion-' + classId);
+    const btn = expansion.previousElementSibling;
+    const icon = btn.querySelector('i');
+    
+    if (expansion.classList.contains('expanded')) {
+        expansion.classList.remove('expanded');
+        icon.classList.remove('fa-chevron-up');
+        icon.classList.add('fa-chevron-down');
+        btn.innerHTML = '<i class="fa-solid fa-chevron-down"></i> Show Details';
+    } else {
+        expansion.classList.add('expanded');
+        icon.classList.remove('fa-chevron-down');
+        icon.classList.add('fa-chevron-up');
+        btn.innerHTML = '<i class="fa-solid fa-chevron-up"></i> Hide Details';
+    }
+}
+</script>
 
 </body>
 </html>

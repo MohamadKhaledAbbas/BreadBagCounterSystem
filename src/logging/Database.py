@@ -202,6 +202,111 @@ class DatabaseManager:
 
         return stats
 
+    def get_ordered_bag_events(self, start_time, end_time):
+        """
+        Retrieve time-ordered bag events with bag type information.
+        Returns list of events with timestamp, class name, arabic_name, thumb, weight, and count (1 per event).
+        """
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            
+            events = conn.execute("""
+                SELECT
+                    be.id,
+                    be.timestamp,
+                    bt.id as bag_type_id,
+                    bt.name AS class_name,
+                    bt.arabic_name,
+                    bt.image_path AS thumb,
+                    bt.weight,
+                    1 as count
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?
+                ORDER BY be.timestamp ASC
+            """, (start_time, end_time)).fetchall()
+            
+            return [
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "bag_type_id": row["bag_type_id"],
+                    "class_name": row["class_name"],
+                    "arabic_name": row["arabic_name"],
+                    "thumb": row["thumb"],
+                    "weight": (row["weight"] or 0) / 1000,  # Convert to kg
+                    "count": row["count"]
+                } for row in events
+            ]
+
+    def get_per_class_time_windows(self, start_time, end_time):
+        """
+        Get first_seen and last_seen timestamps for each bag class within the time window.
+        Also returns per-class event lists.
+        """
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            
+            class_windows = conn.execute("""
+                SELECT
+                    bt.id,
+                    bt.name AS class_name,
+                    bt.arabic_name,
+                    bt.image_path AS thumb,
+                    bt.weight,
+                    MIN(be.timestamp) as first_seen,
+                    MAX(be.timestamp) as last_seen,
+                    COUNT(be.id) as event_count
+                FROM bag_types bt
+                JOIN bag_events be ON bt.id = be.bag_type_id
+                WHERE be.timestamp BETWEEN ? AND ?
+                GROUP BY bt.id, bt.name, bt.arabic_name, bt.image_path, bt.weight
+            """, (start_time, end_time)).fetchall()
+            
+            # Get all events in a single query to avoid N+1 pattern
+            all_events = conn.execute("""
+                SELECT
+                    be.id,
+                    be.timestamp,
+                    bt.id as bag_type_id,
+                    bt.weight,
+                    1 as count
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?
+                ORDER BY bt.id, be.timestamp ASC
+            """, (start_time, end_time)).fetchall()
+            
+            # Group events by bag_type_id
+            events_by_type = {}
+            for event in all_events:
+                bag_type_id = event["bag_type_id"]
+                if bag_type_id not in events_by_type:
+                    events_by_type[bag_type_id] = []
+                events_by_type[bag_type_id].append({
+                    "id": event["id"],
+                    "timestamp": event["timestamp"],
+                    "weight": (event["weight"] or 0) / 1000,
+                    "count": event["count"]
+                })
+            
+            # Build result dictionary
+            result = {}
+            for row in class_windows:
+                bag_type_id = row["id"]
+                result[bag_type_id] = {
+                    "class_name": row["class_name"],
+                    "arabic_name": row["arabic_name"],
+                    "thumb": row["thumb"],
+                    "weight": (row["weight"] or 0) / 1000,  # Convert to kg
+                    "first_seen": row["first_seen"],
+                    "last_seen": row["last_seen"],
+                    "event_count": row["event_count"],
+                    "events": events_by_type.get(bag_type_id, [])
+                }
+            
+            return result
+
     def get_config_value(self, key):
         try:
             with self.get_connection() as conn:
