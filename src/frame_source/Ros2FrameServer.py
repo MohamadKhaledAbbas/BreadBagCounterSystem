@@ -1,3 +1,4 @@
+import os
 import queue
 import threading
 import time
@@ -21,29 +22,37 @@ class FrameServer(Node, FrameSource):
     to be added to an external SingleThreadedExecutor.
     """
 
-    def __init__(self, topic='/nv12_images', target_fps=10.0):
+    def __init__(self, topic='/nv12_images', target_fps=30.0):
         # IMPORTANT: rclpy.init() must be called externally before this class is instantiated.
         super().__init__('frame_server')
+        
+        # Support ROS_TARGET_FPS environment variable override
+        env_fps = os.getenv('ROS_TARGET_FPS')
+        if env_fps:
+            try:
+                target_fps = float(env_fps)
+                logger.info(f"[Ros2FrameServer] Using ROS_TARGET_FPS from environment: {target_fps}")
+            except ValueError:
+                logger.warning(f"[Ros2FrameServer] Invalid ROS_TARGET_FPS value '{env_fps}', using default {target_fps}")
+        
         self.subscription = self.create_subscription(
             HbmMsg1080P,
             topic,
             self.listener_callback,
             qos_profile_sensor_data)
 
-        # Only keep the latest frame
+        # Only keep the latest frame (leaky queue)
         self.frame_queue = queue.Queue(maxsize=1)
         self.last_frame_time = time.time()
         
-        # Frame rate limiting
+        # Store target_fps for logging only
         self.target_fps = target_fps
-        self.min_frame_interval = 1.0 / target_fps  # e.g., 0.1s for 10 FPS
-        self.last_processed_time = 0.0
         
         # Stats for debugging
         self.frames_received = 0
         self.frames_processed = 0
         
-        logger.info(f"[Ros2FrameServer] Initialized with target_fps={target_fps}")
+        logger.info(f"[Ros2FrameServer] Initialized with target_fps={target_fps} (for stats logging only)")
 
         # --- REMOVED ---
         # Removed the internal _ros_spin_thread logic.
@@ -54,12 +63,7 @@ class FrameServer(Node, FrameSource):
         now = time.time()
         self.frames_received += 1
         
-        # Frame rate limiting: skip if too soon after last processed frame
-        time_since_last = now - self.last_processed_time
-        if time_since_last < self.min_frame_interval:
-            return  # Skip this frame
-        
-        self.last_processed_time = now
+        # No time-based frame skipping - rely only on leaky queue
         self.frames_processed += 1
         
         # Log stats periodically (every 100 received frames)

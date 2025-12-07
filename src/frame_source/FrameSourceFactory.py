@@ -1,3 +1,4 @@
+import os
 
 from src.frame_source.FrameSource import FrameSource
 from src.frame_source.OpenCvFrameSource import OpenCVFrameSource
@@ -21,7 +22,18 @@ class FrameSourceFactory:
             # Import ROS2 frame server only when needed (RDK platform)
             from src.frame_source.Ros2FrameServer import FrameServer
             topic = kwargs.get('topic', '/nv12_images')
-            target_fps = kwargs.get('target_fps', 10.0)
+            
+            # Honor ROS_TARGET_FPS environment variable, default to 30.0
+            env_fps = os.getenv('ROS_TARGET_FPS')
+            if env_fps:
+                try:
+                    default_fps = float(env_fps)
+                except ValueError:
+                    default_fps = 30.0
+            else:
+                default_fps = 30.0
+            
+            target_fps = kwargs.get('target_fps', default_fps)
             node = FrameServer(topic=topic, target_fps=target_fps)
             return node
         elif source_type.lower() == 'opencv':
