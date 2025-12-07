@@ -3,6 +3,7 @@ import cv2
 import queue
 import threading
 import time
+from datetime import datetime
 from typing import Dict, Any
 
 from src.counting.Visualizer import Visualizer
@@ -14,6 +15,7 @@ from src.logging.Database import DatabaseManager
 from src.frame_source.FrameSourceFactory import FrameSource, FrameSourceFactory
 from src.tracking.BaseTracker import BaseTracker
 from src import constants
+from src.config.settings import config
 
 from src.logging.ConfigWatcher import ConfigWatcher
 from src.utils.AppLogging import logger
@@ -35,11 +37,7 @@ else:
 # -------------------
 
 
-def on_is_recording_changed(new_value):
-    if new_value == "1":
-        logger.info("[ConfigWatcher] Recording ENABLED")
-    else:
-        logger.info("[ConfigWatcher] Recording DISABLED")
+
 
 
 class BagCounterApp:
@@ -58,9 +56,16 @@ class BagCounterApp:
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
         self.config_watcher.add_watch(constants.show_ui_screen_key, self.on_show_ui_changed)
-        self.config_watcher.add_watch(constants.is_recording_key, on_is_recording_changed)
+        self.config_watcher.add_watch(constants.is_recording_key, self.on_is_recording_changed)
 
         self.is_running = False
+        
+        # Recording state
+        self.is_recording = db.get_config_value(constants.is_recording_key) == "1"
+        self.video_writer = None
+        self.recording_dir = config.recording_dir
+        logger.info(f"[BagCounterApp] Video Recording: {'ENABLED' if self.is_recording else 'DISABLED'}")
+        logger.info(f"[BagCounterApp] Recording directory: {self.recording_dir}")
 
         self.input_queue = queue.Queue(maxsize=1)
 
@@ -127,6 +132,14 @@ class BagCounterApp:
         else:
             self.is_publishing = False
             logger.info("[BagCounterApp] IPC Publishing DISABLED")
+    
+    def on_is_recording_changed(self, new_value):
+        if new_value == "1":
+            self.is_recording = True
+            logger.info("[BagCounterApp] Video Recording ENABLED")
+        else:
+            self.is_recording = False
+            logger.info("[BagCounterApp] Video Recording DISABLED")
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
         label = data['label']
@@ -243,7 +256,69 @@ class BagCounterApp:
                     classify_end = time.perf_counter()
                     classify_time = (classify_end - classify_start) * 1000  # Convert to ms
 
-                # --- 4. PUBLISHING LOGIC ---
+                # --- 4. RECORDING LOGIC (Independent from publishing) ---
+                record_time = 0.0
+                
+                # Handle recording state transitions and write frames
+                if self.is_recording:
+                    record_start = time.perf_counter()
+                    
+                    # Rising edge: Start recording
+                    if self.video_writer is None:
+                        try:
+                            # Ensure recording directory exists
+                            os.makedirs(self.recording_dir, exist_ok=True)
+                            
+                            # Check if directory is writable
+                            if not os.access(self.recording_dir, os.W_OK):
+                                logger.error(f"[Recording] Directory not writable: {self.recording_dir}")
+                                # Skip recording initialization if directory is not writable
+                            else:
+                                # Generate timestamped filename with milliseconds to avoid collisions
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+                                video_filename = os.path.join(self.recording_dir, f"{timestamp}.mp4")
+                                
+                                # Get frame dimensions
+                                height, width = frame.shape[:2]
+                                
+                                # Open video writer with mp4v codec
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                # FPS set to 30.0 by default; can be made configurable via env var if needed
+                                fps = 30.0
+                                self.video_writer = cv2.VideoWriter(
+                                    video_filename, fourcc, fps, (width, height)
+                                )
+                                
+                                if self.video_writer.isOpened():
+                                    logger.info(f"[Recording] Started recording to: {video_filename}")
+                                else:
+                                    logger.error(f"[Recording] Failed to open video writer: {video_filename}")
+                                    self.video_writer = None
+                        except Exception as e:
+                            logger.error(f"[Recording] Error starting recording: {e}")
+                            self.video_writer = None
+                    
+                    # Write frame if writer is open
+                    if self.video_writer is not None and self.video_writer.isOpened():
+                        try:
+                            self.video_writer.write(frame)
+                        except Exception as e:
+                            logger.error(f"[Recording] Error writing frame: {e}")
+                    
+                    record_end = time.perf_counter()
+                    record_time = (record_end - record_start) * 1000  # Convert to ms
+                else:
+                    # Falling edge: Stop recording
+                    if self.video_writer is not None:
+                        try:
+                            self.video_writer.release()
+                            logger.info("[Recording] Stopped recording")
+                        except Exception as e:
+                            logger.error(f"[Recording] Error releasing video writer: {e}")
+                        finally:
+                            self.video_writer = None
+
+                # --- 5. PUBLISHING LOGIC ---
                 publish_time = 0.0
                 
                 if self.is_publishing:
@@ -286,6 +361,8 @@ class BagCounterApp:
                     )
                     if classify_time > 0:
                         timing_msg += f" | Classify: {classify_time:.1f}ms"
+                    if record_time > 0:
+                        timing_msg += f" | Record: {record_time:.1f}ms"
                     if publish_time > 0:
                         timing_msg += f" | Publish: {publish_time:.1f}ms"
                     timing_msg += f" | FPS: {fps:.1f}"
@@ -333,6 +410,16 @@ class BagCounterApp:
         finally:
             logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
             self.is_running = False
+            
+            # Release video writer if recording
+            if self.video_writer is not None:
+                try:
+                    self.video_writer.release()
+                    logger.info("[BagCounterApp] Video writer released")
+                except Exception as e:
+                    logger.error(f"[BagCounterApp] Error releasing video writer: {e}")
+                finally:
+                    self.video_writer = None
 
             self.frame_source.cleanup()
             logger.debug("[BagCounterApp] Frame source cleaned up")
