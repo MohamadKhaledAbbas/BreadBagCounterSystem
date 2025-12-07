@@ -21,9 +21,6 @@ class AppConfig:
 
     db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
     
-    # Recording directory for video output
-    recording_dir: str = os.getenv("RECORDING_DIR", "data/recordings")
-    
     # Classifier class names
     classifier_classes: dict = None
     

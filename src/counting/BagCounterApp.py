@@ -66,24 +66,25 @@ class BagCounterApp:
         try:
             self.recording_segment_seconds = int(self.recording_segment_seconds)
         except Exception:
+            default_segment_seconds = 600
             logger.error(
                 f"[BagCounterApp] Invalid RECORDING_SEGMENT_SECONDS={self.recording_segment_seconds}; "
-                "falling back to 600"
+                f"falling back to {default_segment_seconds}"
             )
-            self.recording_segment_seconds = 600
+            self.recording_segment_seconds = default_segment_seconds
 
         # Recording FPS - configurable via RECORDING_FPS environment variable, default 30.0
-        self.recording_fps = 30.0
-        env_recording_fps = os.getenv('RECORDING_FPS')
-        if env_recording_fps:
-            try:
-                self.recording_fps = float(env_recording_fps)
-                logger.info(f"[BagCounterApp] Using RECORDING_FPS from environment: {self.recording_fps}")
-            except ValueError:
-                logger.warning(
-                    f"[BagCounterApp] Invalid RECORDING_FPS value '{env_recording_fps}', "
-                    f"using default {self.recording_fps}"
-                )
+        self.recording_fps = float(db.get_config_value(constants.recording_fps))
+        try:
+            self.recording_fps = float(self.recording_fps)
+            logger.info(f"[BagCounterApp] Using RECORDING_FPS from config db: {self.recording_fps}")
+        except ValueError:
+            fallback_fps = 30.0
+            logger.warning(
+                f"[BagCounterApp] Invalid RECORDING_FPS value '{self.recording_fps}', "
+                f"using default {fallback_fps}"
+            )
+            self.recording_fps = fallback_fps
 
         self.segment_start_time = None
         self.segment_counter = 0
@@ -122,22 +123,31 @@ class BagCounterApp:
         self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
 
-        self.ipc_publisher = FramePublisher(publish_rate_hz=10.0)
+        self.ipc_publisher = FramePublisher(publish_rate_hz=30.0)
+        self.recording_fps = db.get_config_value(constants.recording_fps)
+        try:
+            self.recording_fps = float(self.recording_fps)
+        except ValueError:
+            fallback_fps = 30.0
+            logger.warning(f"Failed to set recording fps: {self.recording_fps}"
+                           f"falling back to {fallback_fps}")
+            self.recording_fps = fallback_fps
+
 
         if IS_RDK and self.ros_executor is not None:
             self.ros_executor.add_node(self.ipc_publisher)
 
         if is_development:
-            self.frame_source = FrameSourceFactory.create("opencv", source=video_path)
+            self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=self.recording_fps)
             logger.info(f"[BagCounterApp] Development mode: reading from {video_path}")
         else:
             if IS_RDK:
                 os.environ["HOME"] = "/home/sunrise"
-                self.frame_source = FrameSourceFactory.create("ros2")
+                self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
                 logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
             else:
                 # On Windows, fall back to OpenCV even in production mode
-                self.frame_source = FrameSourceFactory.create("opencv", source=video_path)
+                self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=30.0)
                 logger.info(f"[BagCounterApp] Windows mode: reading from {video_path}")
 
         if IS_RDK and self.ros_executor is not None and isinstance(self.frame_source, Node):
