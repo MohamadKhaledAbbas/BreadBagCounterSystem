@@ -269,12 +269,13 @@ class BagCounterApp:
                             # Ensure recording directory exists
                             os.makedirs(self.recording_dir, exist_ok=True)
                             
-                            # Check if directory is writable (optional but recommended)
+                            # Check if directory is writable
                             if not os.access(self.recording_dir, os.W_OK):
                                 logger.error(f"[Recording] Directory not writable: {self.recording_dir}")
+                                # Skip recording initialization if directory is not writable
                             else:
-                                # Generate timestamped filename
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                # Generate timestamped filename with milliseconds to avoid collisions
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
                                 video_filename = os.path.join(self.recording_dir, f"{timestamp}.mp4")
                                 
                                 # Get frame dimensions
@@ -282,7 +283,8 @@ class BagCounterApp:
                                 
                                 # Open video writer with mp4v codec
                                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                fps = 30.0  # Default FPS, adjust as needed
+                                # FPS set to 30.0 by default; can be made configurable via env var if needed
+                                fps = 30.0
                                 self.video_writer = cv2.VideoWriter(
                                     video_filename, fourcc, fps, (width, height)
                                 )
