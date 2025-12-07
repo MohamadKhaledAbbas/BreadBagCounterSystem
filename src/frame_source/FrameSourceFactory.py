@@ -24,14 +24,13 @@ class FrameSourceFactory:
             topic = kwargs.get('topic', '/nv12_images')
             
             # Honor ROS_TARGET_FPS environment variable, default to 30.0
+            default_fps = 30.0
             env_fps = os.getenv('ROS_TARGET_FPS')
             if env_fps:
                 try:
                     default_fps = float(env_fps)
                 except ValueError:
-                    default_fps = 30.0
-            else:
-                default_fps = 30.0
+                    pass  # Keep default 30.0
             
             target_fps = kwargs.get('target_fps', default_fps)
             node = FrameServer(topic=topic, target_fps=target_fps)
