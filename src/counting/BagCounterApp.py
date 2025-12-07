@@ -72,12 +72,26 @@ class BagCounterApp:
             )
             self.recording_segment_seconds = 600
 
+        # Recording FPS - configurable via RECORDING_FPS environment variable, default 30.0
+        self.recording_fps = 30.0
+        env_recording_fps = os.getenv('RECORDING_FPS')
+        if env_recording_fps:
+            try:
+                self.recording_fps = float(env_recording_fps)
+                logger.info(f"[BagCounterApp] Using RECORDING_FPS from environment: {self.recording_fps}")
+            except ValueError:
+                logger.warning(
+                    f"[BagCounterApp] Invalid RECORDING_FPS value '{env_recording_fps}', "
+                    f"using default {self.recording_fps}"
+                )
+
         self.segment_start_time = None
         self.segment_counter = 0
 
         logger.info(f"[BagCounterApp] Video Recording: {'ENABLED' if self.is_recording else 'DISABLED'}")
         logger.info(f"[BagCounterApp] Recording directory: {self.recording_dir}")
         logger.info(f"[BagCounterApp] Recording segment length: {self.recording_segment_seconds}s")
+        logger.info(f"[BagCounterApp] Recording FPS: {self.recording_fps}")
 
         self.input_queue = queue.Queue(maxsize=1)
 
@@ -169,12 +183,12 @@ class BagCounterApp:
 
             height, width = frame.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            fps = 30.0
-            writer = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
+            writer = cv2.VideoWriter(video_filename, fourcc, self.recording_fps, (width, height))
 
             if writer.isOpened():
                 self.segment_start_time = time.perf_counter()
                 self.segment_counter += 1
+                logger.info(f"[Recording] Opened video writer: {video_filename} at {self.recording_fps} FPS")
                 return writer, video_filename
             else:
                 logger.error(f"[Recording] Failed to open video writer: {video_filename}")
