@@ -85,6 +85,7 @@
                         </div>
                         <div class="summary-stat">
                             <span class="stat-label">Total Weight</span>
+                            {# weight is per-item in kg, multiply by event_count for total #}
                             <span class="stat-value weight">{{ (class_data.weight * class_data.event_count) | round(2) }} kg</span>
                         </div>
                     </div>
