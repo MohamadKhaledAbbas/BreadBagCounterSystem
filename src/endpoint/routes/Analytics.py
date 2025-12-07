@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List, Dict
 
 from fastapi.responses import HTMLResponse
 from fastapi import APIRouter, Request, HTTPException, Query
@@ -9,6 +9,7 @@ from src.endpoint.Shared import db
 from src.utils.AppLogging import logger
 
 router = APIRouter()
+
 
 def parse_datetime(val: Optional[str]):
     if not val:
@@ -27,13 +28,46 @@ def parse_datetime(val: Optional[str]):
     except Exception:
         raise HTTPException(status_code=500, detail=f"parsing datetime {val} failed")
 
+
+def build_consecutive_runs(ordered_events: List[Dict]) -> List[Dict]:
+    """
+    Collapse ordered events into consecutive runs of the same bag_type_id.
+    Each run tracks start/end times and total count.
+    """
+    runs = []
+    current = None
+
+    for ev in ordered_events:
+        if current is None or ev["bag_type_id"] != current["bag_type_id"]:
+            if current:
+                runs.append(current)
+            current = {
+                "bag_type_id": ev["bag_type_id"],
+                "class_name": ev["class_name"],
+                "arabic_name": ev.get("arabic_name"),
+                "thumb": ev["thumb"],
+                "weight": ev.get("weight") or 0,
+                "start": ev["timestamp"],
+                "end": ev["timestamp"],
+                "count": 1,
+            }
+        else:
+            current["end"] = ev["timestamp"]
+            current["count"] += 1
+
+    if current:
+        runs.append(current)
+    return runs
+
+
 def get_stats(start_time: datetime, end_time: datetime):
     stats = db.get_aggregated_stats(start_time, end_time)
-    
+
     # Get timeline data
     ordered_events = db.get_ordered_bag_events(start_time, end_time)
     per_class_windows = db.get_per_class_time_windows(start_time, end_time)
-    
+    runs = build_consecutive_runs(ordered_events)
+
     return {
         "meta": {
             "start": start_time,
@@ -42,9 +76,11 @@ def get_stats(start_time: datetime, end_time: datetime):
         "data": stats,
         "timeline": {
             "ordered_events": ordered_events,
-            "per_class_windows": per_class_windows
+            "per_class_windows": per_class_windows,
+            "runs": runs
         }
     }
+
 
 @router.get("/analytics", response_class=HTMLResponse)
 async def analytics(
@@ -72,31 +108,41 @@ async def analytics(
         stats = get_stats(start_dt, end_dt)
         logger.debug(f"[Analytics] Stats retrieved: {stats}")
         for c in stats["data"]["classifications"]:
-            c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
+            c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
+                                                                                       "unknown_classes/")
 
         # Fix image paths for timeline events
         for event in stats["timeline"]["ordered_events"]:
-            event["thumb"] = event["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
-        
+            event["thumb"] = event["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
+                                                                                               "unknown_classes/")
+
         # Fix image paths for per-class windows
         for class_id, class_data in stats["timeline"]["per_class_windows"].items():
-            class_data["thumb"] = class_data["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/","unknown_classes/")
+            class_data["thumb"] = class_data["thumb"].replace("data/classes/", "known_classes/").replace(
+                "data/unknown/", "unknown_classes/")
+
+        # Fix image paths for consecutive runs
+        for run in stats["timeline"].get("runs", []):
+            run["thumb"] = run["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
+                                                                                           "unknown_classes/")
 
         # Adjusting timezone for preview +3
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
         stats["meta"]["end"] = end_dt + timedelta(hours=3)
 
-        logger.info(f"[Analytics] Serving analytics: total={stats['data']['total']}, classes={len(stats['data']['classifications'])}")
+        logger.info(
+            f"[Analytics] Serving analytics: total={stats['data']['total']}, classes={len(stats['data']['classifications'])}")
         return templates.TemplateResponse("analytics.html", {
             "request": request,
             "meta": stats["meta"],
             "total": stats["data"]["total"],
-            "classifications":  stats["data"]["classifications"],
+            "classifications": stats["data"]["classifications"],
             "timeline": stats["timeline"],
         })
     except Exception as e:
         logger.error(f"[Analytics] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/analytics/daily", response_class=HTMLResponse)
 async def get_daily_analytics(
@@ -107,7 +153,7 @@ async def get_daily_analytics(
     if time_now.hour in [16, 17, 18, 19, 20, 21, 22, 23]:
         start_time = time_now
         end_time = (time_now + timedelta(days=1))
-    else: # time_now.hour in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]:
+    else:  # time_now.hour in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]:
         start_time = (time_now - timedelta(days=1))
         end_time = time_now
 
