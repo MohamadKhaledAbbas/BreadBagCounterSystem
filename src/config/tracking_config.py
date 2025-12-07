@@ -21,7 +21,7 @@ class TrackingConfig:
     # IoU Matching Parameters
     # ============================================================================
     
-    iou_threshold: float = 0.20
+    iou_threshold: float = 0.35
     """
     IoU (Intersection over Union) threshold for matching detections to existing events.
     
@@ -36,7 +36,7 @@ class TrackingConfig:
     # State Transition Thresholds
     # ============================================================================
     
-    min_open_frames: int = 4
+    min_open_frames: int = 5
     """
     Minimum consecutive frames a bag must be detected as "open" before allowing 
     transition to "closed" state.
@@ -48,7 +48,7 @@ class TrackingConfig:
     Default: 5
     """
     
-    min_closed_frames: int = 2
+    min_closed_frames: int = 3
     """
     Minimum consecutive frames a bag must be detected as "closed" to trigger 
     classification and counting.
@@ -64,7 +64,7 @@ class TrackingConfig:
     # Detection Confidence Thresholds
     # ============================================================================
     
-    min_conf_threshold: float = 0.2
+    min_conf_threshold: float = 0.5
     """
     Minimum confidence score for creating new tracking events from detections.
     
@@ -79,7 +79,7 @@ class TrackingConfig:
     # Event Management
     # ============================================================================
     
-    max_active_events: int = 50
+    max_active_events: int = 20
     """
     Maximum number of concurrent tracking events to prevent memory issues.
     
