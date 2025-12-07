@@ -263,23 +263,37 @@ class DatabaseManager:
                 GROUP BY bt.id, bt.name, bt.arabic_name, bt.image_path, bt.weight
             """, (start_time, end_time)).fetchall()
             
+            # Get all events in a single query to avoid N+1 pattern
+            all_events = conn.execute("""
+                SELECT
+                    be.id,
+                    be.timestamp,
+                    bt.id as bag_type_id,
+                    bt.weight,
+                    1 as count
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?
+                ORDER BY bt.id, be.timestamp ASC
+            """, (start_time, end_time)).fetchall()
+            
+            # Group events by bag_type_id
+            events_by_type = {}
+            for event in all_events:
+                bag_type_id = event["bag_type_id"]
+                if bag_type_id not in events_by_type:
+                    events_by_type[bag_type_id] = []
+                events_by_type[bag_type_id].append({
+                    "id": event["id"],
+                    "timestamp": event["timestamp"],
+                    "weight": (event["weight"] or 0) / 1000,
+                    "count": event["count"]
+                })
+            
+            # Build result dictionary
             result = {}
             for row in class_windows:
                 bag_type_id = row["id"]
-                
-                # Get individual events for this class
-                events = conn.execute("""
-                    SELECT
-                        be.id,
-                        be.timestamp,
-                        bt.weight,
-                        1 as count
-                    FROM bag_events be
-                    JOIN bag_types bt ON be.bag_type_id = bt.id
-                    WHERE bt.id = ? AND be.timestamp BETWEEN ? AND ?
-                    ORDER BY be.timestamp ASC
-                """, (bag_type_id, start_time, end_time)).fetchall()
-                
                 result[bag_type_id] = {
                     "class_name": row["class_name"],
                     "arabic_name": row["arabic_name"],
@@ -288,14 +302,7 @@ class DatabaseManager:
                     "first_seen": row["first_seen"],
                     "last_seen": row["last_seen"],
                     "event_count": row["event_count"],
-                    "events": [
-                        {
-                            "id": e["id"],
-                            "timestamp": e["timestamp"],
-                            "weight": (e["weight"] or 0) / 1000,
-                            "count": e["count"]
-                        } for e in events
-                    ]
+                    "events": events_by_type.get(bag_type_id, [])
                 }
             
             return result
