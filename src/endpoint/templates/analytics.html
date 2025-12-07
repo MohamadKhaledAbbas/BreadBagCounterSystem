@@ -53,55 +53,40 @@
     </section>
 
     <!-- Global Timeline Section -->
-    {% if timeline and timeline.ordered_events %}
+    {% if timeline and timeline.per_class_windows %}
     <section class="timeline-section">
         <div class="timeline-header">
             <h2 class="timeline-title">
-                <i class="fa-solid fa-clock-rotate-left"></i> Event Timeline
+                <i class="fa-solid fa-clock-rotate-left"></i> Timeline Summary
             </h2>
-            <div class="timeline-controls">
-                <div class="toggle-group">
-                    <button class="toggle-btn active" data-density="compact">
-                        <i class="fa-solid fa-compress"></i> Compact
-                    </button>
-                    <button class="toggle-btn" data-density="comfort">
-                        <i class="fa-solid fa-expand"></i> Comfort
-                    </button>
-                </div>
-                <div class="toggle-group">
-                    <button class="toggle-btn active" data-order="desc">
-                        <i class="fa-solid fa-arrow-down-wide-short"></i> Newest First
-                    </button>
-                    <button class="toggle-btn" data-order="asc">
-                        <i class="fa-solid fa-arrow-up-wide-short"></i> Oldest First
-                    </button>
-                </div>
-            </div>
         </div>
 
-        <div class="timeline-container" id="timelineContainer" data-density="compact" data-order="desc">
-            {% set events_desc = timeline.ordered_events[::-1] %}
-            {% set events = events_desc %}
-            {% set last_date = namespace(value='') %}
-            
-            {% for event in events %}
-                {% set event_date = event.timestamp[:10] %}
-                {% if event_date != last_date.value %}
-                    <div class="day-separator" data-date="{{ event_date }}">
-                        <span class="day-label">{{ event_date }}</span>
+        <div class="timeline-container">
+            {% for class_id, class_data in timeline.per_class_windows.items() %}
+                <div class="timeline-group-card">
+                    <div class="group-header">
+                        <div class="group-thumb">
+                            <img src="{{ class_data.thumb }}" alt="{{ class_data.class_name }}" onerror="this.src='https://placehold.co/60x60/1e293b/FFF?text={{ class_data.class_name[:1] }}'">
+                        </div>
+                        <div class="group-info">
+                            <div class="group-name">{{ class_data.arabic_name or class_data.class_name }}</div>
+                            <div class="group-meta">
+                                <span class="group-time-window">
+                                    <i class="fa-regular fa-clock"></i>
+                                    {{ class_data.first_seen[11:16] }} &rarr; {{ class_data.last_seen[11:16] }}
+                                </span>
+                            </div>
+                        </div>
                     </div>
-                    {% set last_date.value = event_date %}
-                {% endif %}
-                
-                <div class="timeline-event" data-timestamp="{{ event.timestamp }}" data-class-id="{{ event.bag_type_id }}">
-                    <div class="event-time">{{ event.timestamp[11:16] }}</div>
-                    <div class="event-thumb">
-                        <img src="{{ event.thumb }}" alt="{{ event.class_name }}" onerror="this.src='https://placehold.co/40x40/1e293b/FFF?text={{ event.class_name[:1] }}'">
-                    </div>
-                    <div class="event-info">
-                        <div class="event-name">{{ event.arabic_name or event.class_name }}</div>
-                        <div class="event-meta">
-                            <span class="event-weight">{{ event.weight }} kg</span>
+                    <div class="group-summary">
+                        <div class="summary-stat">
+                            <span class="stat-label">Events</span>
+                            <span class="stat-value">{{ class_data.event_count }}</span>
+                        </div>
+                        <div class="summary-stat">
+                            <span class="stat-label">Total Weight</span>
+                            {# weight is per-item in kg, multiply by event_count for total #}
+                            <span class="stat-value weight">{{ (class_data.weight * class_data.event_count) | round(2) }} kg</span>
                         </div>
                     </div>
                 </div>
@@ -173,67 +158,6 @@
 </main>
 
 <script>
-// Toggle timeline density
-document.querySelectorAll('[data-density]').forEach(btn => {
-    btn.addEventListener('click', function() {
-        const density = this.dataset.density;
-        const container = document.getElementById('timelineContainer');
-        if (container) {
-            container.dataset.density = density;
-            document.querySelectorAll('[data-density]').forEach(b => b.classList.remove('active'));
-            this.classList.add('active');
-        }
-    });
-});
-
-// Toggle timeline order
-document.querySelectorAll('[data-order]').forEach(btn => {
-    btn.addEventListener('click', function() {
-        const order = this.dataset.order;
-        const container = document.getElementById('timelineContainer');
-        if (container) {
-            const events = Array.from(container.querySelectorAll('.timeline-event, .day-separator'));
-            
-            // Group events by day
-            const dayGroups = {};
-            let currentDay = null;
-            
-            events.forEach(el => {
-                if (el.classList.contains('day-separator')) {
-                    currentDay = el.dataset.date;
-                    if (!dayGroups[currentDay]) {
-                        dayGroups[currentDay] = { separator: el, events: [] };
-                    }
-                } else if (currentDay && el.classList.contains('timeline-event')) {
-                    dayGroups[currentDay].events.push(el);
-                }
-            });
-            
-            // Clear container
-            container.innerHTML = '';
-            
-            // Re-add in correct order
-            const days = Object.keys(dayGroups).sort((a, b) => order === 'desc' ? b.localeCompare(a) : a.localeCompare(b));
-            
-            days.forEach(day => {
-                const group = dayGroups[day];
-                container.appendChild(group.separator);
-                
-                const sortedEvents = group.events.sort((a, b) => {
-                    const timeA = a.dataset.timestamp;
-                    const timeB = b.dataset.timestamp;
-                    return order === 'desc' ? timeB.localeCompare(timeA) : timeA.localeCompare(timeB);
-                });
-                
-                sortedEvents.forEach(event => container.appendChild(event));
-            });
-            
-            document.querySelectorAll('[data-order]').forEach(b => b.classList.remove('active'));
-            this.classList.add('active');
-        }
-    });
-});
-
 // Toggle card expansion
 function toggleExpansion(classId) {
     const expansion = document.getElementById('expansion-' + classId);
