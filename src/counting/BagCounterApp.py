@@ -94,7 +94,12 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Recording segment length: {self.recording_segment_seconds}s")
         logger.info(f"[BagCounterApp] Recording FPS: {self.recording_fps}")
 
-        self.input_queue = queue.Queue(maxsize=1)
+        self.input_queue = queue.Queue(maxsize=10)
+        # Queue for asynchronous video recording
+        self.recording_queue = queue.Queue(maxsize=30)
+        self.recording_thread = None
+        # Lock for video_writer access synchronization
+        self.video_writer_lock = threading.Lock()
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -124,14 +129,6 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
 
         self.ipc_publisher = FramePublisher(publish_rate_hz=30.0)
-        self.recording_fps = db.get_config_value(constants.recording_fps)
-        try:
-            self.recording_fps = float(self.recording_fps)
-        except ValueError:
-            fallback_fps = 30.0
-            logger.warning(f"Failed to set recording fps: {self.recording_fps}"
-                           f"falling back to {fallback_fps}")
-            self.recording_fps = fallback_fps
 
 
         if IS_RDK and self.ros_executor is not None:
@@ -206,6 +203,63 @@ class BagCounterApp:
         except Exception as e:
             logger.error(f"[Recording] Error starting recording: {e}")
             return None, None
+
+    def _recording_thread_loop(self):
+        """Background thread that handles video recording asynchronously."""
+        logger.info("[RecordingThread] Started")
+        
+        while self.is_running:
+            try:
+                # Get frame from recording queue with timeout
+                frame = self.recording_queue.get(timeout=1.0)
+            except queue.Empty:
+                if not self.is_running:
+                    break
+                continue
+            except Exception as e:
+                logger.error(f"[RecordingThread] Queue error: {e}")
+                continue
+            
+            try:
+                with self.video_writer_lock:
+                    # Start writer if needed
+                    if self.video_writer is None:
+                        self.video_writer, opened_filename = self._open_video_writer(frame)
+                        if opened_filename:
+                            logger.info(f"[Recording] Started recording to: {opened_filename}")
+                    
+                    # Rotate segment if duration exceeded
+                    if (
+                        self.video_writer is not None
+                        and self.video_writer.isOpened()
+                        and self.segment_start_time is not None
+                        and (time.perf_counter() - self.segment_start_time) >= self.recording_segment_seconds
+                    ):
+                        try:
+                            self.video_writer.release()
+                            logger.info("[Recording] Closed segment (time limit reached)")
+                        except Exception as e:
+                            logger.error(f"[Recording] Error closing segment: {e}")
+                        finally:
+                            self.video_writer = None
+                            self.segment_start_time = None
+                        
+                        # Open next segment immediately
+                        self.video_writer, opened_filename = self._open_video_writer(frame)
+                        if opened_filename:
+                            logger.info(f"[Recording] Started new segment: {opened_filename}")
+                    
+                    # Write frame if writer is open
+                    if self.video_writer is not None and self.video_writer.isOpened():
+                        try:
+                            self.video_writer.write(frame)
+                        except Exception as e:
+                            logger.error(f"[Recording] Error writing frame: {e}")
+                        
+            except Exception as e:
+                logger.error(f"[RecordingThread] Error processing frame: {e}")
+        
+        logger.info("[RecordingThread] Stopped")
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
         label = data["label"]
@@ -320,58 +374,30 @@ class BagCounterApp:
                 # --- 4. RECORDING LOGIC (Independent from publishing) ---
                 record_time = 0.0
 
-                # Handle recording state transitions and write frames
+                # Enqueue frame for asynchronous recording
                 if self.is_recording:
                     record_start = time.perf_counter()
-
-                    # Start writer if needed
-                    if self.video_writer is None:
-                        self.video_writer, opened_filename = self._open_video_writer(frame)
-                        if opened_filename:
-                            logger.info(f"[Recording] Started recording to: {opened_filename}")
-
-                    # Rotate segment if duration exceeded
-                    if (
-                        self.video_writer is not None
-                        and self.video_writer.isOpened()
-                        and self.segment_start_time is not None
-                        and (time.perf_counter() - self.segment_start_time) >= self.recording_segment_seconds
-                    ):
-                        try:
-                            self.video_writer.release()
-                            logger.info("[Recording] Closed segment (time limit reached)")
-                        except Exception as e:
-                            logger.error(f"[Recording] Error closing segment: {e}")
-                        finally:
-                            self.video_writer = None
-                            self.segment_start_time = None
-
-                        # Open next segment immediately
-                        self.video_writer, opened_filename = self._open_video_writer(frame)
-                        if opened_filename:
-                            logger.info(f"[Recording] Started new segment: {opened_filename}")
-
-                    # Write frame if writer is open
-                    if self.video_writer is not None and self.video_writer.isOpened():
-                        try:
-                            self.video_writer.write(frame)
-                        except Exception as e:
-                            logger.error(f"[Recording] Error writing frame: {e}")
-
+                    
+                    # Non-blocking enqueue: drop frame if queue is full
+                    try:
+                        self.recording_queue.put_nowait(frame.copy())
+                    except queue.Full:
+                        logger.debug("[Recording] Recording queue full, dropping frame")
+                    
                     record_end = time.perf_counter()
                     record_time = (record_end - record_start) * 1000  # Convert to ms
                 else:
                     # Falling edge: Stop recording
-                    if self.video_writer is not None:
-                        try:
-                            self.video_writer.release()
-                            logger.info("[Recording] Stopped recording")
-                        except Exception as e:
-                            logger.error(f"[Recording] Error releasing video writer: {e}")
-                        finally:
-                            self.video_writer = None
-                            self.segment_start_time = None
-                            self.segment_counter = 0
+                    # Clear the recording queue and let recording thread finish
+                    with self.video_writer_lock:
+                        if self.video_writer is not None:
+                            # Clear queue to ensure recording thread processes remaining frames
+                            while not self.recording_queue.empty():
+                                try:
+                                    self.recording_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                        self.segment_counter = 0
 
                 # --- 5. PUBLISHING LOGIC ---
                 publish_time = 0.0
@@ -439,6 +465,11 @@ class BagCounterApp:
         logic_thread = threading.Thread(target=self._logic_thread_loop, daemon=True)
         logic_thread.start()
 
+        # Start recording thread
+        self.recording_thread = threading.Thread(target=self._recording_thread_loop, daemon=True)
+        self.recording_thread.start()
+        logger.debug("[BagCounterApp] Recording thread started")
+
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
 
@@ -468,17 +499,25 @@ class BagCounterApp:
             logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
             self.is_running = False
 
-            # Release video writer if recording
-            if self.video_writer is not None:
-                try:
-                    self.video_writer.release()
-                    logger.info("[BagCounterApp] Video writer released")
-                except Exception as e:
-                    logger.error(f"[BagCounterApp] Error releasing video writer: {e}")
-                finally:
-                    self.video_writer = None
-                    self.segment_start_time = None
-                    self.segment_counter = 0
+            # Wait for recording thread to finish before releasing video writer
+            # Timeout calculated for 30 frames at ~80ms each = ~2.4s, plus margin = 10s
+            if self.recording_thread is not None and self.recording_thread.is_alive():
+                logger.debug("[BagCounterApp] Waiting for recording thread to finish...")
+                self.recording_thread.join(timeout=10)
+                logger.debug("[BagCounterApp] Recording thread finished")
+
+            # Release video writer if still open (recording thread should have handled this)
+            with self.video_writer_lock:
+                if self.video_writer is not None:
+                    try:
+                        self.video_writer.release()
+                        logger.info("[BagCounterApp] Video writer released")
+                    except Exception as e:
+                        logger.error(f"[BagCounterApp] Error releasing video writer: {e}")
+                    finally:
+                        self.video_writer = None
+                        self.segment_start_time = None
+                        self.segment_counter = 0
 
             self.frame_source.cleanup()
             logger.debug("[BagCounterApp] Frame source cleaned up")
@@ -493,22 +532,11 @@ class BagCounterApp:
                 if isinstance(self.frame_source, Node):
                     self.ros_executor.remove_node(self.frame_source)
 
-                self.ipc_publisher.close_node()
-
-            self.frame_source.cleanup()
+            self.ipc_publisher.close_node()
 
             shutdown_ros2_context()
             if IS_RDK:
                 logger.debug("[BagCounterApp] ROS 2 context shutdown")
-
-            if isinstance(self.frame_source, Node):
-                self.ros_executor.remove_node(self.frame_source)
-
-            self.ipc_publisher.close_node()
-            self.frame_source.cleanup()
-
-            shutdown_ros2_context()
-            logger.debug("[BagCounterApp] ROS 2 context shutdown")
 
             if self.ros_thread.is_alive():
                 self.ros_thread.join(timeout=3)

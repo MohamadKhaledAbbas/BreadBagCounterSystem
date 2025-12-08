@@ -41,8 +41,8 @@ class FrameServer(Node, FrameSource):
             self.listener_callback,
             qos_profile_sensor_data)
 
-        # Only keep the latest frame (leaky queue)
-        self.frame_queue = queue.Queue(maxsize=1)
+        # Buffer more frames to reduce frame drops
+        self.frame_queue = queue.Queue(maxsize=10)
         self.last_frame_time = time.time()
         
         # Store target_fps for logging only
