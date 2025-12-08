@@ -6,7 +6,6 @@ from launch import LaunchDescription
 from launch.actions import SetEnvironmentVariable
 from launch_ros.actions import Node
 
-
 from src.logging.Database import DatabaseManager
 import src.constants as constants
 from src.utils.AppLogging import logger
@@ -23,7 +22,6 @@ def generate_launch_description():
         SetEnvironmentVariable('RMW_FASTRTPS_USE_QOS_FROM_XML', '1'),
         SetEnvironmentVariable('ROS_DISABLE_LOANED_MESSAGES', '0'),
         SetEnvironmentVariable('HOME', '/home/sunrise')
-        # If you source setup.bash manually before running launch, it's fine. Otherwise, see below for shell script notes.
     ]
 
     db = DatabaseManager("/home/sunrise/BreadCounting/data/db/bag_events.db")
@@ -32,12 +30,19 @@ def generate_launch_description():
     rtsp_host = db.get_config_value(constants.rtsp_host)
     rtsp_port = db.get_config_value(constants.rtsp_port)
 
-    PRODUCTION_RTSP = "rtsp://"+rtsp_username+":"+rtsp_password+"@"+rtsp_host+":"+rtsp_port+"/cam/realmonitor?channel=1&subtype=0"
-
-    # PRODUCTION_RTSP = "rtsp://" + rtsp_username + ":a12345678@192.168.2.108:554/cam/realmonitor?channel=1&subtype=0"
+    # NOTE: use subtype=1 (substream) if you want lower bitrate / smaller frames,
+    # or use subtype=0 for main stream. Adjust as needed.
+    PRODUCTION_RTSP = (
+        f"rtsp://{rtsp_username}:{rtsp_password}@{rtsp_host}:{rtsp_port}"
+        "/cam/realmonitor?channel=1&subtype=0"
+    )
 
     CURRENT_RTSP = PRODUCTION_RTSP
 
+    # hobot_rtsp_client parameters:
+    # - some clients expose flags to force TCP or tune reassembly buffer sizes.
+    # - If hobot_rtsp_client supports them, set 'rtsp_transport': 'tcp' to avoid UDP truncation.
+    # - If it doesn't, see the suggested patch to increase LIVE555 buffer (below).
     rtsp_node = Node(
         package='hobot_rtsp_client',
         executable='hobot_rtsp_client',
@@ -45,7 +50,11 @@ def generate_launch_description():
         parameters=[
             {
                 'rtsp_url_num': 1,
-                'rtsp_url_0': CURRENT_RTSP
+                'rtsp_url_0': CURRENT_RTSP,
+                # Optional/experimental parameters — only effective if the node reads them:
+                'rtsp_transport': 'tcp',     # try TCP interleaved to avoid UDP reassembly limits
+                'rtsp_subtype': 0,           # keep examples explicit
+                'rtp_reassembly_buffer_bytes': 1048576  # request larger buffer if supported
             }
         ]
     )

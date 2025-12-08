@@ -161,7 +161,7 @@ class BagCounterApp:
         self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
 
-        self.ipc_publisher = FramePublisher(publish_rate_hz=30.0)
+        self.ipc_publisher = FramePublisher(publish_rate_hz=25.0)
 
 
         if IS_RDK and self.ros_executor is not None:
