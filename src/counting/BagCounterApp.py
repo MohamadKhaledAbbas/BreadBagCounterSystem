@@ -92,7 +92,6 @@ class BagCounterApp:
                     f"using minimum value"
                 )
                 self.recording_fps = self.MIN_RECORDING_FPS
-            logger.info(f"[BagCounterApp] Using RECORDING_FPS from config db: {self.recording_fps}")
         except (ValueError, TypeError):
             fallback_fps = 30.0
             logger.warning(
@@ -100,6 +99,8 @@ class BagCounterApp:
                 f"using default {fallback_fps}"
             )
             self.recording_fps = fallback_fps
+        
+        logger.info(f"[BagCounterApp] Using RECORDING_FPS: {self.recording_fps}")
 
         self.segment_start_time = None
         self.segment_counter = 0
@@ -117,7 +118,8 @@ class BagCounterApp:
         # Lock for video_writer access synchronization
         self.video_writer_lock = threading.Lock()
         
-        # Queue monitoring statistics
+        # Queue monitoring statistics (thread-safe counters)
+        self.stats_lock = threading.Lock()
         self.input_queue_drops = 0
         self.recording_queue_drops = 0
         self.last_queue_stats_log_time = time.perf_counter()
@@ -257,10 +259,15 @@ class BagCounterApp:
             if current_time - last_stats_log >= self.STATS_LOG_INTERVAL:
                 queue_size = self.recording_queue.qsize()
                 queue_utilization = (queue_size / self.RECORDING_QUEUE_SIZE) * 100
+                
+                # Thread-safe read of drop counter
+                with self.stats_lock:
+                    drops = self.recording_queue_drops
+                
                 logger.info(
                     f"[RecordingThread] Queue stats: size={queue_size}/{self.RECORDING_QUEUE_SIZE} "
                     f"({queue_utilization:.1f}% full), frames_written={frame_write_count}, "
-                    f"drops={self.recording_queue_drops}"
+                    f"drops={drops}"
                 )
                 last_stats_log = current_time
             
@@ -441,10 +448,12 @@ class BagCounterApp:
                         try:
                             self.recording_queue.put_nowait(frame.copy())
                         except queue.Full:
-                            self.recording_queue_drops += 1
+                            with self.stats_lock:
+                                self.recording_queue_drops += 1
+                                drops = self.recording_queue_drops
                             logger.warning(
                                 f"[Recording] Recording queue full, dropping frame "
-                                f"(total drops: {self.recording_queue_drops})"
+                                f"(total drops: {drops})"
                             )
                     
                     record_end = time.perf_counter()
@@ -585,10 +594,12 @@ class BagCounterApp:
                 if self.input_queue.full():
                     try:
                         self.input_queue.get_nowait()
-                        self.input_queue_drops += 1
+                        with self.stats_lock:
+                            self.input_queue_drops += 1
+                            drops = self.input_queue_drops
                         logger.warning(
                             f"[BagCounterApp] Dropped frame {frame_count} (input queue full, "
-                            f"total drops: {self.input_queue_drops})"
+                            f"total drops: {drops})"
                         )
                     except queue.Empty:
                         pass
@@ -602,11 +613,16 @@ class BagCounterApp:
                     recording_size = self.recording_queue.qsize()
                     recording_utilization = (recording_size / self.RECORDING_QUEUE_SIZE) * 100
                     
+                    # Thread-safe read of drop counters
+                    with self.stats_lock:
+                        input_drops = self.input_queue_drops
+                        recording_drops = self.recording_queue_drops
+                    
                     logger.info(
                         f"[QueueStats] Input queue: {input_size}/{self.INPUT_QUEUE_SIZE} "
-                        f"({input_utilization:.1f}% full, drops={self.input_queue_drops}) | "
+                        f"({input_utilization:.1f}% full, drops={input_drops}) | "
                         f"Recording queue: {recording_size}/{self.RECORDING_QUEUE_SIZE} "
-                        f"({recording_utilization:.1f}% full, drops={self.recording_queue_drops})"
+                        f"({recording_utilization:.1f}% full, drops={recording_drops})"
                     )
                     
                     # Warning if queues are getting full
