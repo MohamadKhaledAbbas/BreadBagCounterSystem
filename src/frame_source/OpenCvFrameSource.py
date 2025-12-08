@@ -21,9 +21,11 @@ class OpenCVFrameSource(FrameSource):
         self.running = True
         self.last_frame_time = None
         
-        # Target FPS for frame pacing (None = use source FPS)
+        # Target FPS for frame pacing (None = no rate limiting)
         self.target_fps = target_fps
         if self.target_fps is not None:
+            if self.target_fps <= 0:
+                raise ValueError(f"target_fps must be positive, got {self.target_fps}")
             self.frame_interval = 1.0 / self.target_fps
             logger.info(f"[OpenCVFrameSource] Target FPS: {self.target_fps}, frame interval: {self.frame_interval:.4f}s")
         else:
@@ -58,8 +60,9 @@ class OpenCVFrameSource(FrameSource):
             
             # Frame pacing: wait to achieve target FPS
             if self.frame_interval is not None:
-                frame_read_end = time.perf_counter()
-                elapsed = frame_read_end - frame_read_start
+                # Measure total time including queue operations
+                frame_cycle_end = time.perf_counter()
+                elapsed = frame_cycle_end - frame_read_start
                 sleep_time = self.frame_interval - elapsed
                 
                 if sleep_time > 0:
