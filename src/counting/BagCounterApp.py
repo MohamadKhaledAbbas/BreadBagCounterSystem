@@ -501,18 +501,18 @@ class BagCounterApp:
                     # Guard against invalid timing measurements
                     if avg_interval > TIMING_EPSILON:
                         acquisition_fps = 1.0 / avg_interval
+                        logger.info(
+                            f"[BagCounterApp] Frame acquisition stats: "
+                            f"frames={frame_count}, avg_interval={avg_interval*1000:.1f}ms, "
+                            f"acquisition_fps={acquisition_fps:.1f}"
+                        )
                     else:
                         # Extremely unlikely, but handle invalid timing measurements
-                        acquisition_fps = float('inf')
                         logger.warning(
                             f"[BagCounterApp] Invalid frame timing detected: "
-                            f"avg_interval={avg_interval*1000:.6f}ms (below {TIMING_EPSILON*1000:.6f}ms threshold)"
+                            f"frames={frame_count}, avg_interval={avg_interval*1000:.6f}ms "
+                            f"(below {TIMING_EPSILON*1000:.6f}ms threshold) - skipping FPS calculation"
                         )
-                    logger.info(
-                        f"[BagCounterApp] Frame acquisition stats: "
-                        f"frames={frame_count}, avg_interval={avg_interval*1000:.1f}ms, "
-                        f"acquisition_fps={acquisition_fps:.1f}"
-                    )
                     # Reset for next interval
                     frame_interval_sum = 0.0
                     frame_interval_count = 0
