@@ -605,34 +605,43 @@ class BagCounterApp:
                     self.input_queue.put_nowait(frame)
                 except queue.Full:
                     # Queue is full, drop oldest frame and try again (leaky queue behavior)
+                    frame_dropped = False
                     try:
                         self.input_queue.get_nowait()
-                        # Successfully dropped oldest frame, now add new frame
+                        # Successfully dropped oldest frame, increment counter
+                        frame_dropped = True
+                        # Now try to add new frame
                         try:
                             self.input_queue.put_nowait(frame)
                         except queue.Full:
                             # Extremely rare: queue filled again between get and put
+                            # Current frame also dropped
+                            frame_dropped = True
                             logger.debug(
                                 f"[BagCounterApp] Frame {frame_count} dropped: "
                                 "queue refilled immediately after clearing"
                             )
-                        # Increment drop counter
-                        with self.stats_lock:
-                            self.input_queue_drops += 1
-                            drops = self.input_queue_drops
-                        logger.warning(
-                            f"[BagCounterApp] Dropped frame {frame_count} (input queue full, "
-                            f"total drops: {drops})"
-                        )
+                        # Log the drop of the old frame
+                        if frame_dropped:
+                            with self.stats_lock:
+                                self.input_queue_drops += 1
+                                drops = self.input_queue_drops
+                            logger.warning(
+                                f"[BagCounterApp] Dropped old frame (input queue full, "
+                                f"total drops: {drops})"
+                            )
                     except queue.Empty:
                         # Queue was drained by another thread, retry putting the frame
                         try:
                             self.input_queue.put_nowait(frame)
                         except queue.Full:
-                            # Still full after being drained, skip this frame
-                            logger.debug(
+                            # Still full after being drained, current frame must be dropped
+                            with self.stats_lock:
+                                self.input_queue_drops += 1
+                                drops = self.input_queue_drops
+                            logger.warning(
                                 f"[BagCounterApp] Frame {frame_count} dropped: "
-                                "queue refilled by another thread"
+                                f"queue refilled by another thread (total drops: {drops})"
                             )
                 
                 # Periodic queue statistics logging
