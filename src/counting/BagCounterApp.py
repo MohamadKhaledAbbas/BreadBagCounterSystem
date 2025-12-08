@@ -94,12 +94,22 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Recording segment length: {self.recording_segment_seconds}s")
         logger.info(f"[BagCounterApp] Recording FPS: {self.recording_fps}")
 
-        self.input_queue = queue.Queue(maxsize=10)
-        # Queue for asynchronous video recording
-        self.recording_queue = queue.Queue(maxsize=30)
+        # Input queue size set to 100 frames for better buffering with 25 fps RTSP stream
+        self.input_queue = queue.Queue(maxsize=100)
+        # Queue for asynchronous video recording - increased for better margin
+        self.recording_queue = queue.Queue(maxsize=100)
         self.recording_thread = None
         # Lock for video_writer access synchronization
         self.video_writer_lock = threading.Lock()
+        
+        # Queue monitoring statistics
+        self.input_queue_drops = 0
+        self.recording_queue_drops = 0
+        self.last_queue_stats_log_time = time.perf_counter()
+        
+        # Recording frame rate limiting
+        self.last_recording_frame_time = None
+        self.recording_frame_interval = 1.0 / self.recording_fps if self.recording_fps > 0 else 0.04  # default ~25fps
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -169,6 +179,8 @@ class BagCounterApp:
     def on_is_recording_changed(self, new_value):
         if new_value == "1":
             self.is_recording = True
+            # Reset recording frame timing for new recording session
+            self.last_recording_frame_time = None
             logger.info("[BagCounterApp] Video Recording ENABLED")
         else:
             self.is_recording = False
@@ -176,6 +188,7 @@ class BagCounterApp:
             # Reset segment metadata so next start begins fresh
             self.segment_counter = 0
             self.segment_start_time = None
+            self.last_recording_frame_time = None
 
     def _open_video_writer(self, frame):
         """Open a new video writer and return (writer, filename) or (None, None) on failure."""
@@ -208,6 +221,10 @@ class BagCounterApp:
         """Background thread that handles video recording asynchronously."""
         logger.info("[RecordingThread] Started")
         
+        frame_write_count = 0
+        last_stats_log = time.perf_counter()
+        STATS_LOG_INTERVAL = 5.0  # Log stats every 5 seconds
+        
         while self.is_running:
             try:
                 # Get frame from recording queue with timeout
@@ -219,6 +236,17 @@ class BagCounterApp:
             except Exception as e:
                 logger.error(f"[RecordingThread] Queue error: {e}")
                 continue
+            
+            # Periodic queue stats logging
+            current_time = time.perf_counter()
+            if current_time - last_stats_log >= STATS_LOG_INTERVAL:
+                queue_size = self.recording_queue.qsize()
+                queue_utilization = (queue_size / 100) * 100  # 100 is maxsize
+                logger.info(
+                    f"[RecordingThread] Queue stats: size={queue_size}/100 ({queue_utilization:.1f}% full), "
+                    f"frames_written={frame_write_count}, drops={self.recording_queue_drops}"
+                )
+                last_stats_log = current_time
             
             try:
                 with self.video_writer_lock:
@@ -253,6 +281,7 @@ class BagCounterApp:
                     if self.video_writer is not None and self.video_writer.isOpened():
                         try:
                             self.video_writer.write(frame)
+                            frame_write_count += 1
                         except Exception as e:
                             logger.error(f"[Recording] Error writing frame: {e}")
                         
@@ -374,15 +403,33 @@ class BagCounterApp:
                 # --- 4. RECORDING LOGIC (Independent from publishing) ---
                 record_time = 0.0
 
-                # Enqueue frame for asynchronous recording
+                # Enqueue frame for asynchronous recording at target FPS
                 if self.is_recording:
                     record_start = time.perf_counter()
+                    should_record_frame = False
                     
-                    # Non-blocking enqueue: drop frame if queue is full
-                    try:
-                        self.recording_queue.put_nowait(frame.copy())
-                    except queue.Full:
-                        logger.debug("[Recording] Recording queue full, dropping frame")
+                    # Rate limit recording to target FPS
+                    if self.last_recording_frame_time is None:
+                        # Record first frame immediately
+                        should_record_frame = True
+                        self.last_recording_frame_time = record_start
+                    else:
+                        # Check if enough time has elapsed since last recorded frame
+                        time_since_last = record_start - self.last_recording_frame_time
+                        if time_since_last >= self.recording_frame_interval:
+                            should_record_frame = True
+                            self.last_recording_frame_time = record_start
+                    
+                    if should_record_frame:
+                        # Non-blocking enqueue: drop frame if queue is full
+                        try:
+                            self.recording_queue.put_nowait(frame.copy())
+                        except queue.Full:
+                            self.recording_queue_drops += 1
+                            logger.warning(
+                                f"[Recording] Recording queue full, dropping frame "
+                                f"(total drops: {self.recording_queue_drops})"
+                            )
                     
                     record_end = time.perf_counter()
                     record_time = (record_end - record_start) * 1000  # Convert to ms
@@ -475,12 +522,14 @@ class BagCounterApp:
 
         # Configuration constants for frame acquisition monitoring
         FRAME_STATS_INTERVAL = 100  # Log acquisition FPS every N frames
+        QUEUE_STATS_INTERVAL = 5.0  # Log queue stats every N seconds
         TIMING_EPSILON = 1e-6  # 1 microsecond - minimum valid frame interval
         
         frame_count = 0
         last_frame_time = None
         frame_interval_sum = 0.0
         frame_interval_count = 0
+        last_queue_stats_time = time.perf_counter()
 
         try:
             for frame, latencyMs in self.frame_source.frames():
@@ -517,14 +566,47 @@ class BagCounterApp:
                     frame_interval_sum = 0.0
                     frame_interval_count = 0
 
+                # Drop oldest frame if input queue is full (leaky queue behavior)
                 if self.input_queue.full():
                     try:
                         self.input_queue.get_nowait()
-                        logger.debug(f"[BagCounterApp] Dropped frame {frame_count} (queue full)")
+                        self.input_queue_drops += 1
+                        logger.warning(
+                            f"[BagCounterApp] Dropped frame {frame_count} (input queue full, "
+                            f"total drops: {self.input_queue_drops})"
+                        )
                     except queue.Empty:
                         pass
 
                 self.input_queue.put(frame)
+                
+                # Periodic queue statistics logging
+                if current_time - last_queue_stats_time >= QUEUE_STATS_INTERVAL:
+                    input_size = self.input_queue.qsize()
+                    input_utilization = (input_size / 100) * 100  # 100 is maxsize
+                    recording_size = self.recording_queue.qsize()
+                    recording_utilization = (recording_size / 100) * 100  # 100 is maxsize
+                    
+                    logger.info(
+                        f"[QueueStats] Input queue: {input_size}/100 ({input_utilization:.1f}% full, "
+                        f"drops={self.input_queue_drops}) | "
+                        f"Recording queue: {recording_size}/100 ({recording_utilization:.1f}% full, "
+                        f"drops={self.recording_queue_drops})"
+                    )
+                    
+                    # Warning if queues are getting full
+                    if input_utilization > 80:
+                        logger.warning(
+                            f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
+                            "frames may be dropped if processing doesn't keep up"
+                        )
+                    if recording_utilization > 80:
+                        logger.warning(
+                            f"[QueueStats] Recording queue utilization high: {recording_utilization:.1f}% - "
+                            "recording frames may be dropped if disk writes don't keep up"
+                        )
+                    
+                    last_queue_stats_time = current_time
 
         except KeyboardInterrupt:
             logger.info("[BagCounterApp] Interrupted by user")
