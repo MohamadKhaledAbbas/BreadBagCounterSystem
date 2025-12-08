@@ -84,8 +84,14 @@ class BagCounterApp:
         recording_fps_str = db.get_config_value(constants.recording_fps)
         try:
             self.recording_fps = float(recording_fps_str)
-            # Validate minimum FPS to prevent division issues
-            if self.recording_fps < self.MIN_RECORDING_FPS:
+            # Validate FPS is positive and meets minimum threshold
+            if self.recording_fps <= 0:
+                logger.warning(
+                    f"[BagCounterApp] Recording FPS {self.recording_fps} is not positive, "
+                    f"using minimum value {self.MIN_RECORDING_FPS}"
+                )
+                self.recording_fps = self.MIN_RECORDING_FPS
+            elif self.recording_fps < self.MIN_RECORDING_FPS:
                 logger.warning(
                     f"[BagCounterApp] Recording FPS {self.recording_fps} is below minimum {self.MIN_RECORDING_FPS}, "
                     f"using minimum value"
@@ -431,6 +437,8 @@ class BagCounterApp:
                     should_record_frame = False
                     
                     # Rate limit recording to target FPS
+                    # Note: We use elapsed time since last recorded frame (not absolute target time)
+                    # This prevents drift while allowing the recording to adapt to actual processing speed
                     if self.last_recording_frame_time is None:
                         # Record first frame immediately
                         should_record_frame = True
@@ -440,6 +448,7 @@ class BagCounterApp:
                         time_since_last = record_start - self.last_recording_frame_time
                         if time_since_last >= self.recording_frame_interval:
                             should_record_frame = True
+                            # Update reference time to current moment (prevents cumulative drift)
                             self.last_recording_frame_time = record_start
                     
                     if should_record_frame:
@@ -589,11 +598,21 @@ class BagCounterApp:
                     frame_interval_sum = 0.0
                     frame_interval_count = 0
 
-                # Drop oldest frame if input queue is full (leaky queue behavior)
-                if self.input_queue.full():
+                # Use non-blocking put with leaky queue behavior to avoid race conditions
+                try:
+                    self.input_queue.put_nowait(frame)
+                except queue.Full:
+                    # Queue is full, drop oldest frame and try again (leaky queue behavior)
                     try:
                         self.input_queue.get_nowait()
-                        # Only increment counter if we actually dropped a frame
+                        # Successfully dropped oldest frame, now add new frame
+                        try:
+                            self.input_queue.put_nowait(frame)
+                        except queue.Full:
+                            # Extremely rare: queue filled again between get and put
+                            # Just skip this frame to avoid blocking
+                            pass
+                        # Increment drop counter
                         with self.stats_lock:
                             self.input_queue_drops += 1
                             drops = self.input_queue_drops
@@ -602,11 +621,12 @@ class BagCounterApp:
                             f"total drops: {drops})"
                         )
                     except queue.Empty:
-                        # Queue was drained by another thread between full() check and get_nowait()
-                        # No frame was actually dropped, so don't increment counter
-                        pass
-
-                self.input_queue.put(frame)
+                        # Queue was drained by another thread, retry putting the frame
+                        try:
+                            self.input_queue.put_nowait(frame)
+                        except queue.Full:
+                            # Still full, skip this frame
+                            pass
                 
                 # Periodic queue statistics logging
                 if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
