@@ -11,7 +11,7 @@ class FrameSourceFactory:
         """
         source_type: 'ros2' or 'opencv'
         kwargs for ROS2: topic, target_fps
-        kwargs for OpenCV: source
+        kwargs for OpenCV: source, target_fps
         """
         if source_type.lower() == 'ros2':
             if not IS_RDK:
@@ -28,7 +28,8 @@ class FrameSourceFactory:
             return node
         elif source_type.lower() == 'opencv':
             source = kwargs.get('source', 0)  # 0 for webcam, or path/string for file/camera URL
-            return OpenCVFrameSource(source)
+            target_fps = kwargs.get('target_fps', None)  # None = use source FPS
+            return OpenCVFrameSource(source, target_fps=target_fps)
         else:
             raise ValueError(f"Unknown source_type: {source_type}")
 

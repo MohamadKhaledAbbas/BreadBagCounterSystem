@@ -473,11 +473,49 @@ class BagCounterApp:
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
 
+        # Configuration constants for frame acquisition monitoring
+        FRAME_STATS_INTERVAL = 100  # Log acquisition FPS every N frames
+        TIMING_EPSILON = 1e-6  # 1 microsecond - minimum valid frame interval
+        
         frame_count = 0
+        last_frame_time = None
+        frame_interval_sum = 0.0
+        frame_interval_count = 0
 
         try:
             for frame, latencyMs in self.frame_source.frames():
                 frame_count += 1
+                current_time = time.perf_counter()
+                
+                # Track frame-to-frame interval for FPS calculation
+                if last_frame_time is not None:
+                    frame_interval = current_time - last_frame_time
+                    frame_interval_sum += frame_interval
+                    frame_interval_count += 1
+                
+                last_frame_time = current_time
+                
+                # Log frame acquisition FPS periodically
+                if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
+                    avg_interval = frame_interval_sum / frame_interval_count
+                    # Guard against invalid timing measurements
+                    if avg_interval > TIMING_EPSILON:
+                        acquisition_fps = 1.0 / avg_interval
+                        logger.info(
+                            f"[BagCounterApp] Frame acquisition stats: "
+                            f"frames={frame_count}, avg_interval={avg_interval*1000:.1f}ms, "
+                            f"acquisition_fps={acquisition_fps:.1f}"
+                        )
+                    else:
+                        # Extremely unlikely, but handle invalid timing measurements
+                        logger.warning(
+                            f"[BagCounterApp] Invalid frame timing detected: "
+                            f"frames={frame_count}, avg_interval={avg_interval*1000:.6f}ms "
+                            f"(below {TIMING_EPSILON*1000:.6f}ms threshold) - skipping FPS calculation"
+                        )
+                    # Reset for next interval
+                    frame_interval_sum = 0.0
+                    frame_interval_count = 0
 
                 if self.input_queue.full():
                     try:
