@@ -436,9 +436,11 @@ class BagCounterApp:
                     record_start = time.perf_counter()
                     should_record_frame = False
                     
-                    # Rate limit recording to target FPS
-                    # Note: We use elapsed time since last recorded frame (not absolute target time)
-                    # This prevents drift while allowing the recording to adapt to actual processing speed
+                    # Rate limit recording to target FPS using elapsed time tracking
+                    # We update the reference to the current moment (not increment by interval) which:
+                    # - Prevents cumulative drift from small timing errors
+                    # - Allows recording to adapt if processing temporarily slows
+                    # - Maintains average FPS close to target over time
                     if self.last_recording_frame_time is None:
                         # Record first frame immediately
                         should_record_frame = True
@@ -448,7 +450,7 @@ class BagCounterApp:
                         time_since_last = record_start - self.last_recording_frame_time
                         if time_since_last >= self.recording_frame_interval:
                             should_record_frame = True
-                            # Update reference time to current moment (prevents cumulative drift)
+                            # Update reference to current time (not += interval) to prevent cumulative drift
                             self.last_recording_frame_time = record_start
                     
                     if should_record_frame:
@@ -610,8 +612,10 @@ class BagCounterApp:
                             self.input_queue.put_nowait(frame)
                         except queue.Full:
                             # Extremely rare: queue filled again between get and put
-                            # Just skip this frame to avoid blocking
-                            pass
+                            logger.debug(
+                                f"[BagCounterApp] Frame {frame_count} dropped: "
+                                "queue refilled immediately after clearing"
+                            )
                         # Increment drop counter
                         with self.stats_lock:
                             self.input_queue_drops += 1
@@ -625,8 +629,11 @@ class BagCounterApp:
                         try:
                             self.input_queue.put_nowait(frame)
                         except queue.Full:
-                            # Still full, skip this frame
-                            pass
+                            # Still full after being drained, skip this frame
+                            logger.debug(
+                                f"[BagCounterApp] Frame {frame_count} dropped: "
+                                "queue refilled by another thread"
+                            )
                 
                 # Periodic queue statistics logging
                 if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
