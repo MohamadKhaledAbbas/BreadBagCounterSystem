@@ -40,6 +40,8 @@ class BagCounterApp:
     RECORDING_QUEUE_SIZE = 100  # Buffer size for recording frames (100 frames @ 25fps = ~4 seconds)
     QUEUE_WARNING_THRESHOLD = 80  # Percentage threshold for queue utilization warnings
     DEFAULT_FRAME_INTERVAL = 0.04  # Default frame interval for ~25fps (1/25 = 0.04)
+    STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
+    MIN_RECORDING_FPS = 1.0  # Minimum valid recording FPS to prevent division issues
     
     def __init__(
         self,
@@ -80,14 +82,21 @@ class BagCounterApp:
             self.recording_segment_seconds = default_segment_seconds
 
         # Recording FPS - configurable via RECORDING_FPS environment variable, default 30.0
-        self.recording_fps = float(db.get_config_value(constants.recording_fps))
+        recording_fps_str = db.get_config_value(constants.recording_fps)
         try:
-            self.recording_fps = float(self.recording_fps)
+            self.recording_fps = float(recording_fps_str)
+            # Validate minimum FPS to prevent division issues
+            if self.recording_fps < self.MIN_RECORDING_FPS:
+                logger.warning(
+                    f"[BagCounterApp] Recording FPS {self.recording_fps} is below minimum {self.MIN_RECORDING_FPS}, "
+                    f"using minimum value"
+                )
+                self.recording_fps = self.MIN_RECORDING_FPS
             logger.info(f"[BagCounterApp] Using RECORDING_FPS from config db: {self.recording_fps}")
-        except ValueError:
+        except (ValueError, TypeError):
             fallback_fps = 30.0
             logger.warning(
-                f"[BagCounterApp] Invalid RECORDING_FPS value '{self.recording_fps}', "
+                f"[BagCounterApp] Invalid RECORDING_FPS value '{recording_fps_str}', "
                 f"using default {fallback_fps}"
             )
             self.recording_fps = fallback_fps
@@ -115,7 +124,8 @@ class BagCounterApp:
         
         # Recording frame rate limiting
         self.last_recording_frame_time = None
-        self.recording_frame_interval = 1.0 / self.recording_fps if self.recording_fps > 0 else self.DEFAULT_FRAME_INTERVAL
+        # Safe to divide since we validated recording_fps >= MIN_RECORDING_FPS above
+        self.recording_frame_interval = 1.0 / self.recording_fps
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -229,7 +239,6 @@ class BagCounterApp:
         
         frame_write_count = 0
         last_stats_log = time.perf_counter()
-        STATS_LOG_INTERVAL = 5.0  # Log stats every 5 seconds
         
         while self.is_running:
             try:
@@ -245,7 +254,7 @@ class BagCounterApp:
             
             # Periodic queue stats logging
             current_time = time.perf_counter()
-            if current_time - last_stats_log >= STATS_LOG_INTERVAL:
+            if current_time - last_stats_log >= self.STATS_LOG_INTERVAL:
                 queue_size = self.recording_queue.qsize()
                 queue_utilization = (queue_size / self.RECORDING_QUEUE_SIZE) * 100
                 logger.info(
@@ -529,7 +538,6 @@ class BagCounterApp:
 
         # Configuration constants for frame acquisition monitoring
         FRAME_STATS_INTERVAL = 100  # Log acquisition FPS every N frames
-        QUEUE_STATS_INTERVAL = 5.0  # Log queue stats every N seconds
         TIMING_EPSILON = 1e-6  # 1 microsecond - minimum valid frame interval
         
         frame_count = 0
@@ -588,7 +596,7 @@ class BagCounterApp:
                 self.input_queue.put(frame)
                 
                 # Periodic queue statistics logging
-                if current_time - last_queue_stats_time >= QUEUE_STATS_INTERVAL:
+                if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
                     input_size = self.input_queue.qsize()
                     input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
                     recording_size = self.recording_queue.qsize()
