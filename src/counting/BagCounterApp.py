@@ -497,8 +497,8 @@ class BagCounterApp:
                 # Log frame acquisition FPS periodically
                 if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
                     avg_interval = frame_interval_sum / frame_interval_count
-                    # Guard against division by zero
-                    if avg_interval > 1e-9:
+                    # Guard against division by zero (1 microsecond threshold)
+                    if avg_interval > 1e-6:
                         acquisition_fps = 1.0 / avg_interval
                     else:
                         # Extremely unlikely, but handle invalid timing measurements
