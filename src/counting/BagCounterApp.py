@@ -35,6 +35,12 @@ else:
 
 
 class BagCounterApp:
+    # Queue configuration constants
+    INPUT_QUEUE_SIZE = 100  # Buffer size for input frames (100 frames @ 25fps = ~4 seconds)
+    RECORDING_QUEUE_SIZE = 100  # Buffer size for recording frames (100 frames @ 25fps = ~4 seconds)
+    QUEUE_WARNING_THRESHOLD = 80  # Percentage threshold for queue utilization warnings
+    DEFAULT_FRAME_INTERVAL = 0.04  # Default frame interval for ~25fps (1/25 = 0.04)
+    
     def __init__(
         self,
         video_path: str,
@@ -95,9 +101,9 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Recording FPS: {self.recording_fps}")
 
         # Input queue size set to 100 frames for better buffering with 25 fps RTSP stream
-        self.input_queue = queue.Queue(maxsize=100)
+        self.input_queue = queue.Queue(maxsize=self.INPUT_QUEUE_SIZE)
         # Queue for asynchronous video recording - increased for better margin
-        self.recording_queue = queue.Queue(maxsize=100)
+        self.recording_queue = queue.Queue(maxsize=self.RECORDING_QUEUE_SIZE)
         self.recording_thread = None
         # Lock for video_writer access synchronization
         self.video_writer_lock = threading.Lock()
@@ -109,7 +115,7 @@ class BagCounterApp:
         
         # Recording frame rate limiting
         self.last_recording_frame_time = None
-        self.recording_frame_interval = 1.0 / self.recording_fps if self.recording_fps > 0 else 0.04  # default ~25fps
+        self.recording_frame_interval = 1.0 / self.recording_fps if self.recording_fps > 0 else self.DEFAULT_FRAME_INTERVAL
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -241,10 +247,11 @@ class BagCounterApp:
             current_time = time.perf_counter()
             if current_time - last_stats_log >= STATS_LOG_INTERVAL:
                 queue_size = self.recording_queue.qsize()
-                queue_utilization = (queue_size / 100) * 100  # 100 is maxsize
+                queue_utilization = (queue_size / self.RECORDING_QUEUE_SIZE) * 100
                 logger.info(
-                    f"[RecordingThread] Queue stats: size={queue_size}/100 ({queue_utilization:.1f}% full), "
-                    f"frames_written={frame_write_count}, drops={self.recording_queue_drops}"
+                    f"[RecordingThread] Queue stats: size={queue_size}/{self.RECORDING_QUEUE_SIZE} "
+                    f"({queue_utilization:.1f}% full), frames_written={frame_write_count}, "
+                    f"drops={self.recording_queue_drops}"
                 )
                 last_stats_log = current_time
             
@@ -583,24 +590,24 @@ class BagCounterApp:
                 # Periodic queue statistics logging
                 if current_time - last_queue_stats_time >= QUEUE_STATS_INTERVAL:
                     input_size = self.input_queue.qsize()
-                    input_utilization = (input_size / 100) * 100  # 100 is maxsize
+                    input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
                     recording_size = self.recording_queue.qsize()
-                    recording_utilization = (recording_size / 100) * 100  # 100 is maxsize
+                    recording_utilization = (recording_size / self.RECORDING_QUEUE_SIZE) * 100
                     
                     logger.info(
-                        f"[QueueStats] Input queue: {input_size}/100 ({input_utilization:.1f}% full, "
-                        f"drops={self.input_queue_drops}) | "
-                        f"Recording queue: {recording_size}/100 ({recording_utilization:.1f}% full, "
-                        f"drops={self.recording_queue_drops})"
+                        f"[QueueStats] Input queue: {input_size}/{self.INPUT_QUEUE_SIZE} "
+                        f"({input_utilization:.1f}% full, drops={self.input_queue_drops}) | "
+                        f"Recording queue: {recording_size}/{self.RECORDING_QUEUE_SIZE} "
+                        f"({recording_utilization:.1f}% full, drops={self.recording_queue_drops})"
                     )
                     
                     # Warning if queues are getting full
-                    if input_utilization > 80:
+                    if input_utilization > self.QUEUE_WARNING_THRESHOLD:
                         logger.warning(
                             f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
                             "frames may be dropped if processing doesn't keep up"
                         )
-                    if recording_utilization > 80:
+                    if recording_utilization > self.QUEUE_WARNING_THRESHOLD:
                         logger.warning(
                             f"[QueueStats] Recording queue utilization high: {recording_utilization:.1f}% - "
                             "recording frames may be dropped if disk writes don't keep up"
