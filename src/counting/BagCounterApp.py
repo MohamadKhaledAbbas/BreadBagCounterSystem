@@ -397,7 +397,7 @@ class BagCounterApp:
                                     self.recording_queue.get_nowait()
                                 except queue.Empty:
                                     break
-                            self.segment_counter = 0
+                        self.segment_counter = 0
 
                 # --- 5. PUBLISHING LOGIC ---
                 publish_time = 0.0
@@ -500,9 +500,10 @@ class BagCounterApp:
             self.is_running = False
 
             # Wait for recording thread to finish before releasing video writer
+            # Timeout calculated for 30 frames at ~80ms each = ~2.4s, plus margin = 10s
             if self.recording_thread is not None and self.recording_thread.is_alive():
                 logger.debug("[BagCounterApp] Waiting for recording thread to finish...")
-                self.recording_thread.join(timeout=5)
+                self.recording_thread.join(timeout=10)
                 logger.debug("[BagCounterApp] Recording thread finished")
 
             # Release video writer if still open (recording thread should have handled this)
