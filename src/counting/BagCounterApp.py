@@ -39,7 +39,6 @@ class BagCounterApp:
     INPUT_QUEUE_SIZE = 100  # Buffer size for input frames (100 frames @ 25fps = ~4 seconds)
     RECORDING_QUEUE_SIZE = 100  # Buffer size for recording frames (100 frames @ 25fps = ~4 seconds)
     QUEUE_WARNING_THRESHOLD = 80  # Percentage threshold for queue utilization warnings
-    DEFAULT_FRAME_INTERVAL = 0.04  # Default frame interval for ~25fps (1/25 = 0.04)
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     MIN_RECORDING_FPS = 1.0  # Minimum valid recording FPS to prevent division issues
     
@@ -594,6 +593,7 @@ class BagCounterApp:
                 if self.input_queue.full():
                     try:
                         self.input_queue.get_nowait()
+                        # Only increment counter if we actually dropped a frame
                         with self.stats_lock:
                             self.input_queue_drops += 1
                             drops = self.input_queue_drops
@@ -602,6 +602,8 @@ class BagCounterApp:
                             f"total drops: {drops})"
                         )
                     except queue.Empty:
+                        # Queue was drained by another thread between full() check and get_nowait()
+                        # No frame was actually dropped, so don't increment counter
                         pass
 
                 self.input_queue.put(frame)
