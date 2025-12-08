@@ -37,7 +37,7 @@ class OpenCVFrameSource(FrameSource):
 
     def _read_frames(self):
         while self.running:
-            frame_read_start = time.perf_counter()
+            cycle_start = time.perf_counter()
             
             ret, frame = self.cap.read()
             
@@ -45,24 +45,22 @@ class OpenCVFrameSource(FrameSource):
                 self.running = False
                 break
 
-            now = time.perf_counter()
-
-            # Calculate latency as time since last frame was read
+            # Calculate inter-frame interval for latency reporting
             if self.last_frame_time is None:
-                latency_ms = 0.0
+                inter_frame_interval_ms = 0.0
             else:
-                latency_ms = (now - self.last_frame_time) * 1000.0
+                inter_frame_interval_ms = (cycle_start - self.last_frame_time) * 1000.0
 
-            self.last_frame_time = now
+            self.last_frame_time = cycle_start
 
             # Block if consumer is slower (no frame skipping)
-            self.queue.put((frame, latency_ms))
+            self.queue.put((frame, inter_frame_interval_ms))
             
             # Frame pacing: wait to achieve target FPS
             if self.frame_interval is not None:
-                # Measure total time including queue operations
-                frame_cycle_end = time.perf_counter()
-                elapsed = frame_cycle_end - frame_read_start
+                # Measure total time for this cycle (read + queue operations)
+                cycle_end = time.perf_counter()
+                elapsed = cycle_end - cycle_start
                 sleep_time = self.frame_interval - elapsed
                 
                 if sleep_time > 0:

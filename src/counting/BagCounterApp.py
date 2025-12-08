@@ -497,7 +497,8 @@ class BagCounterApp:
                 # Log frame acquisition FPS periodically
                 if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
                     avg_interval = frame_interval_sum / frame_interval_count
-                    acquisition_fps = 1.0 / avg_interval if avg_interval > 0 else 0
+                    # Guard against division by zero with small epsilon
+                    acquisition_fps = 1.0 / avg_interval if avg_interval > 1e-9 else 0.0
                     logger.info(
                         f"[BagCounterApp] Frame acquisition stats: "
                         f"frames={frame_count}, avg_interval={avg_interval*1000:.1f}ms, "
