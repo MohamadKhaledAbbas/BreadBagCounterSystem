@@ -473,13 +473,14 @@ class BagCounterApp:
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
 
+        # Configuration constants for frame acquisition monitoring
+        FRAME_STATS_INTERVAL = 100  # Log acquisition FPS every N frames
+        TIMING_EPSILON = 1e-6  # 1 microsecond - minimum valid frame interval
+        
         frame_count = 0
         last_frame_time = None
         frame_interval_sum = 0.0
         frame_interval_count = 0
-        
-        # Log frame acquisition stats every N frames
-        FRAME_STATS_INTERVAL = 100
 
         try:
             for frame, latencyMs in self.frame_source.frames():
@@ -497,15 +498,15 @@ class BagCounterApp:
                 # Log frame acquisition FPS periodically
                 if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
                     avg_interval = frame_interval_sum / frame_interval_count
-                    # Guard against division by zero (1 microsecond threshold)
-                    if avg_interval > 1e-6:
+                    # Guard against invalid timing measurements
+                    if avg_interval > TIMING_EPSILON:
                         acquisition_fps = 1.0 / avg_interval
                     else:
                         # Extremely unlikely, but handle invalid timing measurements
                         acquisition_fps = float('inf')
                         logger.warning(
                             f"[BagCounterApp] Invalid frame timing detected: "
-                            f"avg_interval={avg_interval*1000:.6f}ms (near zero)"
+                            f"avg_interval={avg_interval*1000:.6f}ms (below {TIMING_EPSILON*1000:.6f}ms threshold)"
                         )
                     logger.info(
                         f"[BagCounterApp] Frame acquisition stats: "

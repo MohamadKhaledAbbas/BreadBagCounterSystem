@@ -30,7 +30,7 @@ class OpenCVFrameSource(FrameSource):
             logger.info(f"[OpenCVFrameSource] Target FPS: {self.target_fps}, frame interval: {self.frame_interval:.4f}s")
         else:
             self.frame_interval = None
-            logger.info(f"[OpenCVFrameSource] No target FPS specified, reading frames as fast as possible")
+            logger.info(f"[OpenCVFrameSource] No target FPS specified, reading frames at source FPS")
 
         self.read_thread = threading.Thread(target=self._read_frames, daemon=True)
         self.read_thread.start()
