@@ -3,6 +3,7 @@ import cv2
 import queue
 import threading
 import time
+import json
 from datetime import datetime
 from typing import Dict, Any
 
@@ -37,7 +38,6 @@ else:
 class BagCounterApp:
     # Queue configuration constants
     INPUT_QUEUE_SIZE = 100  # Buffer size for input frames (100 frames @ 25fps = ~4 seconds)
-    RECORDING_QUEUE_SIZE = 100  # Buffer size for recording frames (100 frames @ 25fps = ~4 seconds)
     QUEUE_WARNING_THRESHOLD = 80  # Percentage threshold for queue utilization warnings
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     MIN_RECORDING_FPS = 1.0  # Minimum valid recording FPS to prevent division issues
@@ -62,24 +62,11 @@ class BagCounterApp:
 
         self.is_running = False
 
-        # Recording state
+        # Recording state (frame-based)
         self.is_recording = db.get_config_value(constants.is_recording_key) == "1"
-        self.video_writer = None
         # Use DB-configured path if present, else fall back to config
         self.recording_dir = db.get_config_value(constants.recording_dir) or config.recording_dir
-        # Segment length (seconds). Default 600 (10 minutes) if not provided in config/env.
-
-        self.recording_segment_seconds = db.get_config_value(constants.recording_seconds)
-        try:
-            self.recording_segment_seconds = int(self.recording_segment_seconds)
-        except Exception:
-            default_segment_seconds = 600
-            logger.error(
-                f"[BagCounterApp] Invalid RECORDING_SEGMENT_SECONDS={self.recording_segment_seconds}; "
-                f"falling back to {default_segment_seconds}"
-            )
-            self.recording_segment_seconds = default_segment_seconds
-
+        
         # Recording FPS - configurable via RECORDING_FPS environment variable, default 30.0
         recording_fps_str = db.get_config_value(constants.recording_fps)
         try:
@@ -106,27 +93,21 @@ class BagCounterApp:
             self.recording_fps = fallback_fps
         
         logger.info(f"[BagCounterApp] Using RECORDING_FPS: {self.recording_fps}")
+        
+        # Session directory for current recording session
+        self.recording_session_dir = None
+        self.recording_frame_counter = 0
 
-        self.segment_start_time = None
-        self.segment_counter = 0
-
-        logger.info(f"[BagCounterApp] Video Recording: {'ENABLED' if self.is_recording else 'DISABLED'}")
+        logger.info(f"[BagCounterApp] Frame Recording: {'ENABLED' if self.is_recording else 'DISABLED'}")
         logger.info(f"[BagCounterApp] Recording directory: {self.recording_dir}")
-        logger.info(f"[BagCounterApp] Recording segment length: {self.recording_segment_seconds}s")
         logger.info(f"[BagCounterApp] Recording FPS: {self.recording_fps}")
 
         # Input queue size set to 100 frames for better buffering with 25 fps RTSP stream
         self.input_queue = queue.Queue(maxsize=self.INPUT_QUEUE_SIZE)
-        # Queue for asynchronous video recording - increased for better margin
-        self.recording_queue = queue.Queue(maxsize=self.RECORDING_QUEUE_SIZE)
-        self.recording_thread = None
-        # Lock for video_writer access synchronization
-        self.video_writer_lock = threading.Lock()
         
         # Queue monitoring statistics (thread-safe counters)
         self.stats_lock = threading.Lock()
         self.input_queue_drops = 0
-        self.recording_queue_drops = 0
         self.last_queue_stats_log_time = time.perf_counter()
         
         # Recording frame rate limiting
@@ -204,119 +185,70 @@ class BagCounterApp:
             self.is_recording = True
             # Reset recording frame timing for new recording session
             self.last_recording_frame_time = None
-            logger.info("[BagCounterApp] Video Recording ENABLED")
+            # Create new session directory
+            self._create_recording_session()
+            logger.info("[BagCounterApp] Frame Recording ENABLED")
         else:
             self.is_recording = False
-            logger.info("[BagCounterApp] Video Recording DISABLED")
-            # Reset segment metadata so next start begins fresh
-            self.segment_counter = 0
-            self.segment_start_time = None
+            logger.info("[BagCounterApp] Frame Recording DISABLED")
+            # Reset session metadata
+            self.recording_session_dir = None
+            self.recording_frame_counter = 0
             self.last_recording_frame_time = None
 
-    def _open_video_writer(self, frame):
-        """Open a new video writer and return (writer, filename) or (None, None) on failure."""
+    def _create_recording_session(self):
+        """Create a new recording session directory."""
         try:
             os.makedirs(self.recording_dir, exist_ok=True)
             if not os.access(self.recording_dir, os.W_OK):
                 logger.error(f"[Recording] Directory not writable: {self.recording_dir}")
-                return None, None
+                return False
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            video_filename = os.path.join(self.recording_dir, f"{timestamp}_p{self.segment_counter:03d}.mp4")
-
-            height, width = frame.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(video_filename, fourcc, self.recording_fps, (width, height))
-
-            if writer.isOpened():
-                self.segment_start_time = time.perf_counter()
-                self.segment_counter += 1
-                logger.info(f"[Recording] Opened video writer: {video_filename} at {self.recording_fps} FPS")
-                return writer, video_filename
-            else:
-                logger.error(f"[Recording] Failed to open video writer: {video_filename}")
-                return None, None
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.recording_session_dir = os.path.join(self.recording_dir, f"session_{timestamp}")
+            os.makedirs(self.recording_session_dir, exist_ok=True)
+            self.recording_frame_counter = 0
+            
+            logger.info(f"[Recording] Created recording session: {self.recording_session_dir}")
+            return True
         except Exception as e:
-            logger.error(f"[Recording] Error starting recording: {e}")
-            return None, None
+            logger.error(f"[Recording] Error creating recording session: {e}")
+            return False
 
-    def _recording_thread_loop(self):
-        """Background thread that handles video recording asynchronously."""
-        logger.info("[RecordingThread] Started")
+    def _save_frame_data(self, frame_raw, frame_annotated, detections_data, events_data, frame_number):
+        """Save frame images (raw and annotated) and metadata as JSON."""
+        if not self.recording_session_dir:
+            return False
         
-        frame_write_count = 0
-        last_stats_log = time.perf_counter()
-        
-        while self.is_running:
-            try:
-                # Get frame from recording queue with timeout
-                frame = self.recording_queue.get(timeout=1.0)
-            except queue.Empty:
-                if not self.is_running:
-                    break
-                continue
-            except Exception as e:
-                logger.error(f"[RecordingThread] Queue error: {e}")
-                continue
+        try:
+            # Generate filenames with zero-padded frame number
+            frame_id = f"frame_{frame_number:06d}"
+            raw_path = os.path.join(self.recording_session_dir, f"{frame_id}_raw.png")
+            annotated_path = os.path.join(self.recording_session_dir, f"{frame_id}_annotated.png")
+            json_path = os.path.join(self.recording_session_dir, f"{frame_id}.json")
             
-            # Periodic queue stats logging
-            current_time = time.perf_counter()
-            if current_time - last_stats_log >= self.STATS_LOG_INTERVAL:
-                queue_size = self.recording_queue.qsize()
-                queue_utilization = (queue_size / self.RECORDING_QUEUE_SIZE) * 100
-                
-                # Thread-safe read of drop counter
-                with self.stats_lock:
-                    drops = self.recording_queue_drops
-                
-                logger.info(
-                    f"[RecordingThread] Queue stats: size={queue_size}/{self.RECORDING_QUEUE_SIZE} "
-                    f"({queue_utilization:.1f}% full), frames_written={frame_write_count}, "
-                    f"drops={drops}"
-                )
-                last_stats_log = current_time
+            # Save raw frame
+            cv2.imwrite(raw_path, frame_raw)
             
-            try:
-                with self.video_writer_lock:
-                    # Start writer if needed
-                    if self.video_writer is None:
-                        self.video_writer, opened_filename = self._open_video_writer(frame)
-                        if opened_filename:
-                            logger.info(f"[Recording] Started recording to: {opened_filename}")
-                    
-                    # Rotate segment if duration exceeded
-                    if (
-                        self.video_writer is not None
-                        and self.video_writer.isOpened()
-                        and self.segment_start_time is not None
-                        and (time.perf_counter() - self.segment_start_time) >= self.recording_segment_seconds
-                    ):
-                        try:
-                            self.video_writer.release()
-                            logger.info("[Recording] Closed segment (time limit reached)")
-                        except Exception as e:
-                            logger.error(f"[Recording] Error closing segment: {e}")
-                        finally:
-                            self.video_writer = None
-                            self.segment_start_time = None
-                        
-                        # Open next segment immediately
-                        self.video_writer, opened_filename = self._open_video_writer(frame)
-                        if opened_filename:
-                            logger.info(f"[Recording] Started new segment: {opened_filename}")
-                    
-                    # Write frame if writer is open
-                    if self.video_writer is not None and self.video_writer.isOpened():
-                        try:
-                            self.video_writer.write(frame)
-                            frame_write_count += 1
-                        except Exception as e:
-                            logger.error(f"[Recording] Error writing frame: {e}")
-                        
-            except Exception as e:
-                logger.error(f"[RecordingThread] Error processing frame: {e}")
-        
-        logger.info("[RecordingThread] Stopped")
+            # Save annotated frame
+            cv2.imwrite(annotated_path, frame_annotated)
+            
+            # Prepare metadata
+            metadata = {
+                "frame_number": frame_number,
+                "timestamp": datetime.now().isoformat(),
+                "detections": detections_data,
+                "events": events_data,
+            }
+            
+            # Save JSON metadata
+            with open(json_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            return True
+        except Exception as e:
+            logger.error(f"[Recording] Error saving frame data: {e}")
+            return False
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
         label = data["label"]
@@ -428,61 +360,9 @@ class BagCounterApp:
                     classify_end = time.perf_counter()
                     classify_time = (classify_end - classify_start) * 1000  # Convert to ms
 
-                # --- 4. RECORDING LOGIC (Independent from publishing) ---
-                record_time = 0.0
-
-                # Enqueue frame for asynchronous recording at target FPS
-                if self.is_recording:
-                    record_start = time.perf_counter()
-                    should_record_frame = False
-                    
-                    # Rate limit recording to target FPS using elapsed time tracking
-                    # We update the reference to the current moment (not increment by interval) which:
-                    # - Prevents cumulative drift from small timing errors
-                    # - Allows recording to adapt if processing temporarily slows
-                    # - Maintains average FPS close to target over time
-                    if self.last_recording_frame_time is None:
-                        # Record first frame immediately
-                        should_record_frame = True
-                        self.last_recording_frame_time = record_start
-                    else:
-                        # Check if enough time has elapsed since last recorded frame
-                        time_since_last = record_start - self.last_recording_frame_time
-                        if time_since_last >= self.recording_frame_interval:
-                            should_record_frame = True
-                            # Update reference to current time (not += interval) to prevent cumulative drift
-                            self.last_recording_frame_time = record_start
-                    
-                    if should_record_frame:
-                        # Non-blocking enqueue: drop frame if queue is full
-                        try:
-                            self.recording_queue.put_nowait(frame.copy())
-                        except queue.Full:
-                            with self.stats_lock:
-                                self.recording_queue_drops += 1
-                                drops = self.recording_queue_drops
-                            logger.warning(
-                                f"[Recording] Recording queue full, dropping frame "
-                                f"(total drops: {drops})"
-                            )
-                    
-                    record_end = time.perf_counter()
-                    record_time = (record_end - record_start) * 1000  # Convert to ms
-                else:
-                    # Falling edge: Stop recording
-                    # Clear the recording queue and let recording thread finish
-                    with self.video_writer_lock:
-                        if self.video_writer is not None:
-                            # Clear queue to ensure recording thread processes remaining frames
-                            while not self.recording_queue.empty():
-                                try:
-                                    self.recording_queue.get_nowait()
-                                except queue.Empty:
-                                    break
-                        self.segment_counter = 0
-
-                # --- 5. PUBLISHING LOGIC ---
+                # --- 4. PUBLISHING LOGIC ---
                 publish_time = 0.0
+                annotated_frame = None
 
                 if self.is_publishing:
                     publish_start = time.perf_counter()
@@ -504,11 +384,83 @@ class BagCounterApp:
                         fps=fps_display,
                     )
 
-                    annotated_frame = cv2.resize(annotated_frame, (1280, 720))
-                    self.ipc_publisher.publish(annotated_frame)
+                    annotated_frame_resized = cv2.resize(annotated_frame, (1280, 720))
+                    self.ipc_publisher.publish(annotated_frame_resized)
 
                     publish_end = time.perf_counter()
                     publish_time = (publish_end - publish_start) * 1000  # Convert to ms
+
+                # --- 5. RECORDING LOGIC (Frame-based) ---
+                record_time = 0.0
+
+                if self.is_recording:
+                    record_start = time.perf_counter()
+                    should_record_frame = False
+                    
+                    # Rate limit recording to target FPS using elapsed time tracking
+                    if self.last_recording_frame_time is None:
+                        # Record first frame immediately
+                        should_record_frame = True
+                        self.last_recording_frame_time = record_start
+                    else:
+                        # Check if enough time has elapsed since last recorded frame
+                        time_since_last = record_start - self.last_recording_frame_time
+                        if time_since_last >= self.recording_frame_interval:
+                            should_record_frame = True
+                            # Update reference to current time to prevent cumulative drift
+                            self.last_recording_frame_time = record_start
+                    
+                    if should_record_frame:
+                        # Create annotated frame if not already created by publishing
+                        if annotated_frame is None:
+                            annotated_frame = frame.copy()
+                            # Calculate FPS for display
+                            frame_mid = time.perf_counter()
+                            mid_time = (frame_mid - frame_start) * 1000
+                            fps_display = 1000 / mid_time if mid_time > 0 else 0
+                            
+                            self.visualizer.render_all(
+                                annotated_frame,
+                                current_frame_detections,
+                                self.monitor.active_events,
+                                counts=self.ui_counts,
+                                fps=fps_display,
+                            )
+                        
+                        # Prepare detection data for JSON
+                        detections_data = []
+                        for det in current_frame_detections:
+                            class_name = self.detector.class_names.get(det["class_id"], "Unknown")
+                            detections_data.append({
+                                "class_id": int(det["class_id"]),
+                                "class_name": class_name,
+                                "confidence": float(det["conf"]),
+                                "bbox": [float(det["box"][0]), float(det["box"][1]), 
+                                        float(det["box"][2]), float(det["box"][3])],
+                            })
+                        
+                        # Prepare events data for JSON
+                        events_data = []
+                        for event in self.monitor.active_events:
+                            events_data.append({
+                                "id": event.id,
+                                "state": event.state,
+                                "bbox": [float(event.box[0]), float(event.box[1]), 
+                                        float(event.box[2]), float(event.box[3])],
+                            })
+                        
+                        # Save frame data
+                        self._save_frame_data(
+                            frame_raw=frame,
+                            frame_annotated=annotated_frame,
+                            detections_data=detections_data,
+                            events_data=events_data,
+                            frame_number=self.recording_frame_counter
+                        )
+                        self.recording_frame_counter += 1
+                    
+                    record_end = time.perf_counter()
+                    record_time = (record_end - record_start) * 1000  # Convert to ms
 
                 # Calculate total frame time including all operations
                 frame_end = time.perf_counter()
@@ -543,14 +495,13 @@ class BagCounterApp:
     def run(self):
         logger.info("[BagCounterApp] Starting main loop")
         self.is_running = True
+        
+        # Create recording session if recording is enabled at startup
+        if self.is_recording:
+            self._create_recording_session()
 
         logic_thread = threading.Thread(target=self._logic_thread_loop, daemon=True)
         logic_thread.start()
-
-        # Start recording thread
-        self.recording_thread = threading.Thread(target=self._recording_thread_loop, daemon=True)
-        self.recording_thread.start()
-        logger.debug("[BagCounterApp] Recording thread started")
 
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
@@ -648,31 +599,21 @@ class BagCounterApp:
                 if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
                     input_size = self.input_queue.qsize()
                     input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
-                    recording_size = self.recording_queue.qsize()
-                    recording_utilization = (recording_size / self.RECORDING_QUEUE_SIZE) * 100
                     
-                    # Thread-safe read of drop counters
+                    # Thread-safe read of drop counter
                     with self.stats_lock:
                         input_drops = self.input_queue_drops
-                        recording_drops = self.recording_queue_drops
                     
                     logger.info(
                         f"[QueueStats] Input queue: {input_size}/{self.INPUT_QUEUE_SIZE} "
-                        f"({input_utilization:.1f}% full, drops={input_drops}) | "
-                        f"Recording queue: {recording_size}/{self.RECORDING_QUEUE_SIZE} "
-                        f"({recording_utilization:.1f}% full, drops={recording_drops})"
+                        f"({input_utilization:.1f}% full, drops={input_drops})"
                     )
                     
-                    # Warning if queues are getting full
+                    # Warning if queue is getting full
                     if input_utilization > self.QUEUE_WARNING_THRESHOLD:
                         logger.warning(
                             f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
                             "frames may be dropped if processing doesn't keep up"
-                        )
-                    if recording_utilization > self.QUEUE_WARNING_THRESHOLD:
-                        logger.warning(
-                            f"[QueueStats] Recording queue utilization high: {recording_utilization:.1f}% - "
-                            "recording frames may be dropped if disk writes don't keep up"
                         )
                     
                     last_queue_stats_time = current_time
@@ -688,25 +629,9 @@ class BagCounterApp:
             logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
             self.is_running = False
 
-            # Wait for recording thread to finish before releasing video writer
-            # Timeout calculated for 30 frames at ~80ms each = ~2.4s, plus margin = 10s
-            if self.recording_thread is not None and self.recording_thread.is_alive():
-                logger.debug("[BagCounterApp] Waiting for recording thread to finish...")
-                self.recording_thread.join(timeout=10)
-                logger.debug("[BagCounterApp] Recording thread finished")
-
-            # Release video writer if still open (recording thread should have handled this)
-            with self.video_writer_lock:
-                if self.video_writer is not None:
-                    try:
-                        self.video_writer.release()
-                        logger.info("[BagCounterApp] Video writer released")
-                    except Exception as e:
-                        logger.error(f"[BagCounterApp] Error releasing video writer: {e}")
-                    finally:
-                        self.video_writer = None
-                        self.segment_start_time = None
-                        self.segment_counter = 0
+            # Log final recording stats if applicable
+            if self.recording_session_dir:
+                logger.info(f"[BagCounterApp] Recording session saved {self.recording_frame_counter} frames to: {self.recording_session_dir}")
 
             self.frame_source.cleanup()
             logger.debug("[BagCounterApp] Frame source cleaned up")
