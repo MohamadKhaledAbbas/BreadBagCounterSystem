@@ -27,17 +27,37 @@ class BagEvent:
         self.open_id = open_id
         self.closed_id = closed_id
 
-        # Separate buffers for open and closed ROIs
-        self.open_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
-        self.closed_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
+        # Separate buffers for open and closed ROIs with IoU tracking
+        # Each entry is (sharpness, iou_score, roi)
+        self.open_rois: List[Tuple[float, float, any]] = []
+        self.closed_rois: List[Tuple[float, float, any]] = []
+        
+        # Track anchor box for IoU computation (updated with each detection)
+        self.anchor_box = box
 
-        # Add first frame
-        self._add_roi(box, frame_img, is_open=True)
+        # Add first frame (IoU is 1.0 for first frame against itself)
+        self._add_roi(box, frame_img, is_open=True, iou_score=1.0)
 
         logger.debug(f"[BagEvent] Created event ID={self.id}")
 
-    def _add_roi(self, box, frame_img, is_open: bool):
-        """Extract ROI and add to appropriate buffer."""
+    def _compute_iou(self, boxA, boxB):
+        """Compute IoU between two boxes."""
+        # Sanity checks for box coordinates
+        if (boxA[2] <= boxA[0] or boxA[3] <= boxA[1] or
+            boxB[2] <= boxB[0] or boxB[3] <= boxB[1]):
+            return 0.0
+        
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+
+    def _add_roi(self, box, frame_img, is_open: bool, iou_score: float = None):
+        """Extract ROI and add to appropriate buffer with IoU tracking."""
         h, w = frame_img.shape[:2]
         x1, y1, x2, y2 = map(int, box)
         x1, y1 = max(0, x1), max(0, y1)
@@ -54,25 +74,30 @@ class BagEvent:
         if not sharpness >= tracking_config.min_roi_sharpness:
             return False
 
+        # Compute IoU against anchor box if not provided
+        if iou_score is None:
+            iou_score = self._compute_iou(box, self.anchor_box)
+
         if is_open:
-            self.open_rois.append((sharpness, roi))
-            # Keep top N sharpest
-            self.open_rois.sort(key=lambda x: x[0], reverse=True)
+            self.open_rois.append((sharpness, iou_score, roi))
+            # Sort by combined quality score: weight sharpness and IoU
+            # Higher sharpness and higher IoU are both better
+            self.open_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
             if len(self.open_rois) > self.max_open_samples:
                 self.open_rois = self.open_rois[:self.max_open_samples]
             logger.debug(
                 f"[BagEvent:{self.id}] Added OPEN ROI "
-                f"(sharpness={sharpness:.1f}, total={len(self.open_rois)})"
+                f"(sharpness={sharpness:.1f}, IoU={iou_score:.3f}, total={len(self.open_rois)})"
             )
         else:
-            self.closed_rois.append((sharpness, roi))
-            # Keep top N sharpest
-            self.closed_rois.sort(key=lambda x: x[0], reverse=True)
+            self.closed_rois.append((sharpness, iou_score, roi))
+            # Sort by combined quality score
+            self.closed_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
             if len(self.closed_rois) > self.max_closed_samples:
                 self.closed_rois = self.closed_rois[:self.max_closed_samples]
             logger.debug(
                 f"[BagEvent:{self.id}] Added CLOSED ROI "
-                f"(sharpness={sharpness:.1f}, total={len(self.closed_rois)})"
+                f"(sharpness={sharpness:.1f}, IoU={iou_score:.3f}, total={len(self.closed_rois)})"
             )
 
         return True
@@ -80,12 +105,16 @@ class BagEvent:
     def add_open_frame(self, box, frame_img):
         """Add ROI from open detection."""
         self.box = box
+        # Update anchor box for better IoU tracking
+        self.anchor_box = box
         self.frames_since_update = 0
         self._add_roi(box, frame_img, is_open=True)
 
     def add_closed_frame(self, box, frame_img):
         """Add ROI from closed detection."""
         self.box = box
+        # Update anchor box for better IoU tracking
+        self.anchor_box = box
         self.frames_since_update = 0
         self._add_roi(box, frame_img, is_open=False)
 
@@ -108,21 +137,34 @@ class BagEvent:
     def get_all_candidates(self) -> List:
         """
         Return all collected ROIs (both open and closed),
-        sorted by sharpness (best first).
+        sorted by combined quality score (sharpness * 0.6 + IoU * 100 * 0.4).
+        This prioritizes ROIs with high consistency (IoU) and good image quality (sharpness).
         """
         # Combine both buffers
         all_rois = self.open_rois + self.closed_rois
 
-        # Sort by sharpness (highest first)
-        all_rois.sort(key=lambda x: x[0], reverse=True)
+        # Sort by combined quality score (sharpness + IoU-weighted)
+        # Weight: 60% sharpness, 40% IoU (scaled by 100 to match sharpness magnitude)
+        all_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
 
-        # Return just the images (not the sharpness scores)
-        candidates = [roi for _, roi in all_rois]
-
-        logger.debug(
-            f"[BagEvent:{self.id}] Returning {len(candidates)} candidates "
-            f"({len(self.open_rois)} open, {len(self.closed_rois)} closed)"
-        )
+        # Return just the images (not the quality scores)
+        candidates = [roi for _, _, roi in all_rois]
+        
+        # Calculate average IoU for logging
+        if all_rois:
+            avg_iou = sum(iou for _, iou, _ in all_rois) / len(all_rois)
+            avg_sharpness = sum(sharp for sharp, _, _ in all_rois) / len(all_rois)
+            logger.debug(
+                f"[BagEvent:{self.id}] Returning {len(candidates)} candidates "
+                f"({len(self.open_rois)} open, {len(self.closed_rois)} closed) - "
+                f"avg_sharpness={avg_sharpness:.1f}, avg_IoU={avg_iou:.3f}"
+            )
+        else:
+            logger.debug(
+                f"[BagEvent:{self.id}] Returning {len(candidates)} candidates "
+                f"({len(self.open_rois)} open, {len(self.closed_rois)} closed)"
+            )
+        
         return candidates
 
     def get_stats(self) -> dict:
