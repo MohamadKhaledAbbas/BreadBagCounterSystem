@@ -83,50 +83,54 @@ class ClassifierService:
             best_unknown = max(results, key=lambda x: x['conf'])
             return best_unknown['roi'], "Unknown", best_unknown['conf']
 
-        # Sort by confidence and take top K
+        # Sort by confidence (highest first)
         valid_results.sort(key=lambda x: x['conf'], reverse=True)
-        top_k = valid_results[:self.voting_top_k]
 
-        # Voting: count label occurrences among top K
-        label_votes = Counter(r['label'] for r in top_k)
-        max_votes = label_votes.most_common(1)[0][1]
-        tied_labels = [label for label, count in label_votes.items() if count == max_votes]
+        # Confidence-weighted voting across all valid candidates
+        label_scores: Dict[str, float] = {}
+        label_counts = Counter()
+        for r in valid_results:
+            label_scores[r['label']] = label_scores.get(r['label'], 0.0) + r['conf']
+            label_counts[r['label']] += 1
 
-        if len(tied_labels) == 1:
-            winning_label = tied_labels[0]
-        else:
-            # Tiebreaker: highest average confidence
-            logger.debug(f"[ClassifierService] Tie detected between {tied_labels}")
-            label_confs = {}
-            for label in tied_labels:
-                confs = [r['conf'] for r in top_k if r['label'] == label]
-                label_confs[label] = sum(confs) / len(confs)
-            winning_label = max(label_confs, key=label_confs.get)
-            logger.debug(
-                f"[ClassifierService] Tiebreaker resolved: {winning_label} "
-                f"(avg_conf={label_confs[winning_label]:.3f})"
+        winning_label, winning_score = max(label_scores.items(), key=lambda x: x[1])
+        total_score = sum(label_scores.values())
+        normalized_score = winning_score / total_score if total_score > 0 else 0.0
+
+        # Margin against the second-best weighted score
+        second_score = max([score for label, score in label_scores.items() if label != winning_label], default=0.0)
+        margin = (winning_score - second_score) / total_score if total_score > 0 else 0.0
+
+        winning_results = [r for r in valid_results if r['label'] == winning_label]
+        best_result = max(winning_results, key=lambda x: x['conf'])
+        best_overall = valid_results[0]
+
+        accepted = (normalized_score >= 0.6) or (margin >= 0.15)
+        final_label = winning_label if accepted else "Unknown"
+        selected_roi = best_result['roi'] if accepted else best_overall['roi']
+        selected_conf = best_result['conf'] if accepted else best_overall['conf']
+
+        if not accepted:
+            logger.warning(
+                f"[ClassifierService] Weighted voting uncertain - winner={winning_label} "
+                f"(norm={normalized_score:.2f}, margin={margin:.2f}); marking as Unknown"
             )
 
-        vote_count = label_votes[winning_label]
-        
-        # Get the highest confidence ROI with the winning label
-        winning_results = [r for r in top_k if r['label'] == winning_label]
-        best_result = max(winning_results, key=lambda x: x['conf'])
-
-        # Calculate voting confidence (votes / total top_k)
-        voting_confidence = vote_count / len(top_k)
-
         logger.info(
-            f"[ClassifierService] Voting result: {winning_label} "
-            f"({vote_count}/{len(top_k)} votes, conf={best_result['conf']:.3f}, "
-            f"voting_conf={voting_confidence:.2f}, time={total_batch_time:.1f}ms)"
+            f"[ClassifierService] Weighted voting result: {final_label} "
+            f"(winner={winning_label}, best_conf={best_result['conf']:.3f}, "
+            f"norm={normalized_score:.2f}, margin={margin:.2f}, "
+            f"candidates={len(valid_results)}, time={total_batch_time:.1f}ms)"
         )
 
-        # Log vote distribution
-        vote_dist = ", ".join([f"{label}: {count}" for label, count in label_votes.items()])
-        logger.debug(f"[ClassifierService] Vote distribution: {vote_dist}")
+        # Log weighted distribution and counts for observability
+        weight_dist = ", ".join([
+            f"{label}: sum={label_scores[label]:.3f}, count={label_counts[label]}"
+            for label in label_scores
+        ])
+        logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
 
-        return best_result['roi'], winning_label, best_result['conf']
+        return selected_roi, final_label, selected_conf
 
     def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float]:
         """
