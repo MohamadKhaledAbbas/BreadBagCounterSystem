@@ -229,12 +229,12 @@ class BagCounterApp:
             
             # Save raw frame
             if not cv2.imwrite(raw_path, frame_raw):
-                logger.error(f"[Recording] Failed to save raw frame: {raw_path}")
+                logger.error(f"[Recording] Failed to save raw frame: {raw_path} (check disk space and permissions)")
                 return False
             
             # Save annotated frame
             if not cv2.imwrite(annotated_path, frame_annotated):
-                logger.error(f"[Recording] Failed to save annotated frame: {annotated_path}")
+                logger.error(f"[Recording] Failed to save annotated frame: {annotated_path} (check disk space and permissions)")
                 return False
             
             # Prepare metadata
