@@ -228,10 +228,14 @@ class BagCounterApp:
             json_path = os.path.join(self.recording_session_dir, f"{frame_id}.json")
             
             # Save raw frame
-            cv2.imwrite(raw_path, frame_raw)
+            if not cv2.imwrite(raw_path, frame_raw):
+                logger.error(f"[Recording] Failed to save raw frame: {raw_path}")
+                return False
             
             # Save annotated frame
-            cv2.imwrite(annotated_path, frame_annotated)
+            if not cv2.imwrite(annotated_path, frame_annotated):
+                logger.error(f"[Recording] Failed to save annotated frame: {annotated_path}")
+                return False
             
             # Prepare metadata
             metadata = {
@@ -360,104 +364,93 @@ class BagCounterApp:
                     classify_end = time.perf_counter()
                     classify_time = (classify_end - classify_start) * 1000  # Convert to ms
 
-                # --- 4. PUBLISHING LOGIC ---
-                publish_time = 0.0
+                # --- 4. ANNOTATION & VISUALIZATION (shared between publishing and recording) ---
                 annotated_frame = None
-
-                if self.is_publishing:
-                    publish_start = time.perf_counter()
-
+                visualization_time = 0.0
+                
+                # Check if we need to record this frame
+                should_record_frame = False
+                if self.is_recording:
+                    if self.last_recording_frame_time is None:
+                        should_record_frame = True
+                        self.last_recording_frame_time = time.perf_counter()
+                    else:
+                        time_since_last = time.perf_counter() - self.last_recording_frame_time
+                        if time_since_last >= self.recording_frame_interval:
+                            should_record_frame = True
+                            self.last_recording_frame_time = time.perf_counter()
+                
+                # Create annotated frame if needed for publishing or recording
+                if self.is_publishing or should_record_frame:
+                    viz_start = time.perf_counter()
+                    
                     annotated_frame = frame.copy()
-
-                    # Calculate total time so far for FPS display
+                    
+                    # Calculate FPS for display
                     frame_mid = time.perf_counter()
-                    mid_time = (frame_mid - frame_start) * 1000  # Convert to ms
+                    mid_time = (frame_mid - frame_start) * 1000
                     fps_display = 1000 / mid_time if mid_time > 0 else 0
-
+                    
                     self.visualizer.render_all(
                         annotated_frame,
-                        # raw detection dicts or tracked objects:
                         current_frame_detections,
-                        # event objects with .id, .state, .box
                         self.monitor.active_events,
                         counts=self.ui_counts,
                         fps=fps_display,
                     )
+                    
+                    viz_end = time.perf_counter()
+                    visualization_time = (viz_end - viz_start) * 1000
 
+                # --- 5. PUBLISHING LOGIC ---
+                publish_time = 0.0
+
+                if self.is_publishing and annotated_frame is not None:
+                    publish_start = time.perf_counter()
+                    
                     annotated_frame_resized = cv2.resize(annotated_frame, (1280, 720))
                     self.ipc_publisher.publish(annotated_frame_resized)
 
                     publish_end = time.perf_counter()
                     publish_time = (publish_end - publish_start) * 1000  # Convert to ms
 
-                # --- 5. RECORDING LOGIC (Frame-based) ---
+                # --- 6. RECORDING LOGIC (Frame-based) ---
                 record_time = 0.0
 
-                if self.is_recording:
+                if should_record_frame and annotated_frame is not None:
                     record_start = time.perf_counter()
-                    should_record_frame = False
                     
-                    # Rate limit recording to target FPS using elapsed time tracking
-                    if self.last_recording_frame_time is None:
-                        # Record first frame immediately
-                        should_record_frame = True
-                        self.last_recording_frame_time = record_start
-                    else:
-                        # Check if enough time has elapsed since last recorded frame
-                        time_since_last = record_start - self.last_recording_frame_time
-                        if time_since_last >= self.recording_frame_interval:
-                            should_record_frame = True
-                            # Update reference to current time to prevent cumulative drift
-                            self.last_recording_frame_time = record_start
+                    # Prepare detection data for JSON
+                    detections_data = []
+                    for det in current_frame_detections:
+                        class_name = self.detector.class_names.get(det["class_id"], "Unknown")
+                        detections_data.append({
+                            "class_id": int(det["class_id"]),
+                            "class_name": class_name,
+                            "confidence": float(det["conf"]),
+                            "bbox": [float(det["box"][0]), float(det["box"][1]), 
+                                    float(det["box"][2]), float(det["box"][3])],
+                        })
                     
-                    if should_record_frame:
-                        # Create annotated frame if not already created by publishing
-                        if annotated_frame is None:
-                            annotated_frame = frame.copy()
-                            # Calculate FPS for display
-                            frame_mid = time.perf_counter()
-                            mid_time = (frame_mid - frame_start) * 1000
-                            fps_display = 1000 / mid_time if mid_time > 0 else 0
-                            
-                            self.visualizer.render_all(
-                                annotated_frame,
-                                current_frame_detections,
-                                self.monitor.active_events,
-                                counts=self.ui_counts,
-                                fps=fps_display,
-                            )
-                        
-                        # Prepare detection data for JSON
-                        detections_data = []
-                        for det in current_frame_detections:
-                            class_name = self.detector.class_names.get(det["class_id"], "Unknown")
-                            detections_data.append({
-                                "class_id": int(det["class_id"]),
-                                "class_name": class_name,
-                                "confidence": float(det["conf"]),
-                                "bbox": [float(det["box"][0]), float(det["box"][1]), 
-                                        float(det["box"][2]), float(det["box"][3])],
-                            })
-                        
-                        # Prepare events data for JSON
-                        events_data = []
-                        for event in self.monitor.active_events:
-                            events_data.append({
-                                "id": event.id,
-                                "state": event.state,
-                                "bbox": [float(event.box[0]), float(event.box[1]), 
-                                        float(event.box[2]), float(event.box[3])],
-                            })
-                        
-                        # Save frame data
-                        self._save_frame_data(
-                            frame_raw=frame,
-                            frame_annotated=annotated_frame,
-                            detections_data=detections_data,
-                            events_data=events_data,
-                            frame_number=self.recording_frame_counter
-                        )
-                        self.recording_frame_counter += 1
+                    # Prepare events data for JSON
+                    events_data = []
+                    for event in self.monitor.active_events:
+                        events_data.append({
+                            "id": event.id,
+                            "state": event.state,
+                            "bbox": [float(event.box[0]), float(event.box[1]), 
+                                    float(event.box[2]), float(event.box[3])],
+                        })
+                    
+                    # Save frame data
+                    self._save_frame_data(
+                        frame_raw=frame,
+                        frame_annotated=annotated_frame,
+                        detections_data=detections_data,
+                        events_data=events_data,
+                        frame_number=self.recording_frame_counter
+                    )
+                    self.recording_frame_counter += 1
                     
                     record_end = time.perf_counter()
                     record_time = (record_end - record_start) * 1000  # Convert to ms
@@ -476,10 +469,12 @@ class BagCounterApp:
                     )
                     if classify_time > 0:
                         timing_msg += f" | Classify: {classify_time:.1f}ms"
-                    if record_time > 0:
-                        timing_msg += f" | Record: {record_time:.1f}ms"
+                    if visualization_time > 0:
+                        timing_msg += f" | Visualize: {visualization_time:.1f}ms"
                     if publish_time > 0:
                         timing_msg += f" | Publish: {publish_time:.1f}ms"
+                    if record_time > 0:
+                        timing_msg += f" | Record: {record_time:.1f}ms"
                     timing_msg += f" | FPS: {fps:.1f}"
 
                     logger.info(timing_msg)
