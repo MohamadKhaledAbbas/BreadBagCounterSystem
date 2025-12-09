@@ -7,6 +7,11 @@ from src.config.tracking_config import tracking_config
 
 
 class BagEvent:
+    # Quality score weights for ROI selection
+    SHARPNESS_WEIGHT = 0.6  # Weight for sharpness in quality score
+    IOU_WEIGHT = 0.4        # Weight for IoU in quality score
+    IOU_SCALE = 100.0       # Scale IoU to match sharpness magnitude
+    
     def __init__(self, box, frame_img, open_id, closed_id):
         self.id = int(uuid.uuid4().int >> 96)
         self.box = box
@@ -82,7 +87,8 @@ class BagEvent:
             self.open_rois.append((sharpness, iou_score, roi))
             # Sort by combined quality score: weight sharpness and IoU
             # Higher sharpness and higher IoU are both better
-            self.open_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
+            quality_score = lambda x: (x[0] * self.SHARPNESS_WEIGHT + x[1] * self.IOU_SCALE * self.IOU_WEIGHT)
+            self.open_rois.sort(key=quality_score, reverse=True)
             if len(self.open_rois) > self.max_open_samples:
                 self.open_rois = self.open_rois[:self.max_open_samples]
             logger.debug(
@@ -92,7 +98,8 @@ class BagEvent:
         else:
             self.closed_rois.append((sharpness, iou_score, roi))
             # Sort by combined quality score
-            self.closed_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
+            quality_score = lambda x: (x[0] * self.SHARPNESS_WEIGHT + x[1] * self.IOU_SCALE * self.IOU_WEIGHT)
+            self.closed_rois.sort(key=quality_score, reverse=True)
             if len(self.closed_rois) > self.max_closed_samples:
                 self.closed_rois = self.closed_rois[:self.max_closed_samples]
             logger.debug(
@@ -144,8 +151,8 @@ class BagEvent:
         all_rois = self.open_rois + self.closed_rois
 
         # Sort by combined quality score (sharpness + IoU-weighted)
-        # Weight: 60% sharpness, 40% IoU (scaled by 100 to match sharpness magnitude)
-        all_rois.sort(key=lambda x: (x[0] * 0.6 + x[1] * 100 * 0.4), reverse=True)
+        quality_score = lambda x: (x[0] * self.SHARPNESS_WEIGHT + x[1] * self.IOU_SCALE * self.IOU_WEIGHT)
+        all_rois.sort(key=quality_score, reverse=True)
 
         # Return just the images (not the quality scores)
         candidates = [roi for _, _, roi in all_rois]

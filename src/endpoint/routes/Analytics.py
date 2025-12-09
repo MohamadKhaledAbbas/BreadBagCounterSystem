@@ -40,6 +40,9 @@ def group_low_frequency_types(classifications: List[Dict], threshold: int = 10) 
     Returns:
         List of classifications with low-frequency types grouped as "Other"
     """
+    if not classifications:
+        return []
+    
     significant = []
     other_items = []
     
