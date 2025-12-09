@@ -363,3 +363,55 @@ class DatabaseManager:
             if row and row[0]:
                 return datetime.fromisoformat(row[0])
             return None
+
+    def get_low_confidence_events(self, start_time, end_time, limit: Optional[int] = None):
+        """
+        Get all low-confidence classification events within a time range.
+        Useful for reviewing and retraining.
+        """
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            
+            query = """
+                SELECT
+                    be.id,
+                    be.timestamp,
+                    be.confidence,
+                    be.decision_margin,
+                    be.is_low_confidence,
+                    be.track_id,
+                    bt.id as bag_type_id,
+                    bt.name AS class_name,
+                    bt.arabic_name,
+                    bt.image_path AS thumb,
+                    bt.weight
+                FROM bag_events be
+                JOIN bag_types bt ON be.bag_type_id = bt.id
+                WHERE be.timestamp BETWEEN ? AND ?
+                  AND be.is_low_confidence = 1
+                ORDER BY be.timestamp DESC
+            """
+            
+            params = [start_time, end_time]
+            
+            if limit:
+                query += " LIMIT ?"
+                params.append(limit)
+            
+            events = conn.execute(query, params).fetchall()
+            
+            return [
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "confidence": row["confidence"],
+                    "decision_margin": row["decision_margin"],
+                    "is_low_confidence": bool(row["is_low_confidence"]),
+                    "track_id": row["track_id"],
+                    "bag_type_id": row["bag_type_id"],
+                    "class_name": row["class_name"],
+                    "arabic_name": row["arabic_name"],
+                    "thumb": row["thumb"],
+                    "weight": (row["weight"] or 0) / 1000,
+                } for row in events
+            ]

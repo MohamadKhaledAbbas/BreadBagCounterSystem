@@ -199,6 +199,57 @@ async def analytics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/analytics/low-confidence")
+async def get_low_confidence_events(
+        start_time: Optional[str] = Query(None, description="Start Time (ISO Format)"),
+        end_time: Optional[str] = Query(None, description="End Time (ISO Format)"),
+        limit: Optional[int] = Query(100, description="Maximum number of events to return")
+):
+    """
+    Get low-confidence classification events for review and retraining.
+    Returns events where is_low_confidence flag is true.
+    """
+    if start_time is None or end_time is None:
+        # Default to last 24 hours
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(hours=24)
+    else:
+        start_dt = parse_datetime(start_time)
+        end_dt = parse_datetime(end_time)
+    
+    # Adjust for timezone
+    start_dt = start_dt - timedelta(hours=3)
+    end_dt = end_dt - timedelta(hours=3)
+    
+    try:
+        events = db.get_low_confidence_events(start_dt, end_dt, limit)
+        
+        # Fix image paths
+        for event in events:
+            if event.get("thumb"):
+                event["thumb"] = event["thumb"].replace("data/classes/", "known_classes/").replace(
+                    "data/unknown/", "unknown_classes/"
+                )
+        
+        logger.info(
+            f"[Analytics/LowConfidence] Retrieved {len(events)} low-confidence events "
+            f"between {start_dt} and {end_dt}"
+        )
+        
+        return {
+            "meta": {
+                "start": (start_dt + timedelta(hours=3)).isoformat(),
+                "end": (end_dt + timedelta(hours=3)).isoformat(),
+                "count": len(events),
+                "limit": limit
+            },
+            "events": events
+        }
+    except Exception as e:
+        logger.error(f"[Analytics/LowConfidence] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/analytics/daily", response_class=HTMLResponse)
 async def get_daily_analytics(
         request: Request
