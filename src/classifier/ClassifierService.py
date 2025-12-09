@@ -1,6 +1,8 @@
 import logging
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from collections import Counter, defaultdict
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
@@ -24,7 +26,9 @@ class ClassifierService:
                  use_voting: bool = True,
                  voting_top_k: Optional[int] = None,
                  voting_accept_norm_threshold: float = 0.6,
-                 voting_accept_margin: float = 0.15):
+                 voting_accept_margin: float = 0.15,
+                 async_classification: bool = True,
+                 max_workers: int = 2):
 
         self.classifier = classifier
         self.data_root = data_root
@@ -35,9 +39,22 @@ class ClassifierService:
         self.voting_top_k = voting_top_k
         self.voting_accept_norm_threshold = voting_accept_norm_threshold
         self.voting_accept_margin = voting_accept_margin
+        self.async_classification = async_classification
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
+
+        # Asynchronous classification thread pool
+        self.executor = None
+        self.pending_futures: Dict[int, Future] = {}
+        self.futures_lock = threading.Lock()
+        
+        if async_classification:
+            self.executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="ClassifierWorker"
+            )
+            logger.info(f"[ClassifierService] Async classification enabled with {max_workers} workers")
 
         candidate_cap = self._get_candidate_cap()
         candidate_cap_desc = 'all' if candidate_cap is None else candidate_cap
@@ -48,7 +65,8 @@ class ClassifierService:
             f"margin_threshold={voting_accept_margin}, "
             f"candidates_per_vote={candidate_cap_desc}, "
             f"low_conf_threshold={self.LOW_CONFIDENCE_THRESHOLD}, "
-            f"low_margin_threshold={self.LOW_MARGIN_THRESHOLD}"
+            f"low_margin_threshold={self.LOW_MARGIN_THRESHOLD}, "
+            f"async={async_classification}"
         )
 
     def _get_candidate_cap(self) -> Optional[int]:
@@ -221,8 +239,8 @@ class ClassifierService:
         else:
             return best_unknown_roi, "Unknown", best_unknown_conf, margin
 
-    def process(self, track_id: int, roi_input):
-        """Process classification request."""
+    def _process_sync(self, track_id: int, roi_input):
+        """Synchronous classification processing (internal method)."""
         try:
             # Handle list vs single image
             if isinstance(roi_input, list):
@@ -321,6 +339,70 @@ class ClassifierService:
                     logger.error(f"[ClassifierService] Callback error: {e}")
 
         except Exception as e:
-            logger.error(f"[ClassifierService] Process error: {e}")
+            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _on_classification_complete(self, track_id: int, future: Future):
+        """Callback when async classification completes."""
+        with self.futures_lock:
+            if track_id in self.pending_futures:
+                del self.pending_futures[track_id]
+        
+        try:
+            # Future will raise exception if task failed
+            future.result()
+            logger.debug(f"[ClassifierService] Async classification completed for track {track_id}")
+        except Exception as e:
+            logger.error(f"[ClassifierService] Async classification failed for track {track_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def process(self, track_id: int, roi_input):
+        """
+        Process classification request.
+        If async_classification is enabled, submits to thread pool.
+        Otherwise, processes synchronously.
+        """
+        if self.async_classification and self.executor is not None:
+            logger.debug(f"[ClassifierService] Enqueueing track {track_id} for async classification")
+            
+            # Submit to thread pool
+            future = self.executor.submit(self._process_sync, track_id, roi_input)
+            
+            # Track pending futures
+            with self.futures_lock:
+                self.pending_futures[track_id] = future
+            
+            # Add completion callback
+            future.add_done_callback(lambda f: self._on_classification_complete(track_id, f))
+            
+            logger.info(
+                f"[ClassifierService] Track {track_id} submitted for async classification "
+                f"(pending tasks: {len(self.pending_futures)})"
+            )
+        else:
+            # Synchronous processing
+            logger.debug(f"[ClassifierService] Processing track {track_id} synchronously")
+            self._process_sync(track_id, roi_input)
+
+    def shutdown(self, wait: bool = True):
+        """Shutdown the classification service and wait for pending tasks."""
+        self.running = False
+        
+        if self.executor is not None:
+            with self.futures_lock:
+                pending_count = len(self.pending_futures)
+            
+            if pending_count > 0:
+                logger.info(
+                    f"[ClassifierService] Shutting down with {pending_count} pending classifications..."
+                )
+            
+            self.executor.shutdown(wait=wait)
+            logger.info("[ClassifierService] Executor shutdown complete")
+
+    def get_pending_count(self) -> int:
+        """Get the number of pending classification tasks."""
+        with self.futures_lock:
+            return len(self.pending_futures)

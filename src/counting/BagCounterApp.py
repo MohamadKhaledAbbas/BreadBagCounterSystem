@@ -637,6 +637,10 @@ class BagCounterApp:
             self.config_watcher.stop()
             logger.debug("[BagCounterApp] Config watcher stopped")
 
+            # Shutdown classifier service
+            self.classifier_service.shutdown(wait=True)
+            logger.debug("[BagCounterApp] Classifier service shutdown")
+
             # --- ROS 2 CLEANUP ---
             if IS_RDK and self.ros_executor is not None:
                 self.ros_executor.remove_node(self.ipc_publisher)
