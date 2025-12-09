@@ -1,6 +1,5 @@
 import os
 import time
-from collections import Counter
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
 from src.classifier.BaseClassifier import BaseClassifier
@@ -17,7 +16,9 @@ class ClassifierService:
                  save_all_rois: bool = False,
                  min_confidence_threshold: float = 0.3,
                  use_voting: bool = True,
-                 voting_top_k: int = 5):
+                 voting_top_k: Optional[int] = None,
+                 weighted_score_threshold: float = 0.55,
+                 weighted_margin_threshold: float = 0.10):
 
         self.classifier = classifier
         self.data_root = data_root
@@ -25,12 +26,17 @@ class ClassifierService:
         self.min_confidence_threshold = min_confidence_threshold
         self.use_voting = use_voting
         self.voting_top_k = voting_top_k
+        self.weighted_score_threshold = weighted_score_threshold
+        self.weighted_margin_threshold = weighted_margin_threshold
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
 
         logger.info(
-            f"[ClassifierService] Initialized: voting={use_voting}, top_k={voting_top_k}"
+            f"[ClassifierService] Initialized: voting={use_voting}, "
+            f"weighted_top_k={voting_top_k or 'all'}, "
+            f"norm_thresh={self.weighted_score_threshold}, "
+            f"margin_thresh={self.weighted_margin_threshold}"
         )
 
     def register_callback(self, callback: ResultCallback):
@@ -83,48 +89,69 @@ class ClassifierService:
             best_unknown = max(results, key=lambda x: x['conf'])
             return best_unknown['roi'], "Unknown", best_unknown['conf']
 
-        # Sort by confidence and take top K
+        # Sort by confidence (descending) and optionally cap candidates
         valid_results.sort(key=lambda x: x['conf'], reverse=True)
-        top_k = valid_results[:self.voting_top_k]
-
-        # Voting: count label occurrences among top K
-        label_votes = Counter(r['label'] for r in top_k)
-        max_votes = label_votes.most_common(1)[0][1]
-        tied_labels = [label for label, count in label_votes.items() if count == max_votes]
-
-        if len(tied_labels) == 1:
-            winning_label = tied_labels[0]
+        if self.voting_top_k is not None and self.voting_top_k > 0:
+            selected_results = valid_results[:self.voting_top_k]
+            logger.debug(f"[ClassifierService] Applying top_k cap: {self.voting_top_k}")
         else:
-            # Tiebreaker: highest average confidence
-            logger.debug(f"[ClassifierService] Tie detected between {tied_labels}")
-            label_confs = {}
-            for label in tied_labels:
-                confs = [r['conf'] for r in top_k if r['label'] == label]
-                label_confs[label] = sum(confs) / len(confs)
-            winning_label = max(label_confs, key=label_confs.get)
-            logger.debug(
-                f"[ClassifierService] Tiebreaker resolved: {winning_label} "
-                f"(avg_conf={label_confs[winning_label]:.3f})"
-            )
+            selected_results = valid_results
 
-        vote_count = label_votes[winning_label]
-        
-        # Get the highest confidence ROI with the winning label
-        winning_results = [r for r in top_k if r['label'] == winning_label]
-        best_result = max(winning_results, key=lambda x: x['conf'])
+        label_conf_sums: Dict[str, float] = {}
+        label_counts: Dict[str, int] = {}
+        label_max_conf: Dict[str, float] = {}
 
-        # Calculate voting confidence (votes / total top_k)
-        voting_confidence = vote_count / len(top_k)
+        for r in selected_results:
+            label = r['label']
+            label_conf_sums[label] = label_conf_sums.get(label, 0.0) + r['conf']
+            label_counts[label] = label_counts.get(label, 0) + 1
+            label_max_conf[label] = max(label_max_conf.get(label, 0.0), r['conf'])
 
-        logger.info(
-            f"[ClassifierService] Voting result: {winning_label} "
-            f"({vote_count}/{len(top_k)} votes, conf={best_result['conf']:.3f}, "
-            f"voting_conf={voting_confidence:.2f}, time={total_batch_time:.1f}ms)"
+        total_conf_sum = sum(label_conf_sums.values())
+        if total_conf_sum <= 0:
+            logger.warning("[ClassifierService] No positive confidences, falling back to max confidence candidate.")
+            best_result = max(selected_results, key=lambda x: x['conf'])
+            return best_result['roi'], "Unknown", max(best_result['conf'], 0.0)
+
+        winning_label = max(label_conf_sums, key=label_conf_sums.get)
+        winning_sum = label_conf_sums[winning_label]
+        runner_up_sum = max(
+            (v for k, v in label_conf_sums.items() if k != winning_label),
+            default=0.0
         )
 
-        # Log vote distribution
-        vote_dist = ", ".join([f"{label}: {count}" for label, count in label_votes.items()])
-        logger.debug(f"[ClassifierService] Vote distribution: {vote_dist}")
+        normalized_score = winning_sum / total_conf_sum
+        runner_up_normalized = runner_up_sum / total_conf_sum
+        margin = normalized_score - runner_up_normalized
+
+        winning_results = [r for r in selected_results if r['label'] == winning_label]
+        best_result = max(winning_results, key=lambda x: x['conf'])
+
+        breakdown = ", ".join(
+            [
+                f"{label}: sum={label_conf_sums[label]:.3f}, "
+                f"max={label_max_conf[label]:.3f}, count={label_counts[label]}"
+                for label in label_conf_sums
+            ]
+        )
+
+        logger.info(
+            f"[ClassifierService] Weighted vote: {winning_label} "
+            f"(norm={normalized_score:.3f}, margin={margin:.3f}, "
+            f"best_conf={best_result['conf']:.3f}, "
+            f"selected={len(selected_results)}/{len(valid_results)}, "
+            f"total_time={total_batch_time:.1f}ms)"
+        )
+        logger.debug(f"[ClassifierService] Score breakdown: {breakdown}")
+
+        if normalized_score < self.weighted_score_threshold and margin < self.weighted_margin_threshold:
+            fallback = max(selected_results, key=lambda x: x['conf'])
+            logger.warning(
+                f"[ClassifierService] Winner below thresholds "
+                f"(norm={normalized_score:.3f}, margin={margin:.3f}); "
+                f"marking as Unknown."
+            )
+            return fallback['roi'], "Unknown", fallback['conf']
 
         return best_result['roi'], winning_label, best_result['conf']
 
