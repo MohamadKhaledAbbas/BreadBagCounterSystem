@@ -347,3 +347,19 @@ class DatabaseManager:
             logger.error(f"[DatabaseManager] get_config_value error: {e}")
 
         return None
+
+    def get_last_event_time_before(self, cutoff_time: datetime) -> Optional[datetime]:
+        """
+        Get the timestamp of the last event on or before the specified cutoff time.
+        Returns None if no events exist before the cutoff.
+        """
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT MAX(timestamp) FROM bag_events
+                WHERE timestamp <= ?
+            """, (cutoff_time,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return datetime.fromisoformat(row[0])
+            return None
