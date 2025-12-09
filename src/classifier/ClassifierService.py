@@ -12,6 +12,10 @@ ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
 class ClassifierService:
+    # Low confidence thresholds
+    LOW_CONFIDENCE_THRESHOLD = 0.5  # Confidence below this is considered low
+    LOW_MARGIN_THRESHOLD = 0.2      # Decision margin below this is considered ambiguous
+    
     def __init__(self,
                  classifier: BaseClassifier,
                  data_root: str = "data",
@@ -42,7 +46,9 @@ class ClassifierService:
             f"[ClassifierService] Initialized: voting={use_voting}, "
             f"weighted_conf_threshold={voting_accept_norm_threshold}, "
             f"margin_threshold={voting_accept_margin}, "
-            f"candidates_per_vote={candidate_cap_desc}"
+            f"candidates_per_vote={candidate_cap_desc}, "
+            f"low_conf_threshold={self.LOW_CONFIDENCE_THRESHOLD}, "
+            f"low_margin_threshold={self.LOW_MARGIN_THRESHOLD}"
         )
 
     def _get_candidate_cap(self) -> Optional[int]:
@@ -86,10 +92,10 @@ class ClassifierService:
             logger.error(f"[ClassifierService] Classification error: {e}")
             return "Unknown", 0.0
 
-    def _select_best_with_voting(self, candidates: List) -> Tuple[Optional[Any], str, float]:
+    def _select_best_with_voting(self, candidates: List) -> Tuple[Optional[Any], str, float, float]:
         """
         Classify all candidates and use voting to select the best label.
-        Returns: (best_roi, winning_label, confidence)
+        Returns: (best_roi, winning_label, confidence, decision_margin)
         """
         if not candidates:
             return None, "Unknown", 0.0
@@ -115,10 +121,10 @@ class ClassifierService:
         valid_results = [r for r in results if r['label'] != "Unknown"]
 
         if not valid_results:
-            # All unknown - return best unknown
+            # All unknown - return best unknown with 0 margin (ambiguous)
             logger.warning("[ClassifierService] All candidates Unknown!")
             best_unknown = max(results, key=lambda x: x['conf'])
-            return best_unknown['roi'], "Unknown", best_unknown['conf']
+            return best_unknown['roi'], "Unknown", best_unknown['conf'], 0.0
 
         # Sort by confidence (highest first) and optionally limit candidates for voting
         valid_results.sort(key=lambda x: x['conf'], reverse=True)
@@ -176,14 +182,16 @@ class ClassifierService:
             ])
             logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
 
-        return selected_roi, final_label, selected_conf
+        return selected_roi, final_label, selected_conf, margin
 
-    def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float]:
+    def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float, float]:
         """
         Select the single best candidate by confidence (no voting).
+        Returns: (best_roi, label, confidence, margin)
+        For single-candidate selection, margin is always 0 (no comparison possible).
         """
         if not candidates:
-            return None, "Unknown", 0.0
+            return None, "Unknown", 0.0, 0.0
 
         best_roi = None
         best_label = "Unknown"
@@ -204,11 +212,14 @@ class ClassifierService:
                     best_label = label
                     best_confidence = conf
 
+        # For single-candidate selection, no meaningful margin (no second choice to compare)
+        margin = 0.0
+        
         if best_roi is not None:
             logger.info(f"[ClassifierService] Best: {best_label} (conf={best_confidence:.3f})")
-            return best_roi, best_label, best_confidence
+            return best_roi, best_label, best_confidence, margin
         else:
-            return best_unknown_roi, "Unknown", best_unknown_conf
+            return best_unknown_roi, "Unknown", best_unknown_conf, margin
 
     def process(self, track_id: int, roi_input):
         """Process classification request."""
@@ -227,18 +238,29 @@ class ClassifierService:
 
             # Select best candidate (with or without voting)
             if self.use_voting and len(candidates) >= 3:
-                best_roi, label, conf = self._select_best_with_voting(candidates)
+                best_roi, label, conf, margin = self._select_best_with_voting(candidates)
             else:
-                best_roi, label, conf = self._select_best_by_confidence(candidates)
+                best_roi, label, conf, margin = self._select_best_by_confidence(candidates)
 
             if best_roi is None:
                 logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
                 return
 
+            # Determine if this is a low confidence classification
+            is_low_confidence = (
+                conf < self.LOW_CONFIDENCE_THRESHOLD or 
+                margin < self.LOW_MARGIN_THRESHOLD
+            )
+            
             # Low confidence warning
-            if conf < self.min_confidence_threshold:
+            if is_low_confidence:
                 logger.warning(
-                    f"[ClassifierService] Track {track_id}: Low confidence "
+                    f"[ClassifierService] Track {track_id}: Low confidence classification - "
+                    f"{label} (conf={conf:.3f}, margin={margin:.3f})"
+                )
+            elif conf < self.min_confidence_threshold:
+                logger.warning(
+                    f"[ClassifierService] Track {track_id}: Below minimum threshold "
                     f"{label} ({conf:.3f} < {self.min_confidence_threshold})"
                 )
 
@@ -280,12 +302,15 @@ class ClassifierService:
                 "phash": phash_str,
                 "image_path": image_path,
                 "confidence": conf,
+                "is_low_confidence": is_low_confidence,
+                "decision_margin": margin,
                 "candidates_evaluated": len(candidates)
             }
 
             logger.info(
                 f"[ClassifierService] Track {track_id} DONE: {label} "
-                f"(conf={conf:.3f}, candidates={len(candidates)})"
+                f"(conf={conf:.3f}, margin={margin:.3f}, low_conf={is_low_confidence}, "
+                f"candidates={len(candidates)})"
             )
 
             # Callbacks

@@ -260,10 +260,13 @@ class BagCounterApp:
         image_path = data["image_path"]
         conf = data.get("confidence", 1.0)
         candidates_count = data.get("candidates_evaluated", 1)
+        is_low_confidence = data.get("is_low_confidence", False)
+        decision_margin = data.get("decision_margin", None)
 
         logger.info(
             f"[BagCounterApp] Classification result: track={track_id}, "
-            f"label={label}, conf={conf:.3f}"
+            f"label={label}, conf={conf:.3f}, low_conf={is_low_confidence}, "
+            f"margin={decision_margin:.3f if decision_margin is not None else 'N/A'}"
         )
         logger.debug(
             f"[BagCounterApp] Result details: phash={phash}, "
@@ -271,7 +274,7 @@ class BagCounterApp:
         )
 
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
-        self.db.log_event(bag_type_id, track_id, conf)
+        self.db.log_event(bag_type_id, track_id, conf, is_low_confidence, decision_margin)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
         logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")

@@ -64,6 +64,8 @@ class DatabaseManager:
                     bag_type_id INTEGER,
                     track_id INTEGER,
                     confidence FLOAT,
+                    is_low_confidence BOOLEAN DEFAULT 0,
+                    decision_margin FLOAT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(bag_type_id) REFERENCES bag_types(id)
                 )
@@ -81,6 +83,19 @@ class DatabaseManager:
                     "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
                     (config_key, '0')
                 )
+
+            # Migration: Add low_confidence tracking columns if they don't exist
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(bag_events)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'is_low_confidence' not in columns:
+                logger.info("[DatabaseManager] Migrating: Adding is_low_confidence column")
+                conn.execute("ALTER TABLE bag_events ADD COLUMN is_low_confidence BOOLEAN DEFAULT 0")
+            
+            if 'decision_margin' not in columns:
+                logger.info("[DatabaseManager] Migrating: Adding decision_margin column")
+                conn.execute("ALTER TABLE bag_events ADD COLUMN decision_margin FLOAT")
 
     def get_or_create_bag_type(self, label: str, phash_obj, image_path: str = None) -> int:
         """
@@ -141,12 +156,13 @@ class DatabaseManager:
 
             return cursor.lastrowid
 
-    def log_event(self, bag_type_id: int, track_id: int, confidence: float = 1.0):
+    def log_event(self, bag_type_id: int, track_id: int, confidence: float = 1.0,
+                  is_low_confidence: bool = False, decision_margin: Optional[float] = None):
         with self.get_connection() as conn:
             conn.execute("""
-                INSERT INTO bag_events (bag_type_id, track_id, confidence)
-                VALUES (?, ?, ?)
-            """, (bag_type_id, track_id, confidence))
+                INSERT INTO bag_events (bag_type_id, track_id, confidence, is_low_confidence, decision_margin)
+                VALUES (?, ?, ?, ?, ?)
+            """, (bag_type_id, track_id, confidence, is_low_confidence, decision_margin))
 
     def get_aggregated_stats(self, start_time, end_time):
         with self.get_connection() as conn:
@@ -214,6 +230,9 @@ class DatabaseManager:
                 SELECT
                     be.id,
                     be.timestamp,
+                    be.confidence,
+                    be.is_low_confidence,
+                    be.decision_margin,
                     bt.id as bag_type_id,
                     bt.name AS class_name,
                     bt.arabic_name,
@@ -230,6 +249,9 @@ class DatabaseManager:
                 {
                     "id": row["id"],
                     "timestamp": row["timestamp"],
+                    "confidence": row["confidence"],
+                    "is_low_confidence": bool(row["is_low_confidence"]),
+                    "decision_margin": row["decision_margin"],
                     "bag_type_id": row["bag_type_id"],
                     "class_name": row["class_name"],
                     "arabic_name": row["arabic_name"],
@@ -268,6 +290,9 @@ class DatabaseManager:
                 SELECT
                     be.id,
                     be.timestamp,
+                    be.confidence,
+                    be.is_low_confidence,
+                    be.decision_margin,
                     bt.id as bag_type_id,
                     bt.weight,
                     1 as count
@@ -286,6 +311,9 @@ class DatabaseManager:
                 events_by_type[bag_type_id].append({
                     "id": event["id"],
                     "timestamp": event["timestamp"],
+                    "confidence": event["confidence"],
+                    "is_low_confidence": bool(event["is_low_confidence"]),
+                    "decision_margin": event["decision_margin"],
                     "weight": (event["weight"] or 0) / 1000,
                     "count": event["count"]
                 })
