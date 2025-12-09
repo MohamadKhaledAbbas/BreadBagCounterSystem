@@ -1,6 +1,8 @@
 import logging
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from collections import Counter, defaultdict
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
@@ -12,6 +14,10 @@ ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
 class ClassifierService:
+    # Low confidence thresholds
+    LOW_CONFIDENCE_THRESHOLD = 0.5  # Confidence below this is considered low
+    LOW_MARGIN_THRESHOLD = 0.2      # Decision margin below this is considered ambiguous
+    
     def __init__(self,
                  classifier: BaseClassifier,
                  data_root: str = "data",
@@ -20,7 +26,9 @@ class ClassifierService:
                  use_voting: bool = True,
                  voting_top_k: Optional[int] = None,
                  voting_accept_norm_threshold: float = 0.6,
-                 voting_accept_margin: float = 0.15):
+                 voting_accept_margin: float = 0.15,
+                 async_classification: bool = True,
+                 max_workers: int = 2):
 
         self.classifier = classifier
         self.data_root = data_root
@@ -31,9 +39,22 @@ class ClassifierService:
         self.voting_top_k = voting_top_k
         self.voting_accept_norm_threshold = voting_accept_norm_threshold
         self.voting_accept_margin = voting_accept_margin
+        self.async_classification = async_classification
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
+
+        # Asynchronous classification thread pool
+        self.executor = None
+        self.pending_futures: Dict[int, Future] = {}
+        self.futures_lock = threading.Lock()
+        
+        if async_classification:
+            self.executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="ClassifierWorker"
+            )
+            logger.info(f"[ClassifierService] Async classification enabled with {max_workers} workers")
 
         candidate_cap = self._get_candidate_cap()
         candidate_cap_desc = 'all' if candidate_cap is None else candidate_cap
@@ -42,7 +63,10 @@ class ClassifierService:
             f"[ClassifierService] Initialized: voting={use_voting}, "
             f"weighted_conf_threshold={voting_accept_norm_threshold}, "
             f"margin_threshold={voting_accept_margin}, "
-            f"candidates_per_vote={candidate_cap_desc}"
+            f"candidates_per_vote={candidate_cap_desc}, "
+            f"low_conf_threshold={self.LOW_CONFIDENCE_THRESHOLD}, "
+            f"low_margin_threshold={self.LOW_MARGIN_THRESHOLD}, "
+            f"async={async_classification}"
         )
 
     def _get_candidate_cap(self) -> Optional[int]:
@@ -86,10 +110,10 @@ class ClassifierService:
             logger.error(f"[ClassifierService] Classification error: {e}")
             return "Unknown", 0.0
 
-    def _select_best_with_voting(self, candidates: List) -> Tuple[Optional[Any], str, float]:
+    def _select_best_with_voting(self, candidates: List) -> Tuple[Optional[Any], str, float, float]:
         """
         Classify all candidates and use voting to select the best label.
-        Returns: (best_roi, winning_label, confidence)
+        Returns: (best_roi, winning_label, confidence, decision_margin)
         """
         if not candidates:
             return None, "Unknown", 0.0
@@ -115,10 +139,10 @@ class ClassifierService:
         valid_results = [r for r in results if r['label'] != "Unknown"]
 
         if not valid_results:
-            # All unknown - return best unknown
+            # All unknown - return best unknown with 0 margin (ambiguous)
             logger.warning("[ClassifierService] All candidates Unknown!")
             best_unknown = max(results, key=lambda x: x['conf'])
-            return best_unknown['roi'], "Unknown", best_unknown['conf']
+            return best_unknown['roi'], "Unknown", best_unknown['conf'], 0.0
 
         # Sort by confidence (highest first) and optionally limit candidates for voting
         valid_results.sort(key=lambda x: x['conf'], reverse=True)
@@ -176,14 +200,16 @@ class ClassifierService:
             ])
             logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
 
-        return selected_roi, final_label, selected_conf
+        return selected_roi, final_label, selected_conf, margin
 
-    def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float]:
+    def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float, float]:
         """
         Select the single best candidate by confidence (no voting).
+        Returns: (best_roi, label, confidence, margin)
+        For single-candidate selection, margin is always 0 (no comparison possible).
         """
         if not candidates:
-            return None, "Unknown", 0.0
+            return None, "Unknown", 0.0, 0.0
 
         best_roi = None
         best_label = "Unknown"
@@ -204,14 +230,17 @@ class ClassifierService:
                     best_label = label
                     best_confidence = conf
 
+        # For single-candidate selection, no meaningful margin (no second choice to compare)
+        margin = 0.0
+        
         if best_roi is not None:
             logger.info(f"[ClassifierService] Best: {best_label} (conf={best_confidence:.3f})")
-            return best_roi, best_label, best_confidence
+            return best_roi, best_label, best_confidence, margin
         else:
-            return best_unknown_roi, "Unknown", best_unknown_conf
+            return best_unknown_roi, "Unknown", best_unknown_conf, margin
 
-    def process(self, track_id: int, roi_input):
-        """Process classification request."""
+    def _process_sync(self, track_id: int, roi_input):
+        """Synchronous classification processing (internal method)."""
         try:
             # Handle list vs single image
             if isinstance(roi_input, list):
@@ -227,18 +256,29 @@ class ClassifierService:
 
             # Select best candidate (with or without voting)
             if self.use_voting and len(candidates) >= 3:
-                best_roi, label, conf = self._select_best_with_voting(candidates)
+                best_roi, label, conf, margin = self._select_best_with_voting(candidates)
             else:
-                best_roi, label, conf = self._select_best_by_confidence(candidates)
+                best_roi, label, conf, margin = self._select_best_by_confidence(candidates)
 
             if best_roi is None:
                 logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
                 return
 
+            # Determine if this is a low confidence classification
+            is_low_confidence = (
+                conf < self.LOW_CONFIDENCE_THRESHOLD or 
+                margin < self.LOW_MARGIN_THRESHOLD
+            )
+            
             # Low confidence warning
-            if conf < self.min_confidence_threshold:
+            if is_low_confidence:
                 logger.warning(
-                    f"[ClassifierService] Track {track_id}: Low confidence "
+                    f"[ClassifierService] Track {track_id}: Low confidence classification - "
+                    f"{label} (conf={conf:.3f}, margin={margin:.3f})"
+                )
+            elif conf < self.min_confidence_threshold:
+                logger.warning(
+                    f"[ClassifierService] Track {track_id}: Below minimum threshold "
                     f"{label} ({conf:.3f} < {self.min_confidence_threshold})"
                 )
 
@@ -280,12 +320,15 @@ class ClassifierService:
                 "phash": phash_str,
                 "image_path": image_path,
                 "confidence": conf,
+                "is_low_confidence": is_low_confidence,
+                "decision_margin": margin,
                 "candidates_evaluated": len(candidates)
             }
 
             logger.info(
                 f"[ClassifierService] Track {track_id} DONE: {label} "
-                f"(conf={conf:.3f}, candidates={len(candidates)})"
+                f"(conf={conf:.3f}, margin={margin:.3f}, low_conf={is_low_confidence}, "
+                f"candidates={len(candidates)})"
             )
 
             # Callbacks
@@ -296,6 +339,70 @@ class ClassifierService:
                     logger.error(f"[ClassifierService] Callback error: {e}")
 
         except Exception as e:
-            logger.error(f"[ClassifierService] Process error: {e}")
+            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _on_classification_complete(self, track_id: int, future: Future):
+        """Callback when async classification completes."""
+        with self.futures_lock:
+            if track_id in self.pending_futures:
+                del self.pending_futures[track_id]
+        
+        try:
+            # Future will raise exception if task failed
+            future.result()
+            logger.debug(f"[ClassifierService] Async classification completed for track {track_id}")
+        except Exception as e:
+            logger.error(f"[ClassifierService] Async classification failed for track {track_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def process(self, track_id: int, roi_input):
+        """
+        Process classification request.
+        If async_classification is enabled, submits to thread pool.
+        Otherwise, processes synchronously.
+        """
+        if self.async_classification and self.executor is not None:
+            logger.debug(f"[ClassifierService] Enqueueing track {track_id} for async classification")
+            
+            # Submit to thread pool
+            future = self.executor.submit(self._process_sync, track_id, roi_input)
+            
+            # Track pending futures
+            with self.futures_lock:
+                self.pending_futures[track_id] = future
+            
+            # Add completion callback
+            future.add_done_callback(lambda f: self._on_classification_complete(track_id, f))
+            
+            logger.info(
+                f"[ClassifierService] Track {track_id} submitted for async classification "
+                f"(pending tasks: {len(self.pending_futures)})"
+            )
+        else:
+            # Synchronous processing
+            logger.debug(f"[ClassifierService] Processing track {track_id} synchronously")
+            self._process_sync(track_id, roi_input)
+
+    def shutdown(self, wait: bool = True):
+        """Shutdown the classification service and wait for pending tasks."""
+        self.running = False
+        
+        if self.executor is not None:
+            with self.futures_lock:
+                pending_count = len(self.pending_futures)
+            
+            if pending_count > 0:
+                logger.info(
+                    f"[ClassifierService] Shutting down with {pending_count} pending classifications..."
+                )
+            
+            self.executor.shutdown(wait=wait)
+            logger.info("[ClassifierService] Executor shutdown complete")
+
+    def get_pending_count(self) -> int:
+        """Get the number of pending classification tasks."""
+        with self.futures_lock:
+            return len(self.pending_futures)
