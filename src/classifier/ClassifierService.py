@@ -1,6 +1,7 @@
+import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
 from src.classifier.BaseClassifier import BaseClassifier
@@ -17,21 +18,57 @@ class ClassifierService:
                  save_all_rois: bool = False,
                  min_confidence_threshold: float = 0.3,
                  use_voting: bool = True,
-                 voting_top_k: int = 5):
+                 voting_top_k: Optional[int] = None,
+                 voting_accept_norm_threshold: float = 0.6,
+                 voting_accept_margin: float = 0.15):
 
         self.classifier = classifier
         self.data_root = data_root
         self.save_all_rois = save_all_rois
         self.min_confidence_threshold = min_confidence_threshold
         self.use_voting = use_voting
+        # Default None processes all candidates; set a positive value to restore legacy top-k behavior.
         self.voting_top_k = voting_top_k
+        self.voting_accept_norm_threshold = voting_accept_norm_threshold
+        self.voting_accept_margin = voting_accept_margin
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
 
+        candidate_cap = self._get_candidate_cap()
+        candidate_cap_desc = 'all' if candidate_cap is None else candidate_cap
+
         logger.info(
-            f"[ClassifierService] Initialized: voting={use_voting}, top_k={voting_top_k}"
+            f"[ClassifierService] Initialized: voting={use_voting}, "
+            f"weighted_conf_threshold={voting_accept_norm_threshold}, "
+            f"margin_threshold={voting_accept_margin}, "
+            f"candidates_per_vote={candidate_cap_desc}"
         )
+
+    def _get_candidate_cap(self) -> Optional[int]:
+        """
+        Optional cap on number of candidates to include in weighted voting based on `voting_top_k`.
+        None or any non-positive value means use all candidates (legacy compatibility and new default).
+        Centralizes the limit handling so call sites don't duplicate the same checks.
+        """
+        if self.voting_top_k is None or self.voting_top_k <= 0:
+            return None
+        return self.voting_top_k
+
+    def _calculate_margin(self, label_scores: Dict[str, float], winning_label: str, winning_score: float,
+                          total_score: float) -> float:
+        tie_epsilon = 1e-9
+        winning_labels = [label for label, score in label_scores.items() if abs(score - winning_score) < tie_epsilon]
+        if len(label_scores) == 1:
+            return 1.0
+        if len(winning_labels) > 1:
+            return 0.0
+
+        second_score = max(
+            (score for label, score in label_scores.items() if label != winning_label),
+            default=0.0
+        )
+        return (winning_score - second_score) / total_score if total_score > 0 else 0.0
 
     def register_callback(self, callback: ResultCallback):
         self.callbacks.append(callback)
@@ -83,14 +120,16 @@ class ClassifierService:
             best_unknown = max(results, key=lambda x: x['conf'])
             return best_unknown['roi'], "Unknown", best_unknown['conf']
 
-        # Sort by confidence (highest first)
+        # Sort by confidence (highest first) and optionally limit candidates for voting
         valid_results.sort(key=lambda x: x['conf'], reverse=True)
+        candidate_cap = self._get_candidate_cap()
+        candidates_for_vote = valid_results if candidate_cap is None else valid_results[:candidate_cap]
 
-        # Confidence-weighted voting across all valid candidates
-        label_scores: Dict[str, float] = {}
+        # Confidence-weighted voting across chosen candidates
+        label_scores: Dict[str, float] = defaultdict(float)
         label_counts = Counter()
-        for r in valid_results:
-            label_scores[r['label']] = label_scores.get(r['label'], 0.0) + r['conf']
+        for r in candidates_for_vote:
+            label_scores[r['label']] += r['conf']
             label_counts[r['label']] += 1
 
         winning_label, winning_score = max(label_scores.items(), key=lambda x: x[1])
@@ -98,37 +137,44 @@ class ClassifierService:
         normalized_score = winning_score / total_score if total_score > 0 else 0.0
 
         # Margin against the second-best weighted score
-        second_score = max([score for label, score in label_scores.items() if label != winning_label], default=0.0)
-        margin = (winning_score - second_score) / total_score if total_score > 0 else 0.0
+        margin = self._calculate_margin(label_scores, winning_label, winning_score, total_score)
 
-        winning_results = [r for r in valid_results if r['label'] == winning_label]
+        winning_results = [r for r in candidates_for_vote if r['label'] == winning_label]
         best_result = max(winning_results, key=lambda x: x['conf'])
-        best_overall = valid_results[0]
+        best_overall = candidates_for_vote[0]
 
-        accepted = (normalized_score >= 0.6) or (margin >= 0.15)
+        # OR condition is intentional: a decisive margin between classes should pass even if the normalized
+        # score (share of total confidence) is moderate, while strong absolute confidence also passes without
+        # needing a large margin. Typical defaults: normalized >= 0.6 or margin >= 0.15.
+        accepted = (normalized_score >= self.voting_accept_norm_threshold) or (margin >= self.voting_accept_margin)
         final_label = winning_label if accepted else "Unknown"
-        selected_roi = best_result['roi'] if accepted else best_overall['roi']
-        selected_conf = best_result['conf'] if accepted else best_overall['conf']
+        selected_result = best_result if accepted else best_overall
+        selected_roi = selected_result['roi']
+        selected_conf = selected_result['conf']
 
         if not accepted:
             logger.warning(
                 f"[ClassifierService] Weighted voting uncertain - winner={winning_label} "
-                f"(norm={normalized_score:.2f}, margin={margin:.2f}); marking as Unknown"
+                f"(norm={normalized_score:.2f}, margin={margin:.2f}); marking as Unknown "
+                f"using thresholds (norm>={self.voting_accept_norm_threshold}, margin>={self.voting_accept_margin})"
             )
 
         logger.info(
             f"[ClassifierService] Weighted voting result: {final_label} "
             f"(winner={winning_label}, best_conf={best_result['conf']:.3f}, "
             f"norm={normalized_score:.2f}, margin={margin:.2f}, "
-            f"candidates={len(valid_results)}, time={total_batch_time:.1f}ms)"
+            f"candidates_used={len(candidates_for_vote)}, total_candidates={len(valid_results)}, "
+            f"time={total_batch_time:.1f}ms)"
         )
 
         # Log weighted distribution and counts for observability
-        weight_dist = ", ".join([
-            f"{label}: sum={label_scores[label]:.3f}, count={label_counts[label]}"
-            for label in label_scores
-        ])
-        logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
+        debug_level = getattr(logger, "DEBUG", logging.DEBUG)
+        if logger.isEnabledFor(debug_level):
+            weight_dist = ", ".join([
+                f"{label}: sum={label_scores[label]:.3f}, count={label_counts[label]}"
+                for label in label_scores
+            ])
+            logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
 
         return selected_roi, final_label, selected_conf
 
