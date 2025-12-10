@@ -50,6 +50,7 @@ class ClassifierService:
         self.executor = None
         self.pending_futures: Dict[int, Future] = {}
         self.pending_inputs: Dict[int, Any] = {}
+        self.timeout_timers: Dict[int, threading.Timer] = {}
         self.completed_tracks = set()
         self.completed_lock = threading.Lock()
         self.futures_lock = threading.Lock()
@@ -113,6 +114,13 @@ class ClassifierService:
         with self.futures_lock:
             future = self.pending_futures.get(track_id)
             roi_input = self.pending_inputs.get(track_id)
+            timer = self.timeout_timers.pop(track_id, None)
+
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
 
         if future is None or future.done():
             return
@@ -121,14 +129,22 @@ class ClassifierService:
             return
 
         cancelled = future.cancel()
+        if future.done():
+            return
+
         logger.warning(
             f"[ClassifierService] Track {track_id} timed out after "
             f"{self.classification_timeout}s (cancelled={cancelled})"
         )
 
         candidates = roi_input if isinstance(roi_input, list) else [roi_input] if roi_input is not None else []
-        phash_obj = compute_phash(candidates[0]) if candidates else None
-        phash_str = str(phash_obj) if phash_obj is not None else "0" * 16
+        phash_str = "0" * 16
+        if candidates:
+            try:
+                phash_obj = compute_phash(candidates[0])
+                phash_str = str(phash_obj)
+            except Exception as e:
+                logger.error(f"[ClassifierService] Timeout fallback hash failed for track {track_id}: {e}")
 
         result_data = {
             "label": "Unknown",
@@ -405,6 +421,13 @@ class ClassifierService:
             if track_id in self.pending_futures:
                 del self.pending_futures[track_id]
             self.pending_inputs.pop(track_id, None)
+            timer = self.timeout_timers.pop(track_id, None)
+        
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
         
         try:
             # Future will raise exception if task failed
@@ -443,6 +466,8 @@ class ClassifierService:
             if self.classification_timeout and self.classification_timeout > 0:
                 timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
                 timer.daemon = True
+                with self.futures_lock:
+                    self.timeout_timers[track_id] = timer
                 timer.start()
         else:
             # Synchronous processing

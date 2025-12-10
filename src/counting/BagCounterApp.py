@@ -135,6 +135,7 @@ class BagCounterApp:
         self.ui_counts = {}
         self.total_count = 0
         self.counted_events = set()
+        self.classified_events = set()
 
         # --- IPC SETUP (ROS 2 - Executor Pattern) ---
         from src.utils.platform import IS_RDK
@@ -265,6 +266,11 @@ class BagCounterApp:
         candidates_count = data.get("candidates_evaluated", 1)
         is_low_confidence = data.get("is_low_confidence", False)
         decision_margin = data.get("decision_margin", None)
+
+        if track_id in self.classified_events:
+            logger.debug(f"[BagCounterApp] Duplicate classification ignored for track {track_id}")
+            return
+        self.classified_events.add(track_id)
 
         logger.info(
             f"[BagCounterApp] Classification result: track={track_id}, "
