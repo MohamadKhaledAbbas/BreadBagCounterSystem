@@ -286,10 +286,12 @@ class BagCounterApp:
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf, is_low_confidence, decision_margin)
 
-        if track_id in self.counted_events and self.ui_counts.get("Unclassified", 0) > 0:
-            self.ui_counts["Unclassified"] -= 1
-            if self.ui_counts["Unclassified"] <= 0:
-                self.ui_counts.pop("Unclassified", None)
+        if track_id in self.counted_events:
+            unclassified_count = self.ui_counts.get("Unclassified", 0)
+            if unclassified_count > 0:
+                self.ui_counts["Unclassified"] = unclassified_count - 1
+                if self.ui_counts["Unclassified"] <= 0:
+                    self.ui_counts.pop("Unclassified", None)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
         self.classified_total += 1

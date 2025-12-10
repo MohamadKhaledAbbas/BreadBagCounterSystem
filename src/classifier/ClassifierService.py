@@ -14,6 +14,7 @@ ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
 class ClassifierService:
+    FALLBACK_PHASH = "0" * 16
     # Low confidence thresholds
     LOW_CONFIDENCE_THRESHOLD = 0.5  # Confidence below this is considered low
     LOW_MARGIN_THRESHOLD = 0.2      # Decision margin below this is considered ambiguous
@@ -122,7 +123,7 @@ class ClassifierService:
             except Exception:
                 pass
 
-        if future is None or future.done():
+        if future is None:
             return
 
         if not self._try_mark_completed(track_id):
@@ -143,7 +144,7 @@ class ClassifierService:
             candidates = roi_input
         else:
             candidates = [roi_input]
-        phash_str = "0" * 16
+        phash_str = self.FALLBACK_PHASH
         if candidates:
             try:
                 phash_obj = compute_phash(candidates[0])
@@ -316,6 +317,11 @@ class ClassifierService:
     def _process_sync(self, track_id: int, roi_input):
         """Synchronous classification processing (internal method)."""
         try:
+            with self.completed_lock:
+                if track_id in self.completed_tracks:
+                    logger.debug(f"[ClassifierService] Track {track_id} already completed; skipping processing")
+                    return
+
             # Handle list vs single image
             if isinstance(roi_input, list):
                 candidates = roi_input
@@ -489,6 +495,14 @@ class ClassifierService:
         if self.executor is not None:
             with self.futures_lock:
                 pending_count = len(self.pending_futures)
+                timers = list(self.timeout_timers.values())
+                self.timeout_timers.clear()
+            
+            for timer in timers:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
             
             if pending_count > 0:
                 logger.info(
