@@ -137,7 +137,12 @@ class ClassifierService:
             f"{self.classification_timeout}s (cancelled={cancelled})"
         )
 
-        candidates = roi_input if isinstance(roi_input, list) else [roi_input] if roi_input is not None else []
+        if roi_input is None:
+            candidates = []
+        elif isinstance(roi_input, list):
+            candidates = roi_input
+        else:
+            candidates = [roi_input]
         phash_str = "0" * 16
         if candidates:
             try:
@@ -165,6 +170,7 @@ class ClassifierService:
         with self.futures_lock:
             self.pending_futures.pop(track_id, None)
             self.pending_inputs.pop(track_id, None)
+
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
@@ -449,11 +455,17 @@ class ClassifierService:
             
             # Submit to thread pool
             future = self.executor.submit(self._process_sync, track_id, roi_input)
+            timer = None
+            if self.classification_timeout and self.classification_timeout > 0:
+                timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
+                timer.daemon = True
             
             # Track pending futures
             with self.futures_lock:
                 self.pending_futures[track_id] = future
                 self.pending_inputs[track_id] = roi_input
+                if timer is not None:
+                    self.timeout_timers[track_id] = timer
             
             # Add completion callback
             future.add_done_callback(lambda f: self._on_classification_complete(track_id, f))
@@ -463,11 +475,7 @@ class ClassifierService:
                 f"(pending tasks: {len(self.pending_futures)})"
             )
 
-            if self.classification_timeout and self.classification_timeout > 0:
-                timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
-                timer.daemon = True
-                with self.futures_lock:
-                    self.timeout_timers[track_id] = timer
+            if timer is not None:
                 timer.start()
         else:
             # Synchronous processing

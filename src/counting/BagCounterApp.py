@@ -134,8 +134,9 @@ class BagCounterApp:
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
         self.total_count = 0
-        self.counted_events = set()
-        self.classified_events = set()
+        self.counted_events = set()  # events counted immediately when ready
+        self.classified_events = set()  # events that completed classification callback
+        self.classified_total = 0
 
         # --- IPC SETUP (ROS 2 - Executor Pattern) ---
         from src.utils.platform import IS_RDK
@@ -291,20 +292,17 @@ class BagCounterApp:
                 self.ui_counts.pop("Unclassified", None)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
+        self.classified_total += 1
 
-        classified_total = sum(
-            count for key, count in self.ui_counts.items()
-            if key not in ("Total", "Unclassified")
-        )
-        if classified_total > self.total_count:
+        if self.classified_total > self.total_count:
             logger.warning(
-                f"[BagCounterApp] Classified count ({classified_total}) exceeds "
+                f"[BagCounterApp] Classified count ({self.classified_total}) exceeds "
                 f"preliminary total ({self.total_count})"
             )
-        elif self.total_count > classified_total:
+        elif self.total_count > self.classified_total:
             logger.debug(
                 f"[BagCounterApp] Awaiting classifications: "
-                f"preliminary={self.total_count}, classified={classified_total}"
+                f"preliminary={self.total_count}, classified={self.classified_total}"
             )
 
         logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
