@@ -42,6 +42,7 @@ class BagCounterApp:
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     MIN_RECORDING_FPS = 1.0  # Minimum valid recording FPS to prevent division issues
     MIN_DETECTION_CONFIDENCE = 0.5  # Filter out low-confidence detections early
+    CLASSIFIER_WORKERS = 4
     
     def __init__(
         self,
@@ -55,7 +56,7 @@ class BagCounterApp:
         logger.info("[BagCounterApp] Initializing...")
         self.db = db
         self.detector = detector_engine
-        self.classifier_service = ClassifierService(classifier_engine, max_workers=4)
+        self.classifier_service = ClassifierService(classifier_engine, max_workers=self.CLASSIFIER_WORKERS)
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
         self.config_watcher.add_watch(constants.show_ui_screen_key, self.on_show_ui_changed)
@@ -297,7 +298,7 @@ class BagCounterApp:
         self.classified_total += 1
 
         if self.classified_total > self.total_count:
-            logger.warning(
+            logger.error(
                 f"[BagCounterApp] Classified count ({self.classified_total}) exceeds "
                 f"preliminary total ({self.total_count})"
             )

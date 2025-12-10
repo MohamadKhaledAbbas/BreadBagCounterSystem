@@ -14,7 +14,8 @@ ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
 class ClassifierService:
-    FALLBACK_PHASH = "0" * 16
+    PHASH_LENGTH = 16
+    FALLBACK_PHASH = "0" * PHASH_LENGTH
     # Low confidence thresholds
     LOW_CONFIDENCE_THRESHOLD = 0.5  # Confidence below this is considered low
     LOW_MARGIN_THRESHOLD = 0.2      # Decision margin below this is considered ambiguous
@@ -111,6 +112,13 @@ class ClassifierService:
             self.completed_tracks.add(track_id)
             return True
 
+    def _create_timeout_timer(self, track_id: int) -> Optional[threading.Timer]:
+        if not self.classification_timeout or self.classification_timeout <= 0:
+            return None
+        timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
+        timer.daemon = True
+        return timer
+
     def _handle_timeout(self, track_id: int):
         with self.futures_lock:
             future = self.pending_futures.get(track_id)
@@ -124,6 +132,9 @@ class ClassifierService:
                 pass
 
         if future is None:
+            return
+
+        if future.done():
             return
 
         if not self._try_mark_completed(track_id):
@@ -461,13 +472,7 @@ class ClassifierService:
             
             # Submit to thread pool
             future = self.executor.submit(self._process_sync, track_id, roi_input)
-            timer = (
-                threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
-                if self.classification_timeout and self.classification_timeout > 0
-                else None
-            )
-            if timer is not None:
-                timer.daemon = True
+            timer = self._create_timeout_timer(track_id)
             
             # Track pending futures
             with self.futures_lock:
