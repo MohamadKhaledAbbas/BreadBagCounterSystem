@@ -130,7 +130,7 @@ class ClassifierService:
             return
 
         cancelled = future.cancel()
-        if future.done():
+        if future.done() and not cancelled:
             return
 
         logger.warning(
@@ -461,9 +461,12 @@ class ClassifierService:
             
             # Submit to thread pool
             future = self.executor.submit(self._process_sync, track_id, roi_input)
-            timer = None
-            if self.classification_timeout and self.classification_timeout > 0:
-                timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
+            timer = (
+                threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
+                if self.classification_timeout and self.classification_timeout > 0
+                else None
+            )
+            if timer is not None:
                 timer.daemon = True
             
             # Track pending futures

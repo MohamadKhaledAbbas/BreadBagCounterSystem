@@ -290,7 +290,7 @@ class BagCounterApp:
             unclassified_count = self.ui_counts.get("Unclassified", 0)
             if unclassified_count > 0:
                 self.ui_counts["Unclassified"] = unclassified_count - 1
-                if self.ui_counts["Unclassified"] <= 0:
+                if self.ui_counts["Unclassified"] == 0:
                     self.ui_counts.pop("Unclassified", None)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
