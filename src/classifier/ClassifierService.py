@@ -28,7 +28,8 @@ class ClassifierService:
                  voting_accept_norm_threshold: float = 0.6,
                  voting_accept_margin: float = 0.15,
                  async_classification: bool = True,
-                 max_workers: int = 2):
+                 max_workers: int = 2,
+                 classification_timeout: float = 5.0):
 
         self.classifier = classifier
         self.data_root = data_root
@@ -40,6 +41,7 @@ class ClassifierService:
         self.voting_accept_norm_threshold = voting_accept_norm_threshold
         self.voting_accept_margin = voting_accept_margin
         self.async_classification = async_classification
+        self.classification_timeout = classification_timeout
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
@@ -47,6 +49,9 @@ class ClassifierService:
         # Asynchronous classification thread pool
         self.executor = None
         self.pending_futures: Dict[int, Future] = {}
+        self.pending_inputs: Dict[int, Any] = {}
+        self.completed_tracks = set()
+        self.completed_lock = threading.Lock()
         self.futures_lock = threading.Lock()
         
         if async_classification:
@@ -66,7 +71,7 @@ class ClassifierService:
             f"candidates_per_vote={candidate_cap_desc}, "
             f"low_conf_threshold={self.LOW_CONFIDENCE_THRESHOLD}, "
             f"low_margin_threshold={self.LOW_MARGIN_THRESHOLD}, "
-            f"async={async_classification}"
+            f"async={async_classification}, timeout={classification_timeout}s"
         )
 
     def _get_candidate_cap(self) -> Optional[int]:
@@ -97,6 +102,53 @@ class ClassifierService:
     def register_callback(self, callback: ResultCallback):
         self.callbacks.append(callback)
 
+    def _try_mark_completed(self, track_id: int) -> bool:
+        with self.completed_lock:
+            if track_id in self.completed_tracks:
+                return False
+            self.completed_tracks.add(track_id)
+            return True
+
+    def _handle_timeout(self, track_id: int):
+        with self.futures_lock:
+            future = self.pending_futures.get(track_id)
+            roi_input = self.pending_inputs.get(track_id)
+
+        if future is None or future.done():
+            return
+
+        if not self._try_mark_completed(track_id):
+            return
+
+        cancelled = future.cancel()
+        logger.warning(
+            f"[ClassifierService] Track {track_id} timed out after "
+            f"{self.classification_timeout}s (cancelled={cancelled})"
+        )
+
+        candidates = roi_input if isinstance(roi_input, list) else [roi_input] if roi_input is not None else []
+        phash_obj = compute_phash(candidates[0]) if candidates else None
+        phash_str = str(phash_obj) if phash_obj is not None else "0" * 16
+
+        result_data = {
+            "label": "Unknown",
+            "phash": phash_str,
+            "image_path": None,
+            "confidence": 0.0,
+            "is_low_confidence": True,
+            "decision_margin": None,
+            "candidates_evaluated": len(candidates)
+        }
+
+        for cb in self.callbacks:
+            try:
+                cb(track_id, result_data)
+            except Exception as e:
+                logger.error(f"[ClassifierService] Callback error (timeout) for track {track_id}: {e}")
+
+        with self.futures_lock:
+            self.pending_futures.pop(track_id, None)
+            self.pending_inputs.pop(track_id, None)
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
         """Classify a single ROI."""
         try:
@@ -282,6 +334,10 @@ class ClassifierService:
                     f"{label} ({conf:.3f} < {self.min_confidence_threshold})"
                 )
 
+            if not self._try_mark_completed(track_id):
+                logger.debug(f"[ClassifierService] Track {track_id} result skipped (already completed)")
+                return
+
             # Compute hash
             phash_obj = compute_phash(best_roi)
             phash_str = str(phash_obj)
@@ -348,6 +404,7 @@ class ClassifierService:
         with self.futures_lock:
             if track_id in self.pending_futures:
                 del self.pending_futures[track_id]
+            self.pending_inputs.pop(track_id, None)
         
         try:
             # Future will raise exception if task failed
@@ -373,6 +430,7 @@ class ClassifierService:
             # Track pending futures
             with self.futures_lock:
                 self.pending_futures[track_id] = future
+                self.pending_inputs[track_id] = roi_input
             
             # Add completion callback
             future.add_done_callback(lambda f: self._on_classification_complete(track_id, f))
@@ -381,6 +439,11 @@ class ClassifierService:
                 f"[ClassifierService] Track {track_id} submitted for async classification "
                 f"(pending tasks: {len(self.pending_futures)})"
             )
+
+            if self.classification_timeout and self.classification_timeout > 0:
+                timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
+                timer.daemon = True
+                timer.start()
         else:
             # Synchronous processing
             logger.debug(f"[ClassifierService] Processing track {track_id} synchronously")

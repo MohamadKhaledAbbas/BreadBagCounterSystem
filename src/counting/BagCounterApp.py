@@ -37,10 +37,11 @@ else:
 
 class BagCounterApp:
     # Queue configuration constants
-    INPUT_QUEUE_SIZE = 100  # Buffer size for input frames (100 frames @ 25fps = ~4 seconds)
+    INPUT_QUEUE_SIZE = 200  # Buffer size for input frames (200 frames @ 25fps = ~8 seconds)
     QUEUE_WARNING_THRESHOLD = 80  # Percentage threshold for queue utilization warnings
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     MIN_RECORDING_FPS = 1.0  # Minimum valid recording FPS to prevent division issues
+    MIN_DETECTION_CONFIDENCE = 0.5  # Filter out low-confidence detections early
     
     def __init__(
         self,
@@ -54,7 +55,7 @@ class BagCounterApp:
         logger.info("[BagCounterApp] Initializing...")
         self.db = db
         self.detector = detector_engine
-        self.classifier_service = ClassifierService(classifier_engine)
+        self.classifier_service = ClassifierService(classifier_engine, max_workers=4)
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
         self.config_watcher.add_watch(constants.show_ui_screen_key, self.on_show_ui_changed)
@@ -132,6 +133,8 @@ class BagCounterApp:
         self.visualizer = Visualizer(names)
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
+        self.total_count = 0
+        self.counted_events = set()
 
         # --- IPC SETUP (ROS 2 - Executor Pattern) ---
         from src.utils.platform import IS_RDK
@@ -276,7 +279,28 @@ class BagCounterApp:
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf, is_low_confidence, decision_margin)
 
+        if track_id in self.counted_events and self.ui_counts.get("Unclassified", 0) > 0:
+            self.ui_counts["Unclassified"] -= 1
+            if self.ui_counts["Unclassified"] <= 0:
+                self.ui_counts.pop("Unclassified", None)
+
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
+
+        classified_total = sum(
+            count for key, count in self.ui_counts.items()
+            if key not in ("Total", "Unclassified")
+        )
+        if classified_total > self.total_count:
+            logger.warning(
+                f"[BagCounterApp] Classified count ({classified_total}) exceeds "
+                f"preliminary total ({self.total_count})"
+            )
+        elif self.total_count > classified_total:
+            logger.debug(
+                f"[BagCounterApp] Awaiting classifications: "
+                f"preliminary={self.total_count}, classified={classified_total}"
+            )
+
         logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
 
     def _logic_thread_loop(self):
@@ -325,6 +349,13 @@ class BagCounterApp:
                     confidences = detections[0].boxes.conf.cpu().numpy()
 
                     for i in range(len(cls_ids)):
+                        if confidences[i] < self.MIN_DETECTION_CONFIDENCE:
+                            logger.debug(
+                                f"[LogicThread] Skipping low-conf detection "
+                                f"class_id={cls_ids[i]}, conf={confidences[i]:.3f} "
+                                f"(min={self.MIN_DETECTION_CONFIDENCE})"
+                            )
+                            continue
                         current_frame_detections.append(
                             {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
                         )
@@ -356,6 +387,13 @@ class BagCounterApp:
                         f"[LogicThread] Frame {frame_count}: "
                         f"{len(ready_events)} events ready for classification"
                     )
+
+                    for event_id, _ in ready_events:
+                        if event_id not in self.counted_events:
+                            self.counted_events.add(event_id)
+                            self.total_count += 1
+                            self.ui_counts["Total"] = self.total_count
+                            self.ui_counts["Unclassified"] = self.ui_counts.get("Unclassified", 0) + 1
 
                     classify_start = time.perf_counter()
                     for event_id, candidates in ready_events:
