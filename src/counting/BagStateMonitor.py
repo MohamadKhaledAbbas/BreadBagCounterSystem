@@ -96,7 +96,7 @@ class BagEvent:
             min_size = tracking_config.min_roi_size
         if min_sharpness is None:
             min_sharpness = tracking_config.min_roi_sharpness
-        
+
         h, w = roi.shape[:2]
         if h < min_size or w < min_size:
             return False
@@ -142,7 +142,7 @@ class BagStateMonitor:
 
         self.open_id = open_cls_id
         self.closed_id = closed_cls_id
-        
+
         # Use config values if not explicitly provided
         self.iou_threshold = iou_threshold if iou_threshold is not None else tracking_config.iou_threshold
         self.min_open_frames = min_open_frames if min_open_frames is not None else tracking_config.min_open_frames
@@ -162,7 +162,7 @@ class BagStateMonitor:
             boxB[2] <= boxB[0] or boxB[3] <= boxB[1]):
             logger.debug("[BagStateMonitor] Invalid box coordinates in IoU computation")
             return 0.0
-        
+
         xA = max(boxA[0], boxB[0])
         yA = max(boxA[1], boxB[1])
         xB = min(boxA[2], boxB[2])
@@ -266,7 +266,7 @@ class BagStateMonitor:
                         f"conf={det.get('conf', 1.0):.3f} < {tracking_config.min_conf_threshold}"
                     )
                     continue
-                
+
                 # Prevent memory issues with too many events
                 if len(self.active_events) >= tracking_config.max_active_events:
                     logger.warning(
@@ -274,7 +274,7 @@ class BagStateMonitor:
                         f"skipping new event creation"
                     )
                     break
-                
+
                 new_event = BagEvent(det['box'], frame_img, self.open_id, self.closed_id)
                 self.active_events.append(new_event)
                 logger.info(
@@ -300,7 +300,8 @@ class BagStateMonitor:
                 stats = event.get_stats()
 
                 if candidates:
-                    ready_to_classify.append((event.id, candidates))
+                    # include box and stats for downstream debugging/snapshots
+                    ready_to_classify.append((event.id, candidates, event.box, stats))
                     logger.info(
                         f"[BagStateMonitor] Event {event.id} READY: "
                         f"{stats['total']} candidates "

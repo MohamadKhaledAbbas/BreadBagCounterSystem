@@ -36,7 +36,7 @@ class TrackingConfig:
     # State Transition Thresholds
     # ============================================================================
     
-    min_open_frames: int = 5
+    min_open_frames: int = 4
     """
     Minimum consecutive frames a bag must be detected as "open" before allowing 
     transition to "closed" state.
@@ -64,7 +64,7 @@ class TrackingConfig:
     # Detection Confidence Thresholds
     # ============================================================================
     
-    min_conf_threshold: float = 0.5
+    min_conf_threshold: float = 0.4
     """
     Minimum confidence score for creating new tracking events from detections.
     
@@ -79,7 +79,7 @@ class TrackingConfig:
     # Event Management
     # ============================================================================
     
-    max_active_events: int = 20
+    max_active_events: int = 10
     """
     Maximum number of concurrent tracking events to prevent memory issues.
     
@@ -93,7 +93,7 @@ class TrackingConfig:
     # State-Aware Expiry Timeouts
     # ============================================================================
     
-    expiry_detecting_open: int = 20
+    expiry_detecting_open: int = 10
     """
     Frames without update before expiring an event in 'detecting_open' state.
     
@@ -104,7 +104,7 @@ class TrackingConfig:
     Default: 12 (relaxed from 8 to handle temporary occlusions better)
     """
     
-    expiry_detecting_closed: int = 15
+    expiry_detecting_closed: int = 10
     """
     Frames without update before expiring an event in 'detecting_closed' state.
     
@@ -129,7 +129,7 @@ class TrackingConfig:
     # ROI Collection Parameters (BagEvent)
     # ============================================================================
     
-    max_open_samples: int = 8
+    max_open_samples: int = 6
     """
     Maximum number of ROI samples to collect during the 'open' phase.
     
