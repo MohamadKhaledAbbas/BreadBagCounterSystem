@@ -112,11 +112,12 @@ class ClassifierService:
             self.completed_tracks.add(track_id)
             return True
 
-    def _create_timeout_timer(self, track_id: int) -> Optional[threading.Timer]:
+    def _start_timeout_timer(self, track_id: int) -> Optional[threading.Timer]:
         if not self.classification_timeout or self.classification_timeout <= 0:
             return None
         timer = threading.Timer(self.classification_timeout, self._handle_timeout, args=(track_id,))
         timer.daemon = True
+        timer.start()
         return timer
 
     def _handle_timeout(self, track_id: int):
@@ -141,8 +142,6 @@ class ClassifierService:
             return
 
         cancelled = future.cancel()
-        if future.done() and not cancelled:
-            return
 
         logger.warning(
             f"[ClassifierService] Track {track_id} timed out after "
@@ -472,7 +471,7 @@ class ClassifierService:
             
             # Submit to thread pool
             future = self.executor.submit(self._process_sync, track_id, roi_input)
-            timer = self._create_timeout_timer(track_id)
+            timer = self._start_timeout_timer(track_id)
             
             # Track pending futures
             with self.futures_lock:
@@ -488,9 +487,6 @@ class ClassifierService:
                 f"[ClassifierService] Track {track_id} submitted for async classification "
                 f"(pending tasks: {len(self.pending_futures)})"
             )
-
-            if timer is not None:
-                timer.start()
         else:
             # Synchronous processing
             logger.debug(f"[ClassifierService] Processing track {track_id} synchronously")

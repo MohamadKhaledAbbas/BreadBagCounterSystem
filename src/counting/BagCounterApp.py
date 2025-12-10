@@ -138,6 +138,7 @@ class BagCounterApp:
         self.counted_events = set()  # events counted immediately when ready
         self.classified_events = set()  # events that completed classification callback
         self.classified_total = 0
+        self.counts_lock = threading.Lock()
 
         # --- IPC SETUP (ROS 2 - Executor Pattern) ---
         from src.utils.platform import IS_RDK
@@ -269,10 +270,11 @@ class BagCounterApp:
         is_low_confidence = data.get("is_low_confidence", False)
         decision_margin = data.get("decision_margin", None)
 
-        if track_id in self.classified_events:
-            logger.debug(f"[BagCounterApp] Duplicate classification ignored for track {track_id}")
-            return
-        self.classified_events.add(track_id)
+        with self.counts_lock:
+            if track_id in self.classified_events:
+                logger.debug(f"[BagCounterApp] Duplicate classification ignored for track {track_id}")
+                return
+            self.classified_events.add(track_id)
 
         logger.info(
             f"[BagCounterApp] Classification result: track={track_id}, "
@@ -287,28 +289,29 @@ class BagCounterApp:
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf, is_low_confidence, decision_margin)
 
-        if track_id in self.counted_events:
-            unclassified_count = self.ui_counts.get("Unclassified", 0)
-            if unclassified_count > 0:
-                self.ui_counts["Unclassified"] = unclassified_count - 1
-                if self.ui_counts["Unclassified"] == 0:
-                    self.ui_counts.pop("Unclassified", None)
+        with self.counts_lock:
+            if track_id in self.counted_events:
+                unclassified_count = self.ui_counts.get("Unclassified", 0)
+                if unclassified_count > 0:
+                    self.ui_counts["Unclassified"] = unclassified_count - 1
+                    if self.ui_counts["Unclassified"] == 0:
+                        self.ui_counts.pop("Unclassified", None)
 
-        self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
-        self.classified_total += 1
+            self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
+            self.classified_total += 1
 
-        if self.classified_total > self.total_count:
-            logger.error(
-                f"[BagCounterApp] Classified count ({self.classified_total}) exceeds "
-                f"preliminary total ({self.total_count})"
-            )
-        elif self.total_count > self.classified_total:
-            logger.debug(
-                f"[BagCounterApp] Awaiting classifications: "
-                f"preliminary={self.total_count}, classified={self.classified_total}"
-            )
+            if self.classified_total > self.total_count:
+                logger.error(
+                    f"[BagCounterApp] Classified count ({self.classified_total}) exceeds "
+                    f"preliminary total ({self.total_count})"
+                )
+            elif self.total_count > self.classified_total:
+                logger.debug(
+                    f"[BagCounterApp] Awaiting classifications: "
+                    f"preliminary={self.total_count}, classified={self.classified_total}"
+                )
 
-        logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
+            logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
 
     def _logic_thread_loop(self):
         logger.info("[LogicThread] Started")
@@ -395,12 +398,13 @@ class BagCounterApp:
                         f"{len(ready_events)} events ready for classification"
                     )
 
-                    for event_id, _ in ready_events:
-                        if event_id not in self.counted_events:
-                            self.counted_events.add(event_id)
-                            self.total_count += 1
-                            self.ui_counts["Total"] = self.total_count
-                            self.ui_counts["Unclassified"] = self.ui_counts.get("Unclassified", 0) + 1
+                    with self.counts_lock:
+                        for event_id, _ in ready_events:
+                            if event_id not in self.counted_events:
+                                self.counted_events.add(event_id)
+                                self.total_count += 1
+                                self.ui_counts["Total"] = self.total_count
+                                self.ui_counts["Unclassified"] = self.ui_counts.get("Unclassified", 0) + 1
 
                     classify_start = time.perf_counter()
                     for event_id, candidates in ready_events:
