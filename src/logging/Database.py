@@ -116,7 +116,7 @@ class DatabaseManager:
 
             # Threshold for "similarity" (0-5 is usually the same object)
             best_match_id = None
-            min_dist = 10
+            min_dist = 20
 
             for uid, uname, uhash in unknowns:
                 if uhash:
@@ -126,7 +126,7 @@ class DatabaseManager:
                         min_dist = dist
                         best_match_id = uid
 
-            if best_match_id is not None and min_dist <= 8:  # 8 is a safe threshold
+            if best_match_id:  # 8 is a safe threshold
                 return best_match_id
 
             # 3. Create NEW Unknown Type

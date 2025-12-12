@@ -55,19 +55,22 @@ class BagCounterApp:
 
         self.config_watcher = ConfigWatcher(db.db_path, poll_interval=5)
         self.config_watcher.add_watch(constants.show_ui_screen_key, self.on_show_ui_changed)
-        # Recording is removed; keep watcher to avoid errors if config changes exist
         self.config_watcher.add_watch(constants.is_recording_key, self.on_is_recording_changed)
 
         self.is_running = False
 
-        # Recording removed; snapshots only
+        # Recording removed; snapshots only, but flag will now toggle based on config
         self.is_recording = False
-        logger.info("[BagCounterApp] Video Recording: DISABLED (snapshots only)")
+        logger.info(
+            f"[BagCounterApp] Video Recording: {'ENABLED' if self.is_recording else 'DISABLED'} (snapshots controlled by is_recording flag)")
 
         # Snapshot directory
         self.recording_dir = db.get_config_value(constants.recording_dir) or config.recording_dir
         self.snapshot_dir = os.path.join(self.recording_dir, "snapshots")
-        os.makedirs(self.snapshot_dir, exist_ok=True)
+        try:
+            os.makedirs(self.snapshot_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"[Snapshot Saving] snapshot saving error due to -> {e}")
         logger.info(f"[BagCounterApp] Snapshot directory: {self.snapshot_dir}")
 
         # Input queue
@@ -139,8 +142,9 @@ class BagCounterApp:
             logger.info("[BagCounterApp] IPC Publishing DISABLED")
 
     def on_is_recording_changed(self, new_value):
-        # Recording is disabled; keep for compatibility/logging
-        logger.info("[BagCounterApp] Recording change ignored (recording disabled)")
+        # Now toggle flag based on config key
+        self.is_recording = (new_value == "1" or new_value is True or new_value == 1)
+        logger.info(f"[BagCounterApp] is_recording set to {self.is_recording}")
 
     # --- Snapshot helpers ---
     def _annotate_frame(self, frame, detections, label, conf, event_box=None):
@@ -198,7 +202,7 @@ class BagCounterApp:
         frame_id = context.get("frame_id")
         ts_epoch = context.get("timestamp", time.time())
 
-        timestamp_str = datetime.fromtimestamp(ts_epoch).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        timestamp_str = datetime.fromtimestamp(float(ts_epoch)).strftime("%Y%m%d_%H%M%S_%f")[:-3]
         base_name = f"{timestamp_str}_track{track_id}_{label}"
         orig_file = os.path.join(self.snapshot_dir, base_name + "_orig.jpg")
         ann_file = os.path.join(self.snapshot_dir, base_name + "_ann.jpg")
@@ -214,23 +218,33 @@ class BagCounterApp:
         for d in detections:
             box = d.get("box")
             det_json.append({
-                "box": box.tolist() if hasattr(box, "tolist") else list(box) if box is not None else None,
-                "class_id": d.get("class_id"),
-                "class_name": self.detector.class_names.get(d.get("class_id"), "Unknown"),
+                "box": (
+                    box.tolist() if hasattr(box, "tolist")
+                    else [float(x) for x in box] if box is not None
+                    else None
+                ),
+                "class_id": int(d.get("class_id")) if d.get("class_id") is not None else None,
+                "class_name": self.detector.class_names.get(
+                    int(d.get("class_id")), "Unknown"
+                ) if d.get("class_id") is not None else "Unknown",
                 "conf": float(d.get("conf", 0)),
             })
 
         meta = {
             "timestamp": timestamp_str,
-            "timestamp_epoch": ts_epoch,
-            "frame_id": frame_id,
-            "track_id": track_id,
+            "timestamp_epoch": float(ts_epoch),
+            "frame_id": int(frame_id) if frame_id is not None else None,
+            "track_id": int(track_id) if track_id is not None else None,
             "label": label,
             "confidence": float(conf),
             "phash": phash,
             "roi_saved_path": image_path,
-            "candidates_evaluated": candidates_count,
-            "event_box": event_box.tolist() if hasattr(event_box, "tolist") else list(event_box) if event_box is not None else None,
+            "candidates_evaluated": int(candidates_count) if candidates_count is not None else None,
+            "event_box": (
+                event_box.tolist() if hasattr(event_box, "tolist")
+                else [float(x) for x in event_box] if event_box is not None
+                else None
+            ),
             "event_stats": event_stats,
             "detections": det_json,
             "files": {
@@ -269,8 +283,8 @@ class BagCounterApp:
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
         logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
 
-        # Save snapshot if context is available
-        if context and context.get("frame") is not None:
+        # Save snapshot only if context is available and is_recording flag enabled
+        if self.is_recording and context and context.get("frame") is not None:
             try:
                 self._save_snapshot(track_id, label, conf, phash, image_path, candidates_count, context)
             except Exception as e:
@@ -341,7 +355,8 @@ class BagCounterApp:
 
                 # 2. Update Monitor
                 monitor_start = time.perf_counter()
-                ready_events = self.monitor.update(current_frame_detections, {"frame_count" : frame_count, "frame": frame})
+                ready_events = self.monitor.update(current_frame_detections,
+                                                   {"frame_count": frame_count, "frame": frame})
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
 
@@ -419,7 +434,7 @@ class BagCounterApp:
                         timing_msg += f" | Publish: {publish_time:.1f}ms"
                     timing_msg += f" | FPS: {fps:.1f}"
                     logger.info(timing_msg)
-                
+
                 # Log pipeline metrics periodically
                 pipeline_metrics.maybe_log_summary()
 
@@ -467,14 +482,14 @@ class BagCounterApp:
                         acquisition_fps = 1.0 / avg_interval
                         logger.info(
                             f"[BagCounterApp] Frame acquisition stats: "
-                            f"frames={frame_count}, avg_interval={avg_interval*1000:.1f}ms, "
+                            f"frames={frame_count}, avg_interval={avg_interval * 1000:.1f}ms, "
                             f"acquisition_fps={acquisition_fps:.1f}"
                         )
                     else:
                         logger.warning(
                             f"[BagCounterApp] Invalid frame timing detected: "
-                            f"frames={frame_count}, avg_interval={avg_interval*1000:.6f}ms "
-                            f"(below {TIMING_EPSILON*1000:.6f}ms threshold) - skipping FPS calculation"
+                            f"frames={frame_count}, avg_interval={avg_interval * 1000:.6f}ms "
+                            f"(below {TIMING_EPSILON * 1000:.6f}ms threshold) - skipping FPS calculation"
                         )
                     frame_interval_sum = 0.0
                     frame_interval_count = 0
