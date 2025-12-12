@@ -411,20 +411,21 @@ class ClassifierService:
         if not accepted:
             rejection_reasons = []
             if not base_accepted:
-                rejection_reasons.append(f"voting(norm={normalized_score:.2f}<{self.voting_accept_norm_threshold}, margin={margin:.2f}<{self.voting_accept_margin})")
+                rejection_reasons.append(
+                    f"voting(norm={normalized_score:.2f}, margin={margin:.2f})"
+                )
             if not entropy_acceptable:
-                rejection_reasons.append(f"entropy({normalized_entropy:.2f}>{self.max_normalized_entropy})")
+                rejection_reasons.append(f"entropy={normalized_entropy:.2f}")
             logger.warning(
-                f"[ClassifierService] Weighted voting uncertain - winner={top_label} "
-                f"rejected due to: {', '.join(rejection_reasons)}; marking as Unknown"
+                f"[ClassifierService] Uncertain: {top_label} rejected - "
+                f"{', '.join(rejection_reasons)}"
             )
 
         logger.info(
-            f"[ClassifierService] Weighted voting result: {final_label} "
-            f"(winner={top_label}, best_conf={selected_conf:.3f}, "
-            f"norm={normalized_score:.2f}, margin={margin:.2f}, entropy={normalized_entropy:.3f}, "
-            f"candidates_used={len(candidates_for_vote)}, total_candidates={len(valid_results)}, "
-            f"time={total_batch_time:.1f}ms)"
+            f"[ClassifierService] Result: {final_label} "
+            f"(conf={selected_conf:.3f}, norm={normalized_score:.2f}, "
+            f"margin={margin:.2f}, entropy={normalized_entropy:.3f}, "
+            f"n={len(candidates_for_vote)}/{len(valid_results)}, {total_batch_time:.1f}ms)"
         )
 
         label_scores = {lbl: float(alpha[i]) for i, lbl in enumerate(classes)}

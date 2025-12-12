@@ -260,11 +260,19 @@ class BagEvent:
         
         return (True, sharpness, None)
 
-    def add_open_frame(self, box, frame_img, confidence: float = 1.0):
+    def add_open_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
         """
         Add ROI from open detection with motion tracking.
         
         V2: Added confidence tracking and aspect ratio validation.
+        
+        Args:
+            box: Bounding box coordinates [x1, y1, x2, y2]
+            frame_img: Full frame image for ROI extraction
+            confidence: Detection confidence score
+            
+        Returns:
+            bool: True if frame was added successfully, False if validation failed
         """
         # V2: Validate aspect ratio
         if not self._validate_aspect_ratio(box):
@@ -276,11 +284,19 @@ class BagEvent:
         self.total_frames_tracked += 1
         return self._add_roi(self.smoothed_box, frame_img, is_open=True)
 
-    def add_closed_frame(self, box, frame_img, confidence: float = 1.0):
+    def add_closed_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
         """
         Add ROI from closed detection with motion tracking.
         
         V2: Added confidence tracking and aspect ratio validation.
+        
+        Args:
+            box: Bounding box coordinates [x1, y1, x2, y2]
+            frame_img: Full frame image for ROI extraction
+            confidence: Detection confidence score
+            
+        Returns:
+            bool: True if frame was added successfully, False if validation failed
         """
         # V2: Validate aspect ratio
         if not self._validate_aspect_ratio(box):
@@ -470,8 +486,6 @@ class BagStateMonitor:
                         best_event.closed_hits = 0
                         best_event.state = 'detecting_open'
 
-        # ---------------------------------------------------
-        # 2. Match CLOSED detections to existing events
         # ---------------------------------------------------
         # 2. Match CLOSED detections to existing events
         # ---------------------------------------------------
