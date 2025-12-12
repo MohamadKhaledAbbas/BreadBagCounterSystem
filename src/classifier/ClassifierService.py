@@ -10,6 +10,7 @@ import cv2
 from src.classifier.BaseClassifier import BaseClassifier
 from src.utils.Utils import compute_phash
 from src.utils.AppLogging import logger
+from src.utils.PipelineMetrics import pipeline_metrics
 
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
@@ -388,6 +389,12 @@ class ClassifierService:
                 "candidates_evaluated": len(candidates),
                 "context": context,  # pass-through for downstream snapshot saving
             }
+            
+            # Record classification metrics
+            used_voting = self.use_voting and len(candidates) >= 3
+            pipeline_metrics.record_classification(
+                label, conf, len(candidates), used_voting
+            )
 
             logger.info(
                 f"[ClassifierService] Track {track_id} DONE: {label} "
