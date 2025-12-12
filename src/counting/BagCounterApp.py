@@ -21,6 +21,7 @@ from src.config.settings import config
 from src.logging.ConfigWatcher import ConfigWatcher
 from src.utils.AppLogging import logger
 from src.utils.platform import IS_RDK
+from src.utils.PipelineMetrics import pipeline_metrics
 
 from src.counting.IPC import ExecutorThread, init_ros2_context, shutdown_ros2_context
 from src.counting.FramePublisherNode import FramePublisher
@@ -330,6 +331,14 @@ class BagCounterApp:
                 else:
                     logger.debug(f"[LogicThread] Frame {frame_count}: No detections")
 
+                # Record detection metrics
+                pipeline_metrics.record_detection(
+                    current_frame_detections, 
+                    detect_time,
+                    self.monitor.open_id,
+                    self.monitor.closed_id
+                )
+
                 # 2. Update Monitor
                 monitor_start = time.perf_counter()
                 ready_events = self.monitor.update(current_frame_detections, {"frame_count" : frame_count, "frame": frame})
@@ -393,7 +402,7 @@ class BagCounterApp:
                     publish_end = time.perf_counter()
                     publish_time = (publish_end - publish_start) * 1000
 
-                # 5. Timing logs
+                # 5. Timing logs and pipeline metrics
                 frame_end = time.perf_counter()
                 total_time = (frame_end - frame_start) * 1000
                 fps = 1000 / total_time if total_time > 0 else 0
@@ -410,6 +419,9 @@ class BagCounterApp:
                         timing_msg += f" | Publish: {publish_time:.1f}ms"
                     timing_msg += f" | FPS: {fps:.1f}"
                     logger.info(timing_msg)
+                
+                # Log pipeline metrics periodically
+                pipeline_metrics.maybe_log_summary()
 
             except Exception as e:
                 logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
