@@ -356,6 +356,124 @@ class PipelineMetrics:
                     "avg_sharpness": self.quality.avg_sharpness,
                 },
             }
+    
+    def perform_health_check(self) -> Dict[str, Any]:
+        """
+        V2: Perform comprehensive health check on the pipeline.
+        
+        Returns a health status with detailed diagnostics for production monitoring.
+        
+        Health Status:
+        - "healthy": All KPIs within targets
+        - "degraded": Some KPIs below targets but system functional
+        - "critical": Multiple KPIs failing, immediate attention needed
+        """
+        with self._lock:
+            issues = []
+            warnings = []
+            
+            # Calculate current KPIs
+            total_rois = (self.quality.rois_accepted + 
+                         self.quality.rois_rejected_size + 
+                         self.quality.rois_rejected_sharpness +
+                         self.quality.rois_rejected_brightness)
+            
+            roi_acceptance_rate = (
+                self.quality.rois_accepted / total_rois if total_rois > 0 else 1.0
+            )
+            
+            event_completion_rate = (
+                self.events.events_counted / self.events.events_created
+                if self.events.events_created > 0 else 1.0
+            )
+            
+            unknown_rate = (
+                self.classification.unknown_count / self.classification.total_classified
+                if self.classification.total_classified > 0 else 0.0
+            )
+            
+            # Check detection confidence
+            if self.detection.total_detections >= 10:
+                if self.detection.avg_confidence < self.TARGET_DETECTION_CONFIDENCE:
+                    if self.detection.avg_confidence < self.TARGET_DETECTION_CONFIDENCE * 0.7:
+                        issues.append(f"Detection confidence critically low: {self.detection.avg_confidence:.2f}")
+                    else:
+                        warnings.append(f"Detection confidence below target: {self.detection.avg_confidence:.2f}")
+            
+            # Check classification confidence
+            if self.classification.total_classified >= 10:
+                if self.classification.avg_confidence < self.TARGET_CLASSIFICATION_CONFIDENCE:
+                    if self.classification.avg_confidence < self.TARGET_CLASSIFICATION_CONFIDENCE * 0.7:
+                        issues.append(f"Classification confidence critically low: {self.classification.avg_confidence:.2f}")
+                    else:
+                        warnings.append(f"Classification confidence below target: {self.classification.avg_confidence:.2f}")
+            
+            # Check event completion rate
+            if self.events.events_created >= 10:
+                if event_completion_rate < self.TARGET_EVENT_COMPLETION_RATE:
+                    if event_completion_rate < self.TARGET_EVENT_COMPLETION_RATE * 0.7:
+                        issues.append(f"Event completion rate critically low: {event_completion_rate:.1%}")
+                    else:
+                        warnings.append(f"Event completion rate below target: {event_completion_rate:.1%}")
+            
+            # Check ROI acceptance rate
+            if total_rois >= 10:
+                if roi_acceptance_rate < self.TARGET_ROI_ACCEPTANCE_RATE:
+                    if roi_acceptance_rate < self.TARGET_ROI_ACCEPTANCE_RATE * 0.7:
+                        issues.append(f"ROI acceptance rate critically low: {roi_acceptance_rate:.1%}")
+                    else:
+                        warnings.append(f"ROI acceptance rate below target: {roi_acceptance_rate:.1%}")
+            
+            # Check unknown classification rate
+            if self.classification.total_classified >= 10:
+                if unknown_rate > 0.10:  # More than 10% unknown
+                    if unknown_rate > 0.20:
+                        issues.append(f"Unknown classification rate too high: {unknown_rate:.1%}")
+                    else:
+                        warnings.append(f"Unknown classification rate elevated: {unknown_rate:.1%}")
+            
+            # Check for anomalies
+            if self._consecutive_low_conf_detections >= 20:
+                issues.append(f"Sustained low-confidence detections: {self._consecutive_low_conf_detections}")
+            
+            if self._consecutive_unknown_classifications >= 10:
+                issues.append(f"Sustained unknown classifications: {self._consecutive_unknown_classifications}")
+            
+            # Determine overall status
+            if len(issues) >= 2:
+                status = "critical"
+            elif len(issues) >= 1:
+                status = "degraded"
+            elif len(warnings) >= 2:
+                status = "degraded"
+            else:
+                status = "healthy"
+            
+            health_result = {
+                "status": status,
+                "timestamp": time.time(),
+                "issues": issues,
+                "warnings": warnings,
+                "kpis": {
+                    "detection_confidence": self.detection.avg_confidence,
+                    "classification_confidence": self.classification.avg_confidence,
+                    "event_completion_rate": event_completion_rate,
+                    "roi_acceptance_rate": roi_acceptance_rate,
+                    "unknown_rate": unknown_rate,
+                },
+                "targets": {
+                    "detection_confidence": self.TARGET_DETECTION_CONFIDENCE,
+                    "classification_confidence": self.TARGET_CLASSIFICATION_CONFIDENCE,
+                    "event_completion_rate": self.TARGET_EVENT_COMPLETION_RATE,
+                    "roi_acceptance_rate": self.TARGET_ROI_ACCEPTANCE_RATE,
+                },
+            }
+            
+            # Log health check result
+            from src.utils.AppLogging import structured_logger
+            structured_logger.health_check(status, health_result)
+            
+            return health_result
 
 
 # Global metrics instance

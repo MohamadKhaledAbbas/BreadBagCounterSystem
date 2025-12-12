@@ -1,10 +1,16 @@
+"""
+BreadBag Counter System - Main Entry Point
+
+V2: Enhanced with model version tracking, structured logging, and health checks.
+"""
+
 import os
 
 from src import constants
 from src.counting.BagCounterApp import BagCounterApp
 from src.logging.Database import DatabaseManager
 from src.config.settings import config
-from src.utils.AppLogging import logger
+from src.utils.AppLogging import logger, get_log_file_paths
 from src.utils.platform import IS_RDK
 
 # Platform-aware detector and classifier imports
@@ -18,6 +24,19 @@ else:
     logger.info("[Platform] Running on non-RDK platform - using Ultralytics models")
 
 if __name__ == "__main__":
+    
+    # V2: Log startup banner
+    logger.info("=" * 60)
+    logger.info("  BreadBag Counter System V2")
+    logger.info("  Production-Grade Accuracy Pipeline")
+    logger.info("=" * 60)
+    
+    # V2: Log file paths for debugging
+    log_paths = get_log_file_paths()
+    logger.info(f"[Startup] Log files: {log_paths}")
+    
+    # V2: Log configuration with model versions
+    config.log_configuration()
 
     # Configuration
     db_manager = DatabaseManager(config.db_path)
@@ -25,6 +44,7 @@ if __name__ == "__main__":
     classifier = Classifier(config.classification_model, config.classifier_classes)
 
     is_development = db_manager.get_config_value(constants.is_development_key) == "1"
+    logger.info(f"[Startup] Development mode: {is_development}")
 
     try:
         logger.info(f"os.environ['HOME'] = {os.environ['HOME']}")
@@ -40,8 +60,9 @@ if __name__ == "__main__":
         is_development = is_development,
     )
 
-    logger.info("[INFO] Detection Model: {}".format(config.detection_model))
-    logger.info("[INFO] Classification Model: {}".format(config.classification_model))
-    logger.info("[INFO] DB: {}".format(db_manager.db_path))
+    logger.info("[Startup] Detection Model: {}".format(config.detection_model))
+    logger.info("[Startup] Classification Model: {}".format(config.classification_model))
+    logger.info("[Startup] DB: {}".format(db_manager.db_path))
+    logger.info("[Startup] Starting main application loop...")
 
     app.run()
