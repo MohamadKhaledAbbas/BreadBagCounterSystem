@@ -21,7 +21,7 @@ class TrackingConfig:
     # IoU Matching Parameters
     # ============================================================================
     
-    iou_threshold: float = 0.35
+    iou_threshold: float = 0.45
     """
     IoU (Intersection over Union) threshold for matching detections to existing events.
     
@@ -31,12 +31,18 @@ class TrackingConfig:
     
     Default: 0.35 (relaxed from 0.45 to improve detection sensitivity)
     """
-    
+
+    # ============================================================================
+    # Number of frames to suppress new events
+    # ============================================================================
+    lockout_window: int = 25
+
+
     # ============================================================================
     # State Transition Thresholds
     # ============================================================================
     
-    min_open_frames: int = 4
+    min_open_frames: int = 5
     """
     Minimum consecutive frames a bag must be detected as "open" before allowing 
     transition to "closed" state.
@@ -153,17 +159,17 @@ class TrackingConfig:
     # ROI Quality Validation
     # ============================================================================
     
-    min_roi_size: int = 80
+    min_roi_size: int = 300
     """
     Minimum width/height (in pixels) for a valid ROI.
     
-    Range: 50 - 200
+    Range: 100 - 400
     ROIs smaller than this are rejected as too small for reliable classification.
     
-    Default: 80
+    Default: 100
     """
     
-    min_roi_sharpness: float = 30.0
+    min_roi_sharpness: float = 400
     """
     Minimum sharpness score (Laplacian variance) for a valid ROI.
     
@@ -173,6 +179,10 @@ class TrackingConfig:
     
     Default: 30.0 (relaxed from 50 to accept more samples; changed to float for precision)
     """
+
+    min_mean_brightness = 100
+
+    max_mean_brightness = 200
 
 
 # Global configuration instance

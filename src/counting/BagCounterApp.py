@@ -332,7 +332,7 @@ class BagCounterApp:
 
                 # 2. Update Monitor
                 monitor_start = time.perf_counter()
-                ready_events = self.monitor.update(current_frame_detections, frame)
+                ready_events = self.monitor.update(current_frame_detections, {"frame_count" : frame_count, "frame": frame})
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
 
