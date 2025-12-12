@@ -101,21 +101,25 @@ class BagEvent:
 
         roi = frame_img[y1:y2, x1:x2].copy()
 
-        # Quality check
+        # Quality check (size and brightness)
         is_valid, sharpness, reject_reason = self._is_valid_roi_with_reason(roi)
         
-        # Record metrics
-        pipeline_metrics.record_roi_quality(is_valid, sharpness, reject_reason)
-        
         if not is_valid:
+            # Record rejection for size or brightness
+            pipeline_metrics.record_roi_quality(False, sharpness, reject_reason)
             return False
-        if not sharpness >= tracking_config.min_roi_sharpness:
+        
+        # Check sharpness threshold (separate from basic validation)
+        if sharpness < tracking_config.min_roi_sharpness:
             logger.debug(
                 f"[BagEvent:{self.id}] ROI failed sharpness check: {sharpness:.1f} < "
                 f"{tracking_config.min_roi_sharpness}"
             )
             pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             return False
+        
+        # ROI passed all quality checks - record as accepted
+        pipeline_metrics.record_roi_quality(True, sharpness, None)
 
         if is_open:
             self.open_rois.append((sharpness, roi))

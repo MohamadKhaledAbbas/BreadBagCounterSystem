@@ -70,6 +70,12 @@ class PipelineMetrics:
     """
     
     # Target KPIs for 99.9% accuracy
+    # NOTE: TARGET_DETECTION_CONFIDENCE (0.7) is intentionally higher than the 
+    # min_conf_threshold (0.4) in tracking_config.py. The min_conf_threshold is a
+    # permissive filter to avoid missing bags, while TARGET_DETECTION_CONFIDENCE
+    # represents the desired average confidence for high-quality detection.
+    # Warnings are triggered when average confidence drops below target, indicating
+    # potential model degradation or environmental issues.
     TARGET_DETECTION_CONFIDENCE = 0.7
     TARGET_CLASSIFICATION_CONFIDENCE = 0.5
     TARGET_EVENT_COMPLETION_RATE = 0.95  # Events that complete vs expire
