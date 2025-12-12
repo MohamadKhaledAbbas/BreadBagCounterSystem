@@ -1,9 +1,10 @@
 import cv2
 import uuid
 import math
+import numpy as np
 from typing import List, Tuple, Optional
 
-from src.utils.AppLogging import logger
+from src.utils.AppLogging import logger, structured_logger
 from src.config.tracking_config import tracking_config
 from src.utils.PipelineMetrics import pipeline_metrics
 
@@ -14,12 +15,24 @@ class BagEvent:
     
     State Machine: detecting_open -> detecting_closed -> counted
     
-    Enhanced with motion tracking for adaptive suppression.
+    V2 Enhancements:
+    - Motion tracking for adaptive suppression
+    - Temporal bounding box smoothing for detection stability
+    - Aspect ratio validation for shape consistency
+    - Enhanced logging for debugging
     """
+    
+    # V2: Temporal smoothing parameters
+    BOX_SMOOTHING_ALPHA = 0.3  # EMA smoothing factor (lower = more smoothing)
+    
+    # V2: Aspect ratio validation
+    MIN_ASPECT_RATIO = 0.3  # Minimum width/height ratio
+    MAX_ASPECT_RATIO = 3.0  # Maximum width/height ratio
     
     def __init__(self, box, frame_img, open_id, closed_id):
         self.id = int(uuid.uuid4().int >> 96)
-        self.box = box
+        self.box = np.array(box, dtype=float)  # V2: Use numpy for smoothing
+        self.smoothed_box = self.box.copy()  # V2: Smoothed box for stable tracking
         self.previous_box = box  # For motion tracking
         
         # State Machine: detecting_open -> detecting_closed -> counted
@@ -46,6 +59,10 @@ class BagEvent:
         # Motion tracking for adaptive suppression
         self.motion_history: List[float] = []  # Recent motion magnitudes
         self.max_motion_history = 10
+        
+        # V2: Confidence tracking for detection quality
+        self.confidence_history: List[float] = []
+        self.max_confidence_history = 10
 
         # Add first frame
         self._add_roi(box, frame_img, is_open=True)
@@ -69,14 +86,76 @@ class BagEvent:
         motion = math.sqrt((new_cx - old_cx) ** 2 + (new_cy - old_cy) ** 2)
         return motion
     
-    def _update_motion(self, new_box):
-        """Update motion history with new box position."""
+    def _smooth_box(self, new_box) -> np.ndarray:
+        """
+        V2: Apply temporal smoothing to bounding box coordinates.
+        
+        Uses exponential moving average (EMA) to reduce detection jitter
+        and stabilize bounding box positions across frames.
+        
+        Returns:
+            np.ndarray: Smoothed bounding box [x1, y1, x2, y2]
+        """
+        new_box_array = np.array(new_box, dtype=float)
+        
+        # EMA smoothing: smoothed = alpha * new + (1 - alpha) * old
+        self.smoothed_box = (
+            self.BOX_SMOOTHING_ALPHA * new_box_array + 
+            (1 - self.BOX_SMOOTHING_ALPHA) * self.smoothed_box
+        )
+        
+        return self.smoothed_box
+    
+    def _validate_aspect_ratio(self, box) -> bool:
+        """
+        V2: Validate that bounding box has a reasonable aspect ratio.
+        
+        Rejects boxes that are too narrow or too wide, which likely
+        indicate detection errors.
+        
+        Returns:
+            bool: True if aspect ratio is valid
+        """
+        width = box[2] - box[0]
+        height = box[3] - box[1]
+        
+        if height <= 0:
+            return False
+        
+        aspect_ratio = width / height
+        
+        is_valid = self.MIN_ASPECT_RATIO <= aspect_ratio <= self.MAX_ASPECT_RATIO
+        
+        if not is_valid:
+            logger.debug(
+                f"[BagEvent:{self.id}] Invalid aspect ratio: {aspect_ratio:.2f} "
+                f"(valid range: [{self.MIN_ASPECT_RATIO}, {self.MAX_ASPECT_RATIO}])"
+            )
+        
+        return is_valid
+    
+    def _update_motion(self, new_box, confidence: float = 1.0):
+        """Update motion history with new box position and apply smoothing."""
         motion = self._calculate_motion(new_box)
         self.motion_history.append(motion)
         if len(self.motion_history) > self.max_motion_history:
             self.motion_history = self.motion_history[-self.max_motion_history:]
-        self.previous_box = self.box
-        self.box = new_box
+        
+        # V2: Track confidence history
+        self.confidence_history.append(confidence)
+        if len(self.confidence_history) > self.max_confidence_history:
+            self.confidence_history = self.confidence_history[-self.max_confidence_history:]
+        
+        self.previous_box = self.box.copy()
+        
+        # V2: Apply temporal smoothing
+        self.box = self._smooth_box(new_box)
+    
+    def get_avg_confidence(self) -> float:
+        """V2: Get average confidence over recent detections."""
+        if not self.confidence_history:
+            return 0.0
+        return sum(self.confidence_history) / len(self.confidence_history)
     
     def get_avg_motion(self) -> float:
         """Get average motion over recent frames."""
@@ -181,19 +260,53 @@ class BagEvent:
         
         return (True, sharpness, None)
 
-    def add_open_frame(self, box, frame_img):
-        """Add ROI from open detection with motion tracking."""
-        self._update_motion(box)
+    def add_open_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
+        """
+        Add ROI from open detection with motion tracking.
+        
+        V2: Added confidence tracking and aspect ratio validation.
+        
+        Args:
+            box: Bounding box coordinates [x1, y1, x2, y2]
+            frame_img: Full frame image for ROI extraction
+            confidence: Detection confidence score
+            
+        Returns:
+            bool: True if frame was added successfully, False if validation failed
+        """
+        # V2: Validate aspect ratio
+        if not self._validate_aspect_ratio(box):
+            logger.debug(f"[BagEvent:{self.id}] Skipping frame with invalid aspect ratio")
+            return False
+        
+        self._update_motion(box, confidence)
         self.frames_since_update = 0
         self.total_frames_tracked += 1
-        self._add_roi(box, frame_img, is_open=True)
+        return self._add_roi(self.smoothed_box, frame_img, is_open=True)
 
-    def add_closed_frame(self, box, frame_img):
-        """Add ROI from closed detection with motion tracking."""
-        self._update_motion(box)
+    def add_closed_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
+        """
+        Add ROI from closed detection with motion tracking.
+        
+        V2: Added confidence tracking and aspect ratio validation.
+        
+        Args:
+            box: Bounding box coordinates [x1, y1, x2, y2]
+            frame_img: Full frame image for ROI extraction
+            confidence: Detection confidence score
+            
+        Returns:
+            bool: True if frame was added successfully, False if validation failed
+        """
+        # V2: Validate aspect ratio
+        if not self._validate_aspect_ratio(box):
+            logger.debug(f"[BagEvent:{self.id}] Skipping frame with invalid aspect ratio")
+            return False
+        
+        self._update_motion(box, confidence)
         self.frames_since_update = 0
         self.total_frames_tracked += 1
-        self._add_roi(box, frame_img, is_open=False)
+        return self._add_roi(self.smoothed_box, frame_img, is_open=False)
 
     def _is_valid_roi(self, roi, min_size=None, min_sharpness=None):
         """Basic quality gate (backward compatible wrapper)."""
@@ -231,6 +344,7 @@ class BagEvent:
             "total_frames_tracked": self.total_frames_tracked,
             "avg_motion": self.get_avg_motion(),
             "is_stationary": self.is_stationary(),
+            "avg_confidence": self.get_avg_confidence(),  # V2: Added
         }
 
 
@@ -351,7 +465,9 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                best_event.add_open_frame(det['box'], frame_dict['frame'])
+                # V2: Pass confidence to add_open_frame
+                det_conf = det.get('conf', 1.0)
+                best_event.add_open_frame(det['box'], frame_dict['frame'], confidence=det_conf)
                 used_open_indices.add(i)
                 matched_event_ids.add(best_event.id)
 
@@ -385,7 +501,9 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                best_event.add_closed_frame(det['box'], frame_dict['frame'])
+                # V2: Pass confidence to add_closed_frame
+                det_conf = det.get('conf', 1.0)
+                best_event.add_closed_frame(det['box'], frame_dict['frame'], confidence=det_conf)
                 used_closed_indices.add(j)
                 matched_event_ids.add(best_event.id)
 
