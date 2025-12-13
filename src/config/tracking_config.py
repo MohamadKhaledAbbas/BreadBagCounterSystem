@@ -208,5 +208,90 @@ class TrackingConfig:
     """
 
 
+    # ============================================================================
+    # Classification Parameters (V4: Evidence-Based Classification)
+    # ============================================================================
+    
+    top_k_candidates: int = 5
+    """
+    Number of top ROI candidates to select for classification at track end.
+    
+    Range: 3 - 7
+    These are selected by sharpness (primary) and frame recency (secondary).
+    
+    Default: 5
+    """
+    
+    min_total_evidence_score: float = 0.3
+    """
+    Minimum total evidence score required to accept a classification.
+    
+    Range: 0.1 - 1.0
+    Below this threshold, the track is classified as "Unknown".
+    
+    Default: 0.3
+    """
+    
+    evidence_ratio_threshold: float = 1.5
+    """
+    Minimum ratio of winner score to runner-up score for acceptance.
+    
+    Range: 1.1 - 3.0
+    Higher values require more confident differentiation between top classes.
+    
+    Default: 1.5
+    """
+    
+    min_candidates_for_classification: int = 2
+    """
+    Minimum number of valid ROI candidates required for classification.
+    
+    Range: 1 - 5
+    Tracks with fewer candidates are classified as "Unknown" (insufficient data).
+    
+    Default: 2
+    """
+    
+    min_track_frames: int = 3
+    """
+    Minimum number of frames a track must exist before classification.
+    
+    Range: 2 - 10
+    Very short tracks are considered unreliable and classified as "Unknown".
+    
+    Default: 3
+    """
+    
+    sharpness_weight_scale: float = 100.0
+    """
+    Scaling factor for sharpness-based weighting.
+    
+    Range: 50.0 - 500.0
+    Higher values give more weight to sharper frames.
+    
+    Default: 100.0
+    """
+    
+    temporal_weight_scale: float = 0.5
+    """
+    Weight given to later frames in the track (temporal recency).
+    
+    Range: 0.0 - 1.0
+    Higher values favor frames captured later in the track lifecycle.
+    
+    Default: 0.5
+    """
+    
+    max_single_roi_weight: float = 0.6
+    """
+    Maximum weight any single ROI can contribute to the final evidence.
+    
+    Range: 0.3 - 1.0
+    Prevents one very confident ROI from overwhelming all other evidence.
+    
+    Default: 0.6
+    """
+
+
 # Global configuration instance
 tracking_config = TrackingConfig()

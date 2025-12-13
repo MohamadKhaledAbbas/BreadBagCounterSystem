@@ -1,24 +1,31 @@
 """
-ClassifierService Module V2 - Enhanced for Production-Grade Accuracy.
+ClassifierService Module V4 - Evidence-Based Classification.
 
-Key V2 Improvements:
-- Entropy-based uncertainty filtering for rejecting ambiguous predictions
-- Class-specific confidence thresholds for handling class-imbalanced scenarios
-- Enhanced logging for debugging and pattern detection
-- Improved voting algorithm stability
+Production-grade classification system that:
+- Runs classifier only on top-K candidate ROIs (selected by sharpness)
+- Accumulates evidence across candidates using weighted scoring
+- Uses winner vs runner-up ratio for final decision
+- Provides explainable logging for every classification
+
+Key Changes from V2:
+- REMOVED: Entropy-based filtering
+- REMOVED: EMA smoothing
+- REMOVED: Dirichlet voting
+- ADDED: Evidence accumulation with sharpness and temporal weights
+- ADDED: Winner/runner-up ratio threshold
+- ADDED: Structural "Unknown" definition (not statistical uncertainty)
 """
 
 import logging
-import math
 import os
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import Callable, List, Dict, Any, Tuple, Optional
 
-import numpy as np
 import cv2
 
 from src.classifier.BaseClassifier import BaseClassifier
+from src.config.tracking_config import tracking_config
 from src.utils.Utils import compute_phash
 from src.utils.AppLogging import logger, structured_logger
 from src.utils.PipelineMetrics import pipeline_metrics
@@ -28,118 +35,82 @@ ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 class ClassifierService:
     """
-    Enhanced classifier service with voting, entropy filtering, and production-grade accuracy.
+    Evidence-based classifier service for production-grade accuracy.
     
-    V2 Features:
-    - Dirichlet-EMA weighted voting for robust multi-candidate classification
-    - Entropy-based uncertainty filtering to reject ambiguous predictions
-    - Class-specific confidence thresholds for fine-grained control
-    - Comprehensive structured logging for debugging
+    V4 Design Principles:
+    1. Classification is a scarce resource - spend only on best frames
+    2. One track → one final decision (classification at track end only)
+    3. Evidence accumulation replaces statistical voting
+    4. Unknown = structural issue, not statistical uncertainty
+    
+    Evidence Scoring:
+        evidence_score[label] += confidence × sharpness_weight × temporal_weight
+    
+    Final Decision:
+        - Accept winner if: winner_score >= MIN_TOTAL_SCORE AND
+                          winner_score / runner_up_score >= RATIO_THRESHOLD
+        - Otherwise: Unknown
     """
-    
-    # Default class-specific confidence thresholds (can be overridden)
-    # Classes that are harder to distinguish may need higher thresholds
-    DEFAULT_CLASS_THRESHOLDS = {
-        "Unknown": 0.5,  # Higher bar for unknown to reduce false negatives
-    }
-    
-    # Entropy threshold for uncertainty filtering
-    # Lower values = more strict (reject more uncertain predictions)
-    # Max entropy for K classes is log(K), normalized entropy = entropy / log(K)
-    DEFAULT_MAX_NORMALIZED_ENTROPY = 0.7  # Reject if normalized entropy > 0.7
     
     def __init__(self,
                  classifier: BaseClassifier,
                  data_root: str = "data",
                  save_all_rois: bool = False,
-                 min_confidence_threshold: float = 0.3,
-                 use_voting: bool = True,
-                 voting_top_k: Optional[int] = None,
-                 voting_accept_norm_threshold: float = 0.4,
-                 voting_accept_margin: float = 0.15,
-                 # Dirichlet / EMA params
-                 alpha0: float = 0.5,
-                 ema_beta: float = 0.3,
-                 sharpness_s0: float = 100.0,
-                 sharpness_scale: float = 20.0,
-                 best_conf_break: float = 0.99,
-                 weight_min: float = 1e-6,
-                 # V2: Entropy-based filtering
-                 use_entropy_filtering: bool = True,
-                 max_normalized_entropy: float = 0.7,
-                 # V2: Class-specific thresholds
-                 class_confidence_thresholds: Optional[Dict[str, float]] = None):
+                 min_confidence_threshold: float = 0.3):
+        """
+        Initialize the evidence-based classifier service.
+        
+        Args:
+            classifier: Base classifier model for predictions
+            data_root: Root directory for saving ROI images
+            save_all_rois: Whether to save all classified ROIs
+            min_confidence_threshold: Minimum confidence for individual predictions
+        """
         self.classifier = classifier
         self.data_root = data_root
         self.save_all_rois = save_all_rois
         self.min_confidence_threshold = min_confidence_threshold
-        self.use_voting = use_voting
-        # Default None processes all candidates; set a positive value to restore legacy top-k behavior.
-        self.voting_top_k = voting_top_k
-        self.voting_accept_norm_threshold = voting_accept_norm_threshold
-        self.voting_accept_margin = voting_accept_margin
-
-        # New algorithm params
-        self.alpha0 = alpha0
-        self.ema_beta = ema_beta
-        self.sharpness_s0 = sharpness_s0
-        self.sharpness_scale = sharpness_scale
-        self.best_conf_break = best_conf_break
-        self.weight_min = weight_min
         
-        # V2: Entropy-based uncertainty filtering
-        self.use_entropy_filtering = use_entropy_filtering
-        self.max_normalized_entropy = max_normalized_entropy
-        
-        # V2: Class-specific confidence thresholds
-        self.class_confidence_thresholds = class_confidence_thresholds or self.DEFAULT_CLASS_THRESHOLDS.copy()
+        # V4: Configuration from centralized config
+        self.top_k = tracking_config.top_k_candidates
+        self.min_total_evidence = tracking_config.min_total_evidence_score
+        self.ratio_threshold = tracking_config.evidence_ratio_threshold
+        self.min_candidates = tracking_config.min_candidates_for_classification
+        self.min_track_frames = tracking_config.min_track_frames
+        self.sharpness_scale = tracking_config.sharpness_weight_scale
+        self.temporal_scale = tracking_config.temporal_weight_scale
+        self.max_single_weight = tracking_config.max_single_roi_weight
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
-
-        # per-track state
-        self.track_states: Dict[int, Dict[str, Any]] = {}
         
-        # V2: Metrics tracking
-        self._entropy_rejections = 0
-        self._class_threshold_rejections = 0
-
-        candidate_cap = self._get_candidate_cap()
-        candidate_cap_desc = 'all' if candidate_cap is None else candidate_cap
+        # V4: Track classification statistics
+        self._total_classified = 0
+        self._unknown_structural = 0
+        self._unknown_low_evidence = 0
+        self._unknown_ambiguous = 0
 
         logger.info(
-            f"[ClassifierService] Initialized V2: voting={use_voting}, "
-            f"weighted_conf_threshold={voting_accept_norm_threshold}, "
-            f"margin_threshold={voting_accept_margin}, "
-            f"candidates_per_vote={candidate_cap_desc}, "
-            f"alpha0={self.alpha0}, ema_beta={self.ema_beta}, "
-            f"entropy_filtering={use_entropy_filtering}, max_entropy={max_normalized_entropy}"
+            f"[ClassifierService] Initialized V4 (Evidence-Based): "
+            f"top_k={self.top_k}, min_evidence={self.min_total_evidence}, "
+            f"ratio_threshold={self.ratio_threshold}, min_candidates={self.min_candidates}"
         )
-
-    def _get_candidate_cap(self) -> Optional[int]:
-        if self.voting_top_k is None or self.voting_top_k <= 0:
-            return None
-        return self.voting_top_k
-
-    def _calculate_margin(self, label_scores: Dict[str, float], winning_label: str, winning_score: float,
-                          total_score: float) -> float:
-        tie_epsilon = 1e-9
-        winning_labels = [label for label, score in label_scores.items() if abs(score - winning_score) < tie_epsilon]
-        if len(label_scores) == 1:
-            return 1.0
-        if len(winning_labels) > 1:
-            return 0.0
-
-        second_score = max(
-            (score for label, score in label_scores.items() if label != winning_label),
-            default=0.0
-        )
-        return (winning_score - second_score) / total_score if total_score > 0 else 0.0
 
     def register_callback(self, callback: ResultCallback):
+        """Register a callback for classification results."""
         self.callbacks.append(callback)
 
     def _classify_single(self, roi_image, idx: int = 0) -> Tuple[str, float]:
+        """
+        Classify a single ROI image.
+        
+        Args:
+            roi_image: ROI image to classify
+            idx: Candidate index for logging
+            
+        Returns:
+            Tuple of (label, confidence)
+        """
         try:
             t1 = time.perf_counter()
             label, conf = self.classifier.predict(roi_image)
@@ -151,455 +122,466 @@ class ClassifierService:
             logger.error(f"[ClassifierService] Classification error: {e}")
             return "Unknown", 0.0
 
-    def _compute_sharpness(self, img) -> float:
-        try:
-            if img is None:
-                return 0.0
-            if len(img.shape) == 3:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = img
-            lap = cv2.Laplacian(gray, cv2.CV_64F)
-            var = float(lap.var())
-            return var
-        except Exception:
-            return 0.0
-
-    def _sigmoid(self, x: float) -> float:
-        return 1.0 / (1.0 + np.exp(-x))
-
-    def _compute_entropy(self, proba: np.ndarray) -> float:
+    def _compute_sharpness_weight(self, sharpness: float) -> float:
         """
-        Compute Shannon entropy of a probability distribution.
+        Compute sharpness-based weight for evidence scoring.
         
-        Entropy measures the uncertainty in the prediction.
-        Higher entropy = more uncertain (spread across classes).
-        Lower entropy = more certain (concentrated on one class).
+        Higher sharpness = sharper image = more reliable classification.
+        Weight is normalized and clamped to prevent extreme values.
         
-        Returns:
-            float: Shannon entropy in nats (natural log)
-        """
-        # Filter out zero probabilities to avoid log(0)
-        proba = proba[proba > 0]
-        if len(proba) == 0:
-            return 0.0
-        return -np.sum(proba * np.log(proba))
-    
-    def _compute_normalized_entropy(self, proba: np.ndarray) -> float:
-        """
-        Compute normalized entropy (0 to 1).
-        
-        Normalized entropy = entropy / max_entropy
-        where max_entropy = log(K) for K classes.
-        
-        Returns:
-            float: Normalized entropy between 0 (certain) and 1 (uniform/uncertain)
-        """
-        K = len(proba)
-        if K <= 1:
-            return 0.0
-        
-        entropy = self._compute_entropy(proba)
-        max_entropy = math.log(K)  # Maximum entropy for uniform distribution
-        
-        return entropy / max_entropy if max_entropy > 0 else 0.0
-    
-    def _check_entropy_threshold(self, proba: np.ndarray, label: str) -> Tuple[bool, float]:
-        """
-        Check if the prediction entropy is below the threshold.
-        
-        Returns:
-            Tuple[bool, float]: (is_acceptable, normalized_entropy)
-        """
-        normalized_entropy = self._compute_normalized_entropy(proba)
-        
-        # Prediction is acceptable if entropy is below threshold
-        is_acceptable = normalized_entropy <= self.max_normalized_entropy
-        
-        if not is_acceptable:
-            logger.debug(
-                f"[ClassifierService] Entropy filter: normalized_entropy={normalized_entropy:.3f} > "
-                f"threshold={self.max_normalized_entropy} for label={label}"
-            )
-            self._entropy_rejections += 1
-        
-        return is_acceptable, normalized_entropy
-    
-    def _check_class_threshold(self, label: str, confidence: float) -> bool:
-        """
-        Check if the confidence meets the class-specific threshold.
-        
-        Returns:
-            bool: True if confidence is acceptable for this class
-        """
-        threshold = self.class_confidence_thresholds.get(label, self.min_confidence_threshold)
-        
-        is_acceptable = confidence >= threshold
-        
-        if not is_acceptable:
-            logger.debug(
-                f"[ClassifierService] Class threshold filter: conf={confidence:.3f} < "
-                f"threshold={threshold} for class={label}"
-            )
-            self._class_threshold_rejections += 1
-        
-        return is_acceptable
-
-    def _select_best_with_voting(self, track_id: int, candidates: List) -> Tuple[Optional[Any], str, float, Dict[str, Any]]:
-        # (identical to the Dirichlet/EMA implementation provided earlier)
-        # V2: Enhanced with entropy-based filtering and improved metadata
-        # It returns (selected_roi, final_label, top_prob, metadata)
-        # ------------------
-        metadata = {}
-        
-        if not candidates:
-            return None, "Unknown", 0.0, metadata
-
-        results = []
-        batch_start = time.perf_counter()
-        logger.info(f"[ClassifierService] Classifying {len(candidates)} candidates...")
-
-        for idx, roi in enumerate(candidates):
-            label, conf = self._classify_single(roi, idx)
-            sharpness = self._compute_sharpness(roi)
-            results.append({'roi': roi, 'label': label, 'conf': conf, 'sharpness': sharpness})
-
-        batch_end = time.perf_counter()
-        total_batch_time = (batch_end - batch_start) * 1000
-
-        valid_results = [r for r in results if r['label'] != "Unknown"]
-        if not valid_results:
-            logger.warning("[ClassifierService] All candidates Unknown!")
-            best_unknown = max(results, key=lambda x: x['conf'])
-            metadata = {"all_unknown": True, "candidates_evaluated": len(candidates)}
-            return best_unknown['roi'], "Unknown", best_unknown['conf'], metadata
-
-        valid_results.sort(key=lambda x: x['conf'], reverse=True)
-        candidate_cap = self._get_candidate_cap()
-        candidates_for_vote = valid_results if candidate_cap is None else valid_results[:candidate_cap]
-
-        if hasattr(self.classifier, "classes_") and getattr(self.classifier, "classes_") is not None:
-            classes = list(getattr(self.classifier, "classes_"))
-        else:
-            classes = sorted({r['label'] for r in candidates_for_vote})
-
-        K = len(classes)
-        label_to_index = {lbl: idx for idx, lbl in enumerate(classes)}
-        proba_available = hasattr(self.classifier, "predict_proba") and callable(getattr(self.classifier, "predict_proba"))
-
-        candidate_vectors = []
-        for r in candidates_for_vote:
-            if proba_available:
-                try:
-                    probs = self.classifier.predict_proba(r['roi'])
-                    if hasattr(self.classifier, "classes_") and getattr(self.classifier, "classes_") is not None:
-                        clf_classes = list(getattr(self.classifier, "classes_"))
-                        proba_vec = np.zeros(K, dtype=float)
-                        for i_c, cname in enumerate(clf_classes):
-                            if cname in label_to_index:
-                                proba_vec[label_to_index[cname]] = float(probs[i_c])
-                        if proba_vec.sum() <= 0:
-                            proba_vec = np.ones(K, dtype=float) / float(K)
-                        else:
-                            proba_vec = proba_vec / proba_vec.sum()
-                    else:
-                        proba_vec = np.array(probs, dtype=float)
-                        if proba_vec.size != K:
-                            proba_vec = np.zeros(K, dtype=float)
-                            proba_vec[label_to_index.get(r['label'], 0)] = r['conf']
-                            remaining = max(0.0, 1.0 - r['conf'])
-                            if K > 1:
-                                proba_vec += remaining / (K - 1)
-                except Exception:
-                    proba_vec = np.zeros(K, dtype=float)
-                    proba_vec[label_to_index.get(r['label'], 0)] = r['conf']
-                    remaining = max(0.0, 1.0 - r['conf'])
-                    if K > 1:
-                        proba_vec += remaining / (K - 1)
-            else:
-                proba_vec = np.zeros(K, dtype=float)
-                proba_vec[label_to_index.get(r['label'], 0)] = r['conf']
-                remaining = max(0.0, 1.0 - r['conf'])
-                if K > 1:
-                    proba_vec += remaining / (K - 1)
-
-            if proba_vec.sum() <= 0:
-                proba_vec = np.ones(K, dtype=float) / float(K)
-            else:
-                proba_vec = proba_vec / proba_vec.sum()
-
-            candidate_vectors.append(proba_vec)
-
-        weights = []
-        for r in candidates_for_vote:
-            sharp = float(r.get('sharpness', 0.0))
-            sharp_w = float(self._sigmoid((sharp - self.sharpness_s0) / max(1.0, self.sharpness_scale)))
-            conf_w = float(r['conf'])
-            w = max(conf_w * sharp_w, self.weight_min)
-            weights.append(w)
-
-        weights = np.array(weights, dtype=float)
-        if weights.sum() > 0:
-            weights = weights / weights.sum()
-        else:
-            weights = np.ones_like(weights) / float(len(weights))
-
-        alpha = np.full(K, float(self.alpha0), dtype=float)
-        for vec, w in zip(candidate_vectors, weights):
-            alpha += w * vec
-
-        posterior = alpha / float(alpha.sum())
-
-        ts = time.time()
-        track_state = self.track_states.get(track_id)
-        if track_state is None:
-            ema_post = posterior.copy()
-        else:
-            prev_post = track_state.get('posterior')
-            if prev_post is not None and prev_post.size == posterior.size:
-                ema_post = (1.0 - self.ema_beta) * prev_post + self.ema_beta * posterior
-            else:
-                ema_post = posterior.copy()
-
-        self.track_states[track_id] = {
-            'posterior': ema_post,
-            'labels': classes,
-            'last_update': ts
-        }
-
-        top_idx = int(np.argmax(ema_post))
-        top_label = classes[top_idx]
-        top_prob = float(ema_post[top_idx])
-        second_prob = float(np.partition(ema_post, -2)[-2]) if K > 1 else 0.0
-        margin = top_prob - second_prob
-        normalized_score = top_prob
-        
-        # V2: Compute entropy for uncertainty detection
-        normalized_entropy = self._compute_normalized_entropy(ema_post)
-        entropy_acceptable = True
-        if self.use_entropy_filtering:
-            entropy_acceptable, normalized_entropy = self._check_entropy_threshold(ema_post, top_label)
-
-        strong_single = False
-        for r, w, _ in zip(candidates_for_vote, weights, candidate_vectors):
-            if r['conf'] >= self.best_conf_break and w >= (1.0 / len(weights)) * 0.5:
-                strong_single = True
-                break
-
-        # V2: Add entropy check to acceptance criteria
-        base_accepted = (normalized_score >= self.voting_accept_norm_threshold) or (margin >= self.voting_accept_margin) or strong_single
-        accepted = base_accepted and entropy_acceptable
-        
-        # V2: Check class-specific threshold
-        if accepted and not self._check_class_threshold(top_label, top_prob):
-            accepted = False
-        
-        final_label = top_label if accepted else "Unknown"
-
-        if accepted:
-            matching = [r for r in candidates_for_vote if r['label'] == final_label]
-            if matching:
-                selected_result = max(matching, key=lambda x: x['conf'])
-            else:
-                selected_result = max(candidates_for_vote, key=lambda x: x['conf'])
-        else:
-            selected_result = max(candidates_for_vote, key=lambda x: x['conf'])
-
-        selected_roi = selected_result['roi']
-        selected_conf = selected_result['conf']
-
-        if not accepted:
-            rejection_reasons = []
-            if not base_accepted:
-                rejection_reasons.append(
-                    f"voting(norm={normalized_score:.2f}, margin={margin:.2f})"
-                )
-            if not entropy_acceptable:
-                rejection_reasons.append(f"entropy={normalized_entropy:.2f}")
-            logger.warning(
-                f"[ClassifierService] Uncertain: {top_label} rejected - "
-                f"{', '.join(rejection_reasons)}"
-            )
-
-        logger.info(
-            f"[ClassifierService] Result: {final_label} "
-            f"(conf={selected_conf:.3f}, norm={normalized_score:.2f}, "
-            f"margin={margin:.2f}, entropy={normalized_entropy:.3f}, "
-            f"n={len(candidates_for_vote)}/{len(valid_results)}, {total_batch_time:.1f}ms)"
-        )
-
-        label_scores = {lbl: float(alpha[i]) for i, lbl in enumerate(classes)}
-        label_counts = Counter([r['label'] for r in candidates_for_vote])
-        if logger.isEnabledFor(getattr(logger, "DEBUG", logging.DEBUG)):
-            weight_dist = ", ".join([
-                f"{label}: alpha={label_scores[label]:.3f}, count={label_counts[label]}"
-                for label in classes
-            ])
-            logger.debug(f"[ClassifierService] Weighted distribution: {weight_dist}")
-
-        # V2: Include comprehensive metadata for debugging
-        metadata = {
-            "normalized_score": normalized_score,
-            "margin": margin,
-            "normalized_entropy": normalized_entropy,
-            "entropy_acceptable": entropy_acceptable,
-            "base_accepted": base_accepted,
-            "strong_single": strong_single,
-            "candidates_evaluated": len(candidates),
-            "candidates_voted": len(candidates_for_vote),
-            "processing_time_ms": total_batch_time,
-            "label_scores": label_scores,
-        }
-
-        return selected_roi, final_label, top_prob, metadata
-
-    def _select_best_by_confidence(self, candidates: List) -> Tuple[Optional[Any], str, float, Dict[str, Any]]:
-        """Select best candidate by confidence (fallback when voting not used)."""
-        metadata = {"method": "confidence_only"}
-        
-        if not candidates:
-            return None, "Unknown", 0.0, metadata
-
-        best_roi = None
-        best_label = "Unknown"
-        best_confidence = 0.0
-        best_unknown_roi = None
-        best_unknown_conf = 0.0
-
-        for idx, roi in enumerate(candidates):
-            label, conf = self._classify_single(roi, idx)
-
-            if label == "Unknown":
-                if conf > best_unknown_conf:
-                    best_unknown_roi = roi
-                    best_unknown_conf = conf
-            else:
-                if conf > best_confidence:
-                    best_roi = roi
-                    best_label = label
-                    best_confidence = conf
-
-        metadata["candidates_evaluated"] = len(candidates)
-        
-        if best_roi is not None:
-            # V2: Check class-specific threshold
-            if not self._check_class_threshold(best_label, best_confidence):
-                logger.warning(
-                    f"[ClassifierService] Class threshold not met: {best_label} "
-                    f"conf={best_confidence:.3f}"
-                )
-                return best_roi, "Unknown", best_confidence, metadata
+        Args:
+            sharpness: Laplacian variance score
             
-            logger.info(f"[ClassifierService] Best: {best_label} (conf={best_confidence:.3f})")
-            return best_roi, best_label, best_confidence, metadata
-        else:
-            return best_unknown_roi, "Unknown", best_unknown_conf, metadata
-
-    def process(self, track_id: int, roi_input, context: Optional[Dict[str, Any]] = None):
+        Returns:
+            Weight between 0.1 and 1.0
         """
-        Process classification request.
+        # Normalize sharpness relative to scale
+        normalized = sharpness / self.sharpness_scale
+        # Sigmoid-like clamping
+        weight = min(1.0, max(0.1, normalized))
+        return weight
+
+    def _compute_temporal_weight(self, relative_time: float) -> float:
+        """
+        Compute temporal weight favoring later frames in the track.
         
-        V2 enhancements:
-        - Entropy-based uncertainty filtering
-        - Class-specific confidence thresholds
-        - Structured logging for debugging
+        Later frames tend to have better views of the bag after it settles.
+        
+        Args:
+            relative_time: Position in track (0.0 = start, 1.0 = end)
+            
+        Returns:
+            Weight between 0.5 and 1.0
         """
-        try:
-            if isinstance(roi_input, list):
-                candidates = roi_input
-            else:
-                candidates = [roi_input]
+        # Linear scaling: later frames get higher weight
+        base_weight = 0.5
+        temporal_bonus = self.temporal_scale * relative_time
+        return min(1.0, base_weight + temporal_bonus)
 
-            logger.info(f"[ClassifierService] Track {track_id}: {len(candidates)} candidates")
-
-            if not candidates:
-                logger.error(f"[ClassifierService] Track {track_id}: Empty candidates!")
-                return
-
-            # V2: Methods now return metadata as 4th element
-            used_voting = self.use_voting and len(candidates) >= 3
-            if used_voting:
-                best_roi, label, conf, metadata = self._select_best_with_voting(track_id, candidates)
-            else:
-                best_roi, label, conf, metadata = self._select_best_by_confidence(candidates)
-
-            if best_roi is None:
-                logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
-                return
-
-            if conf < self.min_confidence_threshold:
-                logger.warning(
-                    f"[ClassifierService] Track {track_id}: Low confidence "
-                    f"{label} ({conf:.3f} < {self.min_confidence_threshold})"
-                )
-
-            phash_obj = compute_phash(best_roi)
-            phash_str = str(phash_obj)
-
-            if label == "Unknown":
-                target_dir = os.path.join(self.data_root, "unknown", phash_str)
-            else:
-                target_dir = os.path.join(self.data_root, "classes", label)
-
-            os.makedirs(target_dir, exist_ok=True)
-
-            should_save = False
-            existing_files = os.listdir(target_dir)
-
-            if self.save_all_rois:
-                should_save = True
-            elif not existing_files:
-                should_save = True
-
-            image_path = None
-            if should_save:
-                timestamp = int(time.time())
-                filename = f"{timestamp}_{track_id}.jpg"
-                save_path = os.path.join(target_dir, filename)
-
-                cv2.imwrite(save_path, best_roi)
-                image_path = save_path
-            elif existing_files:
-                image_path = os.path.join(target_dir, existing_files[0])
-
-            result_data = {
-                "label": label,
-                "phash": phash_str,
-                "image_path": image_path,
-                "confidence": conf,
-                "candidates_evaluated": len(candidates),
-                "context": context,  # pass-through for downstream snapshot saving
-                "metadata": metadata,  # V2: Include classification metadata
+    def _accumulate_evidence(self, classifications: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Accumulate evidence across all classified candidates.
+        
+        For each classified candidate:
+            evidence_score[label] += confidence × sharpness_weight × temporal_weight
+        
+        Also tracks the best representative frame for each label.
+        
+        Args:
+            classifications: List of classification results with metadata
+            
+        Returns:
+            Dictionary mapping labels to evidence data:
+            {
+                "label": {
+                    "score": total_evidence_score,
+                    "count": number_of_votes,
+                    "best_roi": ROI with highest contribution,
+                    "best_confidence": highest confidence for this label,
+                    "contributions": list of individual contributions
+                }
             }
+        """
+        evidence: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "score": 0.0,
+            "count": 0,
+            "best_roi": None,
+            "best_confidence": 0.0,
+            "contributions": []
+        })
+        
+        for clf in classifications:
+            label = clf['label']
+            confidence = clf['confidence']
+            sharpness = clf['sharpness']
+            relative_time = clf['relative_time']
+            roi = clf['roi']
             
-            # Record classification metrics
-            pipeline_metrics.record_classification(
-                label, conf, len(candidates), used_voting
-            )
+            # Skip Unknown predictions - they don't contribute evidence
+            # Note: If ALL predictions are Unknown, the track will be classified as Unknown
+            # with reason "no_valid_classifications" in _finalize_classification().
+            # This is intentional: Unknown predictions indicate classifier uncertainty,
+            # so they should not influence the evidence accumulation.
+            if label == "Unknown":
+                continue
             
-            # V2: Structured logging for pattern detection
-            structured_logger.classification_result(
-                track_id=track_id,
-                label=label,
-                confidence=conf,
-                candidates=len(candidates),
-                used_voting=used_voting,
-                entropy=metadata.get("normalized_entropy", 0.0),
-                margin=metadata.get("margin", 0.0),
-            )
+            # Compute weights
+            sharpness_weight = self._compute_sharpness_weight(sharpness)
+            temporal_weight = self._compute_temporal_weight(relative_time)
+            
+            # Calculate contribution with clamping
+            raw_contribution = confidence * sharpness_weight * temporal_weight
+            clamped_contribution = min(raw_contribution, self.max_single_weight)
+            
+            # Accumulate evidence
+            evidence[label]["score"] += clamped_contribution
+            evidence[label]["count"] += 1
+            evidence[label]["contributions"].append({
+                "confidence": confidence,
+                "sharpness": sharpness,
+                "temporal": relative_time,
+                "raw_contribution": raw_contribution,
+                "clamped_contribution": clamped_contribution
+            })
+            
+            # Track best representative frame for this label
+            if confidence > evidence[label]["best_confidence"]:
+                evidence[label]["best_confidence"] = confidence
+                evidence[label]["best_roi"] = roi
+        
+        return dict(evidence)
 
+    def _finalize_classification(self, evidence: Dict[str, Dict[str, Any]], 
+                                 event_stats: Dict[str, Any]) -> Tuple[str, float, str, Dict[str, Any]]:
+        """
+        Finalize classification using evidence accumulation and ratio thresholds.
+        
+        Decision Rules:
+        1. If no evidence → Unknown (no valid classifications)
+        2. If winner_score < min_total_evidence → Unknown (insufficient evidence)
+        3. If winner/runner_up < ratio_threshold → Unknown (ambiguous)
+        4. Otherwise → Accept winner
+        
+        Args:
+            evidence: Accumulated evidence per label
+            event_stats: Track statistics for structural validation
+            
+        Returns:
+            Tuple of (final_label, confidence, rejection_reason, metadata)
+        """
+        metadata = {
+            "evidence_per_label": {},
+            "total_candidates_classified": sum(e["count"] for e in evidence.values()),
+        }
+        
+        # Check for structural issues first
+        total_rois = event_stats.get("total", 0)
+        track_duration = event_stats.get("track_duration_frames", 0)
+        avg_sharpness = event_stats.get("avg_sharpness", 0)
+        
+        # Structural check: too few ROIs
+        if total_rois < self.min_candidates:
+            self._unknown_structural += 1
+            return "Unknown", 0.0, f"too_few_rois ({total_rois} < {self.min_candidates})", metadata
+        
+        # Structural check: track too short
+        if track_duration < self.min_track_frames:
+            self._unknown_structural += 1
+            return "Unknown", 0.0, f"track_too_short ({track_duration} < {self.min_track_frames})", metadata
+        
+        # No evidence accumulated (all predictions were Unknown)
+        if not evidence:
+            self._unknown_structural += 1
+            return "Unknown", 0.0, "no_valid_classifications", metadata
+        
+        # Sort labels by evidence score
+        sorted_labels = sorted(evidence.items(), key=lambda x: x[1]["score"], reverse=True)
+        
+        # Record evidence for logging
+        for label, data in sorted_labels:
+            metadata["evidence_per_label"][label] = {
+                "score": round(data["score"], 4),
+                "count": data["count"],
+                "best_confidence": round(data["best_confidence"], 3)
+            }
+        
+        winner_label, winner_data = sorted_labels[0]
+        winner_score = winner_data["score"]
+        winner_confidence = winner_data["best_confidence"]
+        
+        # Check minimum evidence threshold
+        if winner_score < self.min_total_evidence:
+            self._unknown_low_evidence += 1
+            return "Unknown", winner_confidence, f"low_evidence ({winner_score:.3f} < {self.min_total_evidence})", metadata
+        
+        # Calculate ratio against runner-up
+        if len(sorted_labels) > 1:
+            runner_up_label, runner_up_data = sorted_labels[1]
+            runner_up_score = runner_up_data["score"]
+            
+            # Avoid division by zero - if runner_up has no score, winner wins by default
+            if runner_up_score > 1e-9:  # Use small epsilon for floating point comparison
+                ratio = winner_score / runner_up_score
+                metadata["winner_ratio"] = round(ratio, 3)
+                metadata["runner_up"] = {
+                    "label": runner_up_label,
+                    "score": round(runner_up_score, 4)
+                }
+                
+                if ratio < self.ratio_threshold:
+                    self._unknown_ambiguous += 1
+                    return "Unknown", winner_confidence, f"ambiguous ({ratio:.2f} < {self.ratio_threshold})", metadata
+            else:
+                # Runner-up has essentially zero evidence, winner is uncontested
+                metadata["winner_ratio"] = float('inf')
+                metadata["runner_up"] = {
+                    "label": runner_up_label,
+                    "score": 0.0
+                }
+        
+        # Accept winner
+        metadata["accepted"] = True
+        metadata["winner_score"] = round(winner_score, 4)
+        return winner_label, winner_confidence, None, metadata
+
+    def _select_best_representative(self, evidence: Dict[str, Dict[str, Any]], 
+                                    final_label: str) -> Optional[Any]:
+        """
+        Select the best representative ROI for the final label.
+        
+        Args:
+            evidence: Accumulated evidence per label
+            final_label: The winning label
+            
+        Returns:
+            Best ROI image for the label, or None
+        """
+        if final_label in evidence:
+            return evidence[final_label].get("best_roi")
+        return None
+
+    def process(self, track_id: int, candidates_input: List[Dict], context: Optional[Dict[str, Any]] = None):
+        """
+        Process classification for a completed track.
+        
+        V4 Evidence-Based Classification Pipeline:
+        1. Validate structural requirements (min ROIs, track length)
+        2. Classify each candidate ROI
+        3. Accumulate evidence with weighted scoring
+        4. Finalize using winner/runner-up ratio
+        5. Select best representative frame
+        6. Invoke callbacks with result
+        
+        Args:
+            track_id: Unique track identifier
+            candidates_input: List of candidate dictionaries from BagEvent.get_all_candidates()
+            context: Optional context for snapshot saving
+        """
+        try:
+            self._total_classified += 1
+            batch_start = time.perf_counter()
+            
+            # V4: candidates_input is now a list of dicts with metadata
+            if isinstance(candidates_input, list) and len(candidates_input) > 0:
+                if isinstance(candidates_input[0], dict):
+                    candidates = candidates_input
+                else:
+                    # Backward compatibility: convert old format (list of ROI images)
+                    # Warning: This path uses default metadata which may lead to suboptimal
+                    # evidence accumulation. Prefer using the new dict format.
+                    logger.warning(
+                        f"[ClassifierService] Track {track_id}: Using legacy candidate format. "
+                        f"Update to new dict format for optimal evidence weighting."
+                    )
+                    candidates = [{'roi': roi, 'sharpness': 100.0, 'frame_index': 0, 
+                                   'bbox_area': 0, 'confidence': 0.8, 'relative_time': 0.5} 
+                                  for roi in candidates_input]
+            else:
+                candidates = []
+            
+            # Extract event_stats from context if available
+            event_stats = context.get("event_stats", {}) if context else {}
+            
             logger.info(
-                f"[ClassifierService] Track {track_id} DONE: {label} "
-                f"(conf={conf:.3f}, candidates={len(candidates)})"
+                f"[ClassifierService] Track {track_id}: Processing {len(candidates)} candidates "
+                f"(top-K={self.top_k})"
             )
-
-            for cb in self.callbacks:
-                try:
-                    cb(track_id, result_data)
-                except Exception as e:
-                    logger.error(f"[ClassifierService] Callback error: {e}")
+            
+            # Structural validation
+            if not candidates:
+                logger.warning(f"[ClassifierService] Track {track_id}: No candidates!")
+                self._invoke_unknown_result(track_id, "no_candidates", context)
+                return
+            
+            # Step 1: Classify each candidate
+            classifications = []
+            for idx, cand in enumerate(candidates):
+                roi = cand['roi']
+                label, conf = self._classify_single(roi, idx)
+                
+                classifications.append({
+                    'label': label,
+                    'confidence': conf,
+                    'roi': roi,
+                    'sharpness': cand.get('sharpness', 0),
+                    'frame_index': cand.get('frame_index', 0),
+                    'relative_time': cand.get('relative_time', 0.5),
+                })
+            
+            classify_time = (time.perf_counter() - batch_start) * 1000
+            
+            # Step 2: Accumulate evidence
+            evidence = self._accumulate_evidence(classifications)
+            
+            # Step 3: Finalize classification
+            final_label, final_conf, rejection_reason, metadata = self._finalize_classification(
+                evidence, event_stats
+            )
+            
+            # Step 4: Select best representative ROI
+            if final_label != "Unknown":
+                best_roi = self._select_best_representative(evidence, final_label)
+            else:
+                # For Unknown, use the ROI with highest individual confidence
+                best_classification = max(classifications, key=lambda x: x['confidence'])
+                best_roi = best_classification['roi']
+                final_conf = best_classification['confidence']
+            
+            # Log decision with full explainability
+            self._log_classification_decision(
+                track_id, final_label, final_conf, rejection_reason, 
+                metadata, len(candidates), classify_time
+            )
+            
+            # Include rejection reason in metadata for callbacks
+            if rejection_reason:
+                metadata["rejection_reason"] = rejection_reason
+            
+            # Save ROI and invoke callbacks
+            self._save_and_callback(
+                track_id, best_roi, final_label, final_conf, 
+                len(candidates), metadata, context
+            )
 
         except Exception as e:
-            logger.error(f"[ClassifierService] Process error: {e}")
+            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _log_classification_decision(self, track_id: int, label: str, confidence: float,
+                                     rejection_reason: Optional[str], metadata: Dict,
+                                     num_candidates: int, classify_time_ms: float):
+        """
+        Log the classification decision with full explainability.
+        
+        This implements Task 10: Explainable logging per track.
+        """
+        evidence_summary = metadata.get("evidence_per_label", {})
+        winner_ratio = metadata.get("winner_ratio", "N/A")
+        
+        if rejection_reason:
+            logger.warning(
+                f"[ClassifierService] Track {track_id} -> Unknown: {rejection_reason}\n"
+                f"  Candidates: {num_candidates}, Time: {classify_time_ms:.1f}ms\n"
+                f"  Evidence: {evidence_summary}"
+            )
+        else:
+            logger.info(
+                f"[ClassifierService] Track {track_id} -> {label} (conf={confidence:.3f})\n"
+                f"  Winner score: {metadata.get('winner_score', 'N/A')}, Ratio: {winner_ratio}\n"
+                f"  Candidates: {num_candidates}, Time: {classify_time_ms:.1f}ms\n"
+                f"  Evidence: {evidence_summary}"
+            )
+        
+        # Structured logging for analysis
+        structured_logger.classification_result(
+            track_id=track_id,
+            label=label,
+            confidence=confidence,
+            candidates=num_candidates,
+            used_voting=True,  # V4 always uses evidence accumulation
+            entropy=0.0,  # Not used in V4
+            margin=winner_ratio if isinstance(winner_ratio, float) else 0.0,
+        )
+
+    def _invoke_unknown_result(self, track_id: int, reason: str, context: Optional[Dict]):
+        """Invoke callbacks with Unknown result for structural failures."""
+        result_data = {
+            "label": "Unknown",
+            "phash": "unknown",
+            "image_path": None,
+            "confidence": 0.0,
+            "candidates_evaluated": 0,
+            "context": context,
+            "metadata": {"rejection_reason": reason},
+        }
+        
+        for cb in self.callbacks:
+            try:
+                cb(track_id, result_data)
+            except Exception as e:
+                logger.error(f"[ClassifierService] Callback error: {e}")
+
+    def _save_and_callback(self, track_id: int, best_roi: Any, label: str, 
+                           confidence: float, candidates_count: int,
+                           metadata: Dict, context: Optional[Dict]):
+        """Save ROI image and invoke registered callbacks."""
+        if best_roi is None:
+            logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
+            return
+        
+        # Compute phash
+        phash_obj = compute_phash(best_roi)
+        phash_str = str(phash_obj)
+        
+        # Determine save path
+        if label == "Unknown":
+            target_dir = os.path.join(self.data_root, "unknown", phash_str)
+        else:
+            target_dir = os.path.join(self.data_root, "classes", label)
+        
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # Save logic
+        should_save = False
+        existing_files = os.listdir(target_dir)
+        
+        if self.save_all_rois:
+            should_save = True
+        elif not existing_files:
+            should_save = True
+        
+        image_path = None
+        if should_save:
+            timestamp = int(time.time())
+            filename = f"{timestamp}_{track_id}.jpg"
+            save_path = os.path.join(target_dir, filename)
+            cv2.imwrite(save_path, best_roi)
+            image_path = save_path
+        elif existing_files:
+            image_path = os.path.join(target_dir, existing_files[0])
+        
+        # Prepare result data
+        result_data = {
+            "label": label,
+            "phash": phash_str,
+            "image_path": image_path,
+            "confidence": confidence,
+            "candidates_evaluated": candidates_count,
+            "context": context,
+            "metadata": metadata,
+        }
+        
+        # Record metrics
+        pipeline_metrics.record_classification(
+            label, confidence, candidates_count, used_voting=True
+        )
+        
+        logger.info(
+            f"[ClassifierService] Track {track_id} DONE: {label} "
+            f"(conf={confidence:.3f}, candidates={candidates_count})"
+        )
+        
+        # Invoke callbacks
+        for cb in self.callbacks:
+            try:
+                cb(track_id, result_data)
+            except Exception as e:
+                logger.error(f"[ClassifierService] Callback error: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get classification statistics for monitoring.
+        
+        Returns:
+            Dictionary with classification statistics
+        """
+        return {
+            "total_classified": self._total_classified,
+            "unknown_structural": self._unknown_structural,
+            "unknown_low_evidence": self._unknown_low_evidence,
+            "unknown_ambiguous": self._unknown_ambiguous,
+            "successful": self._total_classified - (
+                self._unknown_structural + self._unknown_low_evidence + self._unknown_ambiguous
+            ),
+        }
