@@ -70,7 +70,10 @@ class AppConfig:
     """
     Application configuration with V2 model version tracking.
     """
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\20251118_00_01.mp4")
+
+    APP_VERSION: str = "2025-12-13-v1.0.0"
+
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Orange_Overlay_20251128010005_20251128011157.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
@@ -155,6 +158,7 @@ class AppConfig:
         from src.utils.AppLogging import logger
         
         logger.info("[AppConfig] === Configuration Summary ===")
+        logger.info(f"[AppConfig] App Version: {self.APP_VERSION}")
         logger.info(f"[AppConfig] Platform: {'RDK' if IS_RDK else 'Standard'}")
         logger.info(f"[AppConfig] Detection Model: {self.detection_model}")
         logger.info(f"[AppConfig] Detection Version: {self.detection_model_version}")
