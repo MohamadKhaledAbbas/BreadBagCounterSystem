@@ -15,11 +15,11 @@ class BagEvent:
     
     State Machine: detecting_open -> detecting_closed -> counted
     
-    V2 Enhancements:
-    - Motion tracking for adaptive suppression
-    - Temporal bounding box smoothing for detection stability
-    - Aspect ratio validation for shape consistency
-    - Enhanced logging for debugging
+    V4 Enhancements:
+    - ROI collection deferred to track end for classification
+    - Frame index and temporal metadata tracked for each ROI
+    - Sharpness-based candidate selection at track end
+    - Evidence-based classification (replaces entropy/EMA/Dirichlet)
     """
     
     # V2: Temporal smoothing parameters
@@ -29,7 +29,7 @@ class BagEvent:
     MIN_ASPECT_RATIO = 0.3  # Minimum width/height ratio
     MAX_ASPECT_RATIO = 3.0  # Maximum width/height ratio
     
-    def __init__(self, box, frame_img, open_id, closed_id):
+    def __init__(self, box, frame_img, open_id, closed_id, frame_index: int = 0):
         self.id = int(uuid.uuid4().int >> 96)
         self.box = np.array(box, dtype=float)  # V2: Use numpy for smoothing
         self.smoothed_box = self.box.copy()  # V2: Smoothed box for stable tracking
@@ -44,6 +44,10 @@ class BagEvent:
 
         self.frames_since_update = 0
         self.total_frames_tracked = 1  # Track lifetime
+        
+        # V4: Track lifecycle timestamps
+        self.start_frame_index = frame_index
+        self.current_frame_index = frame_index
 
         # Buffer settings (from centralized config)
         self.max_open_samples = tracking_config.max_open_samples
@@ -52,9 +56,10 @@ class BagEvent:
         self.open_id = open_id
         self.closed_id = closed_id
 
-        # Separate buffers for open and closed ROIs
-        self.open_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
-        self.closed_rois: List[Tuple[float, any]] = []  # (sharpness, roi)
+        # V4: Enhanced ROI storage with full metadata
+        # Each entry: (sharpness, roi, frame_index, bbox_area, confidence)
+        self.open_rois: List[Tuple[float, any, int, float, float]] = []
+        self.closed_rois: List[Tuple[float, any, int, float, float]] = []
         
         # Motion tracking for adaptive suppression
         self.motion_history: List[float] = []  # Recent motion magnitudes
@@ -65,12 +70,12 @@ class BagEvent:
         self.max_confidence_history = 10
 
         # Add first frame
-        self._add_roi(box, frame_img, is_open=True)
+        self._add_roi(box, frame_img, is_open=True, frame_index=frame_index, confidence=1.0)
         
         # Record metrics
         pipeline_metrics.record_event_created()
 
-        logger.debug(f"[BagEvent] Created event ID={self.id}")
+        logger.debug(f"[BagEvent] Created event ID={self.id}, start_frame={frame_index}")
     
     def _calculate_motion(self, new_box) -> float:
         """Calculate motion magnitude between current and new box."""
@@ -167,8 +172,17 @@ class BagEvent:
         """Check if the event has been relatively stationary."""
         return self.get_avg_motion() < threshold
 
-    def _add_roi(self, box, frame_img, is_open: bool):
-        """Extract ROI and add to appropriate buffer with quality tracking."""
+    def _add_roi(self, box, frame_img, is_open: bool, frame_index: int = 0, confidence: float = 1.0):
+        """
+        V4: Extract ROI and add to appropriate buffer with full metadata.
+        
+        Args:
+            box: Bounding box coordinates [x1, y1, x2, y2]
+            frame_img: Full frame image for ROI extraction
+            is_open: True if this is an open bag detection
+            frame_index: Current frame index in the video/stream
+            confidence: Detection confidence score
+        """
         h, w = frame_img.shape[:2]
         x1, y1, x2, y2 = map(int, box)
         x1, y1 = max(0, x1), max(0, y1)
@@ -179,6 +193,9 @@ class BagEvent:
             return False
 
         roi = frame_img[y1:y2, x1:x2].copy()
+        
+        # Calculate bbox area for stability tracking
+        bbox_area = (x2 - x1) * (y2 - y1)
 
         # Quality check (size and brightness)
         is_valid, sharpness, reject_reason = self._is_valid_roi_with_reason(roi)
@@ -199,26 +216,29 @@ class BagEvent:
         
         # ROI passed all quality checks - record as accepted
         pipeline_metrics.record_roi_quality(True, sharpness, None)
+        
+        # V4: Store ROI with full metadata (sharpness, roi, frame_index, bbox_area, confidence)
+        roi_entry = (sharpness, roi, frame_index, bbox_area, confidence)
 
         if is_open:
-            self.open_rois.append((sharpness, roi))
+            self.open_rois.append(roi_entry)
             # Keep top N sharpest
             self.open_rois.sort(key=lambda x: x[0], reverse=True)
             if len(self.open_rois) > self.max_open_samples:
                 self.open_rois = self.open_rois[:self.max_open_samples]
             logger.debug(
                 f"[BagEvent:{self.id}] Added OPEN ROI "
-                f"(sharpness={sharpness:.1f}, total={len(self.open_rois)})"
+                f"(sharpness={sharpness:.1f}, frame={frame_index}, conf={confidence:.2f}, total={len(self.open_rois)})"
             )
         else:
-            self.closed_rois.append((sharpness, roi))
+            self.closed_rois.append(roi_entry)
             # Keep top N sharpest
             self.closed_rois.sort(key=lambda x: x[0], reverse=True)
             if len(self.closed_rois) > self.max_closed_samples:
                 self.closed_rois = self.closed_rois[:self.max_closed_samples]
             logger.debug(
                 f"[BagEvent:{self.id}] Added CLOSED ROI "
-                f"(sharpness={sharpness:.1f}, total={len(self.closed_rois)})"
+                f"(sharpness={sharpness:.1f}, frame={frame_index}, conf={confidence:.2f}, total={len(self.closed_rois)})"
             )
 
         return True
@@ -260,16 +280,17 @@ class BagEvent:
         
         return (True, sharpness, None)
 
-    def add_open_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
+    def add_open_frame(self, box, frame_img, confidence: float = 1.0, frame_index: int = 0) -> bool:
         """
         Add ROI from open detection with motion tracking.
         
-        V2: Added confidence tracking and aspect ratio validation.
+        V4: Added frame_index for temporal tracking.
         
         Args:
             box: Bounding box coordinates [x1, y1, x2, y2]
             frame_img: Full frame image for ROI extraction
             confidence: Detection confidence score
+            frame_index: Current frame index
             
         Returns:
             bool: True if frame was added successfully, False if validation failed
@@ -282,18 +303,20 @@ class BagEvent:
         self._update_motion(box, confidence)
         self.frames_since_update = 0
         self.total_frames_tracked += 1
-        return self._add_roi(self.smoothed_box, frame_img, is_open=True)
+        self.current_frame_index = frame_index
+        return self._add_roi(self.smoothed_box, frame_img, is_open=True, frame_index=frame_index, confidence=confidence)
 
-    def add_closed_frame(self, box, frame_img, confidence: float = 1.0) -> bool:
+    def add_closed_frame(self, box, frame_img, confidence: float = 1.0, frame_index: int = 0) -> bool:
         """
         Add ROI from closed detection with motion tracking.
         
-        V2: Added confidence tracking and aspect ratio validation.
+        V4: Added frame_index for temporal tracking.
         
         Args:
             box: Bounding box coordinates [x1, y1, x2, y2]
             frame_img: Full frame image for ROI extraction
             confidence: Detection confidence score
+            frame_index: Current frame index
             
         Returns:
             bool: True if frame was added successfully, False if validation failed
@@ -306,35 +329,75 @@ class BagEvent:
         self._update_motion(box, confidence)
         self.frames_since_update = 0
         self.total_frames_tracked += 1
-        return self._add_roi(self.smoothed_box, frame_img, is_open=False)
+        self.current_frame_index = frame_index
+        return self._add_roi(self.smoothed_box, frame_img, is_open=False, frame_index=frame_index, confidence=confidence)
 
     def _is_valid_roi(self, roi, min_size=None, min_sharpness=None):
         """Basic quality gate (backward compatible wrapper)."""
         is_valid, sharpness, _ = self._is_valid_roi_with_reason(roi, min_size, min_sharpness)
         return [is_valid, sharpness]
 
-    def get_all_candidates(self) -> List:
+    def get_all_candidates(self) -> List[dict]:
         """
-        Return all collected ROIs (both open and closed),
-        sorted by sharpness (best first).
+        V4: Return all collected ROIs with full metadata for evidence-based classification.
+        
+        Returns:
+            List of candidate dictionaries, each containing:
+            - roi: The ROI image
+            - sharpness: Laplacian variance score
+            - frame_index: Frame number when captured
+            - bbox_area: Bounding box area in pixels
+            - confidence: Detection confidence
+            - relative_time: Position in track lifecycle (0.0 = start, 1.0 = end)
         """
         # Combine both buffers
         all_rois = self.open_rois + self.closed_rois
-
-        # Sort by sharpness (highest first)
-        all_rois.sort(key=lambda x: x[0], reverse=True)
-
-        # Return just the images (not the sharpness scores)
-        candidates = [roi for _, roi in all_rois]
+        
+        if not all_rois:
+            logger.debug(f"[BagEvent:{self.id}] No ROIs collected")
+            return []
+        
+        # Calculate relative time for each ROI
+        track_duration = max(1, self.current_frame_index - self.start_frame_index)
+        
+        # Convert to list of dictionaries with full metadata
+        candidates = []
+        for sharpness, roi, frame_index, bbox_area, confidence in all_rois:
+            relative_time = (frame_index - self.start_frame_index) / track_duration
+            candidates.append({
+                'roi': roi,
+                'sharpness': sharpness,
+                'frame_index': frame_index,
+                'bbox_area': bbox_area,
+                'confidence': confidence,
+                'relative_time': relative_time,
+            })
+        
+        # Sort by sharpness (highest first), then by frame_index (later first) for ties
+        candidates.sort(key=lambda x: (x['sharpness'], x['frame_index']), reverse=True)
+        
+        # Select top-K candidates
+        top_k = tracking_config.top_k_candidates
+        selected_candidates = candidates[:top_k]
 
         logger.debug(
-            f"[BagEvent:{self.id}] Returning {len(candidates)} candidates "
-            f"({len(self.open_rois)} open, {len(self.closed_rois)} closed)"
+            f"[BagEvent:{self.id}] Returning {len(selected_candidates)}/{len(candidates)} candidates "
+            f"(top-K={top_k}, {len(self.open_rois)} open, {len(self.closed_rois)} closed)"
         )
-        return candidates
+        return selected_candidates
 
     def get_stats(self) -> dict:
-        """Return stats about collected ROIs and event lifecycle."""
+        """
+        V4: Return comprehensive stats about collected ROIs and event lifecycle.
+        
+        Includes track duration for determining if track is long enough for classification.
+        """
+        track_duration = self.current_frame_index - self.start_frame_index
+        
+        # Calculate average sharpness of all ROIs
+        all_sharpness = [s for s, _, _, _, _ in self.open_rois + self.closed_rois]
+        avg_sharpness = sum(all_sharpness) / len(all_sharpness) if all_sharpness else 0.0
+        
         return {
             "open_count": len(self.open_rois),
             "closed_count": len(self.closed_rois),
@@ -344,7 +407,12 @@ class BagEvent:
             "total_frames_tracked": self.total_frames_tracked,
             "avg_motion": self.get_avg_motion(),
             "is_stationary": self.is_stationary(),
-            "avg_confidence": self.get_avg_confidence(),  # V2: Added
+            "avg_confidence": self.get_avg_confidence(),
+            # V4: New metrics for evidence-based classification
+            "track_duration_frames": track_duration,
+            "start_frame": self.start_frame_index,
+            "end_frame": self.current_frame_index,
+            "avg_sharpness": avg_sharpness,
         }
 
 
@@ -482,9 +550,9 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                # V2: Pass confidence to add_open_frame
+                # V4: Pass confidence and frame_index to add_open_frame
                 det_conf = det.get('conf', 1.0)
-                best_event.add_open_frame(det['box'], frame_dict['frame'], confidence=det_conf)
+                best_event.add_open_frame(det['box'], frame_dict['frame'], confidence=det_conf, frame_index=current_frame)
                 used_open_indices.add(i)
                 matched_event_ids.add(best_event.id)
 
@@ -518,9 +586,9 @@ class BagStateMonitor:
                     best_event = event
 
             if best_event:
-                # V2: Pass confidence to add_closed_frame
+                # V4: Pass confidence and frame_index to add_closed_frame
                 det_conf = det.get('conf', 1.0)
-                best_event.add_closed_frame(det['box'], frame_dict['frame'], confidence=det_conf)
+                best_event.add_closed_frame(det['box'], frame_dict['frame'], confidence=det_conf, frame_index=current_frame)
                 used_closed_indices.add(j)
                 matched_event_ids.add(best_event.id)
 
@@ -584,13 +652,13 @@ class BagStateMonitor:
                 if suppress_event:
                     continue
 
-                # Create a new event
-                new_event = BagEvent(det['box'], frame_dict['frame'], self.open_id, self.closed_id)
+                # Create a new event with frame_index
+                new_event = BagEvent(det['box'], frame_dict['frame'], self.open_id, self.closed_id, frame_index=current_frame)
                 self.active_events.append(new_event)
                 self.total_events_created += 1
                 logger.info(
                     f"[BagStateMonitor] New event: ID={new_event.id}, "
-                    f"conf={det.get('conf', 1.0):.3f}"
+                    f"conf={det.get('conf', 1.0):.3f}, frame={current_frame}"
                 )
 
         # ---------------------------------------------------
