@@ -126,7 +126,7 @@ class OpenCVFrameSource(FrameSource):
         cycle_start = time.perf_counter()
         
         ret, frame = self.cap.read()
-        
+        frame = cv2.resize(frame, (1280, 720))
         if not ret:
             self.running = False
             return None

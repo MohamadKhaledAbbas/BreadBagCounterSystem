@@ -381,6 +381,11 @@ class BagStateMonitor:
         self.total_events_expired = 0
         self.total_events_suppressed = 0
 
+        self.HIGH_MOTION_THRESHOLD = 15.0  # tune for your data
+        self.STATIONARY_THRESHOLD = 5.0
+        self.LOW_IOU_FOR_FLIPPING = 0.2  # for flipping/spinning, allow more difference
+        self.SUPPRESSION_CENTER_DIST_PX = 40  # Tune for your image scaling
+
         logger.info(
             f"[BagStateMonitor] Initialized: open_id={open_cls_id}, "
             f"closed_id={closed_cls_id}, iou={self.iou_threshold}, "
@@ -395,17 +400,29 @@ class BagStateMonitor:
         For stationary objects (likely conveyor stopped), use longer lockout.
         For moving objects, use shorter lockout to not miss fast sequences.
         """
-        base_lockout = self.lockout_window
-        
-        if event is None:
-            return base_lockout
-        
-        if event.is_stationary():
-            # Stationary - use longer lockout to prevent double-counting
-            return int(base_lockout * self.STATIONARY_LOCKOUT_MULTIPLIER)
-        else:
-            # Moving - use shorter lockout for fast sequences
-            return int(base_lockout * self.MOTION_LOCKOUT_REDUCTION)
+        return self.lockout_window
+        # base_lockout = self.lockout_window
+        #
+        # if event is None:
+        #     return base_lockout
+
+        # avg_motion = event.get_avg_motion()
+
+        # if avg_motion > self.HIGH_MOTION_THRESHOLD:
+        #     # Flipping/spinning: give a "normal" lockout (because we use low IoU for them)
+        #     return base_lockout
+        # elif avg_motion < self.STATIONARY_THRESHOLD:
+        #     return int(base_lockout * self.STATIONARY_LOCKOUT_MULTIPLIER)
+        # else:
+        #     # Simple moving (not stationary, not flipping): give long lockout (even longer if you wish)
+        #     return int(base_lockout * 2.0)  # or any value >1.0 you prefer
+
+    def _center_distance(self, boxA, boxB):
+        ax = (boxA[0] + boxA[2]) / 2
+        ay = (boxA[1] + boxA[3]) / 2
+        bx = (boxB[0] + boxB[2]) / 2
+        by = (boxB[1] + boxB[3]) / 2
+        return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
     def compute_iou(self, boxA, boxB):
         # Sanity checks for box coordinates
@@ -543,7 +560,18 @@ class BagStateMonitor:
                 suppress_event = False
                 for counted_event in self.recently_counted:
                     iou = self.compute_iou(det['box'], counted_event['box'])
-                    if iou > self.iou_threshold:
+                    avg_motion = counted_event['avg_motion']
+
+                    # If the counted event had very high motion (flipping/spinning), reduce IoU threshold
+                    if avg_motion > self.HIGH_MOTION_THRESHOLD:
+                        iou_thresh = self.LOW_IOU_FOR_FLIPPING
+                        logger.debug(
+                            f"[BagStateMonitor] Flipping/Spinning event (avg_motion={avg_motion:.1f}), "
+                            f"using low IoU threshold {iou_thresh:.2f}"
+                        )
+
+                    center_dist = self._center_distance(det['box'], counted_event['box'])
+                    if iou > self.iou_threshold or center_dist < self.SUPPRESSION_CENTER_DIST_PX:
                         suppress_event = True
                         self.total_events_suppressed += 1
                         pipeline_metrics.record_event_suppressed()
@@ -606,12 +634,14 @@ class BagStateMonitor:
                 # Use adaptive lockout based on motion patterns
                 # ---------------------------------------------------
                 adaptive_lockout = self._get_adaptive_lockout(event)
+                avg_motion = event.get_avg_motion()
                 self.recently_counted.append({
                     'frame_count': frame_dict['frame_count'],
                     'box': event.box,
                     'id': event.id,
                     'adaptive_lockout': adaptive_lockout,
                     'is_stationary': event.is_stationary(),
+                    'avg_motion': avg_motion,
                 })
                 logger.debug(
                     f"[BagStateMonitor] Event {event.id} state -> counted, "

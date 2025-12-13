@@ -45,7 +45,7 @@ class TrackingConfig:
     # ============================================================================
     # Number of frames to suppress new events
     # ============================================================================
-    lockout_window: int = 20  # V3: Reduced from 25 for faster event recovery
+    lockout_window: int = 50  # V3: Reduced from 25 for faster event recovery
 
 
     # ============================================================================
@@ -109,7 +109,7 @@ class TrackingConfig:
     # State-Aware Expiry Timeouts
     # ============================================================================
     
-    expiry_detecting_open: int = 25  # V3: Reduced from 10 for faster cleanup
+    expiry_detecting_open: int = 20   # V3: Reduced from 10 for faster cleanup
     """
     Frames without update before expiring an event in 'detecting_open' state.
     
@@ -120,7 +120,7 @@ class TrackingConfig:
     Default: 8 (V3: reduced from 10)
     """
     
-    expiry_detecting_closed: int = 8  # V3: Reduced from 10 for faster cleanup
+    expiry_detecting_closed: int = 20  # V3: Reduced from 10 for faster cleanup
     """
     Frames without update before expiring an event in 'detecting_closed' state.
     
@@ -182,7 +182,7 @@ class TrackingConfig:
     min_size=300. This was preventing classification from ever running.
     """
     
-    min_roi_sharpness: float = 300  # V3: Reduced from 400 for more accepted samples
+    min_roi_sharpness: float = 500  # V3: Reduced from 400 for more accepted samples
     """
     Minimum sharpness score (Laplacian variance) for a valid ROI.
     
