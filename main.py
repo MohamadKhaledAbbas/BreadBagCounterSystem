@@ -8,10 +8,11 @@ import os
 
 from src import constants
 from src.counting.BagCounterApp import BagCounterApp
+from src.counting.BagCounterAppTestingMode import BagCounterAppTestingMode
 from src.logging.Database import DatabaseManager
 from src.config.settings import config
 from src.utils.AppLogging import logger, get_log_file_paths
-from src.utils.platform import IS_RDK
+from src.utils.platform import IS_RDK, IS_WINDOWS
 
 # Platform-aware detector and classifier imports
 if IS_RDK:
@@ -52,13 +53,32 @@ if __name__ == "__main__":
         os.environ["HOME"] = "/home/sunrise"
         logger.info("HOME environment variable not set, using default: /home/sunrise")
 
-    app = BagCounterApp(
-        video_path = config.video_path,
-        detector_engine=detector,
-        classifier_engine=classifier,
-        db=db_manager,
-        is_development = is_development,
-    )
+    use_testing_mode = False
+    if not IS_RDK:
+        if is_development:
+            use_testing_mode = True
+            logger.info("[BagCounterApp] Testing mode auto-enabled (development mode on non-RDK)")
+        elif IS_WINDOWS:
+            use_testing_mode = True
+            logger.info("[BagCounterApp] Testing mode auto-enabled (development mode on non-RDK)")
+
+    if use_testing_mode:
+        app = BagCounterAppTestingMode(
+            video_path = config.video_path,
+            detector_engine=detector,
+            classifier_engine=classifier,
+            db=db_manager,
+            is_development = is_development,
+        )
+    else:
+        app = BagCounterApp(
+            video_path=config.video_path,
+            detector_engine=detector,
+            classifier_engine=classifier,
+            db=db_manager,
+            is_development=is_development,
+        )
+
 
     logger.info("[Startup] Detection Model: {}".format(config.detection_model))
     logger.info("[Startup] Classification Model: {}".format(config.classification_model))
