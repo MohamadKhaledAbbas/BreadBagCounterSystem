@@ -52,6 +52,27 @@ Detection logic:
 
 **Note**: ROS2 frame sources are only available on RDK platform.
 
+#### OpenCV Testing Mode
+
+For testing on slower machines (e.g., Windows PCs without optimized hardware like RDK X5's BPU), the `OpenCVFrameSource` supports a **testing mode** that:
+
+- Reads frames **synchronously on-demand** (no background thread)
+- **Never drops frames** - every frame is processed
+- Allows processing to take **4-5x longer than real-time** without overloading the system
+- Prevents resource exhaustion and system hangs
+
+**When to use Testing Mode:**
+- Development/testing on machines without hardware acceleration
+- When you need to analyze every frame without drops
+- When debugging or validating detection/classification accuracy
+
+**How to enable:**
+1. **Automatically**: Enabled by default in development mode on non-RDK platforms
+2. **Environment variable**: `export OPENCV_TESTING_MODE=true`
+3. **In code**: `FrameSourceFactory.create("opencv", source=path, testing_mode=True)`
+
+**Note**: Testing mode is never used on RDK platform to ensure optimal real-time performance.
+
 ### IPC/Publishing
 
 | Platform | Implementation | Purpose |
@@ -77,6 +98,9 @@ Override with environment variables:
 ```bash
 export DETECTION_MODEL="path/to/custom/model.pt"
 export CLASS_MODEL="path/to/custom/classifier.pt"
+
+# Enable testing mode for OpenCV frame source (slower machines)
+export OPENCV_TESTING_MODE=true
 ```
 
 ## Running the Application

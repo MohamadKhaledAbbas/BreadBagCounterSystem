@@ -151,8 +151,29 @@ class BagCounterApp:
         if IS_RDK and self.ros_executor is not None:
             self.ros_executor.add_node(self.ipc_publisher)
 
+        # Determine if testing mode should be enabled for OpenCV frame source
+        # Testing mode: synchronous frame reading, no drops, slower than real-time
+        # Useful for development/testing on machines without optimized hardware (non-RDK)
+        use_testing_mode = False
+        if not IS_RDK:
+            # On non-RDK platforms, check config or default to testing mode in development
+            if config.opencv_testing_mode:
+                use_testing_mode = True
+                logger.info("[BagCounterApp] Testing mode enabled via OPENCV_TESTING_MODE config")
+            elif is_development:
+                use_testing_mode = True
+                logger.info("[BagCounterApp] Testing mode auto-enabled (development mode on non-RDK)")
+
         if is_development:
-            self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=30.0)
+            # In testing mode, target_fps is set to None to allow frames to be read
+            # at whatever pace the consumer can process them (on-demand), preventing
+            # any frame pacing that could cause backpressure or resource exhaustion
+            self.frame_source = FrameSourceFactory.create(
+                "opencv", 
+                source=video_path, 
+                target_fps=None if use_testing_mode else 30.0,
+                testing_mode=use_testing_mode
+            )
             logger.info(f"[BagCounterApp] Development mode: reading from {video_path}")
         else:
             if IS_RDK:
@@ -160,7 +181,14 @@ class BagCounterApp:
                 self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
                 logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
             else:
-                self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=30.0)
+                # In testing mode, target_fps is set to None to allow frames to be read
+                # at whatever pace the consumer can process them (on-demand)
+                self.frame_source = FrameSourceFactory.create(
+                    "opencv", 
+                    source=video_path, 
+                    target_fps=None if use_testing_mode else 30.0,
+                    testing_mode=use_testing_mode
+                )
                 logger.info(f"[BagCounterApp] Windows mode: reading from {video_path}")
 
         if IS_RDK and self.ros_executor is not None and isinstance(self.frame_source, Node):

@@ -5,6 +5,9 @@ V2 Enhancements:
 - Model version tracking for experiment management
 - Recording directory configuration
 - Environment-based configuration overrides
+
+V3 Enhancements:
+- Testing mode for OpenCV frame source on slower machines
 """
 
 import os
@@ -14,6 +17,14 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 from src.utils.platform import IS_RDK
+
+
+def _parse_bool_env(env_var: str, default: bool) -> bool:
+    """Parse boolean from environment variable."""
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    return value.lower() in ('true', '1', 'yes', 'on')
 
 
 @dataclass
@@ -83,6 +94,12 @@ class AppConfig:
     detection_model_version: str = os.getenv("DETECTION_MODEL_VERSION", "v5.0")
     classification_model_version: str = os.getenv("CLASS_MODEL_VERSION", "v5.0")
     
+    # V3: Testing mode for OpenCV frame source
+    # When enabled, frames are read synchronously on-demand (no background thread)
+    # This prevents frame drops and resource exhaustion on slower machines
+    # Set OPENCV_TESTING_MODE=true to enable, or it auto-enables in development mode on non-RDK
+    opencv_testing_mode: bool = field(default_factory=lambda: _parse_bool_env("OPENCV_TESTING_MODE", False))
+    
     # Classifier class names
     classifier_classes: dict = None
     
@@ -149,6 +166,7 @@ class AppConfig:
             logger.info(f"[AppConfig] Classification Checksum: {self.classification_model_info.checksum}")
         logger.info(f"[AppConfig] Database: {self.db_path}")
         logger.info(f"[AppConfig] Recording Dir: {self.recording_dir}")
+        logger.info(f"[AppConfig] OpenCV Testing Mode: {self.opencv_testing_mode}")
 
 
 config = AppConfig()
