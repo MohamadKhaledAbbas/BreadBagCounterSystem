@@ -9,9 +9,26 @@ class FrameSourceFactory:
     @staticmethod
     def create(source_type, **kwargs) -> FrameSource:
         """
-        source_type: 'ros2' or 'opencv'
-        kwargs for ROS2: topic, target_fps
-        kwargs for OpenCV: source, target_fps
+        Create a frame source based on the specified type.
+        
+        Args:
+            source_type: 'ros2' or 'opencv'
+            
+        Kwargs for ROS2:
+            topic: ROS2 topic name (default: '/nv12_images')
+            target_fps: Target frames per second (default: 30.0)
+            
+        Kwargs for OpenCV:
+            source: Video source - file path, camera index, or RTSP URL (default: 0)
+            target_fps: Target FPS for frame pacing (default: None = source FPS)
+            testing_mode: If True, enables synchronous on-demand frame reading
+                         for testing on slower machines without frame drops.
+                         Ideal for development/testing where processing every
+                         frame is more important than real-time playback.
+                         (default: False)
+        
+        Returns:
+            FrameSource instance
         """
         if source_type.lower() == 'ros2':
             if not IS_RDK:
@@ -29,7 +46,8 @@ class FrameSourceFactory:
         elif source_type.lower() == 'opencv':
             source = kwargs.get('source', 0)  # 0 for webcam, or path/string for file/camera URL
             target_fps = kwargs.get('target_fps', None)  # None = use source FPS
-            return OpenCVFrameSource(source, target_fps=target_fps)
+            testing_mode = kwargs.get('testing_mode', False)  # Testing mode for slower machines
+            return OpenCVFrameSource(source, target_fps=target_fps, testing_mode=testing_mode)
         else:
             raise ValueError(f"Unknown source_type: {source_type}")
 
