@@ -450,11 +450,15 @@ class BagCounterApp:
                 
                 # V3: Check if we should skip processing due to backpressure
                 queue_utilization = self.input_queue.qsize() / self.INPUT_QUEUE_SIZE
+                # V3: Compute average detection time efficiently (deque sum is O(n) but n is small)
+                avg_detection_time = (
+                    sum(self._recent_detection_times) / len(self._recent_detection_times)
+                    if len(self._recent_detection_times) > 5 else 0.0
+                )
                 should_skip = (
                     self._adaptive_skip_enabled and 
                     queue_utilization > self.ADAPTIVE_SKIP_THRESHOLD and
-                    len(self._recent_detection_times) > 5 and
-                    sum(self._recent_detection_times) / len(self._recent_detection_times) > self.MAX_DETECTION_TIME_MS
+                    avg_detection_time > self.MAX_DETECTION_TIME_MS
                 )
                 
                 if should_skip:
@@ -462,7 +466,8 @@ class BagCounterApp:
                     if self._frames_skipped % 10 == 0:
                         logger.warning(
                             f"[LogicThread] Skipping frame {frame_count} due to backpressure "
-                            f"(queue={queue_utilization:.1%}, total_skipped={self._frames_skipped})"
+                            f"(queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms, "
+                            f"total_skipped={self._frames_skipped})"
                         )
                     continue
 
@@ -538,10 +543,15 @@ class BagCounterApp:
                                     "class_id": d["class_id"],
                                     "conf": float(d.get("conf", 0)),
                                 })
+                            # V3: Safe copy of event_box - handle numpy arrays and lists
+                            try:
+                                event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
+                            except (TypeError, AttributeError):
+                                event_box_copy = event_box  # Fallback to reference if copy fails
                             context = {
                                 "frame": frame.copy(),  # Only copy when needed
                                 "detections": det_copy,
-                                "event_box": event_box.copy() if hasattr(event_box, 'copy') else event_box,
+                                "event_box": event_box_copy,
                                 "event_stats": event_stats,
                                 "frame_id": frame_count,
                                 "timestamp": time.time(),
@@ -761,11 +771,20 @@ class BagCounterApp:
             logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
             self.is_running = False
             
-            # V3: Stop classification thread
+            # V3: Thread shutdown timeout (configurable via class constant)
+            THREAD_SHUTDOWN_TIMEOUT = 3.0  # seconds
+            
+            # V3: Stop classification thread with timeout logging
             self._classification_running = False
             if self._classification_thread and self._classification_thread.is_alive():
-                self._classification_thread.join(timeout=3)
-                logger.debug("[BagCounterApp] Classification thread joined")
+                self._classification_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if self._classification_thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] Classification thread did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug("[BagCounterApp] Classification thread joined")
 
             self.frame_source.cleanup()
             logger.debug("[BagCounterApp] Frame source cleaned up")
@@ -785,12 +804,24 @@ class BagCounterApp:
                 logger.debug("[BagCounterApp] ROS 2 context shutdown")
 
             if self.ros_thread.is_alive():
-                self.ros_thread.join(timeout=3)
-                logger.debug("[BagCounterApp] ROS thread joined")
+                self.ros_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if self.ros_thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] ROS thread did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug("[BagCounterApp] ROS thread joined")
 
             if logic_thread.is_alive():
-                logic_thread.join()
-                logger.debug("[BagCounterApp] Logic thread joined")
+                logic_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if logic_thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] Logic thread did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug("[BagCounterApp] Logic thread joined")
 
             # Close database connection
             self.db.close()
