@@ -198,6 +198,10 @@ class ClassifierService:
             roi = clf['roi']
             
             # Skip Unknown predictions - they don't contribute evidence
+            # Note: If ALL predictions are Unknown, the track will be classified as Unknown
+            # with reason "no_valid_classifications" in _finalize_classification().
+            # This is intentional: Unknown predictions indicate classifier uncertainty,
+            # so they should not influence the evidence accumulation.
             if label == "Unknown":
                 continue
             
@@ -295,7 +299,8 @@ class ClassifierService:
             runner_up_label, runner_up_data = sorted_labels[1]
             runner_up_score = runner_up_data["score"]
             
-            if runner_up_score > 0:
+            # Avoid division by zero - if runner_up has no score, winner wins by default
+            if runner_up_score > 1e-9:  # Use small epsilon for floating point comparison
                 ratio = winner_score / runner_up_score
                 metadata["winner_ratio"] = round(ratio, 3)
                 metadata["runner_up"] = {
@@ -306,6 +311,13 @@ class ClassifierService:
                 if ratio < self.ratio_threshold:
                     self._unknown_ambiguous += 1
                     return "Unknown", winner_confidence, f"ambiguous ({ratio:.2f} < {self.ratio_threshold})", metadata
+            else:
+                # Runner-up has essentially zero evidence, winner is uncontested
+                metadata["winner_ratio"] = float('inf')
+                metadata["runner_up"] = {
+                    "label": runner_up_label,
+                    "score": 0.0
+                }
         
         # Accept winner
         metadata["accepted"] = True
@@ -354,9 +366,15 @@ class ClassifierService:
                 if isinstance(candidates_input[0], dict):
                     candidates = candidates_input
                 else:
-                    # Backward compatibility: convert old format
-                    candidates = [{'roi': roi, 'sharpness': 0, 'frame_index': 0, 
-                                   'bbox_area': 0, 'confidence': 1.0, 'relative_time': 0.5} 
+                    # Backward compatibility: convert old format (list of ROI images)
+                    # Warning: This path uses default metadata which may lead to suboptimal
+                    # evidence accumulation. Prefer using the new dict format.
+                    logger.warning(
+                        f"[ClassifierService] Track {track_id}: Using legacy candidate format. "
+                        f"Update to new dict format for optimal evidence weighting."
+                    )
+                    candidates = [{'roi': roi, 'sharpness': 100.0, 'frame_index': 0, 
+                                   'bbox_area': 0, 'confidence': 0.8, 'relative_time': 0.5} 
                                   for roi in candidates_input]
             else:
                 candidates = []

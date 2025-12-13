@@ -56,10 +56,11 @@ class BagEvent:
         self.open_id = open_id
         self.closed_id = closed_id
 
-        # V4: Enhanced ROI storage with full metadata
+    # V4: Enhanced ROI storage with full metadata
         # Each entry: (sharpness, roi, frame_index, bbox_area, confidence)
-        self.open_rois: List[Tuple[float, any, int, float, float]] = []
-        self.closed_rois: List[Tuple[float, any, int, float, float]] = []
+        # roi is np.ndarray (BGR image)
+        self.open_rois: List[Tuple[float, np.ndarray, int, float, float]] = []
+        self.closed_rois: List[Tuple[float, np.ndarray, int, float, float]] = []
         
         # Motion tracking for adaptive suppression
         self.motion_history: List[float] = []  # Recent motion magnitudes
@@ -357,13 +358,14 @@ class BagEvent:
             logger.debug(f"[BagEvent:{self.id}] No ROIs collected")
             return []
         
-        # Calculate relative time for each ROI
+        # V4: Calculate relative time for each ROI
         track_duration = max(1, self.current_frame_index - self.start_frame_index)
         
         # Convert to list of dictionaries with full metadata
         candidates = []
         for sharpness, roi, frame_index, bbox_area, confidence in all_rois:
-            relative_time = (frame_index - self.start_frame_index) / track_duration
+            # Ensure no division by zero with additional safety check
+            relative_time = (frame_index - self.start_frame_index) / track_duration if track_duration > 0 else 0.5
             candidates.append({
                 'roi': roi,
                 'sharpness': sharpness,
