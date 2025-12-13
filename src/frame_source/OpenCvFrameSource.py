@@ -143,11 +143,17 @@ class OpenCVFrameSource(FrameSource):
         
         # Log progress periodically in testing mode
         if self._frame_count % 100 == 0:
-            progress = (self._frame_count / self.total_frames * 100) if self.total_frames > 0 else 0
-            logger.info(
-                f"[OpenCVFrameSource] Testing mode progress: "
-                f"frame {self._frame_count}/{self.total_frames} ({progress:.1f}%)"
-            )
+            if self.total_frames > 0:
+                progress = (self._frame_count / self.total_frames * 100)
+                logger.info(
+                    f"[OpenCVFrameSource] Testing mode progress: "
+                    f"frame {self._frame_count}/{self.total_frames} ({progress:.1f}%)"
+                )
+            else:
+                # Live stream (webcam/RTSP) - no total frames available
+                logger.info(
+                    f"[OpenCVFrameSource] Testing mode: processed {self._frame_count} frames"
+                )
         
         return (frame, inter_frame_interval_ms)
 
@@ -171,10 +177,11 @@ class OpenCVFrameSource(FrameSource):
             # Production mode: read from queue
             while self.running or not self.queue.empty():
                 try:
-                    yield self.queue.get(timeout=1.0)
+                    # Use short timeout to allow checking self.running flag
+                    # This enables graceful shutdown while still being responsive
+                    yield self.queue.get(timeout=0.1)
                 except queue.Empty:
-                    if not self.running:
-                        break
+                    # Queue is temporarily empty, check if we should continue
                     continue
 
     def cleanup(self):
@@ -184,7 +191,11 @@ class OpenCVFrameSource(FrameSource):
         if self.read_thread is not None and self.read_thread.is_alive():
             self.read_thread.join(timeout=2.0)
             if self.read_thread.is_alive():
-                logger.warning("[OpenCVFrameSource] Read thread did not stop in time")
+                logger.warning(
+                    "[OpenCVFrameSource] Read thread did not stop within 2s - "
+                    "this may indicate a blocking read operation. "
+                    "Thread will be terminated when process exits."
+                )
         
         if self.cap.isOpened():
             self.cap.release()

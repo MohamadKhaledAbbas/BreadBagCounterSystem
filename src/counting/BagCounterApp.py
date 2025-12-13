@@ -165,6 +165,9 @@ class BagCounterApp:
                 logger.info("[BagCounterApp] Testing mode auto-enabled (development mode on non-RDK)")
 
         if is_development:
+            # In testing mode, target_fps is set to None to allow frames to be read
+            # at whatever pace the consumer can process them (on-demand), preventing
+            # any frame pacing that could cause backpressure or resource exhaustion
             self.frame_source = FrameSourceFactory.create(
                 "opencv", 
                 source=video_path, 
@@ -178,6 +181,8 @@ class BagCounterApp:
                 self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
                 logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
             else:
+                # In testing mode, target_fps is set to None to allow frames to be read
+                # at whatever pace the consumer can process them (on-demand)
                 self.frame_source = FrameSourceFactory.create(
                     "opencv", 
                     source=video_path, 
