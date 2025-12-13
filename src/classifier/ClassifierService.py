@@ -433,6 +433,10 @@ class ClassifierService:
                 metadata, len(candidates), classify_time
             )
             
+            # Include rejection reason in metadata for callbacks
+            if rejection_reason:
+                metadata["rejection_reason"] = rejection_reason
+            
             # Save ROI and invoke callbacks
             self._save_and_callback(
                 track_id, best_roi, final_label, final_conf, 
