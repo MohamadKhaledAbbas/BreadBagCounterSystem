@@ -159,7 +159,7 @@ class TrackingConfig:
     # ROI Quality Validation
     # ============================================================================
     
-    min_roi_size: int = 300
+    min_roi_size: int = 100
     """
     Minimum width/height (in pixels) for a valid ROI.
     
@@ -169,7 +169,7 @@ class TrackingConfig:
     Default: 100
     """
     
-    min_roi_sharpness: float = 400
+    min_roi_sharpness: float = 300
     """
     Minimum sharpness score (Laplacian variance) for a valid ROI.
     

@@ -37,8 +37,8 @@ log_level_name = os.environ.get("LOG_LEVEL", "DEBUG").upper()
 LOG_LEVEL = getattr(logging, log_level_name, logging.DEBUG)
 
 # File logging configuration
-LOG_FILE_MAX_BYTES = int(os.environ.get("LOG_FILE_MAX_BYTES", 10 * 1024 * 1024))  # 10MB default
-LOG_FILE_BACKUP_COUNT = int(os.environ.get("LOG_FILE_BACKUP_COUNT", 5))  # Keep 5 backup files
+LOG_FILE_MAX_BYTES = int(os.environ.get("LOG_FILE_MAX_BYTES", 50 * 1024 * 1024))  # 50MB default
+LOG_FILE_BACKUP_COUNT = int(os.environ.get("LOG_FILE_BACKUP_COUNT", 10))  # Keep 10 backup files
 ENABLE_JSON_LOGGING = os.environ.get("ENABLE_JSON_LOGGING", "true").lower() == "true"
 
 
