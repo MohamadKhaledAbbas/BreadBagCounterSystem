@@ -4,11 +4,27 @@ import numpy as np
 
 from src.detection.TrackedObject import TrackedObject
 
+# State colors for event-centric tracking visualization
+STATE_COLORS = {
+    'detecting_open': (0, 255, 0),      # Green - bag is open
+    'detecting_closed': (0, 165, 255),  # Orange - transitioning to closed
+    'OPEN': (0, 255, 0),                # Green - bag is open
+    'CLOSING': (0, 165, 255),           # Orange - transitioning to closed  
+    'CLOSED': (0, 255, 255),            # Yellow - bag is closed, collecting ROIs
+    'COMMITTED': (255, 0, 255),         # Magenta - counted
+    'counted': (255, 0, 255),           # Magenta - counted (legacy)
+}
+
 class Visualizer:
     """Handles all drawing operations."""
 
     def __init__(self, class_names: Dict[int, str]):
         self.names = class_names
+        self.exit_margin = 50  # Default exit boundary margin
+
+    def set_exit_margin(self, margin: int):
+        """Set the exit boundary margin for visualization."""
+        self.exit_margin = margin
 
     @staticmethod
     def _compute_draw_params(box, frame_shape,
@@ -106,24 +122,54 @@ class Visualizer:
                           fixed_font_scale: float = None,
                           fixed_thickness: int = None):
         """
-        Draw active bag events (ID and state) with consistent formatting near the box.
-        Expects active_events as a list of objects with .id, .state, .box
+        Draw active bag events with state-colored boxes, centroids, and detailed info.
+        Expects active_events as a list of objects with .id, .state, .box, and optionally
+        .open_hits, .closed_hits, .last_centroid, .roi_count
         """
         font = cv2.FONT_HERSHEY_SIMPLEX
         h, w = frame.shape[:2]
+        
         for event in active_events:
             x1, y1, x2, y2 = map(int, event.box)
             thickness, font_scale, text_thickness, pad, baseline = self._compute_draw_params(
                 event.box, frame.shape, fixed_font_scale, fixed_thickness
             )
 
-            color = (0, 255, 255)  # Cyan/yellow for events
-            event_label = f"ID:{event.id} {event.state}"
-            (text_w, text_h), _ = cv2.getTextSize(event_label, font, font_scale, text_thickness)
+            # Get state-specific color
+            state_str = str(event.state) if not isinstance(event.state, str) else event.state
+            color = STATE_COLORS.get(state_str, (0, 255, 255))  # Default cyan
+            
+            # Draw bounding box with state color
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness + 1)
+            
+            # Draw centroid marker
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            if hasattr(event, 'last_centroid') and event.last_centroid:
+                cx, cy = int(event.last_centroid[0]), int(event.last_centroid[1])
+            cv2.circle(frame, (cx, cy), 8, color, -1)  # Filled circle at centroid
+            cv2.circle(frame, (cx, cy), 10, (255, 255, 255), 2)  # White outline
+            
+            # Build detailed label
+            event_id_short = event.id % 10000  # Last 4 digits for readability
+            event_label = f"E{event_id_short}: {state_str}"
+            
+            # Add open/closed counts if available
+            open_count = getattr(event, 'open_hits', 0)
+            closed_count = getattr(event, 'closed_hits', 0)
+            if open_count or closed_count:
+                event_label += f" O:{open_count} C:{closed_count}"
+            
+            # Add ROI count if available and in CLOSED state
+            roi_count = getattr(event, 'roi_count', 0)
+            if roi_count and 'CLOSED' in state_str.upper():
+                event_label += f" ROI:{roi_count}"
+            
+            (text_w, text_h), _ = cv2.getTextSize(event_label, font, font_scale * 0.8, text_thickness)
             label_x1 = x1
             label_x2 = x1 + text_w + 2 * pad
             label_y1 = y2 + 5
             label_y2 = label_y1 + (text_h + 2 * pad)
+            
             # Clamp if off-screen
             if label_y2 > h:
                 label_y2 = y1 - 5
@@ -131,13 +177,53 @@ class Visualizer:
                 if label_y1 < 0:
                     label_y1 = max(2, h - (text_h + 2 * pad) - 2)
                     label_y2 = label_y1 + (text_h + 2 * pad)
+            
             cv2.rectangle(frame, (label_x1, label_y1), (label_x2, label_y2), color, cv2.FILLED)
             b, g, r = color
             brightness = (0.299 * r + 0.587 * g + 0.114 * b)
             text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
             text_x = label_x1 + pad
             text_y = label_y2 - pad - (baseline // 2)
-            cv2.putText(frame, event_label, (text_x, text_y), font, font_scale, text_color, text_thickness, cv2.LINE_AA)
+            cv2.putText(frame, event_label, (text_x, text_y), font, font_scale * 0.8, text_color, text_thickness, cv2.LINE_AA)
+
+    def draw_exit_boundary(self, frame: np.ndarray, margin: int = None):
+        """
+        Draw the exit boundary zone around the frame edges.
+        Bags must reach this zone to be counted.
+        
+        Args:
+            frame: Frame to draw on
+            margin: Exit boundary margin in pixels (uses self.exit_margin if None)
+        """
+        h, w = frame.shape[:2]
+        if margin is None:
+            margin = self.exit_margin
+        
+        # Draw semi-transparent exit zone around edges
+        overlay = frame.copy()
+        exit_color = (0, 100, 0)  # Dark green for exit zone
+        
+        # Top edge
+        cv2.rectangle(overlay, (0, 0), (w, margin), exit_color, -1)
+        # Bottom edge
+        cv2.rectangle(overlay, (0, h - margin), (w, h), exit_color, -1)
+        # Left edge
+        cv2.rectangle(overlay, (0, 0), (margin, h), exit_color, -1)
+        # Right edge
+        cv2.rectangle(overlay, (w - margin, 0), (w, h), exit_color, -1)
+        
+        # Blend with original frame
+        cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        
+        # Draw boundary lines
+        line_color = (0, 200, 0)  # Brighter green for lines
+        thickness = 2
+        # Inner rectangle showing work zone
+        cv2.rectangle(frame, (margin, margin), (w - margin, h - margin), line_color, thickness)
+        
+        # Add label
+        cv2.putText(frame, "EXIT ZONE", (margin + 5, margin - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, line_color, 1, cv2.LINE_AA)
 
     def draw_stats(self, frame: np.ndarray, counts: Dict[str, int]):
         y = 60
@@ -150,14 +236,57 @@ class Visualizer:
         cv2.putText(frame, f"FPS: {int(fps)}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
+    def draw_state_legend(self, frame: np.ndarray):
+        """Draw a legend showing what each state color means."""
+        h, w = frame.shape[:2]
+        legend_x = w - 220
+        legend_y = 30
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        line_height = 25
+        
+        # Background for legend
+        cv2.rectangle(frame, (legend_x - 10, legend_y - 20), 
+                     (w - 10, legend_y + len(STATE_COLORS) * line_height), 
+                     (40, 40, 40), -1)
+        
+        cv2.putText(frame, "Event States:", (legend_x, legend_y), 
+                    font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        
+        for i, (state, color) in enumerate(STATE_COLORS.items()):
+            if state in ['detecting_open', 'detecting_closed', 'counted']:  # Skip legacy names
+                continue
+            y = legend_y + (i + 1) * line_height
+            # Draw color box
+            cv2.rectangle(frame, (legend_x, y - 12), (legend_x + 15, y + 3), color, -1)
+            # Draw state name
+            cv2.putText(frame, state, (legend_x + 20, y), 
+                        font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
     def render_all(self, frame: np.ndarray,
                    detections: List[Union[TrackedObject, Dict]],
                    active_events: List,
                    counts: Dict[str, int] = None,
-                   fps: float = None):
+                   fps: float = None,
+                   show_exit_boundary: bool = True,
+                   show_legend: bool = True):
         """
-        Full pass: draws detections, events, stats, fps in one call.
+        Full pass: draws detections, events, stats, fps, and visual guides in one call.
+        
+        Args:
+            frame: Frame to draw on
+            detections: List of detections to draw
+            active_events: List of active events to draw
+            counts: Dictionary of counts per class
+            fps: Current FPS to display
+            show_exit_boundary: Whether to show the exit boundary zone
+            show_legend: Whether to show the state color legend
         """
+        # Draw exit boundary first (background layer)
+        if show_exit_boundary:
+            self.draw_exit_boundary(frame)
+        
         if detections:
             self.draw_detections(frame, detections)
         if active_events:
@@ -166,3 +295,7 @@ class Visualizer:
             self.draw_stats(frame, counts)
         if fps is not None:
             self.draw_fps(frame, fps)
+        
+        # Draw legend last (on top)
+        if show_legend:
+            self.draw_state_legend(frame)

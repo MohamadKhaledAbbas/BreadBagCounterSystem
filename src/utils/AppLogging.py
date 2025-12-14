@@ -82,8 +82,9 @@ class JSONFormatter(logging.Formatter):
     """
     
     def format(self, record: logging.LogRecord) -> str:
+        from datetime import timezone
         log_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -519,6 +520,93 @@ class StructuredLogger:
             error_message=error_message,
             affected_ids=affected_ids,
             upstream_context=context,
+            **kwargs
+        )
+    
+    # ==========================================================================
+    # V5 Event-Centric Tracking Logs
+    # ==========================================================================
+    
+    def event_committed(self, event_id: int, lifespan_ms: float, state: str,
+                       open_evidence: int, closed_evidence: int,
+                       roi_count: int, commit_reason: str,
+                       detection_gaps: list = None, **kwargs):
+        """Log event commit with full debug information for analysis."""
+        msg = (
+            f"[EVENT_COMMITTED] id={event_id}, lifespan={lifespan_ms:.0f}ms, "
+            f"open_ev={open_evidence}, closed_ev={closed_evidence}, "
+            f"rois={roi_count}, reason={commit_reason}"
+        )
+        self._log_structured(
+            logging.INFO,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            lifespan_ms=lifespan_ms,
+            state=state,
+            open_evidence=open_evidence,
+            closed_evidence=closed_evidence,
+            roi_count=roi_count,
+            commit_reason=commit_reason,
+            detection_gaps=detection_gaps,
+            **kwargs
+        )
+    
+    def event_association(self, event_id: int, detection_centroid: tuple,
+                         event_centroid: tuple, distance_px: float,
+                         time_gap_ms: float, associated: bool, 
+                         rejection_reason: str = None, **kwargs):
+        """Log detection-to-event association decisions for debugging."""
+        status = "ASSOCIATED" if associated else f"REJECTED ({rejection_reason})"
+        msg = (
+            f"[ASSOCIATION] event={event_id}, dist={distance_px:.1f}px, "
+            f"gap={time_gap_ms:.0f}ms, {status}"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            detection_centroid=detection_centroid,
+            event_centroid=event_centroid,
+            distance_px=distance_px,
+            time_gap_ms=time_gap_ms,
+            associated=associated,
+            rejection_reason=rejection_reason,
+            **kwargs
+        )
+    
+    def ghost_state_update(self, event_id: int, time_since_detection_ms: float,
+                          state: str, near_exit: bool = False, **kwargs):
+        """Log ghost state updates for detection gap analysis."""
+        msg = (
+            f"[GHOST_UPDATE] event={event_id}, idle={time_since_detection_ms:.0f}ms, "
+            f"state={state}, near_exit={near_exit}"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            time_since_detection_ms=time_since_detection_ms,
+            state=state,
+            near_exit=near_exit,
+            **kwargs
+        )
+    
+    def event_debug_summary(self, event_id: int, debug_info: dict, **kwargs):
+        """Log comprehensive debug summary for event analysis."""
+        msg = (
+            f"[EVENT_DEBUG] id={event_id}, lifespan={debug_info.get('lifespan_ms', 0):.0f}ms, "
+            f"gaps={len(debug_info.get('detection_gaps', []))}, "
+            f"transitions={len(debug_info.get('state_transitions', []))}"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            **debug_info,
             **kwargs
         )
 
