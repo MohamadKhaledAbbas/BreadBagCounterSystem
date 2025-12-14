@@ -347,6 +347,42 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Velocity-Based Association (robust tracking during fast movements)
+    # --------------------------------------------------------------------------
+    
+    velocity_scaling_enabled: bool = True
+    """
+    Enable velocity-based association distance scaling.
+    
+    When True: Association distance scales up for fast-moving bags
+    When False: Fixed association distance only
+    
+    This helps maintain tracking during bag flipping/throwing.
+    
+    Default: True
+    """
+    
+    velocity_scale_factor: float = 2.5
+    """
+    Maximum multiplier for association distance based on velocity.
+    
+    Range: 1.5 - 4.0
+    Higher values allow tracking faster movements but may cause false associations.
+    
+    Default: 2.5
+    """
+    
+    max_association_distance_px: float = 250.0
+    """
+    Absolute maximum association distance regardless of velocity.
+    
+    Range: 150 - 400
+    Prevents association distance from growing too large.
+    
+    Default: 250.0
+    """
+    
+    # --------------------------------------------------------------------------
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
     
@@ -392,6 +428,46 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Center-of-Frame Counting (for scenarios where bags don't exit to edge)
+    # --------------------------------------------------------------------------
+    
+    allow_center_commit: bool = True
+    """
+    Allow counting bags that don't exit to frame edge.
+    
+    When True: Bags in center of frame will be counted after idle timeout
+    When False: Bags must exit to edge to be counted (strict boundary rule)
+    
+    Enable this for scenarios where workers place closed bags on the table
+    rather than moving them off-frame.
+    
+    Default: True
+    """
+    
+    center_commit_idle_frames: int = 25
+    """
+    Number of frames without detection before counting a bag in center of frame.
+    
+    Range: 15 - 50
+    - Lower values: Faster counting, may count prematurely
+    - Higher values: More certain the bag is done, but slower
+    
+    At 25fps, default of 25 frames = 1 second of no detection.
+    
+    Default: 25
+    """
+    
+    center_commit_min_closed_ratio: float = 0.3
+    """
+    Minimum ratio of closed evidence to total evidence for center commit.
+    
+    Range: 0.2 - 0.6
+    Ensures the bag actually showed closed state before counting.
+    
+    Default: 0.3
+    """
+    
+    # --------------------------------------------------------------------------
     # State Transition Temporal Stability
     # --------------------------------------------------------------------------
     
@@ -433,6 +509,30 @@ class TrackingConfig:
     Used to validate geometric stability during state transitions.
     
     Default: 30.0
+    """
+    
+    # --------------------------------------------------------------------------
+    # State Reversion Parameters (prevents OPEN<->CLOSING oscillation)
+    # --------------------------------------------------------------------------
+    
+    closing_revert_open_count: int = 3
+    """
+    Number of open detections in recent window to revert CLOSING -> OPEN.
+    
+    Range: 2 - 5
+    Higher values prevent oscillation during noisy detection phases.
+    
+    Default: 3 (was 2, increased to reduce oscillation)
+    """
+    
+    closing_revert_window_size: int = 5
+    """
+    Window size (frames) to check for revert condition.
+    
+    Range: 3 - 8
+    Larger windows provide more stability against noise.
+    
+    Default: 5 (was 3, increased to reduce oscillation)
     """
     
     # --------------------------------------------------------------------------
@@ -547,6 +647,11 @@ def get_event_config():
         association_distance_px=tracking_config.association_distance_px,
         association_time_ms=tracking_config.association_time_ms,
         
+        # Velocity-based association
+        velocity_scaling_enabled=tracking_config.velocity_scaling_enabled,
+        velocity_scale_factor=tracking_config.velocity_scale_factor,
+        max_association_distance_px=tracking_config.max_association_distance_px,
+        
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
         
@@ -554,11 +659,20 @@ def get_event_config():
         exit_timeout_ms=tracking_config.exit_timeout_ms,
         exit_boundary_margin_px=tracking_config.exit_boundary_margin_px,
         
+        # Center-of-frame counting
+        allow_center_commit=tracking_config.allow_center_commit,
+        center_commit_idle_frames=tracking_config.center_commit_idle_frames,
+        center_commit_min_closed_ratio=tracking_config.center_commit_min_closed_ratio,
+        
         # State transition timing
         open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,
         closing_stability_time_ms=tracking_config.closing_stability_time_ms,
         closed_stability_time_ms=tracking_config.closed_stability_time_ms,
         centroid_stability_px=tracking_config.centroid_stability_px,
+        
+        # State reversion (anti-oscillation)
+        closing_revert_open_count=tracking_config.closing_revert_open_count,
+        closing_revert_window_size=tracking_config.closing_revert_window_size,
         
         # Evidence thresholds
         min_open_evidence_count=tracking_config.min_open_evidence_count,

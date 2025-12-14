@@ -39,6 +39,11 @@ def default_config():
         association_distance_px=100.0,
         association_time_ms=400.0,
         
+        # Velocity-based association
+        velocity_scaling_enabled=True,
+        velocity_scale_factor=2.5,
+        max_association_distance_px=250.0,
+        
         # Ghost timeout
         ghost_timeout_ms=1000.0,
         
@@ -46,11 +51,20 @@ def default_config():
         exit_timeout_ms=800.0,
         exit_boundary_margin_px=50,
         
+        # Center commit
+        allow_center_commit=True,
+        center_commit_idle_frames=25,
+        center_commit_min_closed_ratio=0.3,
+        
         # State transition timing
         open_to_closing_time_ms=100.0,
         closing_stability_time_ms=150.0,
         closed_stability_time_ms=200.0,
         centroid_stability_px=30.0,
+        
+        # State reversion (anti-oscillation) - use smaller values for tests
+        closing_revert_open_count=3,
+        closing_revert_window_size=5,
         
         # Evidence thresholds
         min_open_evidence_count=3,
@@ -155,17 +169,19 @@ class TestEventStateMachine:
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
-        # Build up open evidence
-        for i in range(1, 4):
-            evidence = create_evidence(i * 50.0, 640, 360, is_open=True, frame_index=i)
-            event.add_detection(evidence)
+        # Build up open evidence with less items so we don't have too many in window
+        event.add_detection(create_evidence(50.0, 640, 360, is_open=True, frame_index=1))
+        event.add_detection(create_evidence(100.0, 640, 360, is_open=True, frame_index=2))
         
-        # Add closed evidence to trigger CLOSING
-        event.add_detection(create_evidence(200.0, 640, 360, is_open=False, is_closed=True, frame_index=4))
+        # Add first closed evidence to trigger CLOSING
+        event.add_detection(create_evidence(200.0, 640, 360, is_open=False, is_closed=True, frame_index=3))
         assert event.state == EventState.CLOSING
         
-        # Add more closed evidence with time passing
-        event.add_detection(create_evidence(400.0, 642, 361, is_open=False, is_closed=True, frame_index=5))
+        # Add more closed evidence with time passing (need enough to avoid reversion)
+        # Window will be: [open, open, closed, closed, closed] -> 2 open, doesn't revert
+        event.add_detection(create_evidence(250.0, 641, 360, is_open=False, is_closed=True, frame_index=4))
+        event.add_detection(create_evidence(300.0, 641, 361, is_open=False, is_closed=True, frame_index=5))
+        event.add_detection(create_evidence(400.0, 642, 361, is_open=False, is_closed=True, frame_index=6))
         
         # Should transition to CLOSED after stability time
         assert event.state == EventState.CLOSED
@@ -182,9 +198,11 @@ class TestEventStateMachine:
         
         assert event.state == EventState.CLOSING
         
-        # Resume open evidence
+        # Resume open evidence - need 3 open detections since entering CLOSING to revert
+        # (based on closing_revert_open_count=3 in config)
         event.add_detection(create_evidence(250.0, 640, 360, is_open=True, frame_index=5))
         event.add_detection(create_evidence(280.0, 640, 360, is_open=True, frame_index=6))
+        event.add_detection(create_evidence(310.0, 640, 360, is_open=True, frame_index=7))
         
         assert event.state == EventState.OPEN
     
@@ -568,6 +586,169 @@ class TestROICollection:
             assert 'frame_index' in cand
             assert 'confidence' in cand
             assert 'relative_time' in cand
+
+
+# =============================================================================
+# Velocity-Based Association Tests
+# =============================================================================
+
+class TestVelocityBasedAssociation:
+    """Tests for velocity-based association during fast movements."""
+    
+    def test_velocity_calculation(self, default_config):
+        """Velocity should be calculated from centroid history."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Move the bag steadily
+        event.add_detection(create_evidence(40.0, 120, 100, is_open=True, frame_index=1))  # +20px in 40ms
+        event.add_detection(create_evidence(80.0, 140, 100, is_open=True, frame_index=2))  # +20px in 40ms
+        
+        vx, vy = event.get_velocity()
+        # Velocity should be approximately 0.5 px/ms (20px / 40ms)
+        assert abs(vx - 0.5) < 0.1
+        assert abs(vy) < 0.1
+    
+    def test_velocity_scales_association_distance(self, default_config):
+        """Fast movement should increase association distance."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Create fast movement history
+        event.add_detection(create_evidence(20.0, 150, 100, is_open=True, frame_index=1))  # +50px
+        event.add_detection(create_evidence(40.0, 200, 100, is_open=True, frame_index=2))  # +50px
+        
+        # Now try to associate with a detection that's far from last position
+        # but in the direction of motion
+        far_detection = create_evidence(60.0, 280, 100, is_open=True, frame_index=3)  # +80px
+        
+        # With velocity scaling enabled, this should associate
+        can_assoc, distance, reason = event.can_associate(far_detection)
+        # The predicted position would be around 250px (200 + 2.5px/ms * 20ms)
+        # so distance to prediction is about 30px which should associate
+        assert can_assoc is True
+    
+    def test_predicted_centroid(self, default_config):
+        """Centroid prediction should extrapolate based on velocity."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Create movement pattern
+        event.add_detection(create_evidence(40.0, 140, 100, is_open=True, frame_index=1))  # +40px in 40ms
+        
+        # Predict position at 80ms
+        pred_x, pred_y = event.predict_centroid(80.0)
+        
+        # Should extrapolate: 140 + (1.0 px/ms * 40ms) = 180
+        assert 170 < pred_x < 190
+
+
+# =============================================================================
+# Center Commit Tests
+# =============================================================================
+
+class TestCenterCommit:
+    """Tests for center-of-frame counting feature."""
+    
+    def test_center_commit_enabled(self):
+        """Event in center should commit after idle timeout when center_commit enabled."""
+        config = EventConfig(
+            allow_center_commit=True,
+            center_commit_idle_frames=10,
+            center_commit_min_closed_ratio=0.3,
+            ghost_timeout_ms=500.0,
+        )
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Force into CLOSED state
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 5  # 5/8 = 62.5% > 30%
+        event.last_detection_frame_index = 0
+        
+        # Centroid is in center
+        event.last_centroid = (640, 360)
+        
+        # Simulate enough idle frames
+        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=35)
+        
+        assert should_commit is True
+        assert event.commit_reason == "center_commit"
+    
+    def test_center_commit_disabled(self):
+        """Event in center should NOT commit when center_commit disabled."""
+        config = EventConfig(
+            allow_center_commit=False,
+            ghost_timeout_ms=500.0,
+        )
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Force into CLOSED state
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.last_detection_frame_index = 0
+        
+        # Centroid is in center
+        event.last_centroid = (640, 360)
+        
+        # Even after long idle, should not commit
+        should_commit = event.update_ghost_state(2000.0, (1280, 720), current_frame_index=100)
+        
+        assert should_commit is False
+    
+    def test_center_commit_requires_closed_ratio(self):
+        """Center commit should require minimum closed evidence ratio."""
+        config = EventConfig(
+            allow_center_commit=True,
+            center_commit_idle_frames=10,
+            center_commit_min_closed_ratio=0.5,  # Require 50%
+            ghost_timeout_ms=500.0,
+        )
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Force into CLOSED state with low closed ratio
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 8
+        event.closed_evidence_count = 2  # 2/10 = 20% < 50%
+        event.last_detection_frame_index = 0
+        event.last_centroid = (640, 360)
+        
+        # Should not commit due to low closed ratio
+        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=35)
+        
+        assert should_commit is False
+
+
+# =============================================================================
+# Anti-Oscillation Tests
+# =============================================================================
+
+class TestAntiOscillation:
+    """Tests for state oscillation prevention."""
+    
+    def test_no_immediate_reversion(self, default_config):
+        """Entering CLOSING should not immediately revert due to past open evidence."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Build up lots of open evidence
+        for i in range(1, 6):
+            event.add_detection(create_evidence(i * 40.0, 640, 360, is_open=True, frame_index=i))
+        
+        # Now add closed - should enter CLOSING
+        event.add_detection(create_evidence(300.0, 640, 360, is_open=False, is_closed=True, frame_index=6))
+        
+        assert event.state == EventState.CLOSING
+        
+        # Add one more closed - should still be in CLOSING, not reverted
+        event.add_detection(create_evidence(350.0, 640, 360, is_open=False, is_closed=True, frame_index=7))
+        
+        assert event.state == EventState.CLOSING  # Should not have reverted
 
 
 if __name__ == '__main__':
