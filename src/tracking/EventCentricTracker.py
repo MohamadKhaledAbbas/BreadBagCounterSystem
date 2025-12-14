@@ -793,12 +793,7 @@ class EventCentricTracker:
         events_to_remove = []
         
         for event_id, event in self.active_events.items():
-            # Skip events that received a detection this frame
-            received_detection = any(
-                event.last_detection_time_ms == timestamp_ms
-                for event in self.active_events.values()
-            )
-            
+            # Check if THIS specific event received a detection this frame
             if event.last_detection_time_ms != timestamp_ms:
                 # No detection for this event - update ghost state
                 should_commit = event.update_ghost_state(timestamp_ms, frame_size)
