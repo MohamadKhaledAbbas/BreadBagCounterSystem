@@ -76,7 +76,14 @@ class BagEvent:
         # Record metrics
         pipeline_metrics.record_event_created()
 
-        logger.debug(f"[BagEvent] Created event ID={self.id}, start_frame={frame_index}")
+        # Structured logging for event creation
+        structured_logger.event_created(
+            event_id=self.id,
+            confidence=confidence,
+            box=box.tolist() if hasattr(box, 'tolist') else list(box),
+            frame_index=frame_index,
+            state=self.state
+        )
     
     def _calculate_motion(self, new_box) -> float:
         """Calculate motion magnitude between current and new box."""
@@ -227,9 +234,16 @@ class BagEvent:
             self.open_rois.sort(key=lambda x: x[0], reverse=True)
             if len(self.open_rois) > self.max_open_samples:
                 self.open_rois = self.open_rois[:self.max_open_samples]
-            logger.debug(
-                f"[BagEvent:{self.id}] Added OPEN ROI "
-                f"(sharpness={sharpness:.1f}, frame={frame_index}, conf={confidence:.2f}, total={len(self.open_rois)})"
+            
+            # Structured logging for ROI addition
+            structured_logger.roi_added(
+                event_id=self.id,
+                is_open=True,
+                sharpness=sharpness,
+                frame_index=frame_index,
+                confidence=confidence,
+                total_rois=len(self.open_rois),
+                bbox_area=bbox_area
             )
         else:
             self.closed_rois.append(roi_entry)
@@ -237,9 +251,16 @@ class BagEvent:
             self.closed_rois.sort(key=lambda x: x[0], reverse=True)
             if len(self.closed_rois) > self.max_closed_samples:
                 self.closed_rois = self.closed_rois[:self.max_closed_samples]
-            logger.debug(
-                f"[BagEvent:{self.id}] Added CLOSED ROI "
-                f"(sharpness={sharpness:.1f}, frame={frame_index}, conf={confidence:.2f}, total={len(self.closed_rois)})"
+            
+            # Structured logging for ROI addition
+            structured_logger.roi_added(
+                event_id=self.id,
+                is_open=False,
+                sharpness=sharpness,
+                frame_index=frame_index,
+                confidence=confidence,
+                total_rois=len(self.closed_rois),
+                bbox_area=bbox_area
             )
 
         return True
@@ -260,19 +281,27 @@ class BagEvent:
 
         h, w = roi.shape[:2]
         if h < min_size or w < min_size:
-            logger.debug(
-                f"[BagEvent:{self.id}] ROI failed min_size check: "
-                f"({w}x{h}) < {min_size}"
+            # Structured logging for ROI rejection
+            structured_logger.roi_rejected(
+                event_id=self.id,
+                reason="size",
+                dimensions=(w, h),
+                sharpness=0.0,
+                min_required=min_size
             )
             return (False, 0.0, "size")
 
         # Brightness check
         mean_brightness = roi.mean()
         if not (tracking_config.min_mean_brightness <= mean_brightness <= tracking_config.max_mean_brightness):
-            logger.debug(
-                f"[BagEvent:{self.id}] ROI failed brightness check: "
-                f"mean={mean_brightness:.1f}, range=[{tracking_config.min_mean_brightness}, "
-                f"{tracking_config.max_mean_brightness}]"
+            # Structured logging for ROI rejection
+            structured_logger.roi_rejected(
+                event_id=self.id,
+                reason="brightness",
+                brightness=mean_brightness,
+                dimensions=(w, h),
+                min_brightness=tracking_config.min_mean_brightness,
+                max_brightness=tracking_config.max_mean_brightness
             )
             return (False, 0.0, "brightness")
 
@@ -566,9 +595,16 @@ class BagStateMonitor:
                     )
 
                     if best_event.state == 'detecting_closed':
-                        logger.debug(
-                            f"[BagStateMonitor] Event {best_event.id}: "
-                            f"Reopened, resetting closed_hits"
+                        # Structured logging for state transition (reopened)
+                        structured_logger.event_state_transition(
+                            event_id=best_event.id,
+                            old_state='detecting_closed',
+                            new_state='detecting_open',
+                            trigger='open_detection_after_closed',
+                            open_hits=best_event.open_hits,
+                            closed_hits=best_event.closed_hits,
+                            iou=best_iou,
+                            frame_index=current_frame
                         )
                         best_event.closed_hits = 0
                         best_event.state = 'detecting_open'
@@ -596,8 +632,23 @@ class BagStateMonitor:
 
                 if best_event.state != 'counted':
                     if best_event.open_hits >= self.min_open_frames:
+                        old_state = best_event.state
                         best_event.closed_hits += 1
                         best_event.state = 'detecting_closed'
+                        
+                        # Structured logging for state transition (if state changed)
+                        if old_state != 'detecting_closed':
+                            structured_logger.event_state_transition(
+                                event_id=best_event.id,
+                                old_state=old_state,
+                                new_state='detecting_closed',
+                                trigger='min_open_frames_reached',
+                                open_hits=best_event.open_hits,
+                                closed_hits=best_event.closed_hits,
+                                iou=best_iou,
+                                frame_index=current_frame
+                            )
+                        
                         logger.debug(
                             f"[BagStateMonitor] Event {best_event.id}: "
                             f"closed_hits={best_event.closed_hits} (IoU={best_iou:.2f})"
@@ -645,9 +696,16 @@ class BagStateMonitor:
                         suppress_event = True
                         self.total_events_suppressed += 1
                         pipeline_metrics.record_event_suppressed()
-                        logger.debug(
-                            f"[BagStateMonitor] Suppressing new event: IoU={iou:.2f}, "
-                            f"Matching recently counted event ID={counted_event['id']}"
+                        
+                        # Structured logging for event suppression
+                        structured_logger.event_suppressed(
+                            event_id=-1,  # New event not created yet
+                            reason='duplicate_spatial_overlap',
+                            iou=iou,
+                            conflicting_event_id=counted_event['id'],
+                            center_distance=center_dist,
+                            frame_index=current_frame,
+                            detection_confidence=det.get('conf', 1.0)
                         )
                         break
 
@@ -693,8 +751,21 @@ class BagStateMonitor:
                         f"[BagStateMonitor] Event {event.id} triggered but no candidates!"
                     )
 
+                old_state = event.state
                 event.state = 'counted'  # Transition to counted
                 self.total_events_counted += 1
+                
+                # Structured logging for state transition to counted
+                structured_logger.event_state_transition(
+                    event_id=event.id,
+                    old_state=old_state,
+                    new_state='counted',
+                    trigger='classification_ready',
+                    open_hits=event.open_hits,
+                    closed_hits=event.closed_hits,
+                    total_frames=event.total_frames_tracked,
+                    candidates_count=len(candidates)
+                )
                 
                 # Record metrics with event details
                 pipeline_metrics.record_event_counted(event.open_hits, event.closed_hits)
@@ -732,9 +803,17 @@ class BagStateMonitor:
                 expired_count += 1
                 self.total_events_expired += 1
                 pipeline_metrics.record_event_expired(event.state)
-                logger.debug(
-                    f"[BagStateMonitor] Event {event.id} expired "
-                    f"(state={event.state}, frames_since_update={event.frames_since_update})"
+                
+                # Structured logging for event expiration
+                structured_logger.event_expired(
+                    event_id=event.id,
+                    state=event.state,
+                    frames_tracked=event.total_frames_tracked,
+                    open_hits=event.open_hits,
+                    closed_hits=event.closed_hits,
+                    frames_since_update=event.frames_since_update,
+                    avg_motion=event.get_avg_motion(),
+                    avg_confidence=event.get_avg_confidence()
                 )
 
         if expired_count > 0:

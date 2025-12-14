@@ -399,13 +399,33 @@ class ClassifierService:
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
                 
+                # Calculate contribution for this candidate
+                sharpness = cand.get('sharpness', 0)
+                relative_time = cand.get('relative_time', 0.5)
+                sharpness_weight = self._compute_sharpness_weight(sharpness)
+                temporal_weight = self._compute_temporal_weight(relative_time)
+                raw_contribution = conf * sharpness_weight * temporal_weight
+                clamped_contribution = min(raw_contribution, self.max_single_weight)
+                
+                # Structured logging for candidate classification
+                structured_logger.classification_candidate(
+                    track_id=track_id,
+                    candidate_idx=idx,
+                    label=label,
+                    confidence=conf,
+                    sharpness=sharpness,
+                    relative_time=relative_time,
+                    contribution=clamped_contribution,
+                    frame_index=cand.get('frame_index', 0)
+                )
+                
                 classifications.append({
                     'label': label,
                     'confidence': conf,
                     'roi': roi,
-                    'sharpness': cand.get('sharpness', 0),
+                    'sharpness': sharpness,
                     'frame_index': cand.get('frame_index', 0),
-                    'relative_time': cand.get('relative_time', 0.5),
+                    'relative_time': relative_time,
                 })
             
             classify_time = (time.perf_counter() - batch_start) * 1000
@@ -444,9 +464,25 @@ class ClassifierService:
             )
 
         except Exception as e:
-            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
             import traceback
-            logger.error(traceback.format_exc())
+            error_trace = traceback.format_exc()
+            
+            # Structured error logging
+            structured_logger.pipeline_error(
+                component='ClassifierService',
+                operation='track_classification',
+                error_type=type(e).__name__,
+                error_message=str(e),
+                affected_ids=[track_id],
+                context={
+                    'candidates_count': len(candidates_input) if candidates_input else 0,
+                    'event_stats': event_stats if 'event_stats' in locals() else {}
+                },
+                traceback=error_trace
+            )
+            
+            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
+            logger.error(error_trace)
 
     def _log_classification_decision(self, track_id: int, label: str, confidence: float,
                                      rejection_reason: Optional[str], metadata: Dict,
@@ -480,8 +516,10 @@ class ClassifierService:
             confidence=confidence,
             candidates=num_candidates,
             used_voting=True,  # V4 always uses evidence accumulation
-            entropy=0.0,  # Not used in V4
-            margin=winner_ratio if isinstance(winner_ratio, float) else 0.0,
+            rejection_reason=rejection_reason,
+            evidence_scores=evidence_summary,
+            winner_ratio=winner_ratio if isinstance(winner_ratio, float) else None,
+            processing_time_ms=classify_time_ms
         )
 
     def _invoke_unknown_result(self, track_id: int, reason: str, context: Optional[Dict]):

@@ -328,7 +328,16 @@ class BagCounterApp:
         self.db.log_event(bag_type_id, track_id, conf)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
-        logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
+        
+        # Structured logging for count update
+        structured_logger.count_updated(
+            bag_type=label,
+            new_count=self.ui_counts[label],
+            track_id=track_id,
+            confidence=conf,
+            phash=phash,
+            candidates_evaluated=candidates_count
+        )
 
         # Save snapshot only if context is available and is_recording flag enabled
         if self.is_recording and context and context.get("frame") is not None:
@@ -375,9 +384,25 @@ class BagCounterApp:
                 )
                 
             except Exception as e:
-                logger.error(f"[ClassificationThread] Error processing event: {e}")
                 import traceback
-                logger.debug(f"[ClassificationThread] Traceback:\n{traceback.format_exc()}")
+                error_trace = traceback.format_exc()
+                
+                # Structured error logging
+                structured_logger.pipeline_error(
+                    component='ClassificationThread',
+                    operation='classification_processing',
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[event_id] if 'event_id' in locals() else None,
+                    context={
+                        'candidates_count': len(candidates) if 'candidates' in locals() else 0,
+                        'classification_queue_size': self.classification_queue.qsize()
+                    },
+                    traceback=error_trace
+                )
+                
+                logger.error(f"[ClassificationThread] Error processing event: {e}")
+                logger.debug(f"[ClassificationThread] Traceback:\n{error_trace}")
         
         logger.info("[ClassificationThread] Stopped")
     
@@ -464,10 +489,14 @@ class BagCounterApp:
                 if should_skip:
                     self._frames_skipped += 1
                     if self._frames_skipped % 10 == 0:
-                        logger.warning(
-                            f"[LogicThread] Skipping frame {frame_count} due to backpressure "
-                            f"(queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms, "
-                            f"total_skipped={self._frames_skipped})"
+                        # Structured logging for backpressure
+                        structured_logger.queue_backpressure(
+                            queue_name='input_queue',
+                            utilization=queue_utilization,
+                            drops=self.input_queue_drops,
+                            action='skip_frame',
+                            avg_detection_time_ms=avg_detection_time,
+                            frames_skipped=self._frames_skipped
                         )
                     continue
 
@@ -618,18 +647,53 @@ class BagCounterApp:
                     timing_msg += f" | FPS: {fps:.1f}"
                     
                     # V3: Add queue status
-                    timing_msg += f" | InputQ: {self.input_queue.qsize()}/{self.INPUT_QUEUE_SIZE}"
-                    timing_msg += f" | ClassQ: {self.classification_queue.qsize()}/{self.CLASSIFICATION_QUEUE_SIZE}"
+                    input_q_size = self.input_queue.qsize()
+                    class_q_size = self.classification_queue.qsize()
+                    timing_msg += f" | InputQ: {input_q_size}/{self.INPUT_QUEUE_SIZE}"
+                    timing_msg += f" | ClassQ: {class_q_size}/{self.CLASSIFICATION_QUEUE_SIZE}"
                     
                     logger.info(timing_msg)
+                    
+                    # Structured logging for frame processing
+                    structured_logger.frame_processed(
+                        frame_id=frame_count,
+                        detection_time_ms=detect_time,
+                        monitor_time_ms=monitor_time,
+                        total_time_ms=total_time,
+                        detections_count=len(current_frame_detections),
+                        events_ready=len(ready_events) if ready_events else 0,
+                        queue_sizes={
+                            'input': input_q_size,
+                            'classification': class_q_size
+                        },
+                        fps=fps
+                    )
 
                 # Log pipeline metrics periodically
                 pipeline_metrics.maybe_log_summary()
 
             except Exception as e:
-                logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
                 import traceback
-                logger.debug(f"[LogicThread] Traceback:\n{traceback.format_exc()}")
+                error_trace = traceback.format_exc()
+                
+                # Structured error logging
+                structured_logger.pipeline_error(
+                    component='LogicThread',
+                    operation='frame_processing',
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[frame_count],
+                    context={
+                        'detections_count': len(current_frame_detections) if 'current_frame_detections' in locals() else 0,
+                        'active_events': len(self.monitor.active_events) if hasattr(self, 'monitor') else 0,
+                        'input_queue_size': self.input_queue.qsize(),
+                        'classification_queue_size': self.classification_queue.qsize()
+                    },
+                    traceback=error_trace
+                )
+                
+                logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
+                logger.debug(f"[LogicThread] Traceback:\n{error_trace}")
 
         logger.info("[LogicThread] Stopped")
 
