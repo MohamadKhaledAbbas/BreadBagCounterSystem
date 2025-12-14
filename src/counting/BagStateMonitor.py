@@ -225,7 +225,6 @@ class BagEvent:
         
         # Check sharpness threshold (separate from basic validation)
         if sharpness < tracking_config.min_roi_sharpness:
-            pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             structured_logger.roi_rejected(
                 event_id=self.id,
                 reason="sharpness",
@@ -233,9 +232,10 @@ class BagEvent:
                 dimensions=(roi.shape[1], roi.shape[0]),
                 min_required=tracking_config.min_roi_sharpness
             )
+            pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             return False
         
-        # ROI passed all quality checks - record as accepted
+        # ROI passed all quality checks - log then record metrics
         pipeline_metrics.record_roi_quality(True, sharpness, None)
         
         # V4: Store ROI with full metadata (sharpness, roi, frame_index, bbox_area, confidence)

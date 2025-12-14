@@ -417,14 +417,17 @@ class BagCounterApp:
             # Queue is full - drop the oldest task and try again
             try:
                 dropped = self.classification_queue.get_nowait()
+                dropped_event_id = dropped[0] if dropped and len(dropped) > 0 else None
                 with self.stats_lock:
                     self.classification_queue_drops += 1
+                queue_util = self.classification_queue.qsize() / self.CLASSIFICATION_QUEUE_SIZE if self.CLASSIFICATION_QUEUE_SIZE > 0 else 1.0
                 structured_logger.queue_backpressure(
                     queue_name='classification_queue',
-                    utilization=1.0,
+                    utilization=queue_util,
                     drops=self.classification_queue_drops,
                     action='drop_oldest_task',
-                    dropped_event_id=dropped[0] if dropped else None
+                    dropped_event_id=dropped_event_id,
+                    new_event_id=event_id
                 )
                 self.classification_queue.put_nowait(task)
                 return True
@@ -433,9 +436,10 @@ class BagCounterApp:
             except queue.Full:
                 with self.stats_lock:
                     self.classification_queue_drops += 1
+                queue_util = self.classification_queue.qsize() / self.CLASSIFICATION_QUEUE_SIZE if self.CLASSIFICATION_QUEUE_SIZE > 0 else 1.0
                 structured_logger.queue_backpressure(
                     queue_name='classification_queue',
-                    utilization=1.0,
+                    utilization=queue_util,
                     drops=self.classification_queue_drops,
                     action='failed_enqueue',
                     event_id=event_id
