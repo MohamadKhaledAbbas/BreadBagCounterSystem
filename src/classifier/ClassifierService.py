@@ -112,14 +112,17 @@ class ClassifierService:
             Tuple of (label, confidence)
         """
         try:
-            t1 = time.perf_counter()
             label, conf = self.classifier.predict(roi_image)
-            t2 = time.perf_counter()
-            processing_time = (t2 - t1) * 1000
-            logger.debug(f"[ClassifierService] Candidate {idx}: {label} ({conf:.3f}) - {processing_time:.1f}ms")
             return label, float(conf)
         except Exception as e:
-            logger.error(f"[ClassifierService] Classification error: {e}")
+            structured_logger.pipeline_error(
+                component="ClassifierService",
+                operation="single_roi_classification",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                affected_ids=[idx],
+                context={"candidate_idx": idx}
+            )
             return "Unknown", 0.0
 
     def _compute_sharpness_weight(self, sharpness: float) -> float:
@@ -367,12 +370,6 @@ class ClassifierService:
                     candidates = candidates_input
                 else:
                     # Backward compatibility: convert old format (list of ROI images)
-                    # Warning: This path uses default metadata which may lead to suboptimal
-                    # evidence accumulation. Prefer using the new dict format.
-                    logger.warning(
-                        f"[ClassifierService] Track {track_id}: Using legacy candidate format. "
-                        f"Update to new dict format for optimal evidence weighting."
-                    )
                     candidates = [{'roi': roi, 'sharpness': 100.0, 'frame_index': 0, 
                                    'bbox_area': 0, 'confidence': 0.8, 'relative_time': 0.5} 
                                   for roi in candidates_input]
@@ -382,14 +379,8 @@ class ClassifierService:
             # Extract event_stats from context if available
             event_stats = context.get("event_stats", {}) if context else {}
             
-            logger.info(
-                f"[ClassifierService] Track {track_id}: Processing {len(candidates)} candidates "
-                f"(top-K={self.top_k})"
-            )
-            
             # Structural validation
             if not candidates:
-                logger.warning(f"[ClassifierService] Track {track_id}: No candidates!")
                 self._invoke_unknown_result(track_id, "no_candidates", context)
                 return
             
@@ -399,13 +390,33 @@ class ClassifierService:
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
                 
+                # Calculate contribution for this candidate
+                sharpness = cand.get('sharpness', 0)
+                relative_time = cand.get('relative_time', 0.5)
+                sharpness_weight = self._compute_sharpness_weight(sharpness)
+                temporal_weight = self._compute_temporal_weight(relative_time)
+                raw_contribution = conf * sharpness_weight * temporal_weight
+                clamped_contribution = min(raw_contribution, self.max_single_weight)
+                
+                # Structured logging for candidate classification
+                structured_logger.classification_candidate(
+                    track_id=track_id,
+                    candidate_idx=idx,
+                    label=label,
+                    confidence=conf,
+                    sharpness=sharpness,
+                    relative_time=relative_time,
+                    contribution=clamped_contribution,
+                    frame_index=cand.get('frame_index', 0)
+                )
+                
                 classifications.append({
                     'label': label,
                     'confidence': conf,
                     'roi': roi,
-                    'sharpness': cand.get('sharpness', 0),
+                    'sharpness': sharpness,
                     'frame_index': cand.get('frame_index', 0),
-                    'relative_time': cand.get('relative_time', 0.5),
+                    'relative_time': relative_time,
                 })
             
             classify_time = (time.perf_counter() - batch_start) * 1000
@@ -444,9 +455,22 @@ class ClassifierService:
             )
 
         except Exception as e:
-            logger.error(f"[ClassifierService] Process error for track {track_id}: {e}")
             import traceback
-            logger.error(traceback.format_exc())
+            error_trace = traceback.format_exc()
+            
+            # Structured error logging
+            structured_logger.pipeline_error(
+                component='ClassifierService',
+                operation='track_classification',
+                error_type=type(e).__name__,
+                error_message=str(e),
+                affected_ids=[track_id],
+                context={
+                    'candidates_count': len(candidates_input) if candidates_input else 0,
+                    'event_stats': event_stats if 'event_stats' in locals() else {}
+                },
+                traceback=error_trace
+            )
 
     def _log_classification_decision(self, track_id: int, label: str, confidence: float,
                                      rejection_reason: Optional[str], metadata: Dict,
@@ -459,29 +483,26 @@ class ClassifierService:
         evidence_summary = metadata.get("evidence_per_label", {})
         winner_ratio = metadata.get("winner_ratio", "N/A")
         
-        if rejection_reason:
-            logger.warning(
-                f"[ClassifierService] Track {track_id} -> Unknown: {rejection_reason}\n"
-                f"  Candidates: {num_candidates}, Time: {classify_time_ms:.1f}ms\n"
-                f"  Evidence: {evidence_summary}"
-            )
-        else:
-            logger.info(
-                f"[ClassifierService] Track {track_id} -> {label} (conf={confidence:.3f})\n"
-                f"  Winner score: {metadata.get('winner_score', 'N/A')}, Ratio: {winner_ratio}\n"
-                f"  Candidates: {num_candidates}, Time: {classify_time_ms:.1f}ms\n"
-                f"  Evidence: {evidence_summary}"
-            )
-        
         # Structured logging for analysis
+        # Validate winner_ratio for logging (handle float, int, inf, and NaN)
+        import math
+        valid_ratio = None
+        if winner_ratio is not None:
+            if isinstance(winner_ratio, (int, float)):
+                if math.isfinite(winner_ratio):
+                    valid_ratio = float(winner_ratio)
+                # Infinite or NaN - log as None
+        
         structured_logger.classification_result(
             track_id=track_id,
             label=label,
             confidence=confidence,
             candidates=num_candidates,
             used_voting=True,  # V4 always uses evidence accumulation
-            entropy=0.0,  # Not used in V4
-            margin=winner_ratio if isinstance(winner_ratio, float) else 0.0,
+            rejection_reason=rejection_reason,
+            evidence_scores=evidence_summary,
+            winner_ratio=valid_ratio,
+            processing_time_ms=classify_time_ms
         )
 
     def _invoke_unknown_result(self, track_id: int, reason: str, context: Optional[Dict]):
@@ -557,17 +578,19 @@ class ClassifierService:
             label, confidence, candidates_count, used_voting=True
         )
         
-        logger.info(
-            f"[ClassifierService] Track {track_id} DONE: {label} "
-            f"(conf={confidence:.3f}, candidates={candidates_count})"
-        )
-        
         # Invoke callbacks
         for cb in self.callbacks:
             try:
                 cb(track_id, result_data)
             except Exception as e:
-                logger.error(f"[ClassifierService] Callback error: {e}")
+                structured_logger.pipeline_error(
+                    component="ClassifierService",
+                    operation="callback_invocation",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[track_id],
+                    context={"label": label, "confidence": confidence}
+                )
 
     def get_statistics(self) -> Dict[str, Any]:
         """

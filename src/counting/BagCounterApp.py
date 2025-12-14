@@ -31,7 +31,7 @@ from src import constants
 from src.config.settings import config
 
 from src.logging.ConfigWatcher import ConfigWatcher
-from src.utils.AppLogging import logger
+from src.utils.AppLogging import logger, structured_logger
 from src.utils.platform import IS_RDK
 from src.utils.PipelineMetrics import pipeline_metrics
 
@@ -315,27 +315,34 @@ class BagCounterApp:
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
 
-        logger.info(
-            f"[BagCounterApp] Classification result: track={track_id}, "
-            f"label={label}, conf={conf:.3f}"
-        )
-        logger.debug(
-            f"[BagCounterApp] Result details: phash={phash}, "
-            f"image_path={image_path}, candidates={candidates_count}"
-        )
-
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
-        logger.info(f"[BagCounterApp] Count updated: {label} = {self.ui_counts[label]}")
+        
+        # Structured logging for count update
+        structured_logger.count_updated(
+            bag_type=label,
+            new_count=self.ui_counts[label],
+            track_id=track_id,
+            confidence=conf,
+            phash=phash,
+            candidates_evaluated=candidates_count
+        )
 
         # Save snapshot only if context is available and is_recording flag enabled
         if self.is_recording and context and context.get("frame") is not None:
             try:
                 self._save_snapshot(track_id, label, conf, phash, image_path, candidates_count, context)
             except Exception as e:
-                logger.error(f"[BagCounterApp] Snapshot save error: {e}")
+                structured_logger.pipeline_error(
+                    component="BagCounterApp",
+                    operation="snapshot_save",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[track_id],
+                    context={"label": label, "phash": phash}
+                )
 
     # --- V3: Async Classification Thread ---
     
@@ -358,7 +365,14 @@ class BagCounterApp:
                     break
                 continue
             except Exception as e:
-                logger.error(f"[ClassificationThread] Queue error: {e}")
+                structured_logger.pipeline_error(
+                    component="ClassificationThread",
+                    operation="queue_get",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=None,
+                    context={"queue_size": self.classification_queue.qsize()}
+                )
                 continue
             
             try:
@@ -368,16 +382,23 @@ class BagCounterApp:
                 # Process classification (this is the slow part)
                 self.classifier_service.process(event_id, candidates, context=context)
                 
-                classify_time = (time.perf_counter() - classify_start) * 1000
-                logger.debug(
-                    f"[ClassificationThread] Event {event_id} classified in {classify_time:.1f}ms "
-                    f"({len(candidates)} candidates)"
-                )
-                
             except Exception as e:
-                logger.error(f"[ClassificationThread] Error processing event: {e}")
                 import traceback
-                logger.debug(f"[ClassificationThread] Traceback:\n{traceback.format_exc()}")
+                error_trace = traceback.format_exc()
+                
+                # Structured error logging
+                structured_logger.pipeline_error(
+                    component='ClassificationThread',
+                    operation='classification_processing',
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[event_id] if 'event_id' in locals() else None,
+                    context={
+                        'candidates_count': len(candidates) if 'candidates' in locals() else 0,
+                        'classification_queue_size': self.classification_queue.qsize()
+                    },
+                    traceback=error_trace
+                )
         
         logger.info("[ClassificationThread] Stopped")
     
@@ -396,11 +417,18 @@ class BagCounterApp:
             # Queue is full - drop the oldest task and try again
             try:
                 dropped = self.classification_queue.get_nowait()
-                logger.warning(
-                    f"[ClassificationQueue] Dropped old task (event {dropped[0]}) to make room"
-                )
+                dropped_event_id = dropped[0] if dropped and len(dropped) > 0 else None
                 with self.stats_lock:
                     self.classification_queue_drops += 1
+                queue_util = self.classification_queue.qsize() / self.CLASSIFICATION_QUEUE_SIZE if self.CLASSIFICATION_QUEUE_SIZE > 0 else 1.0
+                structured_logger.queue_backpressure(
+                    queue_name='classification_queue',
+                    utilization=queue_util,
+                    drops=self.classification_queue_drops,
+                    action='drop_oldest_task',
+                    dropped_event_id=dropped_event_id,
+                    new_event_id=event_id
+                )
                 self.classification_queue.put_nowait(task)
                 return True
             except queue.Empty:
@@ -408,8 +436,13 @@ class BagCounterApp:
             except queue.Full:
                 with self.stats_lock:
                     self.classification_queue_drops += 1
-                logger.warning(
-                    f"[ClassificationQueue] Failed to enqueue event {event_id} - queue full"
+                queue_util = self.classification_queue.qsize() / self.CLASSIFICATION_QUEUE_SIZE if self.CLASSIFICATION_QUEUE_SIZE > 0 else 1.0
+                structured_logger.queue_backpressure(
+                    queue_name='classification_queue',
+                    utilization=queue_util,
+                    drops=self.classification_queue_drops,
+                    action='failed_enqueue',
+                    event_id=event_id
                 )
                 return False
         
@@ -438,10 +471,16 @@ class BagCounterApp:
             except queue.Empty:
                 if not self.is_running:
                     break
-                logger.debug("[LogicThread] Input queue empty, waiting...")
                 continue
             except Exception as e:
-                logger.error(f"[LogicThread] Input queue error: {e}")
+                structured_logger.pipeline_error(
+                    component="LogicThread",
+                    operation="queue_get",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=None,
+                    context={"input_queue_size": self.input_queue.qsize()}
+                )
                 continue
 
             try:
@@ -464,10 +503,14 @@ class BagCounterApp:
                 if should_skip:
                     self._frames_skipped += 1
                     if self._frames_skipped % 10 == 0:
-                        logger.warning(
-                            f"[LogicThread] Skipping frame {frame_count} due to backpressure "
-                            f"(queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms, "
-                            f"total_skipped={self._frames_skipped})"
+                        # Structured logging for backpressure
+                        structured_logger.queue_backpressure(
+                            queue_name='input_queue',
+                            utilization=queue_utilization,
+                            drops=self.input_queue_drops,
+                            action='skip_frame',
+                            avg_detection_time_ms=avg_detection_time,
+                            frames_skipped=self._frames_skipped
                         )
                     continue
 
@@ -492,19 +535,6 @@ class BagCounterApp:
                             {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
                         )
 
-                    logger.debug(f"[LogicThread] Frame {frame_count}: {len(current_frame_detections)} detections")
-
-                    if len(current_frame_detections) > 0:
-                        for det in current_frame_detections:
-                            class_name = self.detector.class_names.get(det["class_id"], "Unknown")
-                            logger.debug(
-                                f"[RAW DETECTION] class={class_name} (id={det['class_id']}), "
-                                f"conf={det['conf']:.3f}, box=[{det['box'][0]:.1f}, {det['box'][1]:.1f}, "
-                                f"{det['box'][2]:.1f}, {det['box'][3]:.1f}]"
-                            )
-                else:
-                    logger.debug(f"[LogicThread] Frame {frame_count}: No detections")
-
                 # Record detection metrics
                 pipeline_metrics.record_detection(
                     current_frame_detections, 
@@ -523,17 +553,8 @@ class BagCounterApp:
                 # 3. V3: Queue ready events for async classification (non-blocking)
                 enqueue_time = 0.0
                 if ready_events:
-                    logger.info(
-                        f"[LogicThread] Frame {frame_count}: "
-                        f"{len(ready_events)} events ready for classification (async)"
-                    )
-
                     enqueue_start = time.perf_counter()
                     for event_id, candidates, event_box, event_stats in ready_events:
-                        logger.debug(
-                            f"[LogicThread] Queueing event {event_id} for classification "
-                            f"({len(candidates)} candidates)"
-                        )
                         # V3: Only copy frame if recording is enabled (save memory bandwidth)
                         if self.is_recording:
                             det_copy = []
@@ -618,18 +639,50 @@ class BagCounterApp:
                     timing_msg += f" | FPS: {fps:.1f}"
                     
                     # V3: Add queue status
-                    timing_msg += f" | InputQ: {self.input_queue.qsize()}/{self.INPUT_QUEUE_SIZE}"
-                    timing_msg += f" | ClassQ: {self.classification_queue.qsize()}/{self.CLASSIFICATION_QUEUE_SIZE}"
+                    input_q_size = self.input_queue.qsize()
+                    class_q_size = self.classification_queue.qsize()
+                    timing_msg += f" | InputQ: {input_q_size}/{self.INPUT_QUEUE_SIZE}"
+                    timing_msg += f" | ClassQ: {class_q_size}/{self.CLASSIFICATION_QUEUE_SIZE}"
                     
                     logger.info(timing_msg)
+                    
+                    # Structured logging for frame processing
+                    structured_logger.frame_processed(
+                        frame_id=frame_count,
+                        detection_time_ms=detect_time,
+                        monitor_time_ms=monitor_time,
+                        total_time_ms=total_time,
+                        detections_count=len(current_frame_detections),
+                        events_ready=len(ready_events) if ready_events else 0,
+                        queue_sizes={
+                            'input': input_q_size,
+                            'classification': class_q_size
+                        },
+                        fps=fps
+                    )
 
                 # Log pipeline metrics periodically
                 pipeline_metrics.maybe_log_summary()
 
             except Exception as e:
-                logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
                 import traceback
-                logger.debug(f"[LogicThread] Traceback:\n{traceback.format_exc()}")
+                error_trace = traceback.format_exc()
+                
+                # Structured error logging
+                structured_logger.pipeline_error(
+                    component='LogicThread',
+                    operation='frame_processing',
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[frame_count],
+                    context={
+                        'detections_count': len(current_frame_detections) if 'current_frame_detections' in locals() else 0,
+                        'active_events': len(self.monitor.active_events) if hasattr(self, 'monitor') else 0,
+                        'input_queue_size': self.input_queue.qsize(),
+                        'classification_queue_size': self.classification_queue.qsize()
+                    },
+                    traceback=error_trace
+                )
 
         logger.info("[LogicThread] Stopped")
 
