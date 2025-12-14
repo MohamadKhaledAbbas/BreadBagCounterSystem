@@ -217,6 +217,19 @@ if event has no detection:
 | `min_open_evidence_count` | 3 | 2-10 | Min open detections before state change |
 | `min_closed_evidence_count` | 2 | 1-5 | Min closed detections for CLOSED |
 
+### V5.1 Additional Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `velocity_scaling_enabled` | true | - | Enable velocity-based distance scaling |
+| `velocity_scale_factor` | 2.5 | 1.5-4.0 | Max multiplier for association distance |
+| `max_association_distance_px` | 250.0 | 150-400 | Absolute max association distance |
+| `allow_center_commit` | true | - | Allow counting bags that don't exit to edge |
+| `center_commit_idle_frames` | 25 | 15-50 | Frames idle before center commit |
+| `center_commit_min_closed_ratio` | 0.3 | 0.2-0.6 | Min closed/total ratio for center commit |
+| `closing_revert_open_count` | 3 | 2-5 | Open detections needed to revert CLOSING→OPEN |
+| `closing_revert_window_size` | 5 | 3-8 | Window size for revert check |
+
 ### Tuning Guidelines
 
 **D (association_distance_px)**
@@ -235,6 +248,23 @@ if event has no detection:
 - 1000ms (1 second) handles most tying scenarios
 - Too short: Counts bag while worker still holding
 - Too long: Delays counting unnecessarily
+
+**Velocity Scaling (NEW in V5.1)**
+- When enabled, association distance scales based on bag velocity
+- Helps maintain tracking during bag flipping/throwing
+- Uses predicted centroid position for association
+- Set `max_association_distance_px` to prevent over-association
+
+**Center Commit (NEW in V5.1)**
+- Enable when bags don't exit to frame edge after closing
+- Requires bag to be idle for `center_commit_idle_frames` frames
+- Requires minimum closed evidence ratio to avoid false commits
+- Useful for table-based operations where bags are placed down
+
+**Anti-Oscillation (NEW in V5.1)**
+- Prevents rapid OPEN↔CLOSING state changes during noisy detections
+- Requires `closing_revert_open_count` open detections SINCE entering CLOSING
+- Uses evidence window SINCE state entry, not global history
 
 ---
 

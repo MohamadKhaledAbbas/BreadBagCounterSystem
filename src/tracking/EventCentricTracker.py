@@ -84,6 +84,15 @@ class EventConfig:
     association_time_ms: float = 400.0      # T: Max time gap for association
     
     # ==========================================================================
+    # Velocity-Based Association (for fast movements during flip/throw)
+    # ==========================================================================
+    velocity_scaling_enabled: bool = True   # Enable velocity-based distance scaling
+    velocity_scale_factor: float = 2.5      # Max multiplier for association distance
+    max_association_distance_px: float = 250.0  # Absolute max association distance
+    min_velocity_threshold: float = 0.01    # Min velocity (px/ms) to trigger scaling
+    max_prediction_time_ms: float = 500.0   # Max time ahead to predict centroid
+    
+    # ==========================================================================
     # Ghost Event Parameters (G from requirements)
     # ==========================================================================
     ghost_timeout_ms: float = 1000.0  # G: Keep event alive without detections
@@ -95,6 +104,13 @@ class EventConfig:
     exit_boundary_margin_px: int = 50  # Margin from frame edge for exit detection
     
     # ==========================================================================
+    # Center-of-Frame Counting (for scenarios where bags don't exit to edge)
+    # ==========================================================================
+    allow_center_commit: bool = True       # Allow counting bags that don't exit to edge
+    center_commit_idle_frames: int = 25    # Frames without detection before center commit
+    center_commit_min_closed_ratio: float = 0.3  # Min ratio of closed/total evidence
+    
+    # ==========================================================================
     # State Transition Parameters (temporal stability)
     # ==========================================================================
     open_to_closing_time_ms: float = 100.0   # Min time in OPEN before CLOSING
@@ -103,6 +119,12 @@ class EventConfig:
     
     # Geometric stability thresholds
     centroid_stability_px: float = 30.0  # Max centroid movement for "stable"
+    
+    # ==========================================================================
+    # State Reversion Parameters (to prevent oscillation)
+    # ==========================================================================
+    closing_revert_open_count: int = 3    # Open detections in recent window to revert CLOSING->OPEN
+    closing_revert_window_size: int = 5   # Window size for revert check
     
     # ==========================================================================
     # Detection Evidence Thresholds
@@ -207,6 +229,7 @@ class BreadBagEvent:
         # State machine
         self.state = EventState.OPEN
         self.state_enter_time_ms = initial_detection.timestamp_ms
+        self.state_enter_evidence_idx = 0  # Track which evidence index we entered current state
         
         # Temporal tracking
         self.created_at_ms = initial_detection.timestamp_ms
@@ -246,6 +269,14 @@ class BreadBagEvent:
         
         # Metrics
         self.total_frames_observed = 1
+        
+        # Velocity tracking for fast movement handling
+        self.velocity = (0.0, 0.0)  # (vx, vy) in pixels per millisecond
+        self.velocity_history: List[Tuple[float, float, float]] = []  # (vx, vy, timestamp_ms)
+        
+        # Frame-based idle tracking for center commit
+        self.frames_without_detection = 0
+        self.last_detection_frame_index = initial_detection.frame_index
         
         # Log event creation
         structured_logger.event_created(
@@ -288,11 +319,71 @@ class BreadBagEvent:
         x1, y1, x2, y2 = box
         return ((x1 + x2) / 2, (y1 + y2) / 2)
     
+    def get_velocity(self) -> Tuple[float, float]:
+        """
+        Get current velocity estimate (pixels per millisecond).
+        
+        Uses recent centroid history to estimate velocity.
+        """
+        if len(self.centroid_history) < 2:
+            return (0.0, 0.0)
+        
+        # Use last 3-5 positions for smoothed velocity
+        recent = self.centroid_history[-5:]
+        if len(recent) < 2:
+            return (0.0, 0.0)
+        
+        # Calculate weighted average velocity (more recent = more weight)
+        total_vx, total_vy = 0.0, 0.0
+        total_weight = 0.0
+        
+        for i in range(1, len(recent)):
+            x1, y1, t1 = recent[i-1]
+            x2, y2, t2 = recent[i]
+            dt = t2 - t1
+            if dt > 0:
+                vx = (x2 - x1) / dt
+                vy = (y2 - y1) / dt
+                weight = i  # More recent = higher weight
+                total_vx += vx * weight
+                total_vy += vy * weight
+                total_weight += weight
+        
+        if total_weight > 0:
+            return (total_vx / total_weight, total_vy / total_weight)
+        return (0.0, 0.0)
+    
+    def get_velocity_magnitude(self) -> float:
+        """Get velocity magnitude in pixels per millisecond."""
+        vx, vy = self.get_velocity()
+        return math.sqrt(vx*vx + vy*vy)
+    
+    def predict_centroid(self, target_time_ms: float) -> Tuple[float, float]:
+        """
+        Predict centroid position at target_time using velocity.
+        
+        This helps with association during fast movements (flip/throw).
+        """
+        if len(self.centroid_history) < 2:
+            return self.last_centroid
+        
+        vx, vy = self.get_velocity()
+        dt = target_time_ms - self.last_detection_time_ms
+        
+        # Limit prediction to configurable max time ahead
+        dt = min(dt, self.config.max_prediction_time_ms)
+        
+        pred_x = self.last_centroid[0] + vx * dt
+        pred_y = self.last_centroid[1] + vy * dt
+        
+        return (pred_x, pred_y)
+    
     def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str]:
         """
         Check if a detection can be associated with this event.
         
         Uses centroid distance and time gap - NO IoU or appearance features.
+        Supports velocity-based scaling for fast movements.
         
         Args:
             detection: Detection to check
@@ -300,20 +391,58 @@ class BreadBagEvent:
         Returns:
             Tuple of (can_associate, distance, reason)
         """
-        # Calculate centroid distance
         det_centroid = (detection.centroid_x, detection.centroid_y)
-        dx = det_centroid[0] - self.last_centroid[0]
-        dy = det_centroid[1] - self.last_centroid[1]
-        distance = math.sqrt(dx*dx + dy*dy)
         
-        # Check distance threshold
-        if distance > self.config.association_distance_px:
-            return False, distance, f"distance_exceeded ({distance:.1f} > {self.config.association_distance_px})"
-        
-        # Check time gap
+        # Check time gap first (cheap check)
         time_gap_ms = detection.timestamp_ms - self.last_detection_time_ms
         if time_gap_ms > self.config.association_time_ms:
+            # Calculate distance for logging
+            dx = det_centroid[0] - self.last_centroid[0]
+            dy = det_centroid[1] - self.last_centroid[1]
+            distance = math.sqrt(dx*dx + dy*dy)
             return False, distance, f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms)"
+        
+        # Calculate base association distance
+        base_distance_threshold = self.config.association_distance_px
+        
+        # Velocity-based scaling: increase threshold for fast-moving bags
+        if self.config.velocity_scaling_enabled:
+            velocity_mag = self.get_velocity_magnitude()
+            
+            # Scale factor: velocity * time_gap gives expected movement
+            # If velocity is high, we expect larger movements
+            if velocity_mag > self.config.min_velocity_threshold:
+                expected_movement = velocity_mag * time_gap_ms
+                # Scale the threshold based on expected movement
+                scale = 1.0 + min(expected_movement / base_distance_threshold, 
+                                  self.config.velocity_scale_factor - 1.0)
+                scaled_threshold = min(base_distance_threshold * scale, 
+                                       self.config.max_association_distance_px)
+            else:
+                scaled_threshold = base_distance_threshold
+        else:
+            scaled_threshold = base_distance_threshold
+        
+        # Calculate distance to last centroid
+        dx = det_centroid[0] - self.last_centroid[0]
+        dy = det_centroid[1] - self.last_centroid[1]
+        distance_to_last = math.sqrt(dx*dx + dy*dy)
+        
+        # Also try distance to predicted position (for fast movements)
+        if self.config.velocity_scaling_enabled and len(self.centroid_history) >= 2:
+            pred_centroid = self.predict_centroid(detection.timestamp_ms)
+            dx_pred = det_centroid[0] - pred_centroid[0]
+            dy_pred = det_centroid[1] - pred_centroid[1]
+            distance_to_pred = math.sqrt(dx_pred*dx_pred + dy_pred*dy_pred)
+            
+            # Use the smaller of the two distances
+            distance = min(distance_to_last, distance_to_pred)
+        else:
+            distance = distance_to_last
+        
+        # Check distance threshold
+        if distance > scaled_threshold:
+            return False, distance, f"distance_exceeded ({distance:.1f} > {scaled_threshold:.1f})"
         
         return True, distance, "associated"
     
@@ -334,6 +463,19 @@ class BreadBagEvent:
                 f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
             )
         
+        # Update velocity before updating centroid
+        if len(self.centroid_history) >= 1:
+            last_pos = self.centroid_history[-1]
+            dt = detection.timestamp_ms - last_pos[2]
+            if dt > 0:
+                vx = (detection.centroid_x - last_pos[0]) / dt
+                vy = (detection.centroid_y - last_pos[1]) / dt
+                self.velocity = (vx, vy)
+                self.velocity_history.append((vx, vy, detection.timestamp_ms))
+                # Keep velocity history bounded
+                if len(self.velocity_history) > 10:
+                    self.velocity_history = self.velocity_history[-10:]
+        
         # Update spatial tracking
         self.last_centroid = (detection.centroid_x, detection.centroid_y)
         self.centroid_history.append(
@@ -352,10 +494,12 @@ class BreadBagEvent:
         if detection.is_closed:
             self.closed_evidence_count += 1
         
-        # Update timing
+        # Update timing and frame tracking
         self.last_detection_time_ms = detection.timestamp_ms
         self.last_update_time_ms = detection.timestamp_ms
         self.total_frames_observed += 1
+        self.frames_without_detection = 0  # Reset idle counter
+        self.last_detection_frame_index = detection.frame_index
         
         # Process state transitions based on evidence
         self._process_state_transition(detection)
@@ -385,14 +529,25 @@ class BreadBagEvent:
         
         elif self.state == EventState.CLOSING:
             # Can transition to CLOSED if closed evidence is stable
-            # Can revert to OPEN if open evidence resumes
+            # Can revert to OPEN if open evidence resumes (with hysteresis)
             
-            # Check for reversion to OPEN
-            recent_open = sum(1 for e in self.evidence_history[-3:] if e.is_open)
-            if recent_open >= 2:
-                self._transition_to(EventState.OPEN, detection.timestamp_ms,
-                                    "open_evidence_resumed")
-                return
+            # Check for reversion to OPEN - only consider evidence SINCE entering CLOSING
+            # This prevents immediate reversion due to earlier open evidence
+            window_size = self.config.closing_revert_window_size
+            revert_threshold = self.config.closing_revert_open_count
+            
+            # Get evidence since entering CLOSING state
+            evidence_since_closing = self.evidence_history[self.state_enter_evidence_idx:]
+            
+            # Only check for reversion if we have enough evidence since CLOSING
+            if len(evidence_since_closing) >= revert_threshold:
+                recent_evidence = evidence_since_closing[-window_size:] if len(evidence_since_closing) >= window_size else evidence_since_closing
+                recent_open = sum(1 for e in recent_evidence if e.is_open)
+                
+                if recent_open >= revert_threshold:
+                    self._transition_to(EventState.OPEN, detection.timestamp_ms,
+                                        f"open_evidence_resumed ({recent_open}/{len(recent_evidence)} open)")
+                    return
             
             # Check for progression to CLOSED
             if (time_in_state_ms >= self.config.closing_stability_time_ms and
@@ -413,6 +568,7 @@ class BreadBagEvent:
         old_state = self.state
         self.state = new_state
         self.state_enter_time_ms = timestamp_ms
+        self.state_enter_evidence_idx = len(self.evidence_history) - 1  # Track evidence index
         
         transition_record = {
             'timestamp_ms': timestamp_ms,
@@ -489,13 +645,15 @@ class BreadBagEvent:
             f"size={roi_width}x{roi_height}, total={len(self.roi_candidates)}"
         )
     
-    def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int]) -> bool:
+    def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
+                           current_frame_index: int = -1) -> bool:
         """
         Update event when no detection is present (ghost state).
         
         Args:
             current_time_ms: Current timestamp in milliseconds
             frame_size: (width, height) of frame for exit boundary check
+            current_frame_index: Current frame index for idle tracking
             
         Returns:
             True if event should be committed (counted), False otherwise
@@ -507,24 +665,46 @@ class BreadBagEvent:
         time_since_detection_ms = current_time_ms - self.last_detection_time_ms
         self.last_update_time_ms = current_time_ms
         
+        # Update frames without detection counter
+        if current_frame_index >= 0:
+            self.frames_without_detection = current_frame_index - self.last_detection_frame_index
+        
         # Check if ghost timeout exceeded
         if time_since_detection_ms > self.config.ghost_timeout_ms:
             if self.state == EventState.CLOSED:
-                # CRITICAL: Only count when bag has LEFT the scene (near exit boundary)
-                # Do NOT count just because detection disappeared while bag is still in scene
+                # Check if near exit boundary
                 if self._is_near_exit_boundary(frame_size):
                     self._transition_to(EventState.COMMITTED, current_time_ms,
                                         f"exit_near_boundary ({time_since_detection_ms:.0f}ms)")
                     self.commit_reason = "exit_boundary"
                     return True
-                else:
-                    # Bag is still in scene center - do NOT count yet
-                    # Keep waiting until it moves to exit boundary
-                    logger.debug(
-                        f"[Event:{self.id}] CLOSED but not near exit boundary - waiting "
-                        f"(centroid={self.last_centroid}, frame_size={frame_size})"
-                    )
-                    return False
+                
+                # Check for center commit (bags that don't exit to edge)
+                if self.config.allow_center_commit:
+                    # Check if enough frames have passed without detection
+                    if self.frames_without_detection >= self.config.center_commit_idle_frames:
+                        # Also verify we have sufficient closed evidence
+                        total_evidence = self.open_evidence_count + self.closed_evidence_count
+                        if total_evidence > 0:
+                            closed_ratio = self.closed_evidence_count / total_evidence
+                            if closed_ratio >= self.config.center_commit_min_closed_ratio:
+                                self._transition_to(EventState.COMMITTED, current_time_ms,
+                                                    f"center_commit (idle={self.frames_without_detection} frames, "
+                                                    f"closed_ratio={closed_ratio:.2f})")
+                                self.commit_reason = "center_commit"
+                                logger.info(
+                                    f"[Event:{self.id}] Center commit: bag counted without exiting to boundary "
+                                    f"(idle={self.frames_without_detection} frames, centroid={self.last_centroid})"
+                                )
+                                return True
+                
+                # Bag is still in scene center and not enough idle time
+                logger.debug(
+                    f"[Event:{self.id}] CLOSED but not near exit boundary - waiting "
+                    f"(centroid={self.last_centroid}, frame_size={frame_size}, "
+                    f"idle_frames={self.frames_without_detection})"
+                )
+                return False
             else:
                 # Event expired without reaching CLOSED state
                 logger.debug(
@@ -799,7 +979,7 @@ class EventCentricTracker:
             # Check if THIS specific event received a detection this frame
             if event.last_detection_time_ms != timestamp_ms:
                 # No detection for this event - update ghost state
-                should_commit = event.update_ghost_state(timestamp_ms, frame_size)
+                should_commit = event.update_ghost_state(timestamp_ms, frame_size, frame_index)
                 
                 if should_commit:
                     # Event is ready for classification
