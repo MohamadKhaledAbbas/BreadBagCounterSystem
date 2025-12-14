@@ -382,6 +382,27 @@ class TrackingConfig:
     Default: 250.0
     """
     
+    min_velocity_threshold: float = 0.01
+    """
+    Minimum velocity (pixels per millisecond) to trigger velocity scaling.
+    
+    Range: 0.005 - 0.05
+    Below this velocity, standard association distance is used.
+    0.01 px/ms = 10 px/s, a reasonable minimum for intentional movement.
+    
+    Default: 0.01
+    """
+    
+    max_prediction_time_ms: float = 500.0
+    """
+    Maximum time ahead (milliseconds) to predict centroid position.
+    
+    Range: 200 - 1000
+    Limits how far ahead velocity-based prediction can extrapolate.
+    
+    Default: 500.0
+    """
+    
     # --------------------------------------------------------------------------
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
@@ -651,6 +672,8 @@ def get_event_config():
         velocity_scaling_enabled=tracking_config.velocity_scaling_enabled,
         velocity_scale_factor=tracking_config.velocity_scale_factor,
         max_association_distance_px=tracking_config.max_association_distance_px,
+        min_velocity_threshold=tracking_config.min_velocity_threshold,
+        max_prediction_time_ms=tracking_config.max_prediction_time_ms,
         
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,

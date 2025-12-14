@@ -89,6 +89,8 @@ class EventConfig:
     velocity_scaling_enabled: bool = True   # Enable velocity-based distance scaling
     velocity_scale_factor: float = 2.5      # Max multiplier for association distance
     max_association_distance_px: float = 250.0  # Absolute max association distance
+    min_velocity_threshold: float = 0.01    # Min velocity (px/ms) to trigger scaling
+    max_prediction_time_ms: float = 500.0   # Max time ahead to predict centroid
     
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
@@ -368,8 +370,8 @@ class BreadBagEvent:
         vx, vy = self.get_velocity()
         dt = target_time_ms - self.last_detection_time_ms
         
-        # Limit prediction to reasonable range (max 500ms ahead)
-        dt = min(dt, 500.0)
+        # Limit prediction to configurable max time ahead
+        dt = min(dt, self.config.max_prediction_time_ms)
         
         pred_x = self.last_centroid[0] + vx * dt
         pred_y = self.last_centroid[1] + vy * dt
@@ -409,7 +411,7 @@ class BreadBagEvent:
             
             # Scale factor: velocity * time_gap gives expected movement
             # If velocity is high, we expect larger movements
-            if velocity_mag > 0.01:  # Min velocity threshold (10px/s)
+            if velocity_mag > self.config.min_velocity_threshold:
                 expected_movement = velocity_mag * time_gap_ms
                 # Scale the threshold based on expected movement
                 scale = 1.0 + min(expected_movement / base_distance_threshold, 

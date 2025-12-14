@@ -43,6 +43,8 @@ def default_config():
         velocity_scaling_enabled=True,
         velocity_scale_factor=2.5,
         max_association_distance_px=250.0,
+        min_velocity_threshold=0.01,
+        max_prediction_time_ms=500.0,
         
         # Ghost timeout
         ghost_timeout_ms=1000.0,
@@ -622,10 +624,11 @@ class TestVelocityBasedAssociation:
         # but in the direction of motion
         far_detection = create_evidence(60.0, 280, 100, is_open=True, frame_index=3)  # +80px
         
-        # With velocity scaling enabled, this should associate
+        # With velocity scaling enabled, this should associate because:
+        # - Velocity is high (about 2.5 px/ms from the movement pattern)
+        # - The predicted position extrapolates in direction of motion
+        # - Distance to predicted position is smaller than distance to last position
         can_assoc, distance, reason = event.can_associate(far_detection)
-        # The predicted position would be around 250px (200 + 2.5px/ms * 20ms)
-        # so distance to prediction is about 30px which should associate
         assert can_assoc is True
     
     def test_predicted_centroid(self, default_config):
