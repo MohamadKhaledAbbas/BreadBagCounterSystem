@@ -353,8 +353,8 @@ class TestExitBoundaryCounting:
         assert should_commit is False
         assert event.state != EventState.COMMITTED
     
-    def test_exit_timeout_commit(self, default_config):
-        """Event should commit after exit timeout even if not at boundary."""
+    def test_no_commit_without_exit_boundary(self, default_config):
+        """Event should NOT commit if not near exit boundary, even after timeout."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
@@ -365,11 +365,12 @@ class TestExitBoundaryCounting:
         # Centroid in center (not near boundary)
         event.last_centroid = (640, 360)
         
-        # Wait for both ghost and exit timeouts
+        # Wait for both ghost and exit timeouts - should NOT commit because not near boundary
         should_commit = event.update_ghost_state(2000.0, (1280, 720))
         
-        assert should_commit is True
-        assert event.state == EventState.COMMITTED
+        # CRITICAL: Should NOT commit if bag is still in scene center
+        assert should_commit is False
+        assert event.state == EventState.CLOSED  # Still in CLOSED, waiting for exit
 
 
 # =============================================================================

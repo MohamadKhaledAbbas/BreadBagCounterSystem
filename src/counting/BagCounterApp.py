@@ -153,6 +153,10 @@ class BagCounterApp:
             logger.info("[BagCounterApp] Using legacy IoU-based tracking")
         
         self.visualizer = Visualizer(names)
+        # Set exit boundary margin for visualization
+        if self.use_event_centric:
+            self.visualizer.set_exit_margin(tracking_config.exit_boundary_margin_px)
+        
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
 

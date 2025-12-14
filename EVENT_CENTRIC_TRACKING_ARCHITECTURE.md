@@ -134,9 +134,8 @@ IoU-based tracking fails because:
     │ classify │
     └────┬─────┘
          │
-         │ (exit_timeout_ms expired
-         │  + near exit boundary
-         │  OR just timeout)
+         │ (ghost_timeout_ms expired
+         │  + MUST be near exit boundary)
          │
          ▼
     ┌──────────┐
@@ -147,6 +146,11 @@ IoU-based tracking fails because:
     └──────────┘
 ```
 
+**CRITICAL COUNTING RULE:**
+A bag is ONLY counted when its centroid is within `exit_boundary_margin_px` of the frame edge.
+If the bag is in the center of the scene, it will NOT be counted even after timeout - it must
+physically move to the exit boundary first.
+
 ### State Transition Requirements
 
 | Transition | Requirements |
@@ -154,7 +158,7 @@ IoU-based tracking fails because:
 | OPEN → CLOSING | `min_open_evidence_count` reached + closed detection + `open_to_closing_time_ms` in OPEN |
 | CLOSING → OPEN | 2+ open detections in last 3 frames |
 | CLOSING → CLOSED | `closing_stability_time_ms` + `min_closed_evidence_count` + centroid stable |
-| CLOSED → COMMITTED | `exit_timeout_ms` without detection + (near exit boundary OR timeout) |
+| CLOSED → COMMITTED | `ghost_timeout_ms` without detection + **MUST be near exit boundary** |
 
 ---
 

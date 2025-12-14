@@ -510,18 +510,21 @@ class BreadBagEvent:
         # Check if ghost timeout exceeded
         if time_since_detection_ms > self.config.ghost_timeout_ms:
             if self.state == EventState.CLOSED:
-                # Check if near exit boundary
+                # CRITICAL: Only count when bag has LEFT the scene (near exit boundary)
+                # Do NOT count just because detection disappeared while bag is still in scene
                 if self._is_near_exit_boundary(frame_size):
                     self._transition_to(EventState.COMMITTED, current_time_ms,
-                                        f"exit_timeout_near_boundary ({time_since_detection_ms:.0f}ms)")
+                                        f"exit_near_boundary ({time_since_detection_ms:.0f}ms)")
                     self.commit_reason = "exit_boundary"
                     return True
-                elif time_since_detection_ms > self.config.exit_timeout_ms:
-                    # Still commit if exit timeout exceeded
-                    self._transition_to(EventState.COMMITTED, current_time_ms,
-                                        f"exit_timeout ({time_since_detection_ms:.0f}ms)")
-                    self.commit_reason = "exit_timeout"
-                    return True
+                else:
+                    # Bag is still in scene center - do NOT count yet
+                    # Keep waiting until it moves to exit boundary
+                    logger.debug(
+                        f"[Event:{self.id}] CLOSED but not near exit boundary - waiting "
+                        f"(centroid={self.last_centroid}, frame_size={frame_size})"
+                    )
+                    return False
             else:
                 # Event expired without reaching CLOSED state
                 logger.debug(

@@ -175,6 +175,8 @@ class EventCentricStateMonitor:
                 state=info['state'],
                 open_hits=info['open_count'],
                 closed_hits=info['closed_count'],
+                centroid=info.get('centroid'),
+                roi_count=info.get('roi_count', 0),
             )
             self.active_events.append(event_proxy)
     
@@ -201,23 +203,16 @@ class _EventProxy:
     Provides the attributes expected by Visualizer.render_all().
     """
     
-    def __init__(self, id: int, box: tuple, state: str, open_hits: int, closed_hits: int):
+    def __init__(self, id: int, box: tuple, state: str, open_hits: int, closed_hits: int,
+                 centroid: tuple = None, roi_count: int = 0):
         self.id = id
         self.box = box
-        self.state = self._convert_state(state)
+        self.state = state  # Keep original state name for proper visualization
         self.open_hits = open_hits
         self.closed_hits = closed_hits
         self.frames_since_update = 0
-    
-    def _convert_state(self, event_state: str) -> str:
-        """Convert EventState name to BagStateMonitor state name."""
-        state_map = {
-            'OPEN': 'detecting_open',
-            'CLOSING': 'detecting_closed',
-            'CLOSED': 'detecting_closed',
-            'COMMITTED': 'counted',
-        }
-        return state_map.get(event_state, 'detecting_open')
+        self.last_centroid = centroid
+        self.roi_count = roi_count
 
 
 def create_event_centric_monitor(open_cls_id: int, closed_cls_id: int) -> EventCentricStateMonitor:
