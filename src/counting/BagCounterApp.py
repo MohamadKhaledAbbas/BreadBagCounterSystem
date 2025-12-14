@@ -32,7 +32,7 @@ from src.config.settings import config
 
 from src.logging.ConfigWatcher import ConfigWatcher
 from src.utils.AppLogging import logger, structured_logger
-from src.utils.platform import IS_RDK
+from src.utils.platform import IS_RDK, IS_WINDOWS
 from src.utils.PipelineMetrics import pipeline_metrics
 
 from src.counting.IPC import ExecutorThread, init_ros2_context, shutdown_ros2_context
@@ -102,10 +102,50 @@ class BagCounterApp:
             logger.error(f"[Snapshot Saving] snapshot saving error due to -> {e}")
         logger.info(f"[BagCounterApp] Snapshot directory: {self.snapshot_dir}")
 
-        # Input queue - V3: Smaller buffer for lower latency
-        self.input_queue = queue.Queue(maxsize=self.INPUT_QUEUE_SIZE)
-        
-        # V3: Async classification queue - process classification without blocking detection
+        # Determine if testing mode should be enabled for OpenCV frame source
+        use_testing_mode = False
+        if not IS_RDK:
+            if getattr(config, "opencv_testing_mode", False):
+                use_testing_mode = True
+                logger.info("[BagCounterApp] Testing mode enabled via OPENCV_TESTING_MODE config")
+            elif is_development:
+                use_testing_mode = True
+                logger.info("[BagCounterApp] Testing mode auto-enabled (development mode on non-RDK)")
+            elif IS_WINDOWS:
+                use_testing_mode = True
+                logger.info("[BagCounterApp] Testing mode auto-enabled (on Windows)")
+
+        self.testing_mode = use_testing_mode
+
+        # Frame source instantiation (with testing_mode logic)
+        if is_development:
+            self.frame_source = FrameSourceFactory.create(
+                "opencv",
+                source=video_path,
+                target_fps=None if use_testing_mode else 30.0,
+                testing_mode=use_testing_mode
+            )
+            logger.info(f"[BagCounterApp] Development mode: reading from {video_path}")
+        else:
+            if IS_RDK:
+                os.environ["HOME"] = "/home/sunrise"
+                self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
+                logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
+            else:
+                self.frame_source = FrameSourceFactory.create(
+                    "opencv",
+                    source=video_path,
+                    target_fps=None if use_testing_mode else 30.0,
+                    testing_mode=use_testing_mode
+                )
+                logger.info(f"[BagCounterApp] Windows mode: reading from {video_path}")
+
+        if self.testing_mode:
+            self.input_queue = None
+        else:
+            self.input_queue = queue.Queue(maxsize=self.INPUT_QUEUE_SIZE)
+
+        # Async classification queue as normal
         self.classification_queue = queue.Queue(maxsize=self.CLASSIFICATION_QUEUE_SIZE)
         self._classification_thread = None
         self._classification_running = False
@@ -150,18 +190,6 @@ class BagCounterApp:
 
         if IS_RDK and self.ros_executor is not None:
             self.ros_executor.add_node(self.ipc_publisher)
-
-        if is_development:
-            self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=30.0)
-            logger.info(f"[BagCounterApp] Development mode: reading from {video_path}")
-        else:
-            if IS_RDK:
-                os.environ["HOME"] = "/home/sunrise"
-                self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
-                logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
-            else:
-                self.frame_source = FrameSourceFactory.create("opencv", source=video_path, target_fps=30.0)
-                logger.info(f"[BagCounterApp] Windows mode: reading from {video_path}")
 
         if IS_RDK and self.ros_executor is not None and isinstance(self.frame_source, Node):
             self.ros_executor.add_node(self.frame_source)
@@ -448,6 +476,81 @@ class BagCounterApp:
         
         return False
 
+    # --- If testing mode, process frames inline, else keep old threaded pipeline ---
+    def _process_frame_inline(self, frame, frame_count):
+        try:
+            frame_start = time.perf_counter()
+            detect_start = time.perf_counter()
+            detections = self.detector.predict(frame)
+            detect_end = time.perf_counter()
+            detect_time = (detect_end - detect_start) * 1000
+            self._recent_detection_times.append(detect_time)
+            current_frame_detections = []
+            if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
+                xyxy = detections[0].boxes.xyxy.cpu().numpy()
+                cls_ids = detections[0].boxes.cls.cpu().numpy().astype(int)
+                confidences = detections[0].boxes.conf.cpu().numpy()
+                for i in range(len(cls_ids)):
+                    current_frame_detections.append(
+                        {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
+                    )
+            pipeline_metrics.record_detection(
+                current_frame_detections,
+                detect_time,
+                self.monitor.open_id,
+                self.monitor.closed_id,
+            )
+            ready_events = self.monitor.update(current_frame_detections,
+                                               {"frame_count": frame_count, "frame": frame})
+            if ready_events:
+                for event_id, candidates, event_box, event_stats in ready_events:
+                    if self.is_recording:
+                        det_copy = []
+                        for d in current_frame_detections:
+                            det_copy.append({
+                                "box": d["box"].copy(),
+                                "class_id": d["class_id"],
+                                "conf": float(d.get("conf", 0)),
+                            })
+                        try:
+                            event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
+                        except Exception:
+                            event_box_copy = event_box
+                        context = {
+                            "frame": frame.copy(),
+                            "detections": det_copy,
+                            "event_box": event_box_copy,
+                            "event_stats": event_stats,
+                            "frame_id": frame_count,
+                            "timestamp": time.time(),
+                        }
+                    else:
+                        context = {
+                            "frame": None,
+                            "detections": [],
+                            "event_box": event_box,
+                            "event_stats": event_stats,
+                            "frame_id": frame_count,
+                            "timestamp": time.time(),
+                        }
+                    self._enqueue_classification(event_id, candidates, context)
+            if self.is_publishing:
+                annotated_frame = frame.copy()
+                self.visualizer.render_all(
+                    annotated_frame,
+                    current_frame_detections,
+                    self.monitor.active_events,
+                    counts=self.ui_counts,
+                    fps=0,
+                )
+                annotated_frame = cv2.resize(annotated_frame, (1280, 720))
+                self.ipc_publisher.publish(annotated_frame)
+            pipeline_metrics.maybe_log_summary()
+        except Exception as e:
+            logger.error(f"[Inline] Error processing frame {frame_count}: {e}")
+            import traceback
+            logger.debug(f"[Inline] Traceback:\n{traceback.format_exc()}")
+
     # --- Main logic thread ---
 
     def _logic_thread_loop(self):
@@ -700,195 +803,182 @@ class BagCounterApp:
         self._classification_thread.start()
         logger.info("[BagCounterApp] Classification thread started")
 
-        logic_thread = threading.Thread(target=self._logic_thread_loop, daemon=True, name="LogicThread")
-        logic_thread.start()
-
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
 
-        FRAME_STATS_INTERVAL = 100
-        TIMING_EPSILON = 1e-6
-
-        frame_count = 0
-        last_frame_time = None
-        frame_interval_sum = 0.0
-        frame_interval_count = 0
-        last_queue_stats_time = time.perf_counter()
-
-        try:
-            for frame, latencyMs in self.frame_source.frames():
-                frame_count += 1
-                current_time = time.perf_counter()
-
-                if last_frame_time is not None:
-                    frame_interval = current_time - last_frame_time
-                    frame_interval_sum += frame_interval
-                    frame_interval_count += 1
-
-                last_frame_time = current_time
-
-                if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
-                    avg_interval = frame_interval_sum / frame_interval_count
-                    if avg_interval > TIMING_EPSILON:
-                        acquisition_fps = 1.0 / avg_interval
-                        logger.info(
-                            f"[BagCounterApp] Frame acquisition stats: "
-                            f"frames={frame_count}, avg_interval={avg_interval * 1000:.1f}ms, "
-                            f"acquisition_fps={acquisition_fps:.1f}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[BagCounterApp] Invalid frame timing detected: "
-                            f"frames={frame_count}, avg_interval={avg_interval * 1000:.6f}ms "
-                            f"(below {TIMING_EPSILON * 1000:.6f}ms threshold) - skipping FPS calculation"
-                        )
-                    frame_interval_sum = 0.0
-                    frame_interval_count = 0
-
-                try:
-                    self.input_queue.put_nowait(frame)
-                except queue.Full:
-                    frame_dropped = False
+        if self.testing_mode:
+            logger.info("[BagCounterApp] TESTING MODE: Inline processing, no input queue, zero frame drops.")
+            frame_count = 0
+            try:
+                for frame, latencyMs in self.frame_source.frames():
+                    frame_count += 1
+                    self._process_frame_inline(frame, frame_count)
+            except KeyboardInterrupt:
+                logger.info("[BagCounterApp] Interrupted by user in testing mode")
+            except Exception as e:
+                logger.error(f"[BagCounterApp] Error in main loop: {e}")
+                import traceback
+                logger.debug(f"[BagCounterApp] Traceback:\n{traceback.format_exc()}")
+            finally:
+                self.shutdown_procedure(None)
+        else:
+            logic_thread = threading.Thread(target=self._logic_thread_loop, daemon=True, name="LogicThread")
+            logic_thread.start()
+            FRAME_STATS_INTERVAL = 100
+            TIMING_EPSILON = 1e-6
+            frame_count = 0
+            last_frame_time = None
+            frame_interval_sum = 0.0
+            frame_interval_count = 0
+            last_queue_stats_time = time.perf_counter()
+            try:
+                for frame, latencyMs in self.frame_source.frames():
+                    frame_count += 1
+                    current_time = time.perf_counter()
+                    if last_frame_time is not None:
+                        frame_interval = current_time - last_frame_time
+                        frame_interval_sum += frame_interval
+                        frame_interval_count += 1
+                    last_frame_time = current_time
+                    if frame_count % FRAME_STATS_INTERVAL == 0 and frame_interval_count > 0:
+                        avg_interval = frame_interval_sum / frame_interval_count
+                        if avg_interval > TIMING_EPSILON:
+                            acquisition_fps = 1.0 / avg_interval
+                            logger.info(
+                                f"[BagCounterApp] Frame acquisition stats: "
+                                f"frames={frame_count}, avg_interval={avg_interval * 1000:.1f}ms, "
+                                f"acquisition_fps={acquisition_fps:.1f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[BagCounterApp] Invalid frame timing detected: "
+                                f"frames={frame_count}, avg_interval={avg_interval * 1000:.6f}ms "
+                                f"(below {TIMING_EPSILON * 1000:.6f}ms threshold) - skipping FPS calculation"
+                            )
+                        frame_interval_sum = 0.0
+                        frame_interval_count = 0
                     try:
-                        self.input_queue.get_nowait()
-                        frame_dropped = True
+                        self.input_queue.put_nowait(frame)
+                    except queue.Full:
+                        frame_dropped = False
                         try:
-                            self.input_queue.put_nowait(frame)
-                        except queue.Full:
+                            self.input_queue.get_nowait()
                             frame_dropped = True
-                            logger.debug(
-                                f"[BagCounterApp] Frame {frame_count} dropped: "
-                                "queue refilled immediately after clearing"
-                            )
-                        if frame_dropped:
-                            with self.stats_lock:
-                                self.input_queue_drops += 1
-                                drops = self.input_queue_drops
-                            logger.warning(
-                                f"[BagCounterApp] Dropped old frame (input queue full, "
-                                f"total drops: {drops})"
-                            )
-                    except queue.Empty:
-                        try:
-                            self.input_queue.put_nowait(frame)
-                        except queue.Full:
-                            with self.stats_lock:
-                                self.input_queue_drops += 1
-                                drops = self.input_queue_drops
-                            logger.warning(
-                                f"[BagCounterApp] Frame {frame_count} dropped: "
-                                f"queue refilled by another thread (total drops: {drops})"
-                            )
-
-                # V3: Queue stats (both input and classification queues)
-                if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
-                    input_size = self.input_queue.qsize()
-                    input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
-                    class_size = self.classification_queue.qsize()
-                    class_utilization = (class_size / self.CLASSIFICATION_QUEUE_SIZE) * 100
-
-                    with self.stats_lock:
-                        input_drops = self.input_queue_drops
-                        class_drops = self.classification_queue_drops
-
-                    # V3: Enhanced queue stats logging
-                    logger.info(
-                        f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
-                        f"({input_utilization:.1f}% full, drops={input_drops}) | "
-                        f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
-                        f"({class_utilization:.1f}% full, drops={class_drops}) | "
-                        f"Skipped: {self._frames_skipped}"
-                    )
-
-                    if input_utilization > self.QUEUE_WARNING_THRESHOLD:
-                        logger.warning(
-                            f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
-                            "frames may be dropped if processing doesn't keep up"
+                            try:
+                                self.input_queue.put_nowait(frame)
+                            except queue.Full:
+                                frame_dropped = True
+                                logger.debug(
+                                    f"[BagCounterApp] Frame {frame_count} dropped: "
+                                    "queue refilled immediately after clearing"
+                                )
+                            if frame_dropped:
+                                with self.stats_lock:
+                                    self.input_queue_drops += 1
+                                    drops = self.input_queue_drops
+                                logger.warning(
+                                    f"[BagCounterApp] Dropped old frame (input queue full, "
+                                    f"total drops: {drops})"
+                                )
+                        except queue.Empty:
+                            try:
+                                self.input_queue.put_nowait(frame)
+                            except queue.Full:
+                                with self.stats_lock:
+                                    self.input_queue_drops += 1
+                                    drops = self.input_queue_drops
+                                logger.warning(
+                                    f"[BagCounterApp] Frame {frame_count} dropped: "
+                                    f"queue refilled by another thread (total drops: {drops})"
+                                )
+                    current_time = time.perf_counter()
+                    if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
+                        input_size = self.input_queue.qsize()
+                        input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
+                        class_size = self.classification_queue.qsize()
+                        class_utilization = (class_size / self.CLASSIFICATION_QUEUE_SIZE) * 100
+                        with self.stats_lock:
+                            input_drops = self.input_queue_drops
+                            class_drops = self.classification_queue_drops
+                        logger.info(
+                            f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
+                            f"({input_utilization:.1f}% full, drops={input_drops}) | "
+                            f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
+                            f"({class_utilization:.1f}% full, drops={class_drops}) | "
+                            f"Skipped: {self._frames_skipped}"
                         )
-                    
-                    if class_utilization > self.QUEUE_WARNING_THRESHOLD:
-                        logger.warning(
-                            f"[QueueStats] Classification queue utilization high: {class_utilization:.1f}% - "
-                            "classification is falling behind"
-                        )
+                        if input_utilization > self.QUEUE_WARNING_THRESHOLD:
+                            logger.warning(
+                                f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
+                                "frames may be dropped if processing doesn't keep up"
+                            )
+                        if class_utilization > self.QUEUE_WARNING_THRESHOLD:
+                            logger.warning(
+                                f"[QueueStats] Classification queue utilization high: {class_utilization:.1f}% - "
+                                "classification is falling behind"
+                            )
+                        last_queue_stats_time = current_time
+            except KeyboardInterrupt:
+                logger.info("[BagCounterApp] Interrupted by user")
+            except Exception as e:
+                logger.error(f"[BagCounterApp] Error in main loop: {e}")
+                import traceback
+                logger.debug(f"[BagCounterApp] Traceback:\n{traceback.format_exc()}")
+            finally:
+                self.shutdown_procedure(logic_thread)
 
-                    last_queue_stats_time = current_time
-
-        except KeyboardInterrupt:
-            logger.info("[BagCounterApp] Interrupted by user")
-        except Exception as e:
-            logger.error(f"[BagCounterApp] Error in main loop: {e}")
-            import traceback
-            logger.debug(f"[BagCounterApp] Traceback:\n{traceback.format_exc()}")
-        finally:
-            logger.info(f"[BagCounterApp] Shutting down (processed {frame_count} frames)...")
-            self.is_running = False
-            
-            # V3: Thread shutdown timeout (configurable via class constant)
-            THREAD_SHUTDOWN_TIMEOUT = 3.0  # seconds
-            
-            # V3: Stop classification thread with timeout logging
-            self._classification_running = False
-            if self._classification_thread and self._classification_thread.is_alive():
-                self._classification_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
-                if self._classification_thread.is_alive():
-                    logger.warning(
-                        f"[BagCounterApp] Classification thread did not stop within "
-                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
-                    )
-                else:
-                    logger.debug("[BagCounterApp] Classification thread joined")
-
-            self.frame_source.cleanup()
-            logger.debug("[BagCounterApp] Frame source cleaned up")
-
-            self.config_watcher.stop()
-            logger.debug("[BagCounterApp] Config watcher stopped")
-
-            # --- ROS 2 CLEANUP ---
-            if IS_RDK and self.ros_executor is not None:
-                self.ros_executor.remove_node(self.ipc_publisher)
-                if isinstance(self.frame_source, Node):
-                    self.ros_executor.remove_node(self.frame_source)
-
-            self.ipc_publisher.close_node()
-            shutdown_ros2_context()
-            if IS_RDK:
-                logger.debug("[BagCounterApp] ROS 2 context shutdown")
-
+    def shutdown_procedure(self, logic_thread=None):
+        logger.info(f"[BagCounterApp] Shutting down...")
+        self.is_running = False
+        THREAD_SHUTDOWN_TIMEOUT = 3.0
+        self._classification_running = False
+        if self._classification_thread and self._classification_thread.is_alive():
+            self._classification_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+            if self._classification_thread.is_alive():
+                logger.warning(
+                    f"[BagCounterApp] Classification thread did not stop within "
+                    f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                )
+            else:
+                logger.debug("[BagCounterApp] Classification thread joined")
+        self.frame_source.cleanup()
+        logger.debug("[BagCounterApp] Frame source cleaned up")
+        self.config_watcher.stop()
+        logger.debug("[BagCounterApp] Config watcher stopped")
+        if IS_RDK and self.ros_executor is not None:
+            self.ros_executor.remove_node(self.ipc_publisher)
+            if isinstance(self.frame_source, Node):
+                self.ros_executor.remove_node(self.frame_source)
+        self.ipc_publisher.close_node()
+        shutdown_ros2_context()
+        if IS_RDK:
+            logger.debug("[BagCounterApp] ROS 2 context shutdown")
+        if self.ros_thread.is_alive():
+            self.ros_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
             if self.ros_thread.is_alive():
-                self.ros_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
-                if self.ros_thread.is_alive():
-                    logger.warning(
-                        f"[BagCounterApp] ROS thread did not stop within "
-                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
-                    )
-                else:
-                    logger.debug("[BagCounterApp] ROS thread joined")
-
+                logger.warning(
+                    f"[BagCounterApp] ROS thread did not stop within "
+                    f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                )
+            else:
+                logger.debug("[BagCounterApp] ROS thread joined")
+        if logic_thread is not None and logic_thread.is_alive():
+            logic_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
             if logic_thread.is_alive():
-                logic_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
-                if logic_thread.is_alive():
-                    logger.warning(
-                        f"[BagCounterApp] Logic thread did not stop within "
-                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
-                    )
-                else:
-                    logger.debug("[BagCounterApp] Logic thread joined")
-
-            # Close database connection
-            self.db.close()
-            logger.debug("[BagCounterApp] Database connection closed")
-            
-            # V3: Final performance summary
-            with self.stats_lock:
-                input_drops = self.input_queue_drops
-                class_drops = self.classification_queue_drops
-            
-            logger.info(
-                f"[BagCounterApp] Final Stats: "
-                f"input_drops={input_drops}, classification_drops={class_drops}, "
-                f"frames_skipped={self._frames_skipped}"
-            )
-
-            logger.info("[BagCounterApp] Shutdown complete")
+                logger.warning(
+                    f"[BagCounterApp] Logic thread did not stop within "
+                    f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                )
+            else:
+                logger.debug("[BagCounterApp] Logic thread joined")
+        self.db.close()
+        logger.debug("[BagCounterApp] Database connection closed")
+        with self.stats_lock:
+            input_drops = self.input_queue_drops if self.input_queue is not None else 0
+            class_drops = self.classification_queue_drops
+        logger.info(
+            f"[BagCounterApp] Final Stats: "
+            f"input_drops={input_drops}, classification_drops={class_drops}, "
+            f"frames_skipped={self._frames_skipped}"
+        )
+        logger.info("[BagCounterApp] Shutdown complete")
