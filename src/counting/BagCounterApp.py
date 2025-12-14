@@ -7,6 +7,12 @@ V3 Performance Optimizations:
 - Reduced frame copy operations for memory efficiency
 - Optimized queue management with adaptive thresholds
 - Frame timing metrics for bottleneck identification
+
+V5 Event-Centric Tracking:
+- Optional event-centric tracking system (enabled by default)
+- Centroid-based association instead of IoU
+- Millisecond-based timing instead of frame counts
+- Exit-boundary-based counting
 """
 
 import os
@@ -29,6 +35,7 @@ from src.frame_source.FrameSourceFactory import FrameSource, FrameSourceFactory
 from src.tracking.BaseTracker import BaseTracker
 from src import constants
 from src.config.settings import config
+from src.config.tracking_config import tracking_config
 
 from src.logging.ConfigWatcher import ConfigWatcher
 from src.utils.AppLogging import logger, structured_logger
@@ -135,7 +142,16 @@ class BagCounterApp:
             logger.error(f"[BagCounterApp] Available classes: {list(name_to_id.keys())}")
             raise ValueError("Model missing required classes: bread-bag-opened, bread-bag-closed")
 
-        self.monitor = BagStateMonitor(open_id, closed_id)
+        # V5: Choose between event-centric and legacy tracking
+        self.use_event_centric = tracking_config.use_event_centric_tracking
+        if self.use_event_centric:
+            from src.counting.EventCentricStateMonitor import EventCentricStateMonitor
+            self.monitor = EventCentricStateMonitor(open_id, closed_id)
+            logger.info("[BagCounterApp] Using V5 Event-Centric Tracking (centroid-based)")
+        else:
+            self.monitor = BagStateMonitor(open_id, closed_id)
+            logger.info("[BagCounterApp] Using legacy IoU-based tracking")
+        
         self.visualizer = Visualizer(names)
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
