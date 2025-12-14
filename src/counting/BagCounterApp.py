@@ -315,15 +315,6 @@ class BagCounterApp:
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
 
-        logger.info(
-            f"[BagCounterApp] Classification result: track={track_id}, "
-            f"label={label}, conf={conf:.3f}"
-        )
-        logger.debug(
-            f"[BagCounterApp] Result details: phash={phash}, "
-            f"image_path={image_path}, candidates={candidates_count}"
-        )
-
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf)
 
@@ -344,7 +335,14 @@ class BagCounterApp:
             try:
                 self._save_snapshot(track_id, label, conf, phash, image_path, candidates_count, context)
             except Exception as e:
-                logger.error(f"[BagCounterApp] Snapshot save error: {e}")
+                structured_logger.pipeline_error(
+                    component="BagCounterApp",
+                    operation="snapshot_save",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[track_id],
+                    context={"label": label, "phash": phash}
+                )
 
     # --- V3: Async Classification Thread ---
     
@@ -367,7 +365,14 @@ class BagCounterApp:
                     break
                 continue
             except Exception as e:
-                logger.error(f"[ClassificationThread] Queue error: {e}")
+                structured_logger.pipeline_error(
+                    component="ClassificationThread",
+                    operation="queue_get",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=None,
+                    context={"queue_size": self.classification_queue.qsize()}
+                )
                 continue
             
             try:
@@ -376,12 +381,6 @@ class BagCounterApp:
                 
                 # Process classification (this is the slow part)
                 self.classifier_service.process(event_id, candidates, context=context)
-                
-                classify_time = (time.perf_counter() - classify_start) * 1000
-                logger.debug(
-                    f"[ClassificationThread] Event {event_id} classified in {classify_time:.1f}ms "
-                    f"({len(candidates)} candidates)"
-                )
                 
             except Exception as e:
                 import traceback
@@ -400,9 +399,6 @@ class BagCounterApp:
                     },
                     traceback=error_trace
                 )
-                
-                logger.error(f"[ClassificationThread] Error processing event: {e}")
-                logger.debug(f"[ClassificationThread] Traceback:\n{error_trace}")
         
         logger.info("[ClassificationThread] Stopped")
     
@@ -421,11 +417,15 @@ class BagCounterApp:
             # Queue is full - drop the oldest task and try again
             try:
                 dropped = self.classification_queue.get_nowait()
-                logger.warning(
-                    f"[ClassificationQueue] Dropped old task (event {dropped[0]}) to make room"
-                )
                 with self.stats_lock:
                     self.classification_queue_drops += 1
+                structured_logger.queue_backpressure(
+                    queue_name='classification_queue',
+                    utilization=1.0,
+                    drops=self.classification_queue_drops,
+                    action='drop_oldest_task',
+                    dropped_event_id=dropped[0] if dropped else None
+                )
                 self.classification_queue.put_nowait(task)
                 return True
             except queue.Empty:
@@ -433,8 +433,12 @@ class BagCounterApp:
             except queue.Full:
                 with self.stats_lock:
                     self.classification_queue_drops += 1
-                logger.warning(
-                    f"[ClassificationQueue] Failed to enqueue event {event_id} - queue full"
+                structured_logger.queue_backpressure(
+                    queue_name='classification_queue',
+                    utilization=1.0,
+                    drops=self.classification_queue_drops,
+                    action='failed_enqueue',
+                    event_id=event_id
                 )
                 return False
         
@@ -463,10 +467,16 @@ class BagCounterApp:
             except queue.Empty:
                 if not self.is_running:
                     break
-                logger.debug("[LogicThread] Input queue empty, waiting...")
                 continue
             except Exception as e:
-                logger.error(f"[LogicThread] Input queue error: {e}")
+                structured_logger.pipeline_error(
+                    component="LogicThread",
+                    operation="queue_get",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=None,
+                    context={"input_queue_size": self.input_queue.qsize()}
+                )
                 continue
 
             try:
@@ -521,19 +531,6 @@ class BagCounterApp:
                             {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
                         )
 
-                    logger.debug(f"[LogicThread] Frame {frame_count}: {len(current_frame_detections)} detections")
-
-                    if len(current_frame_detections) > 0:
-                        for det in current_frame_detections:
-                            class_name = self.detector.class_names.get(det["class_id"], "Unknown")
-                            logger.debug(
-                                f"[RAW DETECTION] class={class_name} (id={det['class_id']}), "
-                                f"conf={det['conf']:.3f}, box=[{det['box'][0]:.1f}, {det['box'][1]:.1f}, "
-                                f"{det['box'][2]:.1f}, {det['box'][3]:.1f}]"
-                            )
-                else:
-                    logger.debug(f"[LogicThread] Frame {frame_count}: No detections")
-
                 # Record detection metrics
                 pipeline_metrics.record_detection(
                     current_frame_detections, 
@@ -552,17 +549,8 @@ class BagCounterApp:
                 # 3. V3: Queue ready events for async classification (non-blocking)
                 enqueue_time = 0.0
                 if ready_events:
-                    logger.info(
-                        f"[LogicThread] Frame {frame_count}: "
-                        f"{len(ready_events)} events ready for classification (async)"
-                    )
-
                     enqueue_start = time.perf_counter()
                     for event_id, candidates, event_box, event_stats in ready_events:
-                        logger.debug(
-                            f"[LogicThread] Queueing event {event_id} for classification "
-                            f"({len(candidates)} candidates)"
-                        )
                         # V3: Only copy frame if recording is enabled (save memory bandwidth)
                         if self.is_recording:
                             det_copy = []
@@ -691,9 +679,6 @@ class BagCounterApp:
                     },
                     traceback=error_trace
                 )
-                
-                logger.error(f"[LogicThread] Error processing frame {frame_count}: {e}")
-                logger.debug(f"[LogicThread] Traceback:\n{error_trace}")
 
         logger.info("[LogicThread] Stopped")
 

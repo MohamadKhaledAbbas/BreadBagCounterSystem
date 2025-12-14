@@ -202,7 +202,12 @@ class BagEvent:
         x2, y2 = min(w, x2), min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-            logger.debug(f"[BagEvent:{self.id}] Invalid ROI dimensions")
+            structured_logger.roi_rejected(
+                event_id=self.id,
+                reason="invalid_dimensions",
+                dimensions=(x2-x1, y2-y1),
+                sharpness=0.0
+            )
             return False
 
         roi = frame_img[y1:y2, x1:x2].copy()
@@ -220,11 +225,14 @@ class BagEvent:
         
         # Check sharpness threshold (separate from basic validation)
         if sharpness < tracking_config.min_roi_sharpness:
-            logger.debug(
-                f"[BagEvent:{self.id}] ROI failed sharpness check: {sharpness:.1f} < "
-                f"{tracking_config.min_roi_sharpness}"
-            )
             pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
+            structured_logger.roi_rejected(
+                event_id=self.id,
+                reason="sharpness",
+                sharpness=sharpness,
+                dimensions=(roi.shape[1], roi.shape[0]),
+                min_required=tracking_config.min_roi_sharpness
+            )
             return False
         
         # ROI passed all quality checks - record as accepted
@@ -332,7 +340,6 @@ class BagEvent:
         """
         # V2: Validate aspect ratio
         if not self._validate_aspect_ratio(box):
-            logger.debug(f"[BagEvent:{self.id}] Skipping frame with invalid aspect ratio")
             return False
         
         self._update_motion(box, confidence)
@@ -358,7 +365,6 @@ class BagEvent:
         """
         # V2: Validate aspect ratio
         if not self._validate_aspect_ratio(box):
-            logger.debug(f"[BagEvent:{self.id}] Skipping frame with invalid aspect ratio")
             return False
         
         self._update_motion(box, confidence)
@@ -389,7 +395,6 @@ class BagEvent:
         all_rois = self.open_rois + self.closed_rois
         
         if not all_rois:
-            logger.debug(f"[BagEvent:{self.id}] No ROIs collected")
             return []
         
         # V4: Calculate relative time for each ROI
@@ -415,11 +420,6 @@ class BagEvent:
         # Select top-K candidates
         top_k = tracking_config.top_k_candidates
         selected_candidates = candidates[:top_k]
-
-        logger.debug(
-            f"[BagEvent:{self.id}] Returning {len(selected_candidates)}/{len(candidates)} candidates "
-            f"(top-K={top_k}, {len(self.open_rois)} open, {len(self.closed_rois)} closed)"
-        )
         return selected_candidates
 
     def get_stats(self) -> dict:
@@ -532,7 +532,6 @@ class BagStateMonitor:
         # Sanity checks for box coordinates
         if (boxA[2] <= boxA[0] or boxA[3] <= boxA[1] or
             boxB[2] <= boxB[0] or boxB[3] <= boxB[1]):
-            logger.debug("[BagStateMonitor] Invalid box coordinates in IoU computation")
             return 0.0
 
         xA = max(boxA[0], boxB[0])
@@ -549,11 +548,6 @@ class BagStateMonitor:
 
         open_dets = [d for d in detections if d['class_id'] == self.open_id]
         closed_dets = [d for d in detections if d['class_id'] == self.closed_id]
-
-        logger.debug(
-            f"[BagStateMonitor] Frame: {len(open_dets)} open, "
-            f"{len(closed_dets)} closed, {len(self.active_events)} active"
-        )
 
         used_open_indices = set()
         used_closed_indices = set()
@@ -594,10 +588,6 @@ class BagStateMonitor:
 
                 if best_event.state != 'counted':
                     best_event.open_hits += 1
-                    logger.debug(
-                        f"[BagStateMonitor] Event {best_event.id}: "
-                        f"open_hits={best_event.open_hits} (IoU={best_iou:.2f})"
-                    )
 
                     if best_event.state == 'detecting_closed':
                         # Structured logging for state transition (reopened)
@@ -653,11 +643,6 @@ class BagStateMonitor:
                                 iou=best_iou,
                                 frame_index=current_frame
                             )
-                        
-                        logger.debug(
-                            f"[BagStateMonitor] Event {best_event.id}: "
-                            f"closed_hits={best_event.closed_hits} (IoU={best_iou:.2f})"
-                        )
 
         # ---------------------------------------------------
         # 3. Create NEW events for unmatched open detections
@@ -665,18 +650,21 @@ class BagStateMonitor:
         for i, det in enumerate(open_dets):
             if i not in used_open_indices:
                 if det.get('conf', 1.0) < tracking_config.min_conf_threshold:
-                    logger.debug(
-                        f"[BagStateMonitor] Skipping low confidence detection: "
-                        f"conf={det.get('conf', 1.0):.3f} < {tracking_config.min_conf_threshold}"
-                    )
                     pipeline_metrics.record_detection_filtered("low_confidence")
                     continue
 
                 # Prevent excessive memory usage with too many active events
                 if len(self.active_events) >= tracking_config.max_active_events:
-                    logger.warning(
-                        f"[BagStateMonitor] Max active events reached ({tracking_config.max_active_events}), "
-                        f"skipping new event creation"
+                    structured_logger.pipeline_error(
+                        component="BagStateMonitor",
+                        operation="event_creation",
+                        error_type="ResourceLimit",
+                        error_message=f"Max active events reached ({tracking_config.max_active_events})",
+                        affected_ids=None,
+                        context={
+                            "active_events_count": len(self.active_events),
+                            "max_allowed": tracking_config.max_active_events
+                        }
                     )
                     break
 
@@ -691,10 +679,6 @@ class BagStateMonitor:
                     # If the counted event had very high motion (flipping/spinning), reduce IoU threshold
                     if avg_motion > self.HIGH_MOTION_THRESHOLD:
                         iou_thresh = self.LOW_IOU_FOR_FLIPPING
-                        logger.debug(
-                            f"[BagStateMonitor] Flipping/Spinning event (avg_motion={avg_motion:.1f}), "
-                            f"using low IoU threshold {iou_thresh:.2f}"
-                        )
 
                     center_dist = self._center_distance(det['box'], counted_event['box'])
                     if iou > self.iou_threshold or center_dist < self.SUPPRESSION_CENTER_DIST_PX:
@@ -721,10 +705,6 @@ class BagStateMonitor:
                 new_event = BagEvent(det['box'], frame_dict['frame'], self.open_id, self.closed_id, frame_index=current_frame)
                 self.active_events.append(new_event)
                 self.total_events_created += 1
-                logger.info(
-                    f"[BagStateMonitor] New event: ID={new_event.id}, "
-                    f"conf={det.get('conf', 1.0):.3f}, frame={current_frame}"
-                )
 
         # ---------------------------------------------------
         # 4. Check triggers & cleanup
@@ -745,15 +725,15 @@ class BagStateMonitor:
 
                 if candidates:
                     ready_to_classify.append((event.id, candidates, event.box, stats))
-                    logger.info(
-                        f"[BagStateMonitor] Event {event.id} READY: "
-                        f"{stats['total']} candidates "
-                        f"({stats['open_count']} open, {stats['closed_count']} closed), "
-                        f"motion={stats['avg_motion']:.1f}"
-                    )
                 else:
-                    logger.warning(
-                        f"[BagStateMonitor] Event {event.id} triggered but no candidates!"
+                    # Log error if event reached counted state without candidates
+                    structured_logger.pipeline_error(
+                        component="BagStateMonitor",
+                        operation="event_classification_ready",
+                        error_type="NoCandidates",
+                        error_message=f"Event {event.id} triggered but no candidates collected",
+                        affected_ids=[event.id],
+                        context=stats
                     )
 
                 old_state = event.state
@@ -820,9 +800,6 @@ class BagStateMonitor:
                     avg_motion=event.get_avg_motion(),
                     avg_confidence=event.get_avg_confidence()
                 )
-
-        if expired_count > 0:
-            logger.debug(f"[BagStateMonitor] Expired {expired_count} events")
 
         self.active_events = active_next_frame
 
