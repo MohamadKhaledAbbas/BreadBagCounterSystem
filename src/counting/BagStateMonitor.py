@@ -77,10 +77,15 @@ class BagEvent:
         pipeline_metrics.record_event_created()
 
         # Structured logging for event creation
+        try:
+            box_list = box.tolist() if hasattr(box, 'tolist') else (list(box) if box is not None else [0, 0, 0, 0])
+        except (TypeError, AttributeError):
+            box_list = [0, 0, 0, 0]
+        
         structured_logger.event_created(
             event_id=self.id,
             confidence=confidence,
-            box=box.tolist() if hasattr(box, 'tolist') else list(box),
+            box=box_list,
             frame_index=frame_index,
             state=self.state
         )

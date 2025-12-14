@@ -215,10 +215,13 @@ class StructuredLogger:
                       open_hits: int, closed_hits: int, total_frames: int = 0, 
                       track_duration: int = 0, **kwargs):
         """Log successful event counting with structured data."""
+        msg = (
+            f"[EVENT_COUNTED] id={event_id}, label={label}, conf={confidence:.3f}, "
+            f"open_hits={open_hits}, closed_hits={closed_hits}, frames={total_frames}"
+        )
         self._log_structured(
             logging.INFO,
-            f"[EVENT_COUNTED] id={event_id}, label={label}, conf={confidence:.3f}, "
-            f"open_hits={open_hits}, closed_hits={closed_hits}, frames={total_frames}",
+            msg,
             component="BagStateMonitor",
             event_id=event_id,
             label=label,
@@ -234,10 +237,18 @@ class StructuredLogger:
                      open_hits: int = 0, closed_hits: int = 0, 
                      frames_since_update: int = 0, **kwargs):
         """Log event expiration with structured data."""
-        self._log_structured(
-            logging.WARNING,
+        # Use WARNING only for events that had significant progress (likely under-counting)
+        # Use DEBUG for events that naturally expired without much progress
+        has_progress = (open_hits >= 3 or closed_hits >= 2)
+        level = logging.WARNING if has_progress else logging.DEBUG
+        
+        msg = (
             f"[EVENT_EXPIRED] id={event_id}, state={state}, frames={frames_tracked}, "
-            f"open_hits={open_hits}, closed_hits={closed_hits}, idle={frames_since_update}",
+            f"open_hits={open_hits}, closed_hits={closed_hits}, idle={frames_since_update}"
+        )
+        self._log_structured(
+            level,
+            msg,
             component="BagStateMonitor",
             event_id=event_id,
             state=state,
@@ -336,9 +347,10 @@ class StructuredLogger:
     def event_state_transition(self, event_id: int, old_state: str, new_state: str, 
                                trigger: str, **kwargs):
         """Log event state transitions for pipeline flow tracking."""
+        msg = f"[STATE_TRANSITION] id={event_id}, {old_state} -> {new_state}, trigger={trigger}"
         self._log_structured(
             logging.INFO,
-            f"[STATE_TRANSITION] id={event_id}, {old_state} -> {new_state}, trigger={trigger}",
+            msg,
             component="BagStateMonitor",
             event_id=event_id,
             old_state=old_state,
@@ -350,10 +362,13 @@ class StructuredLogger:
     def event_suppressed(self, event_id: int, reason: str, iou: float = 0.0, 
                         conflicting_event_id: int = None, **kwargs):
         """Log event suppression with detailed context."""
+        msg = (
+            f"[EVENT_SUPPRESSED] new_id={event_id}, reason={reason}, iou={iou:.2f}, "
+            f"conflict_with={conflicting_event_id}"
+        )
         self._log_structured(
             logging.INFO,
-            f"[EVENT_SUPPRESSED] new_id={event_id}, reason={reason}, iou={iou:.2f}, "
-            f"conflict_with={conflicting_event_id}",
+            msg,
             component="BagStateMonitor",
             event_id=event_id,
             reason=reason,
@@ -366,10 +381,13 @@ class StructuredLogger:
                   frame_index: int, confidence: float, total_rois: int, **kwargs):
         """Log ROI addition with quality metrics."""
         roi_type = "OPEN" if is_open else "CLOSED"
+        msg = (
+            f"[ROI_ADDED] event={event_id}, type={roi_type}, sharpness={sharpness:.1f}, "
+            f"frame={frame_index}, conf={confidence:.2f}, total={total_rois}"
+        )
         self._log_structured(
             logging.DEBUG,
-            f"[ROI_ADDED] event={event_id}, type={roi_type}, sharpness={sharpness:.1f}, "
-            f"frame={frame_index}, conf={confidence:.2f}, total={total_rois}",
+            msg,
             component="BagEvent",
             event_id=event_id,
             roi_type=roi_type,
@@ -384,10 +402,13 @@ class StructuredLogger:
     def roi_rejected(self, event_id: int, reason: str, sharpness: float = 0.0, 
                     dimensions: tuple = None, brightness: float = 0.0, **kwargs):
         """Log ROI rejection with detailed reasons."""
+        msg = (
+            f"[ROI_REJECTED] event={event_id}, reason={reason}, sharpness={sharpness:.1f}, "
+            f"dims={dimensions}, brightness={brightness:.1f}"
+        )
         self._log_structured(
             logging.DEBUG,
-            f"[ROI_REJECTED] event={event_id}, reason={reason}, sharpness={sharpness:.1f}, "
-            f"dims={dimensions}, brightness={brightness:.1f}",
+            msg,
             component="BagEvent",
             event_id=event_id,
             reason=reason,
@@ -401,11 +422,14 @@ class StructuredLogger:
                                 label: str, confidence: float, sharpness: float,
                                 relative_time: float, contribution: float, **kwargs):
         """Log individual candidate classification in evidence accumulation."""
-        self._log_structured(
-            logging.DEBUG,
+        msg = (
             f"[CANDIDATE] track={track_id}, idx={candidate_idx}, label={label}, "
             f"conf={confidence:.3f}, sharpness={sharpness:.1f}, time={relative_time:.2f}, "
-            f"contrib={contribution:.3f}",
+            f"contrib={contribution:.3f}"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
             component="ClassifierService",
             track_id=track_id,
             candidate_idx=candidate_idx,
@@ -420,10 +444,13 @@ class StructuredLogger:
     def count_updated(self, bag_type: str, new_count: int, track_id: int, 
                      confidence: float, phash: str = None, **kwargs):
         """Log count updates for bag types."""
+        msg = (
+            f"[COUNT_UPDATE] type={bag_type}, count={new_count}, track={track_id}, "
+            f"conf={confidence:.3f}"
+        )
         self._log_structured(
             logging.INFO,
-            f"[COUNT_UPDATE] type={bag_type}, count={new_count}, track={track_id}, "
-            f"conf={confidence:.3f}",
+            msg,
             component="BagCounterApp",
             bag_type=bag_type,
             new_count=new_count,
@@ -438,11 +465,14 @@ class StructuredLogger:
                        detections_count: int, events_ready: int = 0,
                        queue_sizes: dict = None, **kwargs):
         """Log frame processing with performance metrics."""
-        self._log_structured(
-            logging.DEBUG,
+        msg = (
             f"[FRAME] id={frame_id}, detect={detection_time_ms:.1f}ms, "
             f"monitor={monitor_time_ms:.1f}ms, total={total_time_ms:.1f}ms, "
-            f"dets={detections_count}, ready={events_ready}",
+            f"dets={detections_count}, ready={events_ready}"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
             component="BagCounterApp",
             frame_id=frame_id,
             detection_time_ms=detection_time_ms,
@@ -457,10 +487,13 @@ class StructuredLogger:
     def queue_backpressure(self, queue_name: str, utilization: float, 
                           drops: int, action: str, **kwargs):
         """Log queue backpressure and adaptive actions."""
+        msg = (
+            f"[BACKPRESSURE] queue={queue_name}, util={utilization:.1%}, "
+            f"drops={drops}, action={action}"
+        )
         self._log_structured(
             logging.WARNING,
-            f"[BACKPRESSURE] queue={queue_name}, util={utilization:.1%}, "
-            f"drops={drops}, action={action}",
+            msg,
             component="BagCounterApp",
             queue_name=queue_name,
             utilization=utilization,
@@ -473,10 +506,13 @@ class StructuredLogger:
                       error_message: str, affected_ids: list = None,
                       context: dict = None, **kwargs):
         """Log pipeline errors with full context for debugging."""
+        msg = (
+            f"[ERROR] component={component}, op={operation}, type={error_type}, "
+            f"msg={error_message}, affected={affected_ids}"
+        )
         self._log_structured(
             logging.ERROR,
-            f"[ERROR] component={component}, op={operation}, type={error_type}, "
-            f"msg={error_message}, affected={affected_ids}",
+            msg,
             component=component,
             operation=operation,
             error_type=error_type,

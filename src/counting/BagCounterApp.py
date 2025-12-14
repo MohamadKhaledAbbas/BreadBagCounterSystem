@@ -31,7 +31,7 @@ from src import constants
 from src.config.settings import config
 
 from src.logging.ConfigWatcher import ConfigWatcher
-from src.utils.AppLogging import logger
+from src.utils.AppLogging import logger, structured_logger
 from src.utils.platform import IS_RDK
 from src.utils.PipelineMetrics import pipeline_metrics
 

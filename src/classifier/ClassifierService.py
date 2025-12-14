@@ -510,6 +510,15 @@ class ClassifierService:
             )
         
         # Structured logging for analysis
+        # Validate winner_ratio for logging (handle float, int, inf, and NaN)
+        import math
+        valid_ratio = None
+        if winner_ratio is not None:
+            if isinstance(winner_ratio, (int, float)):
+                if math.isfinite(winner_ratio):
+                    valid_ratio = float(winner_ratio)
+                # Infinite or NaN - log as None
+        
         structured_logger.classification_result(
             track_id=track_id,
             label=label,
@@ -518,7 +527,7 @@ class ClassifierService:
             used_voting=True,  # V4 always uses evidence accumulation
             rejection_reason=rejection_reason,
             evidence_scores=evidence_summary,
-            winner_ratio=winner_ratio if isinstance(winner_ratio, float) else None,
+            winner_ratio=valid_ratio,
             processing_time_ms=classify_time_ms
         )
 
