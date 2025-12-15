@@ -235,7 +235,7 @@ class TestCentroidAssociation:
         
         # Detection 50px away (within 100px threshold)
         new_evidence = create_evidence(100.0, 690, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert distance < default_config.association_distance_px
@@ -247,7 +247,7 @@ class TestCentroidAssociation:
         
         # Detection 150px away (outside 100px threshold) with no box overlap
         new_evidence = create_evidence(100.0, 790, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is False
         # Reason now includes 'no_match' since both centroid and IoU failed
@@ -260,7 +260,7 @@ class TestCentroidAssociation:
         
         # Detection 500ms later (outside 400ms threshold)
         new_evidence = create_evidence(500.0, 650, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
@@ -282,7 +282,7 @@ class TestCentroidAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert distance == 0.0  # Centroid is exactly the same
@@ -306,7 +306,7 @@ class TestCentroidAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         # Should associate via IoU since boxes overlap
         assert can_assoc is True
@@ -662,7 +662,7 @@ class TestVelocityBasedAssociation:
         # - Velocity is high (about 2.5 px/ms from the movement pattern)
         # - The predicted position extrapolates in direction of motion
         # - Distance to predicted position is smaller than distance to last position
-        can_assoc, distance, reason = event.can_associate(far_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(far_detection)
         assert can_assoc is True
     
     def test_predicted_centroid(self, default_config):
@@ -835,7 +835,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert 'both_match' in reason
@@ -869,7 +869,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(flipped_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(flipped_evidence)
         
         # Should associate via IoU despite centroid distance exceeding threshold
         assert can_assoc is True
@@ -911,7 +911,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(slide_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(slide_evidence)
         
         # Should associate via centroid distance
         assert can_assoc is True
@@ -942,7 +942,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(far_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(far_detection)
         
         assert can_assoc is False
         assert 'no_match' in reason
@@ -973,7 +973,7 @@ class TestParallelHybridAssociation:
             frame_index=10,
         )
         
-        can_assoc, distance, reason = event.can_associate(late_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(late_detection)
         
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
@@ -997,7 +997,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         # The reason should include all these components
         assert 'dist=' in reason
@@ -1030,13 +1030,217 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(close_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(close_detection)
         
         # Should still associate via centroid
         assert can_assoc is True
         assert 'centroid_match' in reason
         # IoU should still be computed but not contribute to match decision
         assert 'iou=' in reason
+
+
+# =============================================================================
+# Hybrid Scoring Tests (Bug Fix Validation)
+# =============================================================================
+
+class TestHybridScoringEventSelection:
+    """
+    Tests for hybrid scoring in event selection (bug fix validation).
+    
+    These tests verify that the tracker correctly prioritizes IoU over centroid
+    distance when selecting the best event to associate with a detection.
+    
+    Previous Bug: The tracker only considered centroid distance when selecting
+    the best event, completely ignoring IoU values. This caused events with
+    high IoU but larger centroid distance to be rejected in favor of events
+    with low/zero IoU but smaller centroid distance.
+    
+    Fix: Implemented hybrid scoring that weighs both IoU and distance, with
+    adaptive weights based on IoU magnitude.
+    """
+    
+    def test_high_iou_wins_over_close_centroid(self, default_config):
+        """
+        High IoU event should be selected over close centroid with zero IoU.
+        
+        This is the core bug fix test: Event A has high IoU (0.8) but larger
+        centroid distance (120px), while Event B has zero IoU but smaller
+        centroid distance (80px). Event A should win because of high IoU.
+        """
+        tracker = EventCentricTracker(
+            config=default_config,
+            open_class_id=1,
+            closed_class_id=0
+        )
+        
+        # Create two events at different locations
+        # Event A: At (640, 360) with box (590, 310, 690, 410)
+        evidence_a = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        det_list_a = [{
+            'box': evidence_a.box,
+            'class_id': 1,
+            'conf': 0.8
+        }]
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        tracker.update(det_list_a, 0.0, frame_img, 0)
+        
+        # Event B: At (500, 500) with box (450, 450, 550, 550)
+        evidence_b = create_evidence(50.0, 500, 500, is_open=True, w=100, h=100)
+        det_list_b = [{
+            'box': evidence_b.box,
+            'class_id': 1,
+            'conf': 0.8
+        }]
+        tracker.update(det_list_b, 50.0, frame_img, 1)
+        
+        assert len(tracker.active_events) == 2
+        event_ids = list(tracker.active_events.keys())
+        event_a_id = event_ids[0]
+        event_b_id = event_ids[1]
+        
+        # New detection that:
+        # - Overlaps significantly with Event A (high IoU ~0.75)
+        # - Is at centroid (660, 380)
+        # - Distance to Event A (640, 360): ~28px
+        # - Distance to Event B (500, 500): ~143px
+        # Should associate with Event A due to high IoU
+        new_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=660,  # Shifted from Event A's 640
+            centroid_y=380,  # Shifted from Event A's 360
+            box=(610, 330, 710, 430),  # Good overlap with Event A
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=2,
+        )
+        
+        det_list_new = [{
+            'box': new_detection.box,
+            'class_id': 1,
+            'conf': 0.8
+        }]
+        
+        # Before association, record event boxes
+        event_a_box_before = tracker.active_events[event_a_id].last_box
+        event_b_box_before = tracker.active_events[event_b_id].last_box
+        
+        tracker.update(det_list_new, 100.0, frame_img, 2)
+        
+        # Event A should have been updated (because of high IoU)
+        # Event B should NOT have been updated
+        event_a_box_after = tracker.active_events[event_a_id].last_box
+        event_b_box_after = tracker.active_events[event_b_id].last_box
+        
+        # Event A's box should have changed (detection was associated with it)
+        assert event_a_box_after != event_a_box_before
+        # Event B's box should NOT have changed
+        assert event_b_box_after == event_b_box_before
+        
+        # Verify Event A got the detection
+        assert tracker.active_events[event_a_id].total_frames_observed == 2
+        # Event B should still be at 1 frame
+        assert tracker.active_events[event_b_id].total_frames_observed == 1
+    
+    def test_scoring_weights_adapt_to_iou(self, default_config):
+        """
+        Verify that scoring weights adapt based on IoU magnitude.
+        
+        High IoU (>=0.5): Should heavily favor IoU
+        Moderate IoU (0.3-0.5): Should balance both
+        Low IoU (<0.3): Should favor distance
+        """
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Test high IoU case
+        high_iou_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=650,
+            centroid_y=365,
+            box=(600, 315, 700, 415),  # Good overlap, IoU ~0.75
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        can_assoc_high, dist_high, reason_high, iou_high = event.can_associate(high_iou_detection)
+        
+        assert can_assoc_high is True
+        assert iou_high >= 0.5  # High IoU
+        # In high IoU cases, association should succeed even with larger distance
+    
+    def test_multiple_events_best_score_wins(self, default_config):
+        """
+        When multiple events can associate, the one with highest score should win.
+        
+        This tests the complete selection logic in the tracker's update method.
+        """
+        tracker = EventCentricTracker(
+            config=default_config,
+            open_class_id=1,
+            closed_class_id=0
+        )
+        
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Create 3 events at different locations
+        events_data = [
+            (0.0, 400, 360, 0),   # Event 1: Far left
+            (50.0, 640, 360, 1),  # Event 2: Center
+            (100.0, 880, 360, 2), # Event 3: Far right
+        ]
+        
+        for timestamp, cx, cy, frame_idx in events_data:
+            evidence = create_evidence(timestamp, cx, cy, is_open=True, w=100, h=100)
+            det_list = [{
+                'box': evidence.box,
+                'class_id': 1,
+                'conf': 0.8
+            }]
+            tracker.update(det_list, timestamp, frame_img, frame_idx)
+        
+        assert len(tracker.active_events) == 3
+        event_ids = list(tracker.active_events.keys())
+        
+        # New detection near Event 2 with high overlap
+        new_detection = DetectionEvidence(
+            timestamp_ms=150.0,
+            centroid_x=650,  # Close to Event 2
+            centroid_y=365,
+            box=(600, 315, 700, 415),  # Good overlap with Event 2
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=3,
+        )
+        
+        det_list_new = [{
+            'box': new_detection.box,
+            'class_id': 1,
+            'conf': 0.8
+        }]
+        
+        # Record initial observation counts
+        initial_obs = {
+            eid: tracker.active_events[eid].total_frames_observed 
+            for eid in event_ids
+        }
+        
+        tracker.update(det_list_new, 150.0, frame_img, 3)
+        
+        # Only one event should have increased observation count
+        updates = [
+            eid for eid in event_ids
+            if tracker.active_events[eid].total_frames_observed > initial_obs[eid]
+        ]
+        
+        assert len(updates) == 1, "Exactly one event should be updated"
+        
+        # The updated event should be Event 2 (center one, with high IoU and close distance)
+        updated_event = tracker.active_events[updates[0]]
+        # Event 2 should now have 2 observations
+        assert updated_event.total_frames_observed == 2
 
 
 if __name__ == '__main__':

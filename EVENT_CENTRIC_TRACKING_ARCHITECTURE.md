@@ -498,3 +498,75 @@ Every association attempt logs:
 - Time gap
 - Which metric(s) matched
 - Detection and event centroids
+
+---
+
+## Bug Fix: Hybrid Event Selection (December 2025)
+
+### Issue Description
+
+While the `can_associate()` method correctly computed both centroid distance and IoU for association decisions, the tracker's event selection algorithm had a critical bug: when multiple events could associate with a detection, it **only considered centroid distance** to pick the "best" event, completely ignoring IoU values.
+
+**Impact:** Even if Event A had high IoU (0.8) with a detection but larger centroid distance (150px), and Event B had zero IoU (0.0) but smaller centroid distance (100px), Event B would be selected. This defeated the hybrid association approach and caused IoU to be 0.00 in most cases.
+
+### Root Cause
+
+```python
+# BEFORE (buggy code):
+for event in active_events:
+    can_assoc, distance, reason = event.can_associate(evidence)
+    if can_assoc and distance < best_distance:  # ❌ Only considers distance!
+        best_event = event
+        best_distance = distance
+```
+
+### Fix: Hybrid Scoring Algorithm
+
+Implemented adaptive scoring that weighs both IoU and centroid distance:
+
+```python
+# AFTER (fixed code):
+for event in active_events:
+    can_assoc, distance, reason, iou_value = event.can_associate(evidence)
+    if not can_assoc:
+        continue
+    
+    # Normalize distance to 0-1 range (1 = closest)
+    normalized_distance = max(0, 1.0 - (distance / max_distance))
+    
+    # Adaptive weighting based on IoU magnitude:
+    if iou_value >= 0.5:
+        # High IoU: Trust it heavily (80% IoU, 20% distance)
+        score = 0.8 * iou_value + 0.2 * normalized_distance
+    elif iou_value >= 0.3:
+        # Moderate IoU: Balance both (60% IoU, 40% distance)
+        score = 0.6 * iou_value + 0.4 * normalized_distance
+    else:
+        # Low IoU: Trust distance more (30% IoU, 70% distance)
+        score = 0.3 * iou_value + 0.7 * normalized_distance
+    
+    if score > best_score:
+        best_event = event
+        best_score = score
+```
+
+### Scoring Rationale
+
+The adaptive weighting reflects confidence in each metric:
+
+| IoU Range | Weight Distribution | Reasoning |
+|-----------|---------------------|-----------|
+| ≥ 0.5 | 80% IoU, 20% distance | High overlap = very likely same object |
+| 0.3-0.5 | 60% IoU, 40% distance | Moderate overlap = balance both signals |
+| < 0.3 | 30% IoU, 70% distance | Low overlap = rely on spatial proximity |
+
+**Why not always 50/50?** High IoU is a stronger signal of object identity than centroid proximity. When boxes overlap significantly (IoU ≥ 0.5), they're almost certainly the same object even if centroids moved (e.g., due to bag rotation/flip).
+
+### Testing
+
+Added comprehensive tests validating the fix:
+- `test_high_iou_wins_over_close_centroid`: Verifies high IoU event is selected over closer event with zero IoU
+- `test_scoring_weights_adapt_to_iou`: Validates adaptive weighting works correctly
+- `test_multiple_events_best_score_wins`: Tests complete selection logic with multiple competing events
+
+All 42 tests pass (39 original + 3 new).

@@ -34,6 +34,7 @@ import uuid
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
+import logging  # Only for DEBUG level constant
 import numpy as np
 import cv2
 
@@ -445,7 +446,7 @@ class BreadBagEvent:
         
         return inter_area / union_area
     
-    def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str]:
+    def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str, float]:
         """
         Check if a detection can be associated with this event using parallel hybrid association.
         
@@ -464,8 +465,11 @@ class BreadBagEvent:
             detection: Detection to check
             
         Returns:
-            Tuple of (can_associate, distance, reason)
-            The reason includes which metric(s) matched or why both failed
+            Tuple of (can_associate, distance, reason, iou_value)
+            - can_associate: True if detection can be associated with this event
+            - distance: Centroid distance in pixels
+            - reason: Human-readable reason for the decision
+            - iou_value: Computed IoU value (0.0-1.0) for association scoring
         """
         det_centroid = (detection.centroid_x, detection.centroid_y)
         
@@ -510,6 +514,17 @@ class BreadBagEvent:
         iou_value = 0.0
         if self.last_box is not None:
             iou_value = self._compute_iou(self.last_box, detection.box)
+            
+            # DEBUG: Log box coordinates for IoU calculation debugging
+            # This helps diagnose why IoU might be 0.00 when it shouldn't be
+            logger.debug(
+                f"[DEBUG] IoU calculation: event={self.id}, "
+                f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
+                f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
+                f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
+                f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
+                f"iou_value={iou_value:.2f}"
+            )
         
         # Check both criteria
         centroid_match = distance <= scaled_threshold
@@ -565,7 +580,7 @@ class BreadBagEvent:
         else:
             reason = f"{match_type} ({metrics_detail})"
         
-        return associated, distance, reason
+        return associated, distance, reason, iou_value
     
     def add_detection(self, detection: DetectionEvidence, frame_img: Optional[np.ndarray] = None):
         """
@@ -1023,20 +1038,86 @@ class EventCentricTracker:
         associated_detection_indices = set()
         
         # 1. Associate detections with existing events
+        # FIX: Use hybrid scoring that considers BOTH IoU and centroid distance
+        # Previous bug: Only considered distance, ignoring IoU completely
         for det_idx, evidence in enumerate(detection_evidences):
             best_event = None
+            best_score = -float('inf')  # Higher score is better
             best_distance = float('inf')
+            best_iou = 0.0
+            
+            # Track all candidates for debug logging
+            candidates = []
             
             for event in self.active_events.values():
                 if event.state == EventState.COMMITTED:
                     continue
                 
-                can_assoc, distance, reason = event.can_associate(evidence)
-                if can_assoc and distance < best_distance:
+                can_assoc, distance, reason, iou_value = event.can_associate(evidence)
+                if not can_assoc:
+                    continue
+                
+                # Hybrid scoring: Prioritize IoU over distance when IoU is significant
+                # IoU > 0.5: Very likely the same object (even if centroid moved)
+                # IoU 0.3-0.5: Possibly the same object, consider distance
+                # IoU < 0.3: Rely primarily on distance
+                #
+                # Score calculation:
+                # - IoU weight: High when IoU is significant (0.5+)
+                # - Distance weight: High when IoU is low (<0.3)
+                # - Normalize distance to 0-1 range (inverse, so closer is better)
+                
+                # Normalize distance to 0-1 range (where 1 is best/closest)
+                # Formula: normalized = max(0, 1 - distance/max_distance)
+                # The max(0, ...) clamps negative values when distance > max_distance
+                # to ensure normalized_distance stays in valid [0, 1] range
+                if self.config.max_association_distance_px > 0:
+                    normalized_distance = max(0, 1.0 - (distance / self.config.max_association_distance_px))
+                else:
+                    # Fallback: If max_distance is 0, use binary close/far logic
+                    normalized_distance = 1.0 if distance == 0 else 0.0
+                
+                # Compute hybrid score with adaptive weighting
+                if iou_value >= 0.5:
+                    # High IoU: Trust it heavily (80% IoU, 20% distance)
+                    score = 0.8 * iou_value + 0.2 * normalized_distance
+                elif iou_value >= 0.3:
+                    # Moderate IoU: Balance both (60% IoU, 40% distance)
+                    score = 0.6 * iou_value + 0.4 * normalized_distance
+                else:
+                    # Low IoU: Trust distance more (30% IoU, 70% distance)
+                    score = 0.3 * iou_value + 0.7 * normalized_distance
+                
+                # Build candidate info for debug logging (only if debug enabled)
+                if logger.isEnabledFor(logging.DEBUG):
+                    candidates.append({
+                        'event_id': event.id,
+                        'distance': distance,
+                        'iou': iou_value,
+                        'score': score,
+                        'reason': reason
+                    })
+                
+                if score > best_score:
                     best_event = event
+                    best_score = score
                     best_distance = distance
+                    best_iou = iou_value
+            
+            # Log all candidates if there were multiple options
+            if len(candidates) > 1:
+                logger.debug(
+                    f"[ASSOCIATION_CANDIDATES] detection_idx={det_idx}, "
+                    f"detection_box=({evidence.box[0]:.1f}, {evidence.box[1]:.1f}, "
+                    f"{evidence.box[2]:.1f}, {evidence.box[3]:.1f}), "
+                    f"candidates={candidates}"
+                )
             
             if best_event is not None:
+                logger.debug(
+                    f"[ASSOCIATION_SELECTED] detection_idx={det_idx} -> event={best_event.id}, "
+                    f"score={best_score:.3f}, iou={best_iou:.2f}, distance={best_distance:.1f}px"
+                )
                 best_event.add_detection(evidence, frame_img)
                 associated_detection_indices.add(det_idx)
         
