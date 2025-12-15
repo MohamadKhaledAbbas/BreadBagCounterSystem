@@ -11,9 +11,17 @@ ARCHITECTURE OVERVIEW:
 - Tracks/detections are observations attached to Events
 - Counting occurs only after bag exits the scene (not at closure moment)
 
+PARALLEL HYBRID ASSOCIATION:
+Detection-to-event association uses a parallel hybrid approach:
+- Both centroid distance AND IoU are ALWAYS computed for every association attempt
+- Association succeeds if EITHER criterion is met
+- This provides robustness during:
+  * Bag flips/spins: centroid may jump but IoU remains high
+  * Fast slides: IoU may drop but centroid distance stays close
+  * Partial occlusions: one metric may fail while the other succeeds
+
 HARD CONSTRAINTS MET:
 - NO visual appearance embeddings
-- NO IoU-based association (uses centroid distance + time)
 - NO frame-based counting (uses millisecond-based timing)
 - Tolerates rotation, deformation, and temporary occlusion
 
@@ -439,35 +447,35 @@ class BreadBagEvent:
     
     def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str]:
         """
-        Check if a detection can be associated with this event.
+        Check if a detection can be associated with this event using parallel hybrid association.
         
-        Uses multiple association criteria for robustness:
-        1. Centroid distance (primary) - with velocity-based scaling
-        2. IoU (complementary) - helps during partial occlusion
-        
-        A detection can associate if EITHER:
-        - Centroid distance is within threshold, OR
+        PARALLEL HYBRID ASSOCIATION LOGIC:
+        Both centroid distance and IoU are ALWAYS computed for every association attempt.
+        A detection can associate if EITHER criterion is met:
+        - Centroid distance is within threshold (with velocity-based scaling), OR
         - IoU is above threshold (when enabled)
+        
+        This approach provides robustness during:
+        - Bag flips/spins: centroid may jump but IoU remains high
+        - Fast slides: IoU may drop but centroid distance stays close
+        - Partial occlusions: one metric may fail while the other succeeds
         
         Args:
             detection: Detection to check
             
         Returns:
             Tuple of (can_associate, distance, reason)
+            The reason includes which metric(s) matched or why both failed
         """
         det_centroid = (detection.centroid_x, detection.centroid_y)
         
-        # Check time gap first (cheap check)
+        # Calculate time gap
         time_gap_ms = detection.timestamp_ms - self.last_detection_time_ms
-        if time_gap_ms > self.config.association_time_ms:
-            # Calculate distance for logging
-            dx = det_centroid[0] - self.last_centroid[0]
-            dy = det_centroid[1] - self.last_centroid[1]
-            distance = math.sqrt(dx*dx + dy*dy)
-            return False, distance, f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms)"
         
-        # Calculate base association distance
+        # Calculate base association distance threshold
         base_distance_threshold = self.config.association_distance_px
+        scaled_threshold = base_distance_threshold
+        velocity_mag = 0.0
         
         # Velocity-based scaling: increase threshold for fast-moving bags
         if self.config.velocity_scaling_enabled:
@@ -482,15 +490,12 @@ class BreadBagEvent:
                                   self.config.velocity_scale_factor - 1.0)
                 scaled_threshold = min(base_distance_threshold * scale, 
                                        self.config.max_association_distance_px)
-            else:
-                scaled_threshold = base_distance_threshold
-        else:
-            scaled_threshold = base_distance_threshold
         
         # Calculate distance to last centroid
         dx = det_centroid[0] - self.last_centroid[0]
         dy = det_centroid[1] - self.last_centroid[1]
         distance_to_last = math.sqrt(dx*dx + dy*dy)
+        distance = distance_to_last
         
         # Also try distance to predicted position (for fast movements)
         if self.config.velocity_scaling_enabled and len(self.centroid_history) >= 2:
@@ -498,33 +503,69 @@ class BreadBagEvent:
             dx_pred = det_centroid[0] - pred_centroid[0]
             dy_pred = det_centroid[1] - pred_centroid[1]
             distance_to_pred = math.sqrt(dx_pred*dx_pred + dy_pred*dy_pred)
-            
             # Use the smaller of the two distances
             distance = min(distance_to_last, distance_to_pred)
-        else:
-            distance = distance_to_last
         
-        # Check centroid distance threshold (primary criterion)
-        centroid_match = distance <= scaled_threshold
-        
-        # If centroid matches, return early (common case optimization)
-        if centroid_match:
-            return True, distance, f"centroid_match (dist={distance:.1f}px)"
-        
-        # Centroid distance failed - check IoU (complementary criterion)
-        # Only compute IoU when centroid distance fails to save computation
-        if self.config.iou_association_enabled and self.last_box is not None:
+        # ALWAYS compute IoU (parallel hybrid association)
+        iou_value = 0.0
+        if self.last_box is not None:
             iou_value = self._compute_iou(self.last_box, detection.box)
-            if iou_value >= self.config.iou_association_threshold:
-                return True, distance, f"iou_match (iou={iou_value:.2f}, dist={distance:.1f}px)"
-            else:
-                # Neither criterion met - include IoU in reason
-                reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f}, iou={iou_value:.2f} < {self.config.iou_association_threshold})"
-                return False, distance, reason
+        
+        # Check both criteria
+        centroid_match = distance <= scaled_threshold
+        iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
+        
+        # Determine match type for structured logging
+        if time_gap_ms > self.config.association_time_ms:
+            match_type = "time_exceeded"
+            associated = False
+        elif centroid_match and iou_match:
+            match_type = "both_match"
+            associated = True
+        elif centroid_match:
+            match_type = "centroid_match"
+            associated = True
+        elif iou_match:
+            match_type = "iou_match"
+            associated = True
         else:
-            # IoU disabled or no last box - centroid failed
-            reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f})"
-            return False, distance, reason
+            match_type = "no_match"
+            associated = False
+        
+        # Use structured logging for detailed debug output
+        structured_logger.hybrid_association_attempt(
+            event_id=self.id,
+            detection_centroid=det_centroid,
+            event_centroid=self.last_centroid,
+            distance_px=distance,
+            distance_threshold=scaled_threshold,
+            iou_value=iou_value,
+            iou_threshold=self.config.iou_association_threshold,
+            time_gap_ms=time_gap_ms,
+            centroid_match=centroid_match,
+            iou_match=iou_match,
+            associated=associated,
+            match_type=match_type,
+            velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
+            base_threshold=base_distance_threshold,
+        )
+        
+        # Build detailed reason string for return value
+        metrics_detail = (
+            f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px), "
+            f"iou={iou_value:.2f} (thresh={self.config.iou_association_threshold}), "
+            f"time_gap={time_gap_ms:.1f}ms"
+        )
+        
+        if velocity_mag > self.config.min_velocity_threshold:
+            metrics_detail += f", velocity={velocity_mag:.3f}px/ms"
+        
+        if match_type == "time_exceeded":
+            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms) | {metrics_detail}"
+        else:
+            reason = f"{match_type} ({metrics_detail})"
+        
+        return associated, distance, reason
     
     def add_detection(self, detection: DetectionEvidence, frame_img: Optional[np.ndarray] = None):
         """
