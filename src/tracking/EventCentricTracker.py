@@ -191,7 +191,9 @@ class EventConfig:
     # ==========================================================================
     # Resource Limits
     # ==========================================================================
-    max_active_events: int = 10
+    max_active_events: int = 4
+
+    use_frame_timestamps: bool = False
 
 
 @dataclass

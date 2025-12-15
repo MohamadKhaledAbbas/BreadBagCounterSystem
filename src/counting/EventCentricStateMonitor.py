@@ -50,8 +50,7 @@ class EventCentricStateMonitor:
                  open_cls_id: int, 
                  closed_cls_id: int,
                  config: Optional[EventConfig] = None,
-                 fps: float = 25.0,
-                 use_frame_timestamps: bool = False):
+                 fps: float = 25.0):
         """
         Initialize the event-centric state monitor.
         
@@ -60,19 +59,17 @@ class EventCentricStateMonitor:
             closed_cls_id: Class ID for closed bag detections
             config: EventConfig instance (creates from tracking_config if None)
             fps: Video frame rate for timestamp calculation
-            use_frame_timestamps: If True, use deterministic frame-based timestamps
-                                  (frame_count * frame_duration_ms) instead of wall clock.
-                                  Recommended for offline/testing mode to avoid timing issues.
         """
         self.open_id = open_cls_id
         self.closed_id = closed_cls_id
         self.fps = fps
         self.frame_duration_ms = 1000.0 / fps
-        self.use_frame_timestamps = use_frame_timestamps
-        
+
         # Get configuration
         if config is None:
             config = get_event_config()
+
+        self.use_frame_timestamps = config.use_frame_timestamps
         
         # Create the event-centric tracker
         self.tracker = EventCentricTracker(
@@ -97,7 +94,7 @@ class EventCentricStateMonitor:
             f"[EventCentricStateMonitor] Initialized: "
             f"open_id={open_cls_id}, closed_id={closed_cls_id}, "
             f"fps={fps}, frame_duration={self.frame_duration_ms:.1f}ms, "
-            f"use_frame_timestamps={use_frame_timestamps}"
+            f"use_frame_timestamps={config.use_frame_timestamps}"
         )
     
     def update(self, 

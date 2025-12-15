@@ -18,6 +18,8 @@ V5 Event-Centric Tracking Notes:
 
 from dataclasses import dataclass
 
+from src.utils.platform import IS_WINDOWS
+
 
 @dataclass
 class TrackingConfig:
@@ -752,6 +754,8 @@ class TrackingConfig:
     Default: 0.15
     """
 
+    use_frame_timestamps: bool = IS_WINDOWS
+
 
 # Global configuration instance
 tracking_config = TrackingConfig()
@@ -832,4 +836,6 @@ def get_event_config():
         
         # Resource limits
         max_active_events=tracking_config.max_active_events,
+
+        use_frame_timestamps=tracking_config.use_frame_timestamps,
     )

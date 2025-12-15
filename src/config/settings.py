@@ -73,14 +73,14 @@ class AppConfig:
 
     APP_VERSION: str = "2025-12-13-v1.0.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Orange_Overlay_20251128010005_20251128011157.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\GREEN.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
     detection_model: str = os.getenv(
         "DETECTION_MODEL",
         "data/model/detect_yolo_small_v5_bayese_640x640_nv12.bin" if IS_RDK
-        else "data/model/detect_yolo_small_v3.pt"
+        else "data/model/detect_yolo_small_v8.pt"
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
