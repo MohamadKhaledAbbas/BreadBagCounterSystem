@@ -226,14 +226,17 @@ class EventConfig:
     min_candidates_for_logging: int = 3
     """Minimum candidate count to log association candidates (only log ambiguous cases)"""
     
-    low_score_threshold: float = 0.7
+    low_score_threshold: float = 0.4
     """Score threshold below which associations are logged (focus on low-confidence matches)"""
     
     # Match types that are always logged (noteworthy cases)
     noteworthy_match_types: tuple = (
-        'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
-        'expanded_iou_match', 'ghost_expanded_iou_match'
     )
+
+    # noteworthy_match_types: tuple = (
+    #     'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
+    #     'expanded_iou_match', 'ghost_expanded_iou_match'
+    # )
     """Match types that are always logged as they indicate special recovery cases"""
 
     use_frame_timestamps: bool = False
@@ -676,23 +679,23 @@ class BreadBagEvent:
         
         # Only log association attempts that fail or are noteworthy (not every successful match)
         # This reduces log flooding while keeping important debug information
-        if not associated or match_type in self.config.noteworthy_match_types:
-            structured_logger.hybrid_association_attempt(
-                event_id=self.id,
-                detection_centroid=det_centroid,
-                event_centroid=self.last_centroid,
-                distance_px=distance,
-                distance_threshold=scaled_threshold,
-                iou_value=iou_value,
-                iou_threshold=self.config.iou_association_threshold,
-                time_gap_ms=time_gap_ms,
-                centroid_match=centroid_match,
-                iou_match=iou_match,
-                associated=associated,
-                match_type=match_type,
-                velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
-                base_threshold=base_distance_threshold,
-            )
+        # if not associated or match_type in self.config.noteworthy_match_types:
+        #     structured_logger.hybrid_association_attempt(
+        #         event_id=self.id,
+        #         detection_centroid=det_centroid,
+        #         event_centroid=self.last_centroid,
+        #         distance_px=distance,
+        #         distance_threshold=scaled_threshold,
+        #         iou_value=iou_value,
+        #         iou_threshold=self.config.iou_association_threshold,
+        #         time_gap_ms=time_gap_ms,
+        #         centroid_match=centroid_match,
+        #         iou_match=iou_match,
+        #         associated=associated,
+        #         match_type=match_type,
+        #         velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
+        #         base_threshold=base_distance_threshold,
+        #     )
         
         # Build detailed reason string for return value
         metrics_detail = (
