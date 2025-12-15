@@ -66,13 +66,17 @@ IoU-based tracking fails because:
 ┌─────────────────────────────────────────────────────────────────┐
 │                     COUNTING RULE                                │
 │                                                                   │
-│   Count ONLY when:                                               │
+│   Count ONLY when (Timeout-Based Commitment):                    │
 │   1. Event state == CLOSED                                       │
-│   2. No detections for exit_timeout_ms                          │
-│   3. Last centroid near scene exit boundary                     │
+│   2. No detections for commit_idle_frames                        │
+│   3. Minimum closed evidence ratio met                           │
 │                                                                   │
 │   ✗ NOT counted at moment of closure                            │
-│   ✗ NOT counted if still in work zone                           │
+│   ✗ Exit boundary logic REMOVED for simplicity                  │
+│                                                                   │
+│   Anti-Double-Counting:                                          │
+│   - Suppress new events near recently committed locations        │
+│   - Configurable suppression distance and duration               │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -135,7 +139,8 @@ IoU-based tracking fails because:
     └────┬─────┘
          │
          │ (ghost_timeout_ms expired
-         │  + MUST be near exit boundary)
+         │  + commit_idle_frames reached
+         │  + min_closed_ratio met)
          │
          ▼
     ┌──────────┐
@@ -146,27 +151,32 @@ IoU-based tracking fails because:
     └──────────┘
 ```
 
-**CRITICAL COUNTING RULE:**
-A bag is ONLY counted when its centroid is within `exit_boundary_margin_px` of the frame edge.
-If the bag is in the center of the scene, it will NOT be counted even after timeout - it must
-physically move to the exit boundary first.
+**TIMEOUT-BASED COUNTING RULE:**
+A bag is counted when it has been undetected for `commit_idle_frames` after entering CLOSED state,
+with a minimum `commit_min_closed_ratio` of closed evidence. Exit boundary logic has been removed
+for simplicity and robustness. Anti-double-counting is achieved through spatial suppression of
+new events near recently committed locations.
 
 ### State Transition Requirements
 
 | Transition | Requirements |
 |------------|--------------|
 | OPEN → CLOSING | `min_open_evidence_count` reached + closed detection + `open_to_closing_time_ms` in OPEN |
-| CLOSING → OPEN | 2+ open detections in last 3 frames |
+| CLOSING → OPEN | `closing_revert_open_count` open detections since entering CLOSING |
 | CLOSING → CLOSED | `closing_stability_time_ms` + `min_closed_evidence_count` + centroid stable |
-| CLOSED → COMMITTED | `ghost_timeout_ms` without detection + **MUST be near exit boundary** |
+| CLOSED → COMMITTED | `ghost_timeout_ms` + `commit_idle_frames` + `commit_min_closed_ratio` met |
 
 ---
 
 ## Event Association Rules
 
-### Centroid-Based Association (NO IoU)
+### Multi-Criteria Association (Centroid + IoU)
 
-For each detection, compute centroid and associate to active Event if:
+Association uses multiple criteria for robustness:
+1. **Centroid distance** (primary) - with velocity-based scaling for fast movements
+2. **IoU** (complementary) - helps during partial occlusion when centroids shift
+
+A detection associates if EITHER criterion is met:
 
 ```python
 # D: Max distance in pixels
@@ -193,8 +203,9 @@ if event has no detection:
     else:
         # Ghost timeout exceeded
         if event.state == CLOSED:
-            # Eligible for commit (count)
-            check exit boundary
+            # Eligible for commit if idle timeout met
+            if frames_without_detection >= commit_idle_frames:
+                commit event (count)
         else:
             # Event expires (not counted)
             expire event
@@ -204,29 +215,52 @@ if event has no detection:
 
 ## Tuning Parameters
 
+### Core Association Parameters
+
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | **D** `association_distance_px` | 100.0 | 50-200 | Max centroid distance for association |
 | **T** `association_time_ms` | 400.0 | 200-800 | Max time gap for association |
 | **G** `ghost_timeout_ms` | 1000.0 | 500-2000 | Keep event alive without detections |
-| `exit_timeout_ms` | 800.0 | 500-1500 | Time in CLOSED before commit |
-| `exit_boundary_margin_px` | 50 | 30-100 | Distance from edge for "near exit" |
 | `open_to_closing_time_ms` | 100.0 | 50-300 | Min time in OPEN before CLOSING |
 | `closing_stability_time_ms` | 150.0 | 100-400 | Closed detections must persist |
 | `centroid_stability_px` | 30.0 | 10-50 | Max movement for "stable" |
 | `min_open_evidence_count` | 3 | 2-10 | Min open detections before state change |
 | `min_closed_evidence_count` | 2 | 1-5 | Min closed detections for CLOSED |
 
-### V5.1 Additional Parameters
+### IoU-Based Association Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `iou_association_enabled` | true | - | Enable IoU as complementary association criterion |
+| `iou_association_threshold` | 0.3 | 0.2-0.5 | Min IoU to associate when centroid fails |
+
+### Velocity-Based Association Parameters
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `velocity_scaling_enabled` | true | - | Enable velocity-based distance scaling |
 | `velocity_scale_factor` | 2.5 | 1.5-4.0 | Max multiplier for association distance |
 | `max_association_distance_px` | 250.0 | 150-400 | Absolute max association distance |
-| `allow_center_commit` | true | - | Allow counting bags that don't exit to edge |
-| `center_commit_idle_frames` | 25 | 15-50 | Frames idle before center commit |
-| `center_commit_min_closed_ratio` | 0.3 | 0.2-0.6 | Min closed/total ratio for center commit |
+
+### Timeout-Based Commitment Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `commit_idle_frames` | 25 | 15-50 | Frames without detection before commit |
+| `commit_min_closed_ratio` | 0.3 | 0.2-0.6 | Min closed/total ratio for commit |
+
+### Anti-Double-Counting Suppression Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `suppression_distance_px` | 150.0 | 100-250 | Distance to suppress new events near commits |
+| `suppression_duration_ms` | 1000.0 | 500-2000 | Duration to suppress after commit |
+
+### Anti-Oscillation Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
 | `closing_revert_open_count` | 3 | 2-5 | Open detections needed to revert CLOSING→OPEN |
 | `closing_revert_window_size` | 5 | 3-8 | Window size for revert check |
 
@@ -249,19 +283,28 @@ if event has no detection:
 - Too short: Counts bag while worker still holding
 - Too long: Delays counting unnecessarily
 
-**Velocity Scaling (NEW in V5.1)**
+**IoU Association**
+- Provides robustness during partial occlusion
+- Helps when centroid shifts but boxes still overlap
+- Set threshold based on expected overlap during manipulation
+
+**Velocity Scaling**
 - When enabled, association distance scales based on bag velocity
 - Helps maintain tracking during bag flipping/throwing
 - Uses predicted centroid position for association
 - Set `max_association_distance_px` to prevent over-association
 
-**Center Commit (NEW in V5.1)**
-- Enable when bags don't exit to frame edge after closing
-- Requires bag to be idle for `center_commit_idle_frames` frames
+**Timeout-Based Commitment**
+- Bags are committed after being undetected for `commit_idle_frames`
+- Works regardless of bag position in frame (no exit boundary required)
 - Requires minimum closed evidence ratio to avoid false commits
-- Useful for table-based operations where bags are placed down
 
-**Anti-Oscillation (NEW in V5.1)**
+**Anti-Double-Counting Suppression**
+- Prevents re-counting bags that are temporarily re-detected after commitment
+- `suppression_distance_px` should be larger than `association_distance_px`
+- `suppression_duration_ms` should cover time for bag to leave scene
+
+**Anti-Oscillation**
 - Prevents rapid OPEN↔CLOSING state changes during noisy detections
 - Requires `closing_revert_open_count` open detections SINCE entering CLOSING
 - Uses evidence window SINCE state entry, not global history
@@ -280,19 +323,25 @@ if event has no detection:
 **Symptom**: Single bag creates multiple events
 **Cause**: Detection gap exceeds time threshold
 **Detection**: Multiple events with overlapping spatial trajectory
-**Mitigation**: Increase `association_time_ms` or `ghost_timeout_ms`
+**Mitigation**: Increase `association_time_ms` or `ghost_timeout_ms`, or enable IoU association
 
 ### Failure Mode 3: Premature Commits
 **Symptom**: Count triggers while bag still in frame
-**Cause**: Exit timeout too short or exit boundary too wide
-**Detection**: `commit_reason` shows "exit_timeout" but bag visible
-**Mitigation**: Increase `exit_timeout_ms` or reduce `exit_boundary_margin_px`
+**Cause**: Idle timeout too short
+**Detection**: `commit_reason` shows "timeout_commit" but bag visible
+**Mitigation**: Increase `commit_idle_frames` or `ghost_timeout_ms`
 
 ### Failure Mode 4: Merged Events
 **Symptom**: Two bags counted as one
-**Cause**: Association distance too large
+**Cause**: Association distance too large or IoU threshold too low
 **Detection**: Single event with abnormally long lifespan
-**Mitigation**: Reduce `association_distance_px`
+**Mitigation**: Reduce `association_distance_px` or increase `iou_association_threshold`
+
+### Failure Mode 5: Double Counting
+**Symptom**: Same bag counted multiple times
+**Cause**: Suppression parameters too restrictive, bag re-detected after commit
+**Detection**: Events created near recently committed locations
+**Mitigation**: Increase `suppression_distance_px` or `suppression_duration_ms`
 
 ---
 
@@ -383,10 +432,10 @@ Per requirements, this implementation explicitly **excludes**:
 
 - ❌ Visual appearance embeddings
 - ❌ DeepSORT / ByteTrack
-- ❌ IoU-based matching
 - ❌ Re-identification networks
 - ❌ Frame-based counting logic
 - ❌ Additional YOLO models
+- ❌ Exit boundary-based commitment (removed for simplicity)
 
 ---
 
@@ -395,7 +444,8 @@ Per requirements, this implementation explicitly **excludes**:
 This event-centric tracking system achieves robust counting in challenging human-operated environments by:
 
 1. **Treating events, not objects** - An Event survives what destroys traditional tracks
-2. **Using centroid distance, not IoU** - Rotation-invariant association
+2. **Using multi-criteria association** - Centroid distance + IoU for robustness
 3. **Using milliseconds, not frames** - Deterministic timing
-4. **Counting at exit, not closure** - Ensures bag has left scene
-5. **Providing full explainability** - Every decision is logged for debugging
+4. **Timeout-based commitment** - Count after idle timeout, not at boundary
+5. **Anti-double-counting** - Suppression of new events near recent commits
+6. **Providing full explainability** - Every decision is logged for debugging

@@ -41,7 +41,10 @@ class EventState(Enum):
         OPEN -> CLOSING (when closed detections start)
         CLOSING -> OPEN (if open detections resume)
         CLOSING -> CLOSED (temporal stability reached)
-        CLOSED -> COMMITTED (after exit timeout with no detections)
+        CLOSED -> COMMITTED (after timeout with no detections - timeout-based only)
+    
+    NOTE: Commitment is based exclusively on timeout (idle time without detection).
+    Exit boundary logic has been removed to simplify and improve robustness.
     """
     OPEN = auto()       # Bag is open, being manipulated
     CLOSING = auto()    # Transitioning to closed state
@@ -64,8 +67,14 @@ class EventConfig:
       Typical: 200-500ms for human manipulation speed
     - G (ghost_timeout_ms): How long to keep event alive without detections.
       Should cover typical hand occlusion duration: 500-1500ms
-    - exit_timeout_ms: Time after CLOSED before COMMIT.
-      Should ensure bag has left scene: 500-1000ms
+    
+    COMMITMENT MODEL (Timeout-Based Only):
+    - Commitment is based exclusively on timeout (idle time without detection).
+    - After an event enters the CLOSED state, it is committed if undetected for
+      the configured idle timeout (commit_idle_frames frames or ghost_timeout_ms).
+    - Exit boundary logic has been removed to simplify and improve robustness.
+    - Anti-double-counting is achieved through suppression of new events near
+      recently committed events for a configurable duration.
     """
     
     # ==========================================================================
@@ -84,6 +93,14 @@ class EventConfig:
     association_time_ms: float = 400.0      # T: Max time gap for association
     
     # ==========================================================================
+    # IoU-Based Association (complementary to centroid distance)
+    # ==========================================================================
+    # IoU provides robustness when centroid distance alone may fail (e.g., during
+    # partial occlusion where box overlaps but centroid shifts significantly)
+    iou_association_enabled: bool = True    # Enable IoU as additional association criterion
+    iou_association_threshold: float = 0.3  # Min IoU to associate (if centroid fails)
+    
+    # ==========================================================================
     # Velocity-Based Association (for fast movements during flip/throw)
     # ==========================================================================
     velocity_scaling_enabled: bool = True   # Enable velocity-based distance scaling
@@ -98,17 +115,20 @@ class EventConfig:
     ghost_timeout_ms: float = 1000.0  # G: Keep event alive without detections
     
     # ==========================================================================
-    # Exit and Counting Parameters
+    # Timeout-Based Commitment Parameters (Exclusive Method)
     # ==========================================================================
-    exit_timeout_ms: float = 800.0    # Time after CLOSED before COMMIT
-    exit_boundary_margin_px: int = 50  # Margin from frame edge for exit detection
+    # NOTE: Exit boundary logic has been removed. Commitment is now based
+    # exclusively on timeout (idle time without detection).
+    commit_idle_frames: int = 25           # Frames without detection before commit
+    commit_min_closed_ratio: float = 0.3   # Min ratio of closed/total evidence for commit
     
     # ==========================================================================
-    # Center-of-Frame Counting (for scenarios where bags don't exit to edge)
+    # Anti-Double-Counting Suppression Parameters
     # ==========================================================================
-    allow_center_commit: bool = True       # Allow counting bags that don't exit to edge
-    center_commit_idle_frames: int = 25    # Frames without detection before center commit
-    center_commit_min_closed_ratio: float = 0.3  # Min ratio of closed/total evidence
+    # These parameters prevent new events from being created for a bag that was
+    # temporarily lost then re-detected after commitment.
+    suppression_distance_px: float = 150.0   # Distance within which new events are suppressed
+    suppression_duration_ms: float = 1000.0  # Duration to suppress new events after commit
     
     # ==========================================================================
     # State Transition Parameters (temporal stability)
@@ -200,11 +220,14 @@ class BreadBagEvent:
     State Machine:
         OPEN -> CLOSING -> CLOSED -> COMMITTED
         
-    Counting Rule:
+    Counting Rule (Timeout-Based Only):
         Event is counted ONLY when:
         1. State == CLOSED
-        2. No detections for exit_timeout_ms
-        3. Last centroid near scene exit boundary
+        2. No detections for commit_idle_frames (timeout-based commitment)
+        3. Minimum closed evidence ratio is met
+        
+    NOTE: Exit boundary logic has been removed. Commitment relies exclusively
+    on timeout-based logic to ensure robustness and simplicity.
     """
     
     def __init__(self, 
@@ -378,12 +401,53 @@ class BreadBagEvent:
         
         return (pred_x, pred_y)
     
+    def _compute_iou(self, box1: Tuple[float, float, float, float], 
+                     box2: Tuple[float, float, float, float]) -> float:
+        """
+        Compute Intersection over Union (IoU) between two bounding boxes.
+        
+        Args:
+            box1: First box (x1, y1, x2, y2)
+            box2: Second box (x1, y1, x2, y2)
+            
+        Returns:
+            IoU value between 0.0 and 1.0
+        """
+        # Compute intersection
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+        # Check if there is an intersection
+        if x2_inter <= x1_inter or y2_inter <= y1_inter:
+            return 0.0
+        
+        inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+        
+        # Compute areas of both boxes
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        # Compute union
+        union_area = area1 + area2 - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
     def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str]:
         """
         Check if a detection can be associated with this event.
         
-        Uses centroid distance and time gap - NO IoU or appearance features.
-        Supports velocity-based scaling for fast movements.
+        Uses multiple association criteria for robustness:
+        1. Centroid distance (primary) - with velocity-based scaling
+        2. IoU (complementary) - helps during partial occlusion
+        
+        A detection can associate if EITHER:
+        - Centroid distance is within threshold, OR
+        - IoU is above threshold (when enabled)
         
         Args:
             detection: Detection to check
@@ -440,11 +504,27 @@ class BreadBagEvent:
         else:
             distance = distance_to_last
         
-        # Check distance threshold
-        if distance > scaled_threshold:
-            return False, distance, f"distance_exceeded ({distance:.1f} > {scaled_threshold:.1f})"
+        # Check centroid distance threshold (primary criterion)
+        centroid_match = distance <= scaled_threshold
         
-        return True, distance, "associated"
+        # If centroid matches, return early (common case optimization)
+        if centroid_match:
+            return True, distance, f"centroid_match (dist={distance:.1f}px)"
+        
+        # Centroid distance failed - check IoU (complementary criterion)
+        # Only compute IoU when centroid distance fails to save computation
+        if self.config.iou_association_enabled and self.last_box is not None:
+            iou_value = self._compute_iou(self.last_box, detection.box)
+            if iou_value >= self.config.iou_association_threshold:
+                return True, distance, f"iou_match (iou={iou_value:.2f}, dist={distance:.1f}px)"
+            else:
+                # Neither criterion met - include IoU in reason
+                reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f}, iou={iou_value:.2f} < {self.config.iou_association_threshold})"
+                return False, distance, reason
+        else:
+            # IoU disabled or no last box - centroid failed
+            reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f})"
+            return False, distance, reason
     
     def add_detection(self, detection: DetectionEvidence, frame_img: Optional[np.ndarray] = None):
         """
@@ -650,9 +730,14 @@ class BreadBagEvent:
         """
         Update event when no detection is present (ghost state).
         
+        Commitment Logic (Timeout-Based Only):
+        - After entering CLOSED state, commit if undetected for commit_idle_frames
+        - Requires minimum closed evidence ratio to be met
+        - No exit boundary check - commitment is purely timeout-based
+        
         Args:
             current_time_ms: Current timestamp in milliseconds
-            frame_size: (width, height) of frame for exit boundary check
+            frame_size: (width, height) of frame (kept for API compatibility)
             current_frame_index: Current frame index for idle tracking
             
         Returns:
@@ -672,37 +757,35 @@ class BreadBagEvent:
         # Check if ghost timeout exceeded
         if time_since_detection_ms > self.config.ghost_timeout_ms:
             if self.state == EventState.CLOSED:
-                # Check if near exit boundary
-                if self._is_near_exit_boundary(frame_size):
-                    self._transition_to(EventState.COMMITTED, current_time_ms,
-                                        f"exit_near_boundary ({time_since_detection_ms:.0f}ms)")
-                    self.commit_reason = "exit_boundary"
-                    return True
+                # Timeout-based commitment: check if enough frames have passed without detection
+                if self.frames_without_detection >= self.config.commit_idle_frames:
+                    # Verify we have sufficient closed evidence
+                    total_evidence = self.open_evidence_count + self.closed_evidence_count
+                    if total_evidence > 0:
+                        closed_ratio = self.closed_evidence_count / total_evidence
+                        if closed_ratio >= self.config.commit_min_closed_ratio:
+                            self._transition_to(EventState.COMMITTED, current_time_ms,
+                                                f"timeout_commit (idle={self.frames_without_detection} frames, "
+                                                f"closed_ratio={closed_ratio:.2f})")
+                            self.commit_reason = "timeout_commit"
+                            logger.info(
+                                f"[Event:{self.id}] Timeout commit: bag counted after idle timeout "
+                                f"(idle={self.frames_without_detection} frames, centroid={self.last_centroid})"
+                            )
+                            return True
+                        else:
+                            # Not enough closed evidence - don't commit
+                            logger.debug(
+                                f"[Event:{self.id}] CLOSED but insufficient closed ratio "
+                                f"({closed_ratio:.2f} < {self.config.commit_min_closed_ratio})"
+                            )
+                            return False
                 
-                # Check for center commit (bags that don't exit to edge)
-                if self.config.allow_center_commit:
-                    # Check if enough frames have passed without detection
-                    if self.frames_without_detection >= self.config.center_commit_idle_frames:
-                        # Also verify we have sufficient closed evidence
-                        total_evidence = self.open_evidence_count + self.closed_evidence_count
-                        if total_evidence > 0:
-                            closed_ratio = self.closed_evidence_count / total_evidence
-                            if closed_ratio >= self.config.center_commit_min_closed_ratio:
-                                self._transition_to(EventState.COMMITTED, current_time_ms,
-                                                    f"center_commit (idle={self.frames_without_detection} frames, "
-                                                    f"closed_ratio={closed_ratio:.2f})")
-                                self.commit_reason = "center_commit"
-                                logger.info(
-                                    f"[Event:{self.id}] Center commit: bag counted without exiting to boundary "
-                                    f"(idle={self.frames_without_detection} frames, centroid={self.last_centroid})"
-                                )
-                                return True
-                
-                # Bag is still in scene center and not enough idle time
+                # Not enough idle time yet
                 logger.debug(
-                    f"[Event:{self.id}] CLOSED but not near exit boundary - waiting "
-                    f"(centroid={self.last_centroid}, frame_size={frame_size}, "
-                    f"idle_frames={self.frames_without_detection})"
+                    f"[Event:{self.id}] CLOSED but waiting for timeout "
+                    f"(idle_frames={self.frames_without_detection}, "
+                    f"required={self.config.commit_idle_frames})"
                 )
                 return False
             else:
@@ -714,28 +797,6 @@ class BreadBagEvent:
                 return False  # Don't commit, just expire
         
         return False
-    
-    def _is_near_exit_boundary(self, frame_size: Tuple[int, int]) -> bool:
-        """
-        Check if last centroid is near frame exit boundary.
-        
-        Args:
-            frame_size: (width, height) of frame
-            
-        Returns:
-            True if centroid is within margin of frame boundary
-        """
-        width, height = frame_size
-        margin = self.config.exit_boundary_margin_px
-        cx, cy = self.last_centroid
-        
-        # Check if near any edge
-        near_left = cx < margin
-        near_right = cx > (width - margin)
-        near_top = cy < margin
-        near_bottom = cy > (height - margin)
-        
-        return near_left or near_right or near_top or near_bottom
     
     def get_roi_candidates(self) -> List[Dict[str, Any]]:
         """
@@ -800,7 +861,12 @@ class EventCentricTracker:
     1. Events, not tracks - An Event represents a physical bag operation
     2. Centroid-based association - No IoU or appearance features
     3. Millisecond-based timing - Not frame counts
-    4. Exit-based counting - Count when bag leaves, not when it closes
+    4. Timeout-based counting - Count after idle timeout, not at boundary
+    
+    Anti-Double-Counting:
+    - Suppresses new event creation near recently committed events
+    - Uses configurable suppression distance and duration
+    - Ensures each physical bag is counted exactly once
     
     Usage:
         tracker = EventCentricTracker(config, open_id=1, closed_id=0)
@@ -835,9 +901,8 @@ class EventCentricTracker:
         # Active events
         self.active_events: Dict[int, BreadBagEvent] = {}
         
-        # Recently committed events (for suppression)
+        # Recently committed events (for anti-double-counting suppression)
         self.recently_committed: List[Dict[str, Any]] = []
-        self.commit_suppression_time_ms: float = 500.0  # Suppress new events near recent commits
         
         # Statistics
         self.stats = {
@@ -853,7 +918,9 @@ class EventCentricTracker:
             f"D={self.config.association_distance_px}px, "
             f"T={self.config.association_time_ms}ms, "
             f"G={self.config.ghost_timeout_ms}ms, "
-            f"exit_timeout={self.config.exit_timeout_ms}ms"
+            f"commit_idle_frames={self.config.commit_idle_frames}, "
+            f"suppression_distance={self.config.suppression_distance_px}px, "
+            f"suppression_duration={self.config.suppression_duration_ms}ms"
         )
     
     def update(self, 
@@ -879,10 +946,10 @@ class EventCentricTracker:
         ready_events = []
         frame_size = (frame_img.shape[1], frame_img.shape[0])
         
-        # Clean up old recently_committed entries
+        # Clean up old recently_committed entries based on suppression duration
         self.recently_committed = [
             rc for rc in self.recently_committed
-            if timestamp_ms - rc['timestamp_ms'] < self.commit_suppression_time_ms
+            if timestamp_ms - rc['timestamp_ms'] < self.config.suppression_duration_ms
         ]
         
         # Convert detections to evidence
@@ -1028,18 +1095,28 @@ class EventCentricTracker:
         """
         Check if new event should be suppressed.
         
-        Prevents duplicate events near recently committed ones.
+        Anti-Double-Counting:
+        Prevents new events from being created for a bag that was temporarily
+        lost then re-detected after commitment. This ensures each physical bag
+        is counted exactly once.
+        
+        Args:
+            evidence: Detection evidence for potential new event
+            
+        Returns:
+            True if event should be suppressed, False otherwise
         """
         for rc in self.recently_committed:
             dx = evidence.centroid_x - rc['centroid'][0]
             dy = evidence.centroid_y - rc['centroid'][1]
             distance = math.sqrt(dx*dx + dy*dy)
             
-            if distance < self.config.association_distance_px:
+            # Use configurable suppression distance for anti-double-counting
+            if distance < self.config.suppression_distance_px:
                 logger.debug(
                     f"[EventCentricTracker] Suppressing new event: "
                     f"too close to recently committed {rc['event_id']} "
-                    f"(distance={distance:.1f}px)"
+                    f"(distance={distance:.1f}px < suppression_threshold={self.config.suppression_distance_px}px)"
                 )
                 return True
         
