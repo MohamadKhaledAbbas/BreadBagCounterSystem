@@ -347,16 +347,28 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
-    # IoU-Based Association (complementary to centroid distance)
+    # IoU-Based Association (parallel hybrid with centroid distance)
     # --------------------------------------------------------------------------
+    # PARALLEL HYBRID ASSOCIATION: Both centroid distance AND IoU are ALWAYS
+    # computed for every association attempt. A detection associates if EITHER
+    # criterion is met. This provides robustness during:
+    # - Bag flips/spins: centroid may jump but IoU remains high
+    # - Fast slides: IoU may drop but centroid distance stays close
+    # - Partial occlusions: one metric may fail while the other succeeds
     
     iou_association_enabled: bool = True
     """
-    Enable IoU as an additional association criterion.
+    Enable IoU as a parallel association criterion.
     
     When True: Detection can associate if IoU is high enough, even if centroid
-               distance exceeds threshold (useful during partial occlusion)
-    When False: Only centroid distance is used for association
+               distance exceeds threshold. Both metrics are ALWAYS computed and
+               logged regardless of this setting (for debugging).
+    When False: Only centroid distance is used for the match decision, but IoU
+                is still computed and logged for debugging purposes.
+    
+    Typical use cases when IoU rescues association:
+    - Bag flip/spin: centroid jumps but boxes still overlap
+    - Partial occlusion: centroid shifts but most of box still visible
     
     Default: True
     """
@@ -366,11 +378,17 @@ class TrackingConfig:
     Minimum IoU value to associate a detection with an event.
     
     Range: 0.2 - 0.5
-    - Lower values: More lenient IoU matching
-    - Higher values: Stricter IoU matching, requires more overlap
+    - Lower values (0.2): More lenient IoU matching, catches more flip scenarios
+    - Higher values (0.5): Stricter IoU matching, reduces false associations
     
-    This provides robustness when centroid distance alone may fail (e.g., during
-    partial occlusion where box overlaps but centroid shifts significantly).
+    This threshold is checked in parallel with centroid distance. Association
+    succeeds if EITHER (centroid_distance <= threshold) OR (IoU >= this threshold).
+    
+    Tuning guidelines:
+    - For flip-heavy scenarios: Use 0.25-0.3
+    - For more stable tracking: Use 0.35-0.45
+    - Values below 0.2 may cause false associations
+    - Values above 0.5 may miss legitimate flip associations
     
     Default: 0.3
     """

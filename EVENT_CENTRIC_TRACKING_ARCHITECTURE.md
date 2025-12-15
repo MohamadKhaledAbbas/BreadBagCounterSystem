@@ -170,25 +170,56 @@ new events near recently committed locations.
 
 ## Event Association Rules
 
-### Multi-Criteria Association (Centroid + IoU)
+### Parallel Hybrid Association (Centroid + IoU)
 
-Association uses multiple criteria for robustness:
-1. **Centroid distance** (primary) - with velocity-based scaling for fast movements
-2. **IoU** (complementary) - helps during partial occlusion when centroids shift
+Association uses **parallel hybrid** evaluation where both metrics are ALWAYS computed:
+
+1. **Centroid distance** - with velocity-based scaling for fast movements
+2. **IoU (Intersection over Union)** - for robustness during flips/spins
+
+**Key Design Choice:** Both metrics are computed for every association attempt, regardless of 
+whether one criterion already passes. This provides:
+- **Robustness during flips/spins**: Centroid may jump but IoU remains high
+- **Robustness during fast slides**: IoU may drop but centroid stays close  
+- **Detailed debugging**: All metrics logged for every association attempt
 
 A detection associates if EITHER criterion is met:
 
 ```python
-# D: Max distance in pixels
+# Compute BOTH metrics in parallel
 distance = sqrt((det_centroid_x - event_centroid_x)^2 + 
                 (det_centroid_y - event_centroid_y)^2)
+iou_value = compute_iou(event.last_box, detection.box)
 
-# T: Max time gap in milliseconds
-time_gap = detection_timestamp_ms - event.last_detection_time_ms
+# Check time gap (fails both if exceeded)
+if time_gap > T:
+    reject with reason "time_gap_exceeded" (still logs both metrics)
+    return False
 
-if distance < D and time_gap < T:
-    associate detection to event
+# Check both criteria
+centroid_match = distance <= D (velocity-scaled)
+iou_match = iou_value >= IoU_threshold
+
+# Associate if EITHER matches
+if centroid_match and iou_match:
+    return True, "both_match"
+elif centroid_match:
+    return True, "centroid_match"  # Typical for fast slides
+elif iou_match:
+    return True, "iou_match"       # Typical for flips/spins
+else:
+    return False, "no_match"
 ```
+
+### Association Result Types
+
+| Result Type | Centroid | IoU | Typical Scenario |
+|-------------|----------|-----|------------------|
+| `both_match` | ✓ | ✓ | Normal small movement |
+| `centroid_match` | ✓ | ✗ | Fast slide, box shape change |
+| `iou_match` | ✗ | ✓ | Flip/spin, centroid jumps |
+| `no_match` | ✗ | ✗ | Different detection, false match |
+| `time_exceeded` | N/A | N/A | Detection too late |
 
 ### Ghost Event Handling
 
@@ -444,8 +475,26 @@ Per requirements, this implementation explicitly **excludes**:
 This event-centric tracking system achieves robust counting in challenging human-operated environments by:
 
 1. **Treating events, not objects** - An Event survives what destroys traditional tracks
-2. **Using multi-criteria association** - Centroid distance + IoU for robustness
+2. **Using parallel hybrid association** - Both centroid distance AND IoU computed for every attempt
 3. **Using milliseconds, not frames** - Deterministic timing
 4. **Timeout-based commitment** - Count after idle timeout, not at boundary
 5. **Anti-double-counting** - Suppression of new events near recent commits
-6. **Providing full explainability** - Every decision is logged for debugging
+6. **Providing full explainability** - Every decision is logged with both metrics for debugging
+
+### Parallel Hybrid Association Benefits
+
+The parallel hybrid approach provides significant robustness improvements:
+
+| Scenario | Centroid Only | Hybrid Approach |
+|----------|---------------|-----------------|
+| Bag flip/spin | ❌ Fails (centroid jumps) | ✅ IoU rescues |
+| Fast slide | ✅ Works | ✅ Works (both metrics) |
+| Partial occlusion | ⚠️ May fail | ✅ IoU handles overlap |
+| Normal movement | ✅ Works | ✅ Both metrics match |
+
+Every association attempt logs:
+- Centroid distance and threshold
+- IoU value and threshold  
+- Time gap
+- Which metric(s) matched
+- Detection and event centroids

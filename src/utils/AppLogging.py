@@ -576,6 +576,59 @@ class StructuredLogger:
             **kwargs
         )
     
+    def hybrid_association_attempt(self, event_id: int, detection_centroid: tuple,
+                                   event_centroid: tuple, distance_px: float,
+                                   distance_threshold: float, iou_value: float,
+                                   iou_threshold: float, time_gap_ms: float,
+                                   centroid_match: bool, iou_match: bool,
+                                   associated: bool, match_type: str, **kwargs):
+        """
+        Log parallel hybrid association attempts with detailed metrics.
+        
+        This logs every association attempt with both centroid distance and IoU values,
+        regardless of whether the association succeeded or failed. This is crucial for
+        debugging flip/spin scenarios where centroid distance fails but IoU succeeds.
+        
+        Args:
+            event_id: Event ID being matched against
+            detection_centroid: (x, y) of detection centroid
+            event_centroid: (x, y) of event's last known centroid
+            distance_px: Computed centroid distance in pixels
+            distance_threshold: Active distance threshold (may be velocity-scaled)
+            iou_value: Computed IoU value (0.0-1.0)
+            iou_threshold: Configured IoU threshold
+            time_gap_ms: Time gap between detection and last event update
+            centroid_match: True if centroid criterion was met
+            iou_match: True if IoU criterion was met
+            associated: True if detection was associated with event
+            match_type: One of 'both_match', 'centroid_match', 'iou_match', 'no_match', 'time_exceeded'
+        """
+        status = "SUCCESS" if associated else "REJECTED"
+        msg = (
+            f"[HYBRID_ASSOCIATION] event={event_id}, {status} ({match_type}) | "
+            f"dist={distance_px:.1f}px (thresh={distance_threshold:.1f}px, match={centroid_match}), "
+            f"iou={iou_value:.2f} (thresh={iou_threshold}, match={iou_match}), "
+            f"gap={time_gap_ms:.0f}ms"
+        )
+        self._log_structured(
+            logging.DEBUG,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            detection_centroid=detection_centroid,
+            event_centroid=event_centroid,
+            distance_px=distance_px,
+            distance_threshold=distance_threshold,
+            iou_value=iou_value,
+            iou_threshold=iou_threshold,
+            time_gap_ms=time_gap_ms,
+            centroid_match=centroid_match,
+            iou_match=iou_match,
+            associated=associated,
+            match_type=match_type,
+            **kwargs
+        )
+    
     def ghost_state_update(self, event_id: int, time_since_detection_ms: float,
                           state: str, near_exit: bool = False, **kwargs):
         """Log ghost state updates for detection gap analysis."""

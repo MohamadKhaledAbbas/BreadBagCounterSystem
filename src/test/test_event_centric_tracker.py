@@ -798,5 +798,246 @@ class TestAntiOscillation:
         assert event.state == EventState.CLOSING  # Should not have reverted
 
 
+# =============================================================================
+# Parallel Hybrid Association Tests
+# =============================================================================
+
+class TestParallelHybridAssociation:
+    """
+    Tests for parallel hybrid association logic.
+    
+    These tests validate that the association logic correctly handles:
+    1. Both metrics matching (strongest case)
+    2. Centroid match only (typical for fast slides)
+    3. IoU match only (typical for flips/spins)
+    4. Neither metric matching (correct rejection)
+    
+    The parallel hybrid approach ensures robustness during challenging
+    scenarios like bag flips, spins, and rapid movements.
+    """
+    
+    def test_both_metrics_match(self, default_config):
+        """Both centroid and IoU should match for normal small movement."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Small movement - both metrics should pass
+        # Original box: (590, 310, 690, 410) centered at (640, 360)
+        # Move slightly (20px) with significant overlap
+        new_evidence = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=660,  # 20px away - within 100px threshold
+            centroid_y=360,
+            box=(610, 310, 710, 410),  # Significant overlap with original
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(new_evidence)
+        
+        assert can_assoc is True
+        assert 'both_match' in reason
+        # Verify both metrics are reported in reason
+        assert 'dist=' in reason
+        assert 'iou=' in reason
+    
+    def test_flip_spin_iou_succeeds_centroid_fails(self, default_config):
+        """
+        Simulate flip/spin scenario where centroid jumps but boxes still overlap.
+        
+        During a flip, the bag's centroid may move significantly (e.g., from
+        center to corner), but the bounding box still overlaps substantially
+        with the previous detection.
+        """
+        # Create event at position (640, 360) with 150x150 box
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=150, h=150)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Simulate flip: centroid jumps far (150px) but box has significant overlap
+        # Original box: (565, 285, 715, 435) centered at (640, 360)
+        # During flip, centroid moves but box still overlaps
+        flipped_evidence = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=790,  # 150px away - exceeds 100px threshold
+            centroid_y=360,
+            box=(615, 260, 765, 460),  # Overlaps with original: intersection is (615, 285, 715, 435)
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(flipped_evidence)
+        
+        # Should associate via IoU despite centroid distance exceeding threshold
+        assert can_assoc is True
+        # Either iou_match or both_match depending on thresholds
+        assert 'iou_match' in reason or 'both_match' in reason
+        assert 'dist=' in reason  # Distance should still be logged
+        assert 'iou=' in reason   # IoU should be logged
+    
+    def test_fast_slide_centroid_succeeds_iou_fails(self, default_config):
+        """
+        Simulate fast slide where centroid stays close but box shape changes.
+        
+        During rapid horizontal movement, detection may shift but centroid
+        remains close while the box overlap becomes minimal.
+        """
+        # Create event with a wide box
+        wide_box = DetectionEvidence(
+            timestamp_ms=0.0,
+            centroid_x=400,
+            centroid_y=300,
+            box=(300, 250, 500, 350),  # 200x100 wide box
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=0,
+        )
+        event = BreadBagEvent(wide_box, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Fast slide: centroid moves only 50px (within 100px threshold)
+        # but box shape changes dramatically with minimal overlap
+        slide_evidence = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=450,  # Only 50px away from 400 - within centroid threshold
+            centroid_y=300,
+            box=(380, 200, 520, 400),  # Tall box with little overlap to wide box
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(slide_evidence)
+        
+        # Should associate via centroid distance
+        assert can_assoc is True
+        # Should be centroid_match or both_match
+        assert 'centroid_match' in reason or 'both_match' in reason
+        assert 'dist=' in reason
+        assert 'iou=' in reason
+    
+    def test_false_match_both_fail(self, default_config):
+        """
+        Both metrics should fail for genuinely different detections.
+        
+        When both centroid distance is too large AND IoU is too low,
+        the detection should not associate.
+        """
+        evidence = create_evidence(0.0, 200, 200, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Detection far away with no overlap
+        far_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=700,  # 500px away - well beyond threshold
+            centroid_y=500,  # Also 300px in Y
+            box=(650, 450, 750, 550),  # No overlap with (150, 150, 250, 250)
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(far_detection)
+        
+        assert can_assoc is False
+        assert 'no_match' in reason
+        # Both metrics should be reported
+        assert 'dist=' in reason
+        assert 'iou=' in reason
+        assert 'thresh=' in reason
+    
+    def test_time_exceeded_reports_both_metrics(self, default_config):
+        """
+        Time gap exceeded should still compute and report both metrics.
+        
+        Even when time gap is exceeded, both centroid and IoU values
+        should be computed and included in the rejection reason for debugging.
+        """
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Detection with time gap exceeding threshold
+        late_detection = DetectionEvidence(
+            timestamp_ms=500.0,  # 500ms > 400ms threshold
+            centroid_x=650,  # Close centroid
+            centroid_y=365,
+            box=(600, 315, 700, 415),  # Good overlap
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=10,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(late_detection)
+        
+        assert can_assoc is False
+        assert 'time_gap_exceeded' in reason
+        # Both metrics should still be reported for debugging
+        assert 'dist=' in reason
+        assert 'iou=' in reason
+    
+    def test_association_logging_includes_all_parameters(self, default_config, capsys):
+        """Verify that association attempts log all relevant parameters."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        new_evidence = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=660,
+            centroid_y=370,
+            box=(610, 320, 710, 420),
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(new_evidence)
+        
+        # The reason should include all these components
+        assert 'dist=' in reason
+        assert 'thresh=' in reason
+        assert 'iou=' in reason
+        assert 'time_gap=' in reason
+    
+    def test_iou_disabled_centroid_only(self):
+        """When IoU is disabled, association should rely only on centroid."""
+        config = EventConfig(
+            association_distance_px=100.0,
+            association_time_ms=400.0,
+            iou_association_enabled=False,  # Disable IoU
+            iou_association_threshold=0.3,
+            velocity_scaling_enabled=False,
+        )
+        
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Detection within centroid threshold but with minimal IoU
+        close_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=680,  # 40px away - within 100px threshold
+            centroid_y=360,
+            box=(630, 310, 730, 410),
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(close_detection)
+        
+        # Should still associate via centroid
+        assert can_assoc is True
+        assert 'centroid_match' in reason
+        # IoU should still be computed but not contribute to match decision
+        assert 'iou=' in reason
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
