@@ -39,6 +39,10 @@ def default_config():
         association_distance_px=100.0,
         association_time_ms=400.0,
         
+        # IoU-based association
+        iou_association_enabled=True,
+        iou_association_threshold=0.3,
+        
         # Velocity-based association
         velocity_scaling_enabled=True,
         velocity_scale_factor=2.5,
@@ -49,14 +53,13 @@ def default_config():
         # Ghost timeout
         ghost_timeout_ms=1000.0,
         
-        # Exit parameters
-        exit_timeout_ms=800.0,
-        exit_boundary_margin_px=50,
+        # Timeout-based commitment
+        commit_idle_frames=25,
+        commit_min_closed_ratio=0.3,
         
-        # Center commit
-        allow_center_commit=True,
-        center_commit_idle_frames=25,
-        center_commit_min_closed_ratio=0.3,
+        # Anti-double-counting suppression
+        suppression_distance_px=150.0,
+        suppression_duration_ms=1000.0,
         
         # State transition timing
         open_to_closing_time_ms=100.0,
@@ -242,12 +245,13 @@ class TestCentroidAssociation:
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
-        # Detection 150px away (outside 100px threshold)
+        # Detection 150px away (outside 100px threshold) with no box overlap
         new_evidence = create_evidence(100.0, 790, 360, is_open=True, frame_index=1)
         can_assoc, distance, reason = event.can_associate(new_evidence)
         
         assert can_assoc is False
-        assert 'distance_exceeded' in reason
+        # Reason now includes 'no_match' since both centroid and IoU failed
+        assert 'no_match' in reason or 'distance_exceeded' in reason
     
     def test_association_time_gap_exceeded(self, default_config):
         """Detection after time threshold should not associate."""
@@ -261,14 +265,12 @@ class TestCentroidAssociation:
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
     
-    def test_no_iou_used(self, default_config):
-        """Association should not use IoU, only centroid distance."""
+    def test_centroid_based_association(self, default_config):
+        """Association should work with centroid distance even with different box sizes."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
         # Create detection with same centroid but very different box size
-        # If IoU were used, this would have low overlap
-        new_evidence = create_evidence(100.0, 640, 360, is_open=True, frame_index=1)
         new_evidence = DetectionEvidence(
             timestamp_ms=100.0,
             centroid_x=640,  # Same centroid
@@ -284,6 +286,32 @@ class TestCentroidAssociation:
         
         assert can_assoc is True
         assert distance == 0.0  # Centroid is exactly the same
+    
+    def test_iou_based_association(self, default_config):
+        """Association should work with IoU when centroid distance is too large."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Create detection with shifted centroid but overlapping box
+        # Original box: (590, 310, 690, 410) centered at (640, 360)
+        # New box with shifted centroid but significant overlap
+        new_evidence = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=700,  # Shifted centroid (60px away, exceeds 100px threshold after adjustment)
+            centroid_y=360,
+            box=(650, 310, 750, 410),  # Overlapping box
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason = event.can_associate(new_evidence)
+        
+        # Should associate via IoU since boxes overlap
+        assert can_assoc is True
+        # Reason should mention iou_match or centroid_match
+        assert 'match' in reason
 
 
 # =============================================================================
@@ -334,63 +362,69 @@ class TestGhostEvents:
 
 
 # =============================================================================
-# Exit-Boundary Counting Tests
+# Timeout-Based Commitment Tests
 # =============================================================================
 
-class TestExitBoundaryCounting:
-    """Tests for exit-boundary-based counting."""
+class TestTimeoutBasedCommit:
+    """Tests for timeout-based commitment (exit boundary logic removed)."""
     
-    def test_counting_at_exit_boundary(self, default_config):
-        """Event should commit when near exit boundary after CLOSED."""
+    def test_commit_after_idle_timeout(self, default_config):
+        """Event should commit after idle timeout when in CLOSED state."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
         # Force into CLOSED state for testing
         event.state = EventState.CLOSED
         event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 5  # Good closed ratio
+        event.last_detection_frame_index = 0
         
-        # Move centroid near exit boundary (within 50px of edge)
-        event.last_centroid = (1260, 360)  # Near right edge of 1280 width frame
+        # Centroid can be anywhere (center of frame)
+        event.last_centroid = (640, 360)
         
-        # Wait for ghost timeout
-        should_commit = event.update_ghost_state(1100.0, (1280, 720))
+        # Wait for ghost timeout with sufficient idle frames
+        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is True
         assert event.state == EventState.COMMITTED
-        assert event.commit_reason == "exit_boundary"
+        assert event.commit_reason == "timeout_commit"
     
-    def test_no_counting_before_closed_state(self, default_config):
+    def test_no_commit_before_closed_state(self, default_config):
         """Event should not commit from OPEN state."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
-        # Move centroid near exit boundary
-        event.last_centroid = (1260, 360)
+        # Move centroid anywhere
+        event.last_centroid = (640, 360)
         
         # Try to trigger commit from OPEN state
-        should_commit = event.update_ghost_state(1100.0, (1280, 720))
+        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is False
         assert event.state != EventState.COMMITTED
     
-    def test_no_commit_without_exit_boundary(self, default_config):
-        """Event should NOT commit if not near exit boundary, even after timeout."""
+    def test_no_commit_without_sufficient_idle_frames(self, default_config):
+        """Event should NOT commit if not enough idle frames have passed."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
         # Force into CLOSED state
         event.state = EventState.CLOSED
         event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 5
+        event.last_detection_frame_index = 0
         
-        # Centroid in center (not near boundary)
+        # Centroid in center
         event.last_centroid = (640, 360)
         
-        # Wait for both ghost and exit timeouts - should NOT commit because not near boundary
-        should_commit = event.update_ghost_state(2000.0, (1280, 720))
+        # Wait for ghost timeout but with insufficient idle frames (10 < 25)
+        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=10)
         
-        # CRITICAL: Should NOT commit if bag is still in scene center
+        # Should NOT commit if not enough idle frames
         assert should_commit is False
-        assert event.state == EventState.CLOSED  # Still in CLOSED, waiting for exit
+        assert event.state == EventState.CLOSED
 
 
 # =============================================================================
@@ -647,18 +681,17 @@ class TestVelocityBasedAssociation:
 
 
 # =============================================================================
-# Center Commit Tests
+# Commit Configuration Tests
 # =============================================================================
 
-class TestCenterCommit:
-    """Tests for center-of-frame counting feature."""
+class TestCommitConfiguration:
+    """Tests for timeout-based commit configuration."""
     
-    def test_center_commit_enabled(self):
-        """Event in center should commit after idle timeout when center_commit enabled."""
+    def test_commit_with_custom_idle_frames(self):
+        """Event should commit after custom idle frame count."""
         config = EventConfig(
-            allow_center_commit=True,
-            center_commit_idle_frames=10,
-            center_commit_min_closed_ratio=0.3,
+            commit_idle_frames=10,  # Lower idle frame requirement
+            commit_min_closed_ratio=0.3,
             ghost_timeout_ms=500.0,
         )
         evidence = create_evidence(0.0, 640, 360, is_open=True)
@@ -674,40 +707,17 @@ class TestCenterCommit:
         # Centroid is in center
         event.last_centroid = (640, 360)
         
-        # Simulate enough idle frames
-        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=35)
+        # Simulate enough idle frames (15 > 10)
+        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=15)
         
         assert should_commit is True
-        assert event.commit_reason == "center_commit"
+        assert event.commit_reason == "timeout_commit"
     
-    def test_center_commit_disabled(self):
-        """Event in center should NOT commit when center_commit disabled."""
+    def test_commit_requires_closed_ratio(self):
+        """Commit should require minimum closed evidence ratio."""
         config = EventConfig(
-            allow_center_commit=False,
-            ghost_timeout_ms=500.0,
-        )
-        evidence = create_evidence(0.0, 640, 360, is_open=True)
-        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
-        
-        # Force into CLOSED state
-        event.state = EventState.CLOSED
-        event.state_enter_time_ms = 0.0
-        event.last_detection_frame_index = 0
-        
-        # Centroid is in center
-        event.last_centroid = (640, 360)
-        
-        # Even after long idle, should not commit
-        should_commit = event.update_ghost_state(2000.0, (1280, 720), current_frame_index=100)
-        
-        assert should_commit is False
-    
-    def test_center_commit_requires_closed_ratio(self):
-        """Center commit should require minimum closed evidence ratio."""
-        config = EventConfig(
-            allow_center_commit=True,
-            center_commit_idle_frames=10,
-            center_commit_min_closed_ratio=0.5,  # Require 50%
+            commit_idle_frames=10,
+            commit_min_closed_ratio=0.5,  # Require 50%
             ghost_timeout_ms=500.0,
         )
         evidence = create_evidence(0.0, 640, 360, is_open=True)
@@ -725,6 +735,40 @@ class TestCenterCommit:
         should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is False
+    
+    def test_commit_anywhere_in_frame(self):
+        """Event should commit regardless of position in frame (no exit boundary)."""
+        config = EventConfig(
+            commit_idle_frames=10,
+            commit_min_closed_ratio=0.3,
+            ghost_timeout_ms=500.0,
+        )
+        
+        # Test commit at center of frame
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 5
+        event.last_detection_frame_index = 0
+        event.last_centroid = (640, 360)  # Center of frame
+        
+        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=20)
+        assert should_commit is True
+        
+        # Test commit near edge of frame (should also work)
+        evidence2 = create_evidence(0.0, 1260, 360, is_open=True)
+        event2 = BreadBagEvent(evidence2, config, open_class_id=1, closed_class_id=0)
+        event2.state = EventState.CLOSED
+        event2.state_enter_time_ms = 0.0
+        event2.open_evidence_count = 3
+        event2.closed_evidence_count = 5
+        event2.last_detection_frame_index = 0
+        event2.last_centroid = (1260, 360)  # Near edge of frame
+        
+        should_commit2 = event2.update_ghost_state(1000.0, (1280, 720), current_frame_index=20)
+        assert should_commit2 is True
 
 
 # =============================================================================

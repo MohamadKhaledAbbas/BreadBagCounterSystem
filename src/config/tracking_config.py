@@ -347,6 +347,35 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # IoU-Based Association (complementary to centroid distance)
+    # --------------------------------------------------------------------------
+    
+    iou_association_enabled: bool = True
+    """
+    Enable IoU as an additional association criterion.
+    
+    When True: Detection can associate if IoU is high enough, even if centroid
+               distance exceeds threshold (useful during partial occlusion)
+    When False: Only centroid distance is used for association
+    
+    Default: True
+    """
+    
+    iou_association_threshold: float = 0.3
+    """
+    Minimum IoU value to associate a detection with an event.
+    
+    Range: 0.2 - 0.5
+    - Lower values: More lenient IoU matching
+    - Higher values: Stricter IoU matching, requires more overlap
+    
+    This provides robustness when centroid distance alone may fail (e.g., during
+    partial occlusion where box overlaps but centroid shifts significantly).
+    
+    Default: 0.3
+    """
+    
+    # --------------------------------------------------------------------------
     # Velocity-Based Association (robust tracking during fast movements)
     # --------------------------------------------------------------------------
     
@@ -422,52 +451,14 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
-    # Exit and Counting Parameters (CRITICAL for counting rule)
+    # Timeout-Based Commitment Parameters (Exclusive Method)
     # --------------------------------------------------------------------------
+    # NOTE: Commitment is based exclusively on timeout (idle time without detection).
+    # Exit boundary logic has been removed for simplicity and robustness.
     
-    exit_timeout_ms: float = 800.0
+    commit_idle_frames: int = 25
     """
-    Time (milliseconds) after CLOSED state before COMMIT (counting).
-    
-    Range: 500 - 1500
-    - Lower values: Faster counting, risk of premature commit
-    - Higher values: More certain the bag has left, but slower
-    
-    Tuning: Should ensure bag has actually left the scene.
-    
-    Default: 800.0
-    """
-    
-    exit_boundary_margin_px: int = 50
-    """
-    Margin from frame edge to consider "near exit boundary".
-    
-    Range: 30 - 100
-    Centroids within this distance from frame edge trigger exit detection.
-    
-    Default: 50
-    """
-    
-    # --------------------------------------------------------------------------
-    # Center-of-Frame Counting (for scenarios where bags don't exit to edge)
-    # --------------------------------------------------------------------------
-    
-    allow_center_commit: bool = True
-    """
-    Allow counting bags that don't exit to frame edge.
-    
-    When True: Bags in center of frame will be counted after idle timeout
-    When False: Bags must exit to edge to be counted (strict boundary rule)
-    
-    Enable this for scenarios where workers place closed bags on the table
-    rather than moving them off-frame.
-    
-    Default: True
-    """
-    
-    center_commit_idle_frames: int = 25
-    """
-    Number of frames without detection before counting a bag in center of frame.
+    Number of frames without detection before committing (counting) a bag.
     
     Range: 15 - 50
     - Lower values: Faster counting, may count prematurely
@@ -478,14 +469,48 @@ class TrackingConfig:
     Default: 25
     """
     
-    center_commit_min_closed_ratio: float = 0.3
+    commit_min_closed_ratio: float = 0.3
     """
-    Minimum ratio of closed evidence to total evidence for center commit.
+    Minimum ratio of closed evidence to total evidence for commitment.
     
     Range: 0.2 - 0.6
     Ensures the bag actually showed closed state before counting.
     
     Default: 0.3
+    """
+    
+    # --------------------------------------------------------------------------
+    # Anti-Double-Counting Suppression Parameters
+    # --------------------------------------------------------------------------
+    # These parameters prevent new events from being created for a bag that was
+    # temporarily lost then re-detected after commitment.
+    
+    suppression_distance_px: float = 150.0
+    """
+    Distance (pixels) within which new events are suppressed near recent commits.
+    
+    Range: 100 - 250
+    - Lower values: Allow events closer to recent commits
+    - Higher values: More aggressive suppression, prevents double-counting
+    
+    Should be larger than association_distance_px to ensure bags don't get
+    re-counted after brief re-detection.
+    
+    Default: 150.0
+    """
+    
+    suppression_duration_ms: float = 1000.0
+    """
+    Duration (milliseconds) to suppress new events after a commit.
+    
+    Range: 500 - 2000
+    - Lower values: Allow new events sooner after commit
+    - Higher values: Longer suppression window, prevents double-counting
+    
+    Should be long enough that a temporarily lost bag won't be re-detected
+    as a new event.
+    
+    Default: 1000.0
     """
     
     # --------------------------------------------------------------------------
@@ -668,6 +693,10 @@ def get_event_config():
         association_distance_px=tracking_config.association_distance_px,
         association_time_ms=tracking_config.association_time_ms,
         
+        # IoU-based association
+        iou_association_enabled=tracking_config.iou_association_enabled,
+        iou_association_threshold=tracking_config.iou_association_threshold,
+        
         # Velocity-based association
         velocity_scaling_enabled=tracking_config.velocity_scaling_enabled,
         velocity_scale_factor=tracking_config.velocity_scale_factor,
@@ -678,14 +707,13 @@ def get_event_config():
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
         
-        # Exit and counting
-        exit_timeout_ms=tracking_config.exit_timeout_ms,
-        exit_boundary_margin_px=tracking_config.exit_boundary_margin_px,
+        # Timeout-based commitment (exclusive method)
+        commit_idle_frames=tracking_config.commit_idle_frames,
+        commit_min_closed_ratio=tracking_config.commit_min_closed_ratio,
         
-        # Center-of-frame counting
-        allow_center_commit=tracking_config.allow_center_commit,
-        center_commit_idle_frames=tracking_config.center_commit_idle_frames,
-        center_commit_min_closed_ratio=tracking_config.center_commit_min_closed_ratio,
+        # Anti-double-counting suppression
+        suppression_distance_px=tracking_config.suppression_distance_px,
+        suppression_duration_ms=tracking_config.suppression_duration_ms,
         
         # State transition timing
         open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,
