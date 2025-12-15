@@ -177,7 +177,7 @@ class TrackingConfig:
     # ROI Quality Validation
     # ============================================================================
     
-    min_roi_size: int = 100  # V3: CRITICAL FIX - was 300 which blocked the pipeline
+    min_roi_size: int = 70  # V3: CRITICAL FIX - was 300 which blocked the pipeline
     """
     Minimum width/height (in pixels) for a valid ROI.
     

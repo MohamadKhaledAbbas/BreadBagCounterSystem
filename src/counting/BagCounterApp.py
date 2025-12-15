@@ -558,7 +558,7 @@ class BagCounterApp:
                 annotated_frame = frame.copy()
                 self.visualizer.render_all(
                     annotated_frame,
-                    current_frame_detections,
+                    [],
                     self.monitor.active_events,
                     counts=self.ui_counts,
                     fps=0,
@@ -729,7 +729,7 @@ class BagCounterApp:
 
                     self.visualizer.render_all(
                         annotated_frame,
-                        current_frame_detections,
+                        [],
                         self.monitor.active_events,
                         counts=self.ui_counts,
                         fps=fps_display,

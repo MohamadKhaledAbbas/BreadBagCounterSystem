@@ -71,15 +71,15 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2025-12-13-v1.0.0"
+    APP_VERSION: str = "2025-12-15-v1.1.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\GREEN.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Bran_Brown_Overlay20251129040005_20251129050005.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
     detection_model: str = os.getenv(
         "DETECTION_MODEL",
-        "data/model/detect_yolo_small_v5_bayese_640x640_nv12.bin" if IS_RDK
+        "data/model/detect_yolo_small_v8_bayese_640x640_nv12.bin" if IS_RDK
         else "data/model/detect_yolo_small_v8.pt"
     )
     classification_model: str = os.getenv(
@@ -94,7 +94,7 @@ class AppConfig:
     recording_dir: str = os.getenv("RECORDING_DIR", "data/recordings")
     
     # V2: Model version identifiers
-    detection_model_version: str = os.getenv("DETECTION_MODEL_VERSION", "v5.0")
+    detection_model_version: str = os.getenv("DETECTION_MODEL_VERSION", "v8.0")
     classification_model_version: str = os.getenv("CLASS_MODEL_VERSION", "v5.0")
     
     # V3: Testing mode for OpenCV frame source
