@@ -235,7 +235,7 @@ class TestCentroidAssociation:
         
         # Detection 50px away (within 100px threshold)
         new_evidence = create_evidence(100.0, 690, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert distance < default_config.association_distance_px
@@ -247,7 +247,7 @@ class TestCentroidAssociation:
         
         # Detection 150px away (outside 100px threshold) with no box overlap
         new_evidence = create_evidence(100.0, 790, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is False
         # Reason now includes 'no_match' since both centroid and IoU failed
@@ -260,7 +260,7 @@ class TestCentroidAssociation:
         
         # Detection 500ms later (outside 400ms threshold)
         new_evidence = create_evidence(500.0, 650, 360, is_open=True, frame_index=1)
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
@@ -282,7 +282,7 @@ class TestCentroidAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert distance == 0.0  # Centroid is exactly the same
@@ -306,7 +306,7 @@ class TestCentroidAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         # Should associate via IoU since boxes overlap
         assert can_assoc is True
@@ -662,7 +662,7 @@ class TestVelocityBasedAssociation:
         # - Velocity is high (about 2.5 px/ms from the movement pattern)
         # - The predicted position extrapolates in direction of motion
         # - Distance to predicted position is smaller than distance to last position
-        can_assoc, distance, reason = event.can_associate(far_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(far_detection)
         assert can_assoc is True
     
     def test_predicted_centroid(self, default_config):
@@ -835,7 +835,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is True
         assert 'both_match' in reason
@@ -869,7 +869,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(flipped_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(flipped_evidence)
         
         # Should associate via IoU despite centroid distance exceeding threshold
         assert can_assoc is True
@@ -911,7 +911,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(slide_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(slide_evidence)
         
         # Should associate via centroid distance
         assert can_assoc is True
@@ -942,7 +942,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(far_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(far_detection)
         
         assert can_assoc is False
         assert 'no_match' in reason
@@ -973,7 +973,7 @@ class TestParallelHybridAssociation:
             frame_index=10,
         )
         
-        can_assoc, distance, reason = event.can_associate(late_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(late_detection)
         
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
@@ -997,7 +997,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(new_evidence)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         # The reason should include all these components
         assert 'dist=' in reason
@@ -1030,7 +1030,7 @@ class TestParallelHybridAssociation:
             frame_index=1,
         )
         
-        can_assoc, distance, reason = event.can_associate(close_detection)
+        can_assoc, distance, reason, iou_value = event.can_associate(close_detection)
         
         # Should still associate via centroid
         assert can_assoc is True
