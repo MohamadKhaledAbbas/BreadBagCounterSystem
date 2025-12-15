@@ -1100,8 +1100,10 @@ class TestHybridScoringEventSelection:
         
         # New detection that:
         # - Overlaps significantly with Event A (high IoU ~0.75)
-        # - Is closer in centroid distance to Event B
-        # Detection at (580, 540) - 80px from Event B, 120px from Event A
+        # - Is at centroid (660, 380)
+        # - Distance to Event A (640, 360): ~28px
+        # - Distance to Event B (500, 500): ~143px
+        # Should associate with Event A due to high IoU
         new_detection = DetectionEvidence(
             timestamp_ms=100.0,
             centroid_x=660,  # Shifted from Event A's 640

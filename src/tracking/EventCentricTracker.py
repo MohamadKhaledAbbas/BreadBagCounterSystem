@@ -31,10 +31,10 @@ TARGET: ≥99.9% counting reliability (≤1 error per 1000 bags)
 import time
 import math
 import uuid
-import logging
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
+import logging  # Only for DEBUG level constant
 import numpy as np
 import cv2
 
@@ -1067,9 +1067,10 @@ class EventCentricTracker:
                 # - Distance weight: High when IoU is low (<0.3)
                 # - Normalize distance to 0-1 range (inverse, so closer is better)
                 
-                # Normalize distance (0-1, where 1 is best/closest)
-                # Use max_association_distance_px as the scale
-                # Guard against division by zero
+                # Normalize distance to 0-1 range (where 1 is best/closest)
+                # Formula: normalized = max(0, 1 - distance/max_distance)
+                # The max(0, ...) clamps negative values when distance > max_distance
+                # to ensure normalized_distance stays in valid [0, 1] range
                 if self.config.max_association_distance_px > 0:
                     normalized_distance = max(0, 1.0 - (distance / self.config.max_association_distance_px))
                 else:
