@@ -474,9 +474,10 @@ class BreadBagEvent:
         
         # Calculate base association distance threshold
         base_distance_threshold = self.config.association_distance_px
+        scaled_threshold = base_distance_threshold
+        velocity_mag = 0.0
         
         # Velocity-based scaling: increase threshold for fast-moving bags
-        velocity_mag = 0.0
         if self.config.velocity_scaling_enabled:
             velocity_mag = self.get_velocity_magnitude()
             
@@ -489,55 +490,69 @@ class BreadBagEvent:
                                   self.config.velocity_scale_factor - 1.0)
                 scaled_threshold = min(base_distance_threshold * scale, 
                                        self.config.max_association_distance_px)
-            else:
-                scaled_threshold = base_distance_threshold
-        else:
-            scaled_threshold = base_distance_threshold
         
         # Calculate distance to last centroid
         dx = det_centroid[0] - self.last_centroid[0]
         dy = det_centroid[1] - self.last_centroid[1]
         distance_to_last = math.sqrt(dx*dx + dy*dy)
+        distance = distance_to_last
         
         # Also try distance to predicted position (for fast movements)
-        pred_centroid = None
         if self.config.velocity_scaling_enabled and len(self.centroid_history) >= 2:
             pred_centroid = self.predict_centroid(detection.timestamp_ms)
             dx_pred = det_centroid[0] - pred_centroid[0]
             dy_pred = det_centroid[1] - pred_centroid[1]
             distance_to_pred = math.sqrt(dx_pred*dx_pred + dy_pred*dy_pred)
-            
             # Use the smaller of the two distances
             distance = min(distance_to_last, distance_to_pred)
-        else:
-            distance = distance_to_last
         
         # ALWAYS compute IoU (parallel hybrid association)
         iou_value = 0.0
         if self.last_box is not None:
             iou_value = self._compute_iou(self.last_box, detection.box)
         
-        # Check time gap first (both metrics fail if time gap exceeded)
-        if time_gap_ms > self.config.association_time_ms:
-            reason = (
-                f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms) | "
-                f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px), iou={iou_value:.2f} (thresh={self.config.iou_association_threshold})"
-            )
-            # Log detailed association attempt
-            logger.debug(
-                f"[Event:{self.id}] Association REJECTED: {reason} | "
-                f"det_centroid=({det_centroid[0]:.1f},{det_centroid[1]:.1f}), "
-                f"event_centroid=({self.last_centroid[0]:.1f},{self.last_centroid[1]:.1f})"
-            )
-            return False, distance, reason
-        
-        # Check both criteria in parallel
+        # Check both criteria
         centroid_match = distance <= scaled_threshold
         iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
         
-        # Build detailed result with both metrics
+        # Determine match type for structured logging
+        if time_gap_ms > self.config.association_time_ms:
+            match_type = "time_exceeded"
+            associated = False
+        elif centroid_match and iou_match:
+            match_type = "both_match"
+            associated = True
+        elif centroid_match:
+            match_type = "centroid_match"
+            associated = True
+        elif iou_match:
+            match_type = "iou_match"
+            associated = True
+        else:
+            match_type = "no_match"
+            associated = False
+        
+        # Use structured logging for detailed debug output
+        structured_logger.hybrid_association_attempt(
+            event_id=self.id,
+            detection_centroid=det_centroid,
+            event_centroid=self.last_centroid,
+            distance_px=distance,
+            distance_threshold=scaled_threshold,
+            iou_value=iou_value,
+            iou_threshold=self.config.iou_association_threshold,
+            time_gap_ms=time_gap_ms,
+            centroid_match=centroid_match,
+            iou_match=iou_match,
+            associated=associated,
+            match_type=match_type,
+            velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
+            base_threshold=base_distance_threshold,
+        )
+        
+        # Build detailed reason string for return value
         metrics_detail = (
-            f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px, base={base_distance_threshold:.1f}px), "
+            f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px), "
             f"iou={iou_value:.2f} (thresh={self.config.iou_association_threshold}), "
             f"time_gap={time_gap_ms:.1f}ms"
         )
@@ -545,40 +560,12 @@ class BreadBagEvent:
         if velocity_mag > self.config.min_velocity_threshold:
             metrics_detail += f", velocity={velocity_mag:.3f}px/ms"
         
-        if centroid_match and iou_match:
-            # Both metrics matched - strongest association
-            reason = f"both_match ({metrics_detail})"
-            logger.debug(
-                f"[Event:{self.id}] Association SUCCESS (BOTH): {metrics_detail} | "
-                f"det_centroid=({det_centroid[0]:.1f},{det_centroid[1]:.1f})"
-            )
-            return True, distance, reason
-        elif centroid_match:
-            # Centroid matched, IoU did not - typical for fast slides
-            reason = f"centroid_match ({metrics_detail})"
-            logger.debug(
-                f"[Event:{self.id}] Association SUCCESS (CENTROID): {metrics_detail} | "
-                f"det_centroid=({det_centroid[0]:.1f},{det_centroid[1]:.1f})"
-            )
-            return True, distance, reason
-        elif iou_match:
-            # IoU matched, centroid did not - typical for flips/spins
-            reason = f"iou_match ({metrics_detail})"
-            logger.debug(
-                f"[Event:{self.id}] Association SUCCESS (IOU): {metrics_detail} | "
-                f"det_centroid=({det_centroid[0]:.1f},{det_centroid[1]:.1f}), "
-                f"event_centroid=({self.last_centroid[0]:.1f},{self.last_centroid[1]:.1f})"
-            )
-            return True, distance, reason
+        if match_type == "time_exceeded":
+            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms) | {metrics_detail}"
         else:
-            # Neither criterion met
-            reason = f"no_match ({metrics_detail})"
-            logger.debug(
-                f"[Event:{self.id}] Association REJECTED: {reason} | "
-                f"det_centroid=({det_centroid[0]:.1f},{det_centroid[1]:.1f}), "
-                f"event_centroid=({self.last_centroid[0]:.1f},{self.last_centroid[1]:.1f})"
-            )
-            return False, distance, reason
+            reason = f"{match_type} ({metrics_detail})"
+        
+        return associated, distance, reason
     
     def add_detection(self, detection: DetectionEvidence, frame_img: Optional[np.ndarray] = None):
         """
