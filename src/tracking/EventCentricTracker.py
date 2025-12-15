@@ -1292,8 +1292,10 @@ class EventCentricTracker:
                     best_distance = distance
                     best_iou = iou_value
             
-            # Only log when there are multiple competing candidates (ambiguous case)
-            # This reduces log flooding while keeping important debug info
+            # Two-tier logging strategy for associations:
+            # 1. Log full candidate list when truly ambiguous (min_candidates_for_logging, default 3+)
+            # 2. Log selected association when noteworthy (low score OR any choice between 2+ candidates)
+            # This provides context without flooding logs
             if len(candidates) >= self.config.min_candidates_for_logging:
                 logger.debug(
                     f"[ASSOCIATION_CANDIDATES] detection_idx={det_idx}, "
@@ -1301,8 +1303,7 @@ class EventCentricTracker:
                 )
             
             if best_event is not None:
-                # Only log associations that are noteworthy (low score or multiple candidates)
-                # Use consistent threshold: log if low score OR there are 2+ candidates
+                # Log selected association if noteworthy: low confidence OR had to choose between options
                 if best_score < self.config.low_score_threshold or len(candidates) >= 2:
                     logger.debug(
                         f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
