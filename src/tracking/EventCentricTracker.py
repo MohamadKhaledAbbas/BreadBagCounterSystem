@@ -1308,10 +1308,11 @@ class EventCentricTracker:
             if best_event is not None:
                 # Log selected association if noteworthy: low confidence OR had to choose between options
                 if best_score < self.config.low_score_threshold or len(candidates) >= 2:
-                    logger.debug(
-                        f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
-                        f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"
-                    )
+                    pass
+                    # logger.debug(
+                    #     f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
+                    #     f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"
+                    # )
                 best_event.add_detection(evidence, frame_img)
                 associated_detection_indices.add(det_idx)
         

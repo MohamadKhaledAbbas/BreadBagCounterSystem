@@ -136,6 +136,7 @@ class BagCounterApp:
         else:
             if IS_RDK:
                 os.environ["HOME"] = "/home/sunrise"
+                self.ros_executor = init_ros2_context()  # <-- initialize ROS2 *before* creating nodes
                 self.frame_source = FrameSourceFactory.create("ros2", target_fps=30.0)
                 logger.info("[BagCounterApp] Production mode: reading from ROS 2 stream")
             else:
