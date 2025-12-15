@@ -228,6 +228,13 @@ class EventConfig:
     
     low_score_threshold: float = 0.7
     """Score threshold below which associations are logged (focus on low-confidence matches)"""
+    
+    # Match types that are always logged (noteworthy cases)
+    noteworthy_match_types: tuple = (
+        'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
+        'expanded_iou_match', 'ghost_expanded_iou_match'
+    )
+    """Match types that are always logged as they indicate special recovery cases"""
 
     use_frame_timestamps: bool = False
 
@@ -669,8 +676,7 @@ class BreadBagEvent:
         
         # Only log association attempts that fail or are noteworthy (not every successful match)
         # This reduces log flooding while keeping important debug information
-        if not associated or match_type in ['ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match', 
-                                             'expanded_iou_match', 'ghost_expanded_iou_match']:
+        if not associated or match_type in self.config.noteworthy_match_types:
             structured_logger.hybrid_association_attempt(
                 event_id=self.id,
                 detection_centroid=det_centroid,
@@ -1296,7 +1302,8 @@ class EventCentricTracker:
             
             if best_event is not None:
                 # Only log associations that are noteworthy (low score or multiple candidates)
-                if best_score < self.config.low_score_threshold or len(candidates) > 1:
+                # Use consistent threshold: log if low score OR there are 2+ candidates
+                if best_score < self.config.low_score_threshold or len(candidates) >= 2:
                     logger.debug(
                         f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
                         f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"

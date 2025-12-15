@@ -737,6 +737,17 @@ class TrackingConfig:
     Default: 0.7
     """
     
+    noteworthy_match_types: tuple = (
+        'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
+        'expanded_iou_match', 'ghost_expanded_iou_match'
+    )
+    """
+    Match types that are always logged.
+    
+    These represent special recovery cases (ghost reattachment, expanded IoU)
+    that are important for debugging tracking robustness.
+    """
+    
     # --------------------------------------------------------------------------
     # Work Zone Configuration
     # --------------------------------------------------------------------------
@@ -902,6 +913,7 @@ def get_event_config():
         min_gap_duration_for_logging_ms=tracking_config.min_gap_duration_for_logging_ms,
         min_candidates_for_logging=tracking_config.min_candidates_for_logging,
         low_score_threshold=tracking_config.low_score_threshold,
+        noteworthy_match_types=tracking_config.noteworthy_match_types,
 
         use_frame_timestamps=tracking_config.use_frame_timestamps,
     )
