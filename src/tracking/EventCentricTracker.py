@@ -1306,7 +1306,7 @@ class EventCentricTracker:
                 # No detection for this event - update ghost state
                 should_commit, status = event.update_ghost_state(timestamp_ms, frame_size, frame_index)
                 
-                if should_commit and status == 'commit':
+                if status == 'commit':
                     # Event is ready for classification
                     ready_events.append(self._prepare_event_output(event))
                     events_to_remove.append(event_id)
