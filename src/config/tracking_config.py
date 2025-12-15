@@ -680,6 +680,30 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Max Event Lifetime (Force Expiration)
+    # --------------------------------------------------------------------------
+    
+    max_event_lifetime_ms: float = 10000.0
+    """
+    Maximum lifetime for an event in milliseconds.
+    
+    After this duration, the event will be expired and counted regardless of
+    whether it's still on screen. This prevents events from staying active
+    indefinitely when workers don't remove bags fast enough.
+    
+    Range: 5000 - 30000 (5-30 seconds)
+    - Lower values: More aggressive cleanup, may count prematurely
+    - Higher values: More patient, but events may accumulate
+    
+    At 25fps:
+    - 5000ms = 125 frames (~5 seconds)
+    - 10000ms = 250 frames (~10 seconds)
+    - 15000ms = 375 frames (~15 seconds)
+    
+    Default: 10000.0 (10 seconds)
+    """
+    
+    # --------------------------------------------------------------------------
     # Work Zone Configuration
     # --------------------------------------------------------------------------
     
@@ -799,6 +823,9 @@ def get_event_config():
         
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
+        
+        # Max event lifetime
+        max_event_lifetime_ms=tracking_config.max_event_lifetime_ms,
         
         # Timeout-based commitment (exclusive method)
         commit_idle_frames=tracking_config.commit_idle_frames,
