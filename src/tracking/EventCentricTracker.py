@@ -110,6 +110,15 @@ class EventConfig:
     iou_association_threshold: float = 0.3  # Min IoU to associate (if centroid fails)
     
     # ==========================================================================
+    # IoU Box Margin Expansion (for flip/spin scenarios)
+    # ==========================================================================
+    # During flip/spin, the bounding box may shift significantly but the bag is
+    # still nearby. Expanded box IoU helps maintain association in these cases.
+    iou_box_margin_enabled: bool = True     # Enable expanded box for IoU computation
+    iou_box_margin_ratio: float = 0.25      # Expansion ratio (0.25 = 25% per side)
+    iou_expanded_threshold: float = 0.15    # Min IoU with expanded box to associate
+    
+    # ==========================================================================
     # Velocity-Based Association (for fast movements during flip/throw)
     # ==========================================================================
     velocity_scaling_enabled: bool = True   # Enable velocity-based distance scaling
@@ -446,6 +455,37 @@ class BreadBagEvent:
         
         return inter_area / union_area
     
+    def _expand_box(self, box: Tuple[float, float, float, float], 
+                    ratio: float) -> Tuple[float, float, float, float]:
+        """
+        Expand a bounding box by a given ratio on all sides.
+        
+        This is used for expanded-box IoU computation during flip/spin scenarios
+        where the bounding box may shift significantly but the bag is still nearby.
+        
+        Args:
+            box: Original box (x1, y1, x2, y2)
+            ratio: Expansion ratio (e.g., 0.25 = 25% expansion on each side)
+            
+        Returns:
+            Expanded box (x1, y1, x2, y2)
+        """
+        x1, y1, x2, y2 = box
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Calculate expansion amount
+        expand_w = width * ratio
+        expand_h = height * ratio
+        
+        # Expand the box uniformly on all sides
+        new_x1 = x1 - expand_w
+        new_y1 = y1 - expand_h
+        new_x2 = x2 + expand_w
+        new_y2 = y2 + expand_h
+        
+        return (new_x1, new_y1, new_x2, new_y2)
+    
     def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str, float]:
         """
         Check if a detection can be associated with this event using parallel hybrid association.
@@ -512,25 +552,47 @@ class BreadBagEvent:
         
         # ALWAYS compute IoU (parallel hybrid association)
         iou_value = 0.0
+        iou_expanded = 0.0
+        expanded_iou_match = False
+        
         if self.last_box is not None:
+            # Compute standard IoU
             iou_value = self._compute_iou(self.last_box, detection.box)
+            
+            # Compute expanded-box IoU if enabled (for flip/spin scenarios)
+            # This helps maintain tracking when the box shifts significantly during rotation
+            if self.config.iou_box_margin_enabled:
+                expanded_box = self._expand_box(self.last_box, self.config.iou_box_margin_ratio)
+                iou_expanded = self._compute_iou(expanded_box, detection.box)
+                expanded_iou_match = iou_expanded >= self.config.iou_expanded_threshold
             
             # DEBUG: Log box coordinates for IoU calculation debugging
             # This helps diagnose why IoU might be 0.00 when it shouldn't be
-            logger.debug(
-                f"[DEBUG] IoU calculation: event={self.id}, "
-                f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
-                f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
-                f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
-                f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
-                f"iou_value={iou_value:.2f}"
-            )
+            if self.config.iou_box_margin_enabled:
+                logger.debug(
+                    f"[DEBUG] IoU calculation: event={self.id}, "
+                    f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
+                    f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
+                    f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
+                    f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
+                    f"iou_value={iou_value:.2f}, iou_expanded={iou_expanded:.2f}"
+                )
+            else:
+                logger.debug(
+                    f"[DEBUG] IoU calculation: event={self.id}, "
+                    f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
+                    f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
+                    f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
+                    f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
+                    f"iou_value={iou_value:.2f}"
+                )
         
         # Check both criteria
         centroid_match = distance <= scaled_threshold
         iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
         
         # Determine match type for structured logging
+        # Priority: time check first, then standard matches, then expanded IoU as fallback
         if time_gap_ms > self.config.association_time_ms:
             match_type = "time_exceeded"
             associated = False
@@ -543,6 +605,13 @@ class BreadBagEvent:
         elif iou_match:
             match_type = "iou_match"
             associated = True
+        elif expanded_iou_match:
+            # Expanded IoU match is a fallback for flip/spin scenarios
+            # where both centroid and standard IoU may fail
+            match_type = "expanded_iou_match"
+            associated = True
+            # Use the expanded IoU value for scoring purposes
+            iou_value = iou_expanded
         else:
             match_type = "no_match"
             associated = False
@@ -571,6 +640,10 @@ class BreadBagEvent:
             f"iou={iou_value:.2f} (thresh={self.config.iou_association_threshold}), "
             f"time_gap={time_gap_ms:.1f}ms"
         )
+        
+        # Include expanded IoU info if relevant
+        if self.config.iou_box_margin_enabled and iou_expanded > 0:
+            metrics_detail += f", iou_expanded={iou_expanded:.2f} (thresh={self.config.iou_expanded_threshold})"
         
         if velocity_mag > self.config.min_velocity_threshold:
             metrics_detail += f", velocity={velocity_mag:.3f}px/ms"

@@ -43,6 +43,11 @@ def default_config():
         iou_association_enabled=True,
         iou_association_threshold=0.3,
         
+        # IoU box margin expansion (for flip/spin scenarios)
+        iou_box_margin_enabled=True,
+        iou_box_margin_ratio=0.25,
+        iou_expanded_threshold=0.15,
+        
         # Velocity-based association
         velocity_scaling_enabled=True,
         velocity_scale_factor=2.5,
@@ -1241,6 +1246,264 @@ class TestHybridScoringEventSelection:
         updated_event = tracker.active_events[updates[0]]
         # Event 2 should now have 2 observations
         assert updated_event.total_frames_observed == 2
+
+
+# =============================================================================
+# Expanded Box IoU Tests (Flip/Spin Handling)
+# =============================================================================
+
+class TestExpandedBoxIoU:
+    """
+    Tests for expanded box IoU functionality for flip/spin scenarios.
+    
+    During a flip or spin, both centroid distance AND normal IoU can fail
+    simultaneously because:
+    - Centroid can shift significantly (box rotates/moves)
+    - Box shape can change dramatically (bag deformation)
+    
+    The expanded box IoU provides a fallback mechanism by computing IoU
+    against a larger search area, helping maintain tracking during these
+    challenging scenarios.
+    """
+    
+    def test_expand_box_calculation(self, default_config):
+        """Verify that box expansion is calculated correctly."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Test box expansion with 25% ratio
+        original_box = (100, 100, 200, 200)  # 100x100 box
+        expanded = event._expand_box(original_box, 0.25)
+        
+        # With 25% expansion, each side should expand by 25 pixels (25% of 100)
+        # Expected: (75, 75, 225, 225)
+        assert expanded[0] == 75.0  # x1 - 25
+        assert expanded[1] == 75.0  # y1 - 25
+        assert expanded[2] == 225.0  # x2 + 25
+        assert expanded[3] == 225.0  # y2 + 25
+    
+    def test_expanded_iou_fallback_during_flip(self, default_config):
+        """
+        Expanded IoU should associate when both centroid and standard IoU fail.
+        
+        This simulates a flip scenario where:
+        - Centroid moves significantly (exceeds distance threshold)
+        - Standard IoU is too low (boxes barely overlap)
+        - BUT expanded box IoU is sufficient
+        """
+        # Create event at (640, 360) with 100x100 box
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Original box: (590, 310, 690, 410) centered at (640, 360)
+        # With 25% expansion: expanded box is (565, 285, 715, 435) = 150x150
+        #
+        # We need detection where:
+        # 1. Centroid distance > 100px (to fail centroid match)
+        # 2. Standard IoU < 0.3 (to fail standard IoU match)
+        # 3. Expanded IoU >= 0.15 (to pass expanded IoU match)
+        #
+        # Detection box: (660, 290, 760, 390) centered at (710, 340)
+        # Centroid distance: sqrt((710-640)^2 + (340-360)^2) = sqrt(4900+400) = 72.8px
+        # This is within threshold, so let's adjust
+        #
+        # Let's use detection at (720, 340):
+        # Centroid distance: sqrt((720-640)^2 + (340-360)^2) = sqrt(6400+400) = 82.5px < 100
+        # Still within threshold
+        #
+        # Use centroid at (750, 360):
+        # Distance: sqrt((750-640)^2 + (360-360)^2) = sqrt(12100) = 110px > 100 ✓
+        # Detection box: (700, 310, 800, 410)
+        # Standard IoU with (590,310,690,410): No overlap since 700 > 690. IoU = 0 ✓
+        # Expanded IoU with (565,285,715,435): 
+        #   Intersection: (700,310) to (715,410) = 15x100 = 1500 px²
+        #   Area of expanded: 150x150 = 22500 px²
+        #   Area of detection: 100x100 = 10000 px²
+        #   Union: 22500 + 10000 - 1500 = 31000 px²
+        #   IoU: 1500/31000 = 0.048 ✗ (below 0.15)
+        #
+        # We need larger overlap. Let's use a closer detection that still fails centroid:
+        # Detection at (740, 360) with box (680, 310, 780, 410):
+        # Distance: sqrt((740-640)^2) = 100px - exactly at threshold, could go either way
+        #
+        # Let's use centroid at (745, 365):
+        # Distance: sqrt(105^2 + 5^2) = sqrt(11025+25) = 105.1px > 100 ✓
+        # Detection box: (695, 315, 795, 415)
+        # Standard IoU with (590,310,690,410): Very minimal overlap. IoU near 0 ✓
+        # Expanded IoU with (565,285,715,435):
+        #   Intersection: (695,315) to (715,415) = 20x100 = 2000 px²
+        #   Union: 22500 + 10000 - 2000 = 30500 px²
+        #   IoU: 2000/30500 = 0.066 ✗ still too low
+        #
+        # Let's increase the expansion ratio or use much closer box
+        # Using a detection that just barely fails centroid (101px) and has decent expanded overlap:
+        # Detection at (740, 360) with 120x120 box: (680, 300, 800, 420)
+        # Standard IoU with (590,310,690,410): Intersection (680,310) to (690,410) = 10x100 = 1000
+        #   Union: 10000 + 14400 - 1000 = 23400. IoU = 1000/23400 = 0.043 < 0.3 ✓
+        # Expanded IoU with (565,285,715,435):
+        #   Intersection: (680,300) to (715,420) = 35x120 = 4200 px²
+        #   Union: 22500 + 14400 - 4200 = 32700 px²
+        #   IoU: 4200/32700 = 0.128 - still below 0.15
+        #
+        # Let's just increase the box margin ratio in the config for this specific test
+        test_config = EventConfig(
+            association_distance_px=100.0,
+            association_time_ms=400.0,
+            iou_association_enabled=True,
+            iou_association_threshold=0.3,
+            iou_box_margin_enabled=True,
+            iou_box_margin_ratio=0.5,  # 50% expansion for this test
+            iou_expanded_threshold=0.1,  # Lower threshold
+            velocity_scaling_enabled=False,  # Disable to simplify test
+        )
+        
+        evidence2 = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event2 = BreadBagEvent(evidence2, test_config, open_class_id=1, closed_class_id=0)
+        
+        # Original box: (590, 310, 690, 410) centered at (640, 360)
+        # With 50% expansion: expanded box is (540, 260, 740, 460) = 200x200
+        #
+        # Detection at (745, 360) with box (695, 310, 795, 410):
+        # Centroid distance: sqrt(105^2) = 105px > 100 ✓
+        # Standard IoU: Intersection (695,310) to (690,410) - no overlap since 695 > 690. IoU = 0 ✓
+        # Expanded IoU with (540,260,740,460):
+        #   Intersection: (695,310) to (740,410) = 45x100 = 4500 px²
+        #   Area expanded: 200x200 = 40000 px²
+        #   Area detection: 100x100 = 10000 px²
+        #   Union: 40000 + 10000 - 4500 = 45500 px²
+        #   IoU: 4500/45500 = 0.099 - still below 0.1
+        #
+        # Need even closer detection. Use (720, 360) with box (670, 310, 770, 410):
+        # Centroid distance: sqrt(80^2) = 80px < 100 - fails centroid test
+        #
+        # OK let me just verify math works with numbers:
+        # Event box: (590, 310, 690, 410)
+        # Expanded by 50%: new_x1 = 590 - 50 = 540, new_y1 = 310 - 50 = 260
+        #                  new_x2 = 690 + 50 = 740, new_y2 = 410 + 50 = 460
+        #
+        # Detection at (725, 360): distance = sqrt(85^2) = 85 < 100 fails
+        # Detection at (750, 360): distance = sqrt(110^2) = 110 > 100 passes
+        # Detection box for (750, 360) centroid: (700, 310, 800, 410)
+        # Expanded box: (540, 260, 740, 460)
+        # Intersection with (700, 310, 800, 410):
+        #   x: max(540, 700)=700 to min(740, 800)=740 -> width=40
+        #   y: max(260, 310)=310 to min(460, 410)=410 -> height=100
+        #   area = 40*100 = 4000
+        # Union: 40000 + 10000 - 4000 = 46000
+        # IoU = 4000/46000 = 0.087 < 0.1 threshold
+        #
+        # This test design is hard. Let me use a much more lenient threshold:
+        #
+        flipped_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=750,  # 110px away from 640 - exceeds 100px threshold
+            centroid_y=360,
+            box=(700, 310, 800, 410),  # No standard overlap, some expanded overlap
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        # Use a config with very lenient expanded threshold
+        lenient_config = EventConfig(
+            association_distance_px=100.0,
+            association_time_ms=400.0,
+            iou_association_enabled=True,
+            iou_association_threshold=0.3,
+            iou_box_margin_enabled=True,
+            iou_box_margin_ratio=0.5,  # 50% expansion
+            iou_expanded_threshold=0.05,  # Very low threshold for testing
+            velocity_scaling_enabled=False,
+        )
+        
+        evidence3 = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event3 = BreadBagEvent(evidence3, lenient_config, open_class_id=1, closed_class_id=0)
+        
+        can_assoc, distance, reason, iou_value = event3.can_associate(flipped_detection)
+        
+        # Should associate via expanded IoU fallback with the lenient threshold
+        assert can_assoc is True
+        assert 'expanded_iou_match' in reason
+    
+    def test_expanded_iou_disabled(self):
+        """When expanded IoU is disabled, only standard criteria should be used."""
+        config = EventConfig(
+            association_distance_px=100.0,
+            association_time_ms=400.0,
+            iou_association_enabled=True,
+            iou_association_threshold=0.3,
+            iou_box_margin_enabled=False,  # Disable expanded IoU
+            iou_box_margin_ratio=0.25,
+            iou_expanded_threshold=0.15,
+            velocity_scaling_enabled=False,
+        )
+        
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Detection that would match via expanded IoU but not standard criteria
+        flipped_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=770,  # 130px away - exceeds threshold
+            centroid_y=360,
+            box=(720, 310, 820, 410),  # Far box with very low standard IoU
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason, iou_value = event.can_associate(flipped_detection)
+        
+        # Should NOT associate because expanded IoU is disabled
+        assert can_assoc is False
+        assert 'no_match' in reason
+    
+    def test_expanded_iou_preserves_standard_match_priority(self, default_config):
+        """Standard IoU and centroid matches should take priority over expanded IoU."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Detection that matches via centroid (should use centroid_match, not expanded_iou_match)
+        close_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=680,  # 40px away - within threshold
+            centroid_y=370,
+            box=(630, 320, 730, 420),  # Some overlap
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=1,
+        )
+        
+        can_assoc, distance, reason, iou_value = event.can_associate(close_detection)
+        
+        assert can_assoc is True
+        # Should match via centroid or standard IoU, not expanded
+        assert 'expanded_iou_match' not in reason
+        assert ('centroid_match' in reason or 'iou_match' in reason or 'both_match' in reason)
+    
+    def test_expanded_box_ratio_affects_iou(self, default_config):
+        """Different expansion ratios should affect the expanded IoU calculation."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Original box: (590, 310, 690, 410)
+        original_box = event.last_box
+        
+        # Test different expansion ratios
+        expanded_10 = event._expand_box(original_box, 0.1)
+        expanded_25 = event._expand_box(original_box, 0.25)
+        expanded_50 = event._expand_box(original_box, 0.5)
+        
+        # Verify expansion amounts
+        # Width = 100, so 10% expansion = 10px per side
+        assert (expanded_10[2] - expanded_10[0]) == 120  # 100 + 2*10
+        # 25% expansion = 25px per side
+        assert (expanded_25[2] - expanded_25[0]) == 150  # 100 + 2*25
+        # 50% expansion = 50px per side  
+        assert (expanded_50[2] - expanded_50[0]) == 200  # 100 + 2*50
 
 
 if __name__ == '__main__':

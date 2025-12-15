@@ -393,6 +393,60 @@ class TrackingConfig:
     Default: 0.3
     """
     
+    iou_box_margin_enabled: bool = True
+    """
+    Enable box margin expansion for IoU computation during flip/spin scenarios.
+    
+    When True: Computes IoU with both original box AND expanded box, using the
+               higher value. This helps maintain tracking during rotation/flip
+               where the bounding box may shift significantly but still be nearby.
+    When False: Only computes IoU with the original box.
+    
+    This is especially useful for:
+    - Bag flip/spin: where the box shape may change dramatically
+    - Rotation: where the centroid shifts but the bag is still the same
+    - Fast movements: where the box may trail behind the actual object position
+    
+    Default: True
+    """
+    
+    iou_box_margin_ratio: float = 0.25
+    """
+    Ratio to expand the bounding box for margin-based IoU computation.
+    
+    Range: 0.1 - 0.5
+    - 0.1: 10% expansion on each side (20% total increase in width/height)
+    - 0.25: 25% expansion on each side (50% total increase in width/height)
+    - 0.5: 50% expansion on each side (100% total increase in width/height)
+    
+    The expansion is applied uniformly to all sides of the event's bounding box,
+    creating a larger search area for association during flip/spin scenarios.
+    
+    Tuning guidelines:
+    - For tight tracking: Use 0.1-0.15
+    - For flip-heavy scenarios: Use 0.2-0.3
+    - Values above 0.4 may cause false associations with nearby objects
+    
+    Default: 0.25
+    """
+    
+    iou_expanded_threshold: float = 0.15
+    """
+    Minimum IoU value with expanded box to associate a detection with an event.
+    
+    Range: 0.1 - 0.3
+    This threshold is lower than iou_association_threshold because the expanded
+    box naturally has higher potential for overlap. The expanded box IoU is only
+    used as a fallback when normal IoU fails.
+    
+    Tuning guidelines:
+    - Keep this value lower than iou_association_threshold
+    - For flip-heavy scenarios: Use 0.1-0.15
+    - Values below 0.1 may cause false associations
+    
+    Default: 0.15
+    """
+    
     # --------------------------------------------------------------------------
     # Velocity-Based Association (robust tracking during fast movements)
     # --------------------------------------------------------------------------
@@ -647,6 +701,18 @@ class TrackingConfig:
     Only used when work_zone_enabled is True.
     """
     
+    exit_boundary_margin_px: int = 50
+    """
+    Exit boundary margin in pixels for visualization.
+    
+    Range: 20 - 100
+    This is used by the Visualizer to draw the exit boundary zone.
+    Note: Exit boundary logic for commitment has been removed; this is
+    purely for visualization purposes.
+    
+    Default: 50
+    """
+    
     # --------------------------------------------------------------------------
     # Event-Centric ROI Collection
     # --------------------------------------------------------------------------
@@ -714,6 +780,11 @@ def get_event_config():
         # IoU-based association
         iou_association_enabled=tracking_config.iou_association_enabled,
         iou_association_threshold=tracking_config.iou_association_threshold,
+        
+        # IoU box margin expansion (for flip/spin scenarios)
+        iou_box_margin_enabled=tracking_config.iou_box_margin_enabled,
+        iou_box_margin_ratio=tracking_config.iou_box_margin_ratio,
+        iou_expanded_threshold=tracking_config.iou_expanded_threshold,
         
         # Velocity-based association
         velocity_scaling_enabled=tracking_config.velocity_scaling_enabled,

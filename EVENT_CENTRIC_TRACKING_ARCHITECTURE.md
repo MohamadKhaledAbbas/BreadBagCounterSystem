@@ -266,6 +266,14 @@ if event has no detection:
 | `iou_association_enabled` | true | - | Enable IoU as complementary association criterion |
 | `iou_association_threshold` | 0.3 | 0.2-0.5 | Min IoU to associate when centroid fails |
 
+### Expanded Box IoU Parameters (Flip/Spin Handling)
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `iou_box_margin_enabled` | true | - | Enable expanded box IoU for flip/spin scenarios |
+| `iou_box_margin_ratio` | 0.25 | 0.1-0.5 | Ratio to expand box (0.25 = 25% per side) |
+| `iou_expanded_threshold` | 0.15 | 0.1-0.3 | Min IoU with expanded box to associate |
+
 ### Velocity-Based Association Parameters
 
 | Parameter | Default | Range | Description |
@@ -318,6 +326,18 @@ if event has no detection:
 - Provides robustness during partial occlusion
 - Helps when centroid shifts but boxes still overlap
 - Set threshold based on expected overlap during manipulation
+
+**Expanded Box IoU (Flip/Spin Handling)**
+- Provides fallback for flip/spin scenarios where both standard IoU and centroid fail
+- The event's bounding box is expanded by a configurable ratio (default 25% per side)
+- Expanded IoU is computed as a fallback when standard association criteria fail
+- Use cases:
+  * Bag flip: centroid jumps and standard IoU drops, but expanded box still overlaps
+  * Bag spin: box shape changes dramatically during rotation
+  * Fast movements: detection box trails behind actual object position
+- Tuning guidelines:
+  * `iou_box_margin_ratio`: Higher values (0.3-0.5) for more aggressive flip handling
+  * `iou_expanded_threshold`: Keep lower than standard IoU threshold since expanded box naturally overlaps more
 
 **Velocity Scaling**
 - When enabled, association distance scales based on bag velocity
