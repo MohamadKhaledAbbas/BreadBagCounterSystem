@@ -50,7 +50,8 @@ class EventCentricStateMonitor:
                  open_cls_id: int, 
                  closed_cls_id: int,
                  config: Optional[EventConfig] = None,
-                 fps: float = 25.0):
+                 fps: float = 25.0,
+                 use_frame_timestamps: bool = False):
         """
         Initialize the event-centric state monitor.
         
@@ -59,11 +60,15 @@ class EventCentricStateMonitor:
             closed_cls_id: Class ID for closed bag detections
             config: EventConfig instance (creates from tracking_config if None)
             fps: Video frame rate for timestamp calculation
+            use_frame_timestamps: If True, use deterministic frame-based timestamps
+                                  (frame_count * frame_duration_ms) instead of wall clock.
+                                  Recommended for offline/testing mode to avoid timing issues.
         """
         self.open_id = open_cls_id
         self.closed_id = closed_cls_id
         self.fps = fps
         self.frame_duration_ms = 1000.0 / fps
+        self.use_frame_timestamps = use_frame_timestamps
         
         # Get configuration
         if config is None:
@@ -91,7 +96,8 @@ class EventCentricStateMonitor:
         logger.info(
             f"[EventCentricStateMonitor] Initialized: "
             f"open_id={open_cls_id}, closed_id={closed_cls_id}, "
-            f"fps={fps}, frame_duration={self.frame_duration_ms:.1f}ms"
+            f"fps={fps}, frame_duration={self.frame_duration_ms:.1f}ms, "
+            f"use_frame_timestamps={use_frame_timestamps}"
         )
     
     def update(self, 
@@ -118,12 +124,14 @@ class EventCentricStateMonitor:
         frame_count = frame_dict['frame_count']
         frame_img = frame_dict['frame']
         
-        # Calculate timestamp from frame count
-        # Use wall clock time for more accurate timing
-        current_time_ms = time.perf_counter() * 1000 - self.start_time_ms
-        
-        # Alternative: use frame-based timing (deterministic for testing)
-        # current_time_ms = frame_count * self.frame_duration_ms
+        # Calculate timestamp
+        if self.use_frame_timestamps:
+            # Deterministic frame-based timing (recommended for offline/testing)
+            # This ensures consistent timing regardless of processing speed
+            current_time_ms = frame_count * self.frame_duration_ms
+        else:
+            # Wall clock time for production (real-time processing)
+            current_time_ms = time.perf_counter() * 1000 - self.start_time_ms
         
         # Update the event-centric tracker
         ready_events = self.tracker.update(
