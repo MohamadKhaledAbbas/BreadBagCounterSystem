@@ -31,6 +31,7 @@ TARGET: ≥99.9% counting reliability (≤1 error per 1000 bags)
 import time
 import math
 import uuid
+import logging
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -1068,8 +1069,12 @@ class EventCentricTracker:
                 
                 # Normalize distance (0-1, where 1 is best/closest)
                 # Use max_association_distance_px as the scale
-                max_dist = self.config.max_association_distance_px
-                normalized_distance = max(0, 1.0 - (distance / max_dist))
+                # Guard against division by zero
+                if self.config.max_association_distance_px > 0:
+                    normalized_distance = max(0, 1.0 - (distance / self.config.max_association_distance_px))
+                else:
+                    # Fallback: If max_distance is 0, use binary close/far logic
+                    normalized_distance = 1.0 if distance == 0 else 0.0
                 
                 # Compute hybrid score with adaptive weighting
                 if iou_value >= 0.5:
@@ -1082,13 +1087,15 @@ class EventCentricTracker:
                     # Low IoU: Trust distance more (30% IoU, 70% distance)
                     score = 0.3 * iou_value + 0.7 * normalized_distance
                 
-                candidates.append({
-                    'event_id': event.id,
-                    'distance': distance,
-                    'iou': iou_value,
-                    'score': score,
-                    'reason': reason
-                })
+                # Build candidate info for debug logging (only if debug enabled)
+                if logger.isEnabledFor(logging.DEBUG):
+                    candidates.append({
+                        'event_id': event.id,
+                        'distance': distance,
+                        'iou': iou_value,
+                        'score': score,
+                        'reason': reason
+                    })
                 
                 if score > best_score:
                     best_event = event
