@@ -20,6 +20,12 @@ Detection-to-event association uses a parallel hybrid approach:
   * Fast slides: IoU may drop but centroid distance stays close
   * Partial occlusions: one metric may fail while the other succeeds
 
+EVENT EXPIRATION:
+- Events have a maximum lifetime (default 10 seconds)
+- After max lifetime, events are automatically expired and counted
+- This prevents events from staying active indefinitely when bags aren't removed
+- Useful when workers don't remove bags fast enough from the work area
+
 HARD CONSTRAINTS MET:
 - NO visual appearance embeddings
 - NO frame-based counting (uses millisecond-based timing)
@@ -705,9 +711,11 @@ class BreadBagEvent:
             gap_duration = detection.timestamp_ms - self.current_gap_start
             self.detection_gaps.append((self.current_gap_start, detection.timestamp_ms))
             self.current_gap_start = None
-            logger.debug(
-                f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
-            )
+            # Only log significant detection gaps (>500ms) to reduce log flooding
+            if gap_duration > 500.0:
+                logger.debug(
+                    f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
+                )
         
         # Update velocity before updating centroid
         if len(self.centroid_history) >= 1:
