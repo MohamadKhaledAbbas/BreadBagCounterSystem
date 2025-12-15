@@ -507,24 +507,23 @@ class BreadBagEvent:
         # Check centroid distance threshold (primary criterion)
         centroid_match = distance <= scaled_threshold
         
-        # Check IoU (complementary criterion)
-        iou_match = False
-        iou_value = 0.0
-        if self.config.iou_association_enabled and self.last_box is not None:
-            iou_value = self._compute_iou(self.last_box, detection.box)
-            iou_match = iou_value >= self.config.iou_association_threshold
-        
-        # Associate if EITHER centroid OR IoU criterion is met
+        # If centroid matches, return early (common case optimization)
         if centroid_match:
             return True, distance, f"centroid_match (dist={distance:.1f}px)"
-        elif iou_match:
-            return True, distance, f"iou_match (iou={iou_value:.2f}, dist={distance:.1f}px)"
+        
+        # Centroid distance failed - check IoU (complementary criterion)
+        # Only compute IoU when centroid distance fails to save computation
+        if self.config.iou_association_enabled and self.last_box is not None:
+            iou_value = self._compute_iou(self.last_box, detection.box)
+            if iou_value >= self.config.iou_association_threshold:
+                return True, distance, f"iou_match (iou={iou_value:.2f}, dist={distance:.1f}px)"
+            else:
+                # Neither criterion met - include IoU in reason
+                reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f}, iou={iou_value:.2f} < {self.config.iou_association_threshold})"
+                return False, distance, reason
         else:
-            # Neither criterion met
-            reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f}"
-            if self.config.iou_association_enabled:
-                reason += f", iou={iou_value:.2f} < {self.config.iou_association_threshold}"
-            reason += ")"
+            # IoU disabled or no last box - centroid failed
+            reason = f"no_match (dist={distance:.1f} > {scaled_threshold:.1f})"
             return False, distance, reason
     
     def add_detection(self, detection: DetectionEvidence, frame_img: Optional[np.ndarray] = None):
