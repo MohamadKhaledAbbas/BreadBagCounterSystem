@@ -680,6 +680,75 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Max Event Lifetime (Force Expiration)
+    # --------------------------------------------------------------------------
+    
+    max_event_lifetime_ms: float = 10000.0
+    """
+    Maximum lifetime for an event in milliseconds.
+    
+    After this duration, the event will be expired and counted regardless of
+    whether it's still on screen. This prevents events from staying active
+    indefinitely when workers don't remove bags fast enough.
+    
+    Range: 5000 - 30000 (5-30 seconds)
+    - Lower values: More aggressive cleanup, may count prematurely
+    - Higher values: More patient, but events may accumulate
+    
+    At 25fps:
+    - 5000ms = 125 frames (~5 seconds)
+    - 10000ms = 250 frames (~10 seconds)
+    - 15000ms = 375 frames (~15 seconds)
+    
+    Default: 10000.0 (10 seconds)
+    """
+    
+    # --------------------------------------------------------------------------
+    # Logging Control Parameters
+    # --------------------------------------------------------------------------
+    
+    min_gap_duration_for_logging_ms: float = 500.0
+    """
+    Minimum detection gap duration to log.
+    
+    Only gaps longer than this will be logged to reduce log flooding.
+    
+    Range: 100 - 1000 (milliseconds)
+    Default: 500.0 (0.5 seconds)
+    """
+    
+    min_candidates_for_logging: int = 3
+    """
+    Minimum candidate count to log association candidates.
+    
+    Only log when there are this many or more competing candidates (ambiguous cases).
+    
+    Range: 2 - 5
+    Default: 3 (truly ambiguous cases)
+    """
+    
+    low_score_threshold: float = 0.7
+    """
+    Association score threshold below which to log.
+    
+    Associations with scores below this are considered low-confidence and logged.
+    
+    Range: 0.5 - 0.9
+    Default: 0.7
+    """
+    
+    noteworthy_match_types: tuple = (
+        'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
+        'expanded_iou_match', 'ghost_expanded_iou_match'
+    )
+    """
+    Match types that are always logged.
+    
+    These represent special recovery cases (ghost reattachment, expanded IoU)
+    that are important for debugging tracking robustness.
+    """
+    
+    # --------------------------------------------------------------------------
     # Work Zone Configuration
     # --------------------------------------------------------------------------
     
@@ -800,6 +869,9 @@ def get_event_config():
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
         
+        # Max event lifetime
+        max_event_lifetime_ms=tracking_config.max_event_lifetime_ms,
+        
         # Timeout-based commitment (exclusive method)
         commit_idle_frames=tracking_config.commit_idle_frames,
         commit_min_closed_ratio=tracking_config.commit_min_closed_ratio,
@@ -836,6 +908,12 @@ def get_event_config():
         
         # Resource limits
         max_active_events=tracking_config.max_active_events,
+        
+        # Logging control
+        min_gap_duration_for_logging_ms=tracking_config.min_gap_duration_for_logging_ms,
+        min_candidates_for_logging=tracking_config.min_candidates_for_logging,
+        low_score_threshold=tracking_config.low_score_threshold,
+        noteworthy_match_types=tracking_config.noteworthy_match_types,
 
         use_frame_timestamps=tracking_config.use_frame_timestamps,
     )

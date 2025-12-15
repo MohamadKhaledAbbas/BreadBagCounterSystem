@@ -20,6 +20,12 @@ Detection-to-event association uses a parallel hybrid approach:
   * Fast slides: IoU may drop but centroid distance stays close
   * Partial occlusions: one metric may fail while the other succeeds
 
+EVENT EXPIRATION:
+- Events have a maximum lifetime (default 10 seconds)
+- After max lifetime, events are automatically expired and counted
+- This prevents events from staying active indefinitely when bags aren't removed
+- Useful when workers don't remove bags fast enough from the work area
+
 HARD CONSTRAINTS MET:
 - NO visual appearance embeddings
 - NO frame-based counting (uses millisecond-based timing)
@@ -192,6 +198,43 @@ class EventConfig:
     # Resource Limits
     # ==========================================================================
     max_active_events: int = 4
+    
+    # ==========================================================================
+    # Max Event Lifetime (Force Expiration)
+    # ==========================================================================
+    max_event_lifetime_ms: float = 10000.0  # Max time event can exist (10 seconds default)
+    """
+    Maximum lifetime for an event in milliseconds.
+    
+    After this duration, the event will be expired and counted regardless of
+    whether it's still on screen. This prevents events from staying active
+    indefinitely when workers don't remove bags fast enough.
+    
+    Range: 5000 - 30000 (5-30 seconds)
+    - Lower values: More aggressive cleanup, may count prematurely
+    - Higher values: More patient, but events may accumulate
+    
+    Default: 10000.0 (10 seconds)
+    """
+    
+    # ==========================================================================
+    # Logging Control Parameters
+    # ==========================================================================
+    min_gap_duration_for_logging_ms: float = 500.0
+    """Minimum detection gap duration to log (reduces log flooding)"""
+    
+    min_candidates_for_logging: int = 3
+    """Minimum candidate count to log association candidates (only log ambiguous cases)"""
+    
+    low_score_threshold: float = 0.7
+    """Score threshold below which associations are logged (focus on low-confidence matches)"""
+    
+    # Match types that are always logged (noteworthy cases)
+    noteworthy_match_types: tuple = (
+        'ghost_iou_match', 'ghost_centroid_match', 'ghost_both_match',
+        'expanded_iou_match', 'ghost_expanded_iou_match'
+    )
+    """Match types that are always logged as they indicate special recovery cases"""
 
     use_frame_timestamps: bool = False
 
@@ -568,26 +611,8 @@ class BreadBagEvent:
                 iou_expanded = self._compute_iou(expanded_box, detection.box)
                 expanded_iou_match = iou_expanded >= self.config.iou_expanded_threshold
             
-            # DEBUG: Log box coordinates for IoU calculation debugging
-            # This helps diagnose why IoU might be 0.00 when it shouldn't be
-            if self.config.iou_box_margin_enabled:
-                logger.debug(
-                    f"[DEBUG] IoU calculation: event={self.id}, "
-                    f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
-                    f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
-                    f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
-                    f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
-                    f"iou_value={iou_value:.2f}, iou_expanded={iou_expanded:.2f}"
-                )
-            else:
-                logger.debug(
-                    f"[DEBUG] IoU calculation: event={self.id}, "
-                    f"last_box=({self.last_box[0]:.2f}, {self.last_box[1]:.2f}, "
-                    f"{self.last_box[2]:.2f}, {self.last_box[3]:.2f}), "
-                    f"detection_box=({detection.box[0]:.2f}, {detection.box[1]:.2f}, "
-                    f"{detection.box[2]:.2f}, {detection.box[3]:.2f}), "
-                    f"iou_value={iou_value:.2f}"
-                )
+            # Note: Detailed IoU calculation debug removed to reduce log flooding
+            # IoU values are logged in the hybrid_association_attempt call below
         
         # Check both criteria
         centroid_match = distance <= scaled_threshold
@@ -649,23 +674,25 @@ class BreadBagEvent:
                 match_type = "no_match"
                 associated = False
         
-        # Use structured logging for detailed debug output
-        structured_logger.hybrid_association_attempt(
-            event_id=self.id,
-            detection_centroid=det_centroid,
-            event_centroid=self.last_centroid,
-            distance_px=distance,
-            distance_threshold=scaled_threshold,
-            iou_value=iou_value,
-            iou_threshold=self.config.iou_association_threshold,
-            time_gap_ms=time_gap_ms,
-            centroid_match=centroid_match,
-            iou_match=iou_match,
-            associated=associated,
-            match_type=match_type,
-            velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
-            base_threshold=base_distance_threshold,
-        )
+        # Only log association attempts that fail or are noteworthy (not every successful match)
+        # This reduces log flooding while keeping important debug information
+        if not associated or match_type in self.config.noteworthy_match_types:
+            structured_logger.hybrid_association_attempt(
+                event_id=self.id,
+                detection_centroid=det_centroid,
+                event_centroid=self.last_centroid,
+                distance_px=distance,
+                distance_threshold=scaled_threshold,
+                iou_value=iou_value,
+                iou_threshold=self.config.iou_association_threshold,
+                time_gap_ms=time_gap_ms,
+                centroid_match=centroid_match,
+                iou_match=iou_match,
+                associated=associated,
+                match_type=match_type,
+                velocity_mag=velocity_mag if velocity_mag > self.config.min_velocity_threshold else None,
+                base_threshold=base_distance_threshold,
+            )
         
         # Build detailed reason string for return value
         metrics_detail = (
@@ -702,9 +729,11 @@ class BreadBagEvent:
             gap_duration = detection.timestamp_ms - self.current_gap_start
             self.detection_gaps.append((self.current_gap_start, detection.timestamp_ms))
             self.current_gap_start = None
-            logger.debug(
-                f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
-            )
+            # Only log significant detection gaps to reduce log flooding
+            if gap_duration > self.config.min_gap_duration_for_logging_ms:
+                logger.debug(
+                    f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
+                )
         
         # Update velocity before updating centroid
         if len(self.centroid_history) >= 1:
@@ -924,6 +953,30 @@ class BreadBagEvent:
         
         # Calculate time in current state
         time_in_state_ms = current_time_ms - self.state_enter_time_ms
+        
+        # PRIORITY CHECK: Max event lifetime exceeded - force commit/expire
+        # This prevents events from staying active indefinitely when bags aren't removed
+        event_lifetime_ms = current_time_ms - self.created_at_ms
+        if event_lifetime_ms > self.config.max_event_lifetime_ms:
+            # Force commit if we have reasonable evidence, otherwise expire
+            if self.state == EventState.CLOSED or self.closed_evidence_count >= self.config.min_closed_evidence_count:
+                # Has closed evidence - commit it
+                self._transition_to(EventState.COMMITTED, current_time_ms,
+                                    f"max_lifetime_exceeded (lifetime={event_lifetime_ms:.0f}ms)")
+                self.commit_reason = "max_lifetime"
+                logger.info(
+                    f"[Event:{self.id}] Max lifetime commit: bag counted after max lifetime "
+                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms, "
+                    f"state={self.state.name})"
+                )
+                return True, 'commit'
+            else:
+                # No closed evidence - just expire
+                logger.info(
+                    f"[Event:{self.id}] Max lifetime expired: no closed evidence "
+                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms)"
+                )
+                return False, 'expire'
         
         # FIRST: Check commit eligibility for CLOSED events (independent of ghost timeout)
         if self.state == EventState.CLOSED:
@@ -1239,20 +1292,23 @@ class EventCentricTracker:
                     best_distance = distance
                     best_iou = iou_value
             
-            # Log all candidates if there were multiple options
-            if len(candidates) > 1:
+            # Two-tier logging strategy for associations:
+            # 1. Log full candidate list when truly ambiguous (min_candidates_for_logging, default 3+)
+            # 2. Log selected association when noteworthy (low score OR any choice between 2+ candidates)
+            # This provides context without flooding logs
+            if len(candidates) >= self.config.min_candidates_for_logging:
                 logger.debug(
                     f"[ASSOCIATION_CANDIDATES] detection_idx={det_idx}, "
-                    f"detection_box=({evidence.box[0]:.1f}, {evidence.box[1]:.1f}, "
-                    f"{evidence.box[2]:.1f}, {evidence.box[3]:.1f}), "
-                    f"candidates={candidates}"
+                    f"candidates={len(candidates)}, best_event={candidates[0]['event_id'] if candidates else None}"
                 )
             
             if best_event is not None:
-                logger.debug(
-                    f"[ASSOCIATION_SELECTED] detection_idx={det_idx} -> event={best_event.id}, "
-                    f"score={best_score:.3f}, iou={best_iou:.2f}, distance={best_distance:.1f}px"
-                )
+                # Log selected association if noteworthy: low confidence OR had to choose between options
+                if best_score < self.config.low_score_threshold or len(candidates) >= 2:
+                    logger.debug(
+                        f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
+                        f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"
+                    )
                 best_event.add_detection(evidence, frame_img)
                 associated_detection_indices.add(det_idx)
         
