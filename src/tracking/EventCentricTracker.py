@@ -216,6 +216,18 @@ class EventConfig:
     
     Default: 10000.0 (10 seconds)
     """
+    
+    # ==========================================================================
+    # Logging Control Parameters
+    # ==========================================================================
+    min_gap_duration_for_logging_ms: float = 500.0
+    """Minimum detection gap duration to log (reduces log flooding)"""
+    
+    min_candidates_for_logging: int = 3
+    """Minimum candidate count to log association candidates (only log ambiguous cases)"""
+    
+    low_score_threshold: float = 0.7
+    """Score threshold below which associations are logged (focus on low-confidence matches)"""
 
     use_frame_timestamps: bool = False
 
@@ -711,8 +723,8 @@ class BreadBagEvent:
             gap_duration = detection.timestamp_ms - self.current_gap_start
             self.detection_gaps.append((self.current_gap_start, detection.timestamp_ms))
             self.current_gap_start = None
-            # Only log significant detection gaps (>500ms) to reduce log flooding
-            if gap_duration > 500.0:
+            # Only log significant detection gaps to reduce log flooding
+            if gap_duration > self.config.min_gap_duration_for_logging_ms:
                 logger.debug(
                     f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
                 )
@@ -1276,7 +1288,7 @@ class EventCentricTracker:
             
             # Only log when there are multiple competing candidates (ambiguous case)
             # This reduces log flooding while keeping important debug info
-            if len(candidates) > 2:  # Only log if 3+ candidates (truly ambiguous)
+            if len(candidates) >= self.config.min_candidates_for_logging:
                 logger.debug(
                     f"[ASSOCIATION_CANDIDATES] detection_idx={det_idx}, "
                     f"candidates={len(candidates)}, best_event={candidates[0]['event_id'] if candidates else None}"
@@ -1284,7 +1296,7 @@ class EventCentricTracker:
             
             if best_event is not None:
                 # Only log associations that are noteworthy (low score or multiple candidates)
-                if best_score < 0.7 or len(candidates) > 1:
+                if best_score < self.config.low_score_threshold or len(candidates) > 1:
                     logger.debug(
                         f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
                         f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"

@@ -704,6 +704,40 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Logging Control Parameters
+    # --------------------------------------------------------------------------
+    
+    min_gap_duration_for_logging_ms: float = 500.0
+    """
+    Minimum detection gap duration to log.
+    
+    Only gaps longer than this will be logged to reduce log flooding.
+    
+    Range: 100 - 1000 (milliseconds)
+    Default: 500.0 (0.5 seconds)
+    """
+    
+    min_candidates_for_logging: int = 3
+    """
+    Minimum candidate count to log association candidates.
+    
+    Only log when there are this many or more competing candidates (ambiguous cases).
+    
+    Range: 2 - 5
+    Default: 3 (truly ambiguous cases)
+    """
+    
+    low_score_threshold: float = 0.7
+    """
+    Association score threshold below which to log.
+    
+    Associations with scores below this are considered low-confidence and logged.
+    
+    Range: 0.5 - 0.9
+    Default: 0.7
+    """
+    
+    # --------------------------------------------------------------------------
     # Work Zone Configuration
     # --------------------------------------------------------------------------
     
@@ -863,6 +897,11 @@ def get_event_config():
         
         # Resource limits
         max_active_events=tracking_config.max_active_events,
+        
+        # Logging control
+        min_gap_duration_for_logging_ms=tracking_config.min_gap_duration_for_logging_ms,
+        min_candidates_for_logging=tracking_config.min_candidates_for_logging,
+        low_score_threshold=tracking_config.low_score_threshold,
 
         use_frame_timestamps=tracking_config.use_frame_timestamps,
     )
