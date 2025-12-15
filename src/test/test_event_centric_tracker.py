@@ -259,16 +259,29 @@ class TestCentroidAssociation:
         assert 'no_match' in reason or 'distance_exceeded' in reason
     
     def test_association_time_gap_exceeded(self, default_config):
-        """Detection after time threshold should not associate."""
+        """Detection after ghost timeout should not associate."""
         evidence = create_evidence(0.0, 640, 360, is_open=True)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
-        # Detection 500ms later (outside 400ms threshold)
-        new_evidence = create_evidence(500.0, 650, 360, is_open=True, frame_index=1)
+        # Detection 1500ms later (outside 1000ms ghost_timeout_ms threshold)
+        new_evidence = create_evidence(1500.0, 650, 360, is_open=True, frame_index=1)
         can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
         
         assert can_assoc is False
         assert 'time_gap_exceeded' in reason
+    
+    def test_ghost_reattachment_within_ghost_window(self, default_config):
+        """Detection within ghost window but outside association window should still associate via ghost reattachment."""
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
+        
+        # Detection 700ms later (outside 400ms association_time_ms but within 1000ms ghost_timeout_ms)
+        new_evidence = create_evidence(700.0, 650, 360, is_open=True, frame_index=1)
+        can_assoc, distance, reason, iou_value = event.can_associate(new_evidence)
+        
+        # Should associate via ghost reattachment since IoU/centroid match
+        assert can_assoc is True
+        assert 'ghost_' in reason  # Should be ghost_both_match, ghost_centroid_match, or ghost_iou_match
     
     def test_centroid_based_association(self, default_config):
         """Association should work with centroid distance even with different box sizes."""
@@ -332,9 +345,10 @@ class TestGhostEvents:
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
         # Simulate ghost state for 500ms (within 1000ms timeout)
-        should_commit = event.update_ghost_state(500.0, (1280, 720))
+        should_commit, status = event.update_ghost_state(500.0, (1280, 720))
         
         assert should_commit is False
+        assert status == 'keep_alive'
         assert event.state == EventState.OPEN  # Still alive
     
     def test_event_tracking_detection_gaps(self, default_config):
@@ -360,10 +374,11 @@ class TestGhostEvents:
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
         # Ghost state for 1500ms (outside 1000ms timeout)
-        should_commit = event.update_ghost_state(1500.0, (1280, 720))
+        should_commit, status = event.update_ghost_state(1500.0, (1280, 720))
         
-        # OPEN state events don't commit, they expire
+        # OPEN state events should expire (not commit)
         assert should_commit is False
+        assert status == 'expire'
 
 
 # =============================================================================
@@ -388,12 +403,14 @@ class TestTimeoutBasedCommit:
         # Centroid can be anywhere (center of frame)
         event.last_centroid = (640, 360)
         
-        # Wait for ghost timeout with sufficient idle frames
-        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=35)
+        # Wait with sufficient idle frames (35 > 25)
+        # Note: Commit no longer requires ghost_timeout_ms to be exceeded
+        should_commit, status = event.update_ghost_state(500.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is True
+        assert status == 'commit'
         assert event.state == EventState.COMMITTED
-        assert event.commit_reason == "timeout_commit"
+        assert event.commit_reason == "idle_commit"
     
     def test_no_commit_before_closed_state(self, default_config):
         """Event should not commit from OPEN state."""
@@ -403,10 +420,11 @@ class TestTimeoutBasedCommit:
         # Move centroid anywhere
         event.last_centroid = (640, 360)
         
-        # Try to trigger commit from OPEN state
-        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=35)
+        # Try to trigger commit from OPEN state (should expire since ghost_timeout exceeded)
+        should_commit, status = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is False
+        assert status == 'expire'  # Non-CLOSED events expire after ghost_timeout
         assert event.state != EventState.COMMITTED
     
     def test_no_commit_without_sufficient_idle_frames(self, default_config):
@@ -424,11 +442,12 @@ class TestTimeoutBasedCommit:
         # Centroid in center
         event.last_centroid = (640, 360)
         
-        # Wait for ghost timeout but with insufficient idle frames (10 < 25)
-        should_commit = event.update_ghost_state(1100.0, (1280, 720), current_frame_index=10)
+        # Not enough idle frames (10 < 25)
+        should_commit, status = event.update_ghost_state(500.0, (1280, 720), current_frame_index=10)
         
-        # Should NOT commit if not enough idle frames
+        # Should NOT commit if not enough idle frames, but should stay waiting
         assert should_commit is False
+        assert status == 'waiting'
         assert event.state == EventState.CLOSED
 
 
@@ -712,11 +731,12 @@ class TestCommitConfiguration:
         # Centroid is in center
         event.last_centroid = (640, 360)
         
-        # Simulate enough idle frames (15 > 10)
-        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=15)
+        # Simulate enough idle frames (15 > 10) - no ghost_timeout requirement
+        should_commit, status = event.update_ghost_state(400.0, (1280, 720), current_frame_index=15)
         
         assert should_commit is True
-        assert event.commit_reason == "timeout_commit"
+        assert status == 'commit'
+        assert event.commit_reason == "idle_commit"
     
     def test_commit_requires_closed_ratio(self):
         """Commit should require minimum closed evidence ratio."""
@@ -736,10 +756,11 @@ class TestCommitConfiguration:
         event.last_detection_frame_index = 0
         event.last_centroid = (640, 360)
         
-        # Should not commit due to low closed ratio
-        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=35)
+        # Should not commit due to low closed ratio, but should stay alive
+        should_commit, status = event.update_ghost_state(400.0, (1280, 720), current_frame_index=35)
         
         assert should_commit is False
+        assert status == 'keep_alive'  # Stays alive hoping for more closed detections
     
     def test_commit_anywhere_in_frame(self):
         """Event should commit regardless of position in frame (no exit boundary)."""
@@ -759,8 +780,9 @@ class TestCommitConfiguration:
         event.last_detection_frame_index = 0
         event.last_centroid = (640, 360)  # Center of frame
         
-        should_commit = event.update_ghost_state(1000.0, (1280, 720), current_frame_index=20)
+        should_commit, status = event.update_ghost_state(300.0, (1280, 720), current_frame_index=20)
         assert should_commit is True
+        assert status == 'commit'
         
         # Test commit near edge of frame (should also work)
         evidence2 = create_evidence(0.0, 1260, 360, is_open=True)
@@ -772,8 +794,9 @@ class TestCommitConfiguration:
         event2.last_detection_frame_index = 0
         event2.last_centroid = (1260, 360)  # Near edge of frame
         
-        should_commit2 = event2.update_ghost_state(1000.0, (1280, 720), current_frame_index=20)
+        should_commit2, status2 = event2.update_ghost_state(300.0, (1280, 720), current_frame_index=20)
         assert should_commit2 is True
+        assert status2 == 'commit'
 
 
 # =============================================================================
@@ -958,17 +981,17 @@ class TestParallelHybridAssociation:
     
     def test_time_exceeded_reports_both_metrics(self, default_config):
         """
-        Time gap exceeded should still compute and report both metrics.
+        Time gap truly exceeded should still compute and report both metrics.
         
-        Even when time gap is exceeded, both centroid and IoU values
+        When time gap exceeds ghost_timeout_ms, both centroid and IoU values
         should be computed and included in the rejection reason for debugging.
         """
         evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
         event = BreadBagEvent(evidence, default_config, open_class_id=1, closed_class_id=0)
         
-        # Detection with time gap exceeding threshold
+        # Detection with time gap exceeding ghost_timeout (1000ms)
         late_detection = DetectionEvidence(
-            timestamp_ms=500.0,  # 500ms > 400ms threshold
+            timestamp_ms=1500.0,  # 1500ms > 1000ms ghost_timeout_ms
             centroid_x=650,  # Close centroid
             centroid_y=365,
             box=(600, 315, 700, 415),  # Good overlap
@@ -1504,6 +1527,163 @@ class TestExpandedBoxIoU:
         assert (expanded_25[2] - expanded_25[0]) == 150  # 100 + 2*25
         # 50% expansion = 50px per side  
         assert (expanded_50[2] - expanded_50[0]) == 200  # 100 + 2*50
+
+
+# =============================================================================
+# Ghost Reattachment Tests (Bug Fix Validation)
+# =============================================================================
+
+class TestGhostReattachment:
+    """
+    Tests for ghost reattachment functionality.
+    
+    These tests validate the fix for the bug where association was rejected
+    when time_gap > association_time_ms, even though IoU/centroid matched.
+    
+    The fix allows reattachment within the ghost_timeout_ms window if IoU
+    or centroid criteria are satisfied.
+    """
+    
+    def test_ghost_reattachment_via_iou(self):
+        """
+        Ghost reattachment should work via IoU after association_time_ms.
+        
+        Bug scenario:
+        - Event created at timestamp 0
+        - New detection at timestamp 700ms (> 400ms association_time_ms)
+        - IoU is high (boxes overlap well)
+        - Should associate via ghost_iou_match
+        """
+        config = EventConfig(
+            association_distance_px=100.0,
+            association_time_ms=400.0,  # Normal association window
+            ghost_timeout_ms=1000.0,     # Ghost window extends to 1000ms
+            iou_association_enabled=True,
+            iou_association_threshold=0.3,
+        )
+        
+        # Create event with 100x100 box centered at (640, 360)
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Detection at 700ms (outside 400ms association window, inside 1000ms ghost window)
+        # Box overlaps well with original
+        ghost_detection = DetectionEvidence(
+            timestamp_ms=700.0,
+            centroid_x=660,  # Within distance threshold
+            centroid_y=370,
+            box=(610, 320, 710, 420),  # Good overlap with (590, 310, 690, 410)
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=17,  # ~700ms at 25fps
+        )
+        
+        can_assoc, distance, reason, iou_value = event.can_associate(ghost_detection)
+        
+        # Should associate via ghost reattachment
+        assert can_assoc is True
+        assert 'ghost_' in reason  # Match type should indicate ghost window match
+        assert iou_value > 0  # IoU should be computed
+    
+    def test_commit_not_require_ghost_timeout(self):
+        """
+        Commit should NOT require ghost_timeout_ms to be exceeded.
+        
+        Bug scenario:
+        - Event in CLOSED state
+        - last_detection_frame_index = 0
+        - current_frame_index = 30 (> 25 required idle frames)
+        - timestamp_ms = 500ms (< 1000ms ghost_timeout_ms)
+        - Should commit because idle_frames threshold is met
+        """
+        config = EventConfig(
+            commit_idle_frames=25,
+            commit_min_closed_ratio=0.3,
+            ghost_timeout_ms=1000.0,
+            closed_stability_time_ms=200.0,
+        )
+        
+        evidence = create_evidence(0.0, 640, 360, is_open=True)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Force into CLOSED state with good evidence
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 7  # 7/10 = 70% > 30%
+        event.last_detection_frame_index = 0
+        
+        # Update at frame 30 (30 > 25 idle frames) but timestamp < ghost_timeout
+        should_commit, status = event.update_ghost_state(
+            current_time_ms=500.0,  # < 1000ms ghost_timeout_ms
+            frame_size=(1280, 720),
+            current_frame_index=30  # 30 > 25 required idle frames
+        )
+        
+        # Should commit because idle_frames threshold is met
+        assert should_commit is True
+        assert status == 'commit'
+        assert event.commit_reason == 'idle_commit'
+    
+    def test_closed_event_not_expired_prematurely(self, tracker, dummy_frame):
+        """
+        CLOSED event should commit instead of expiring when eligible.
+        
+        Bug scenario:
+        - Event in CLOSED state with good evidence
+        - No detections for >= commit_idle_frames
+        - Tracker.update() should trigger commit, not expiration
+        """
+        # Create event
+        detections = [create_detection([600, 320, 680, 400], class_id=1, conf=0.9)]
+        tracker.update(detections, 0.0, dummy_frame, 0)
+        
+        assert len(tracker.active_events) == 1
+        event_id = list(tracker.active_events.keys())[0]
+        event = tracker.active_events[event_id]
+        
+        # Force into CLOSED state with good evidence
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.open_evidence_count = 3
+        event.closed_evidence_count = 7
+        event.last_detection_frame_index = 0
+        event.last_detection_time_ms = 0.0
+        
+        # Simulate frames without detection (>= commit_idle_frames)
+        # At 25fps, 35 frames = 1400ms
+        ready_events = tracker.update([], 1400.0, dummy_frame, 35)
+        
+        # Event should be committed, not expired
+        assert len(ready_events) == 1
+        assert tracker.stats['events_committed'] == 1
+        # Event should be removed (committed, not in active)
+        assert event_id not in tracker.active_events
+    
+    def test_non_closed_event_expires_correctly(self, tracker, dummy_frame):
+        """
+        Non-CLOSED event should expire after ghost_timeout_ms.
+        """
+        # Create event
+        detections = [create_detection([600, 320, 680, 400], class_id=1, conf=0.9)]
+        tracker.update(detections, 0.0, dummy_frame, 0)
+        
+        assert len(tracker.active_events) == 1
+        event_id = list(tracker.active_events.keys())[0]
+        event = tracker.active_events[event_id]
+        
+        # Event stays in OPEN state (no closed detections)
+        assert event.state == EventState.OPEN
+        
+        # Simulate ghost_timeout_ms exceeded without detection
+        # ghost_timeout_ms = 1000ms in default_config
+        ready_events = tracker.update([], 1500.0, dummy_frame, 40)
+        
+        # Event should be expired (not committed since not CLOSED)
+        assert len(ready_events) == 0
+        assert tracker.stats['events_expired'] == 1
+        assert event_id not in tracker.active_events
 
 
 if __name__ == '__main__':

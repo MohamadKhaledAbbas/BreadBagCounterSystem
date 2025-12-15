@@ -591,30 +591,61 @@ class BreadBagEvent:
         centroid_match = distance <= scaled_threshold
         iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
         
+        # Determine time windows for association
+        # - within_association_window: normal matching (higher reliability)
+        # - within_ghost_window: ghost reattachment allowed (event is "alive but lost")
+        within_association_window = time_gap_ms <= self.config.association_time_ms
+        within_ghost_window = time_gap_ms <= self.config.ghost_timeout_ms
+        
         # Determine match type for structured logging
-        # Priority: time check first, then standard matches, then expanded IoU as fallback
-        if time_gap_ms > self.config.association_time_ms:
+        # Priority:
+        # 1. Check time windows (reject if beyond ghost_timeout)
+        # 2. Normal association within association_time_ms
+        # 3. Ghost reattachment within ghost_timeout_ms (if IoU or centroid match)
+        # 4. Expanded IoU as fallback
+        
+        if not within_ghost_window:
+            # Time gap exceeds ghost timeout - cannot associate
             match_type = "time_exceeded"
             associated = False
-        elif centroid_match and iou_match:
-            match_type = "both_match"
-            associated = True
-        elif centroid_match:
-            match_type = "centroid_match"
-            associated = True
-        elif iou_match:
-            match_type = "iou_match"
-            associated = True
-        elif expanded_iou_match:
-            # Expanded IoU match is a fallback for flip/spin scenarios
-            # where both centroid and standard IoU may fail
-            match_type = "expanded_iou_match"
-            associated = True
-            # Use the expanded IoU value for scoring purposes
-            iou_value = iou_expanded
+        elif within_association_window:
+            # Normal association window - all match types allowed
+            if centroid_match and iou_match:
+                match_type = "both_match"
+                associated = True
+            elif centroid_match:
+                match_type = "centroid_match"
+                associated = True
+            elif iou_match:
+                match_type = "iou_match"
+                associated = True
+            elif expanded_iou_match:
+                # Expanded IoU match is a fallback for flip/spin scenarios
+                match_type = "expanded_iou_match"
+                associated = True
+                iou_value = iou_expanded
+            else:
+                match_type = "no_match"
+                associated = False
         else:
-            match_type = "no_match"
-            associated = False
+            # Ghost reattachment window (association_time_ms < gap <= ghost_timeout_ms)
+            # Allow reattachment if IoU or centroid matches - event was alive but lost
+            if centroid_match and iou_match:
+                match_type = "ghost_both_match"
+                associated = True
+            elif centroid_match:
+                match_type = "ghost_centroid_match"
+                associated = True
+            elif iou_match:
+                match_type = "ghost_iou_match"
+                associated = True
+            elif expanded_iou_match:
+                match_type = "ghost_expanded_iou_match"
+                associated = True
+                iou_value = iou_expanded
+            else:
+                match_type = "no_match"
+                associated = False
         
         # Use structured logging for detailed debug output
         structured_logger.hybrid_association_attempt(
@@ -638,7 +669,8 @@ class BreadBagEvent:
         metrics_detail = (
             f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px), "
             f"iou={iou_value:.2f} (thresh={self.config.iou_association_threshold}), "
-            f"time_gap={time_gap_ms:.1f}ms"
+            f"time_gap={time_gap_ms:.1f}ms (assoc_thresh={self.config.association_time_ms}ms, "
+            f"ghost_thresh={self.config.ghost_timeout_ms}ms)"
         )
         
         # Include expanded IoU info if relevant
@@ -649,7 +681,7 @@ class BreadBagEvent:
             metrics_detail += f", velocity={velocity_mag:.3f}px/ms"
         
         if match_type == "time_exceeded":
-            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.association_time_ms}ms) | {metrics_detail}"
+            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.ghost_timeout_ms}ms) | {metrics_detail}"
         else:
             reason = f"{match_type} ({metrics_detail})"
         
@@ -855,14 +887,17 @@ class BreadBagEvent:
         )
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
-                           current_frame_index: int = -1) -> bool:
+                           current_frame_index: int = -1) -> Tuple[bool, str]:
         """
         Update event when no detection is present (ghost state).
         
-        Commitment Logic (Timeout-Based Only):
-        - After entering CLOSED state, commit if undetected for commit_idle_frames
-        - Requires minimum closed evidence ratio to be met
-        - No exit boundary check - commitment is purely timeout-based
+        Commitment Logic (decoupled from ghost timeout):
+        - Commit eligibility is evaluated as soon as:
+          1. State is CLOSED
+          2. frames_without_detection >= commit_idle_frames
+          3. closed_ratio >= commit_min_closed_ratio
+          4. (Optional) time_in_closed >= closed_stability_time_ms
+        - Ghost timeout is used separately to expire non-CLOSED events
         
         Args:
             current_time_ms: Current timestamp in milliseconds
@@ -870,7 +905,9 @@ class BreadBagEvent:
             current_frame_index: Current frame index for idle tracking
             
         Returns:
-            True if event should be committed (counted), False otherwise
+            Tuple of (should_commit, status):
+            - should_commit: True if event should be committed (counted)
+            - status: 'commit', 'keep_alive', 'expire', or 'waiting'
         """
         # Start gap tracking if not already
         if self.current_gap_start is None:
@@ -883,49 +920,72 @@ class BreadBagEvent:
         if current_frame_index >= 0:
             self.frames_without_detection = current_frame_index - self.last_detection_frame_index
         
-        # Check if ghost timeout exceeded
-        if time_since_detection_ms > self.config.ghost_timeout_ms:
-            if self.state == EventState.CLOSED:
-                # Timeout-based commitment: check if enough frames have passed without detection
-                if self.frames_without_detection >= self.config.commit_idle_frames:
-                    # Verify we have sufficient closed evidence
-                    total_evidence = self.open_evidence_count + self.closed_evidence_count
-                    if total_evidence > 0:
-                        closed_ratio = self.closed_evidence_count / total_evidence
-                        if closed_ratio >= self.config.commit_min_closed_ratio:
+        # Calculate time in current state
+        time_in_state_ms = current_time_ms - self.state_enter_time_ms
+        
+        # FIRST: Check commit eligibility for CLOSED events (independent of ghost timeout)
+        if self.state == EventState.CLOSED:
+            # Check if enough idle frames have passed
+            if self.frames_without_detection >= self.config.commit_idle_frames:
+                # Verify we have sufficient closed evidence
+                total_evidence = self.open_evidence_count + self.closed_evidence_count
+                if total_evidence > 0:
+                    closed_ratio = self.closed_evidence_count / total_evidence
+                    
+                    # Check closed ratio threshold
+                    if closed_ratio >= self.config.commit_min_closed_ratio:
+                        # Optional: Check time in CLOSED state for extra stability
+                        if time_in_state_ms >= self.config.closed_stability_time_ms:
                             self._transition_to(EventState.COMMITTED, current_time_ms,
-                                                f"timeout_commit (idle={self.frames_without_detection} frames, "
-                                                f"closed_ratio={closed_ratio:.2f})")
-                            self.commit_reason = "timeout_commit"
+                                                f"idle_commit (idle={self.frames_without_detection} frames, "
+                                                f"closed_ratio={closed_ratio:.2f}, "
+                                                f"time_in_closed={time_in_state_ms:.0f}ms)")
+                            self.commit_reason = "idle_commit"
                             logger.info(
-                                f"[Event:{self.id}] Timeout commit: bag counted after idle timeout "
-                                f"(idle={self.frames_without_detection} frames, centroid={self.last_centroid})"
+                                f"[Event:{self.id}] Idle commit: bag counted after idle threshold "
+                                f"(idle={self.frames_without_detection} frames, "
+                                f"time_since_detection={time_since_detection_ms:.0f}ms, "
+                                f"time_in_closed={time_in_state_ms:.0f}ms, "
+                                f"centroid={self.last_centroid})"
                             )
-                            return True
+                            return True, 'commit'
                         else:
-                            # Not enough closed evidence - don't commit
+                            # Need more time in CLOSED state
                             logger.debug(
-                                f"[Event:{self.id}] CLOSED but insufficient closed ratio "
-                                f"({closed_ratio:.2f} < {self.config.commit_min_closed_ratio})"
+                                f"[Event:{self.id}] CLOSED but waiting for stability "
+                                f"(time_in_closed={time_in_state_ms:.0f}ms, "
+                                f"required={self.config.closed_stability_time_ms}ms)"
                             )
-                            return False
-                
-                # Not enough idle time yet
+                            return False, 'waiting'
+                    else:
+                        # Not enough closed evidence ratio
+                        logger.debug(
+                            f"[Event:{self.id}] CLOSED but insufficient closed ratio "
+                            f"({closed_ratio:.2f} < {self.config.commit_min_closed_ratio})"
+                        )
+                        # Keep alive - might get more closed detections
+                        return False, 'keep_alive'
+            else:
+                # Not enough idle frames yet
                 logger.debug(
-                    f"[Event:{self.id}] CLOSED but waiting for timeout "
+                    f"[Event:{self.id}] CLOSED but waiting for idle threshold "
                     f"(idle_frames={self.frames_without_detection}, "
                     f"required={self.config.commit_idle_frames})"
                 )
-                return False
-            else:
-                # Event expired without reaching CLOSED state
-                logger.debug(
-                    f"[Event:{self.id}] Expired in state {self.state.name} "
-                    f"after {time_since_detection_ms:.0f}ms without detection"
-                )
-                return False  # Don't commit, just expire
+                return False, 'waiting'
         
-        return False
+        # SECOND: For non-CLOSED events, check if ghost timeout exceeded
+        if time_since_detection_ms > self.config.ghost_timeout_ms:
+            # Event expired without reaching CLOSED state or meeting commit criteria
+            logger.debug(
+                f"[Event:{self.id}] Expired in state {self.state.name} "
+                f"after {time_since_detection_ms:.0f}ms without detection "
+                f"(ghost_timeout={self.config.ghost_timeout_ms}ms)"
+            )
+            return False, 'expire'
+        
+        # Event is still alive in ghost state, waiting for detection or state change
+        return False, 'keep_alive'
     
     def get_roi_candidates(self) -> List[Dict[str, Any]]:
         """
@@ -1235,15 +1295,18 @@ class EventCentricTracker:
             self.stats['events_created'] += 1
         
         # 3. Update ghost state for events without detections
+        # CRITICAL: Commit eligibility is evaluated BEFORE expiration
+        # - CLOSED events are committed based on idle_frames, not ghost_timeout
+        # - Only non-CLOSED events are expired by ghost_timeout
         events_to_remove = []
         
         for event_id, event in self.active_events.items():
             # Check if THIS specific event received a detection this frame
             if event.last_detection_time_ms != timestamp_ms:
                 # No detection for this event - update ghost state
-                should_commit = event.update_ghost_state(timestamp_ms, frame_size, frame_index)
+                should_commit, status = event.update_ghost_state(timestamp_ms, frame_size, frame_index)
                 
-                if should_commit:
+                if should_commit and status == 'commit':
                     # Event is ready for classification
                     ready_events.append(self._prepare_event_output(event))
                     events_to_remove.append(event_id)
@@ -1256,24 +1319,38 @@ class EventCentricTracker:
                         'event_id': event_id
                     })
                 
-                elif event.state != EventState.COMMITTED:
-                    # Check if ghost timeout exceeded without reaching CLOSED
+                elif status == 'expire':
+                    # Event expired (non-CLOSED state exceeded ghost_timeout)
+                    events_to_remove.append(event_id)
+                    self.stats['events_expired'] += 1
+                    
+                    # Log expiration with detailed info for debugging
                     time_since = timestamp_ms - event.last_detection_time_ms
-                    if time_since > self.config.ghost_timeout_ms:
-                        events_to_remove.append(event_id)
-                        self.stats['events_expired'] += 1
-                        
-                        # Log expiration with debug info
-                        debug_info = event.get_debug_info()
-                        structured_logger.event_expired(
-                            event_id=event_id,
-                            state=event.state.name,
-                            frames_tracked=event.total_frames_observed,
-                            open_hits=event.open_evidence_count,
-                            closed_hits=event.closed_evidence_count,
-                            frames_since_update=int(time_since / (1000 / 25)),  # Approx frames
-                            avg_motion=event.get_centroid_stability()
-                        )
+                    total_evidence = event.open_evidence_count + event.closed_evidence_count
+                    closed_ratio = event.closed_evidence_count / total_evidence if total_evidence > 0 else 0
+                    time_in_state = timestamp_ms - event.state_enter_time_ms
+                    
+                    structured_logger.event_expired(
+                        event_id=event_id,
+                        state=event.state.name,
+                        frames_tracked=event.total_frames_observed,
+                        open_hits=event.open_evidence_count,
+                        closed_hits=event.closed_evidence_count,
+                        frames_since_update=event.frames_without_detection,
+                        avg_motion=event.get_centroid_stability()
+                    )
+                    
+                    # Additional detailed logging for audit trail
+                    logger.info(
+                        f"[Event:{event_id}] EXPIRED: state={event.state.name}, "
+                        f"time_since_detection={time_since:.0f}ms, "
+                        f"frames_without_detection={event.frames_without_detection}, "
+                        f"closed_ratio={closed_ratio:.2f}, "
+                        f"time_in_state={time_in_state:.0f}ms, "
+                        f"expiration_reason=ghost_timeout_exceeded"
+                    )
+                
+                # status == 'keep_alive' or 'waiting': event stays active
         
         # Remove committed/expired events
         for event_id in events_to_remove:
