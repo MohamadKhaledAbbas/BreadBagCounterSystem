@@ -687,7 +687,7 @@ class TrackingConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     
-    suppression_distance_px: float = 150.0
+    suppression_distance_px: float = 120.0
     """
     Distance (pixels) within which new events are suppressed near recent commits.
     
@@ -698,10 +698,10 @@ class TrackingConfig:
     Should be larger than association_distance_px to ensure bags don't get
     re-counted after brief re-detection.
     
-    Default: 150.0
+    Default: 120.0 (reduced from 150.0 for tighter suppression zone)
     """
     
-    suppression_duration_ms: float = 1000.0
+    suppression_duration_ms: float = 1500.0
     """
     Duration (milliseconds) to suppress new events after a commit.
     
@@ -712,7 +712,7 @@ class TrackingConfig:
     Should be long enough that a temporarily lost bag won't be re-detected
     as a new event.
     
-    Default: 1000.0
+    Default: 1500.0 (increased from 1000.0 for longer suppression window)
     """
     
     # --------------------------------------------------------------------------
@@ -741,7 +741,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_iou_threshold: float = 0.15
+    suppression_iou_threshold: float = 0.10
     """
     ISSUE #3 FIX: Minimum IoU with last committed box to trigger suppression.
     
@@ -762,7 +762,107 @@ class TrackingConfig:
     Tuning: Lower than iou_association_threshold since we're looking for
     overlap with a bag that may have moved slightly before commitment.
     
-    Default: 0.15
+    Default: 0.10 (reduced from 0.15 for more aggressive suppression)
+    """
+    
+    # --------------------------------------------------------------------------
+    # Temporal Cooldown for New Event Creation
+    # --------------------------------------------------------------------------
+    
+    min_event_creation_interval_ms: float = 400.0
+    """
+    Minimum time (milliseconds) before allowing new event creation at same location.
+    
+    After an event is committed, this cooldown prevents rapid creation of new events
+    at the same spatial location. This catches detection flickering and momentary
+    re-detections of the same bag.
+    
+    Range: 200 - 800
+    - Lower values: Allow new events sooner (more responsive)
+    - Higher values: More aggressive duplicate prevention
+    
+    Works in conjunction with temporal_cooldown_distance_px to define a
+    space-time exclusion zone around recently committed events.
+    
+    Default: 400.0
+    """
+    
+    temporal_cooldown_distance_px: float = 120.0
+    """
+    Spatial distance (pixels) within which temporal cooldown applies.
+    
+    Defines the radius around a recently committed event's location where
+    the min_event_creation_interval_ms cooldown is enforced.
+    
+    Range: 80 - 200
+    - Lower values: Tighter cooldown zone (more localized)
+    - Higher values: Wider cooldown zone (more aggressive)
+    
+    Should be similar to suppression_distance_px for consistency.
+    
+    Default: 120.0
+    """
+    
+    # --------------------------------------------------------------------------
+    # Active Event Spatial Exclusion
+    # --------------------------------------------------------------------------
+    
+    active_event_exclusion_distance_px: float = 60.0
+    """
+    Distance (pixels) within which new events are blocked if an active event exists.
+    
+    Before creating a new event, checks if any active (non-COMMITTED) event already
+    covers this spatial area. This prevents duplicate events when:
+    - Detection temporarily lost and immediately re-detected
+    - Multiple detections of the same bag in one frame
+    - Detection flickering/splitting
+    
+    Range: 40 - 100
+    - Lower values: Allow events closer together (may miss duplicates)
+    - Higher values: More aggressive duplicate prevention (may block legitimate new bags)
+    
+    Should be smaller than association_distance_px since we only want to block
+    very close duplicates, not all nearby bags.
+    
+    Default: 60.0
+    """
+    
+    active_event_exclusion_iou: float = 0.25
+    """
+    IoU threshold for active event spatial exclusion.
+    
+    If a new detection overlaps with an existing active event's bounding box
+    by this IoU amount or more, don't create a new event (likely duplicate).
+    
+    Range: 0.15 - 0.40
+    - Lower values: More aggressive duplicate prevention
+    - Higher values: Only block very similar detections
+    
+    Higher than suppression_iou_threshold since we're comparing with currently
+    active events (should be very similar if they're duplicates).
+    
+    Default: 0.25
+    """
+    
+    # --------------------------------------------------------------------------
+    # Detection Clustering Parameters
+    # --------------------------------------------------------------------------
+    
+    detection_cluster_distance_px: float = 80.0
+    """
+    Distance threshold for clustering nearby unassociated detections.
+    
+    Before creating events, nearby detections are clustered together and only
+    the highest confidence detection from each cluster creates an event. This
+    prevents multiple events from detection splits or flickering.
+    
+    Range: 50 - 120
+    - Lower values: Less aggressive clustering (more events may be created)
+    - Higher values: More aggressive clustering (may merge distinct bags)
+    
+    Should be close to association_distance_px for consistency.
+    
+    Default: 80.0
     """
     
     # --------------------------------------------------------------------------
@@ -1095,6 +1195,17 @@ def get_event_config():
         suppression_duration_ms=tracking_config.suppression_duration_ms,
         suppression_require_box_overlap=tracking_config.suppression_require_box_overlap,
         suppression_iou_threshold=tracking_config.suppression_iou_threshold,
+        
+        # Temporal cooldown for new event creation
+        min_event_creation_interval_ms=tracking_config.min_event_creation_interval_ms,
+        temporal_cooldown_distance_px=tracking_config.temporal_cooldown_distance_px,
+        
+        # Active event spatial exclusion
+        active_event_exclusion_distance_px=tracking_config.active_event_exclusion_distance_px,
+        active_event_exclusion_iou=tracking_config.active_event_exclusion_iou,
+        
+        # Detection clustering
+        detection_cluster_distance_px=tracking_config.detection_cluster_distance_px,
         
         # State transition timing
         open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,
