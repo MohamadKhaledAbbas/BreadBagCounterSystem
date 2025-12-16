@@ -1132,6 +1132,94 @@ class TrackingConfig:
 
     use_frame_timestamps: bool = IS_WINDOWS
 
+    # ==========================================================================
+    # Testing Mode Time Scaling (for Windows/Development environments)
+    # ==========================================================================
+    
+    testing_time_scale_factor: float = 1.0
+    """
+    Time scaling multiplier for testing/development mode.
+    
+    When running on slower hardware (e.g., Windows PCs without BPU acceleration),
+    the system processes all frames but at a slower effective speed than production.
+    This parameter scales all time-based thresholds to compensate for the slower
+    processing speed, ensuring event lifecycles behave as they would in production.
+    
+    Calculation:
+        scale_factor = (actual_processing_time_per_frame / target_frame_time)
+        
+        For example, if production runs at 25fps (40ms per frame) but testing
+        takes 200ms per frame (5fps effective), the scale factor would be:
+        scale_factor = 200ms / 40ms = 5.0
+    
+    Usage:
+        - 1.0 (default): No scaling, production behavior
+        - 5.0: Testing runs 5x slower, multiply all timeouts by 5
+        - Auto: Set to 0.0 to auto-calculate based on measured FPS
+    
+    Affects ALL time-based parameters:
+        - association_time_ms
+        - ghost_timeout_ms
+        - max_event_lifetime_ms
+        - suppression_duration_ms
+        - min_event_creation_interval_ms
+        - open_to_closing_time_ms
+        - closing_stability_time_ms
+        - closed_stability_time_ms
+        - max_prediction_time_ms
+        - degraded_mode_delay_threshold_ms
+        - min_gap_duration_for_logging_ms
+    
+    Note: This only affects time-based parameters when use_frame_timestamps=True
+          (typically Windows/testing mode). Frame-based parameters (commit_idle_frames,
+          etc.) are not affected as they already scale naturally with frame rate.
+    
+    Range: 1.0 - 20.0 (or 0.0 for auto)
+    Default: 1.0 (no scaling)
+    """
+    
+    enable_auto_time_scaling: bool = IS_WINDOWS
+    """
+    Automatically calculate time scaling factor based on actual processing speed.
+    
+    When enabled, the system measures the actual time taken per frame and
+    calculates the appropriate time scaling factor dynamically. This is useful
+    when the processing speed varies or is unknown.
+    
+    The auto-calculated factor is applied after a warm-up period (first 100 frames)
+    to ensure stable measurements.
+    
+    Precedence: If both `enable_auto_time_scaling=True` and a manual 
+    `testing_time_scale_factor` are set, the manual factor is used initially,
+    then replaced by the auto-calculated factor after warmup (if significantly
+    different). To maintain a fixed manual factor, set `enable_auto_time_scaling=False`.
+    
+    Default: True on Windows, False on RDK (production)
+    """
+    
+    auto_scaling_target_frame_time_ms: float = 40.0
+    """
+    Target frame time in milliseconds for auto-scaling calculation.
+    Default: 40ms (25fps). The auto-scaling factor is calculated as:
+    measured_frame_time / target_frame_time.
+    """
+    
+    auto_scaling_warmup_frames: int = 100
+    """
+    Number of frames to process before calculating auto-scaling factor.
+    Ensures stable measurements by allowing system to reach steady state.
+    Default: 100 frames
+    """
+    
+    auto_scaling_activation_threshold: float = 1.2
+    """
+    Minimum scale factor to activate auto-scaling.
+    If calculated factor is below this threshold (processing close to real-time),
+    no scaling is applied.
+    Range: 1.1 - 2.0
+    Default: 1.2 (20% slower than target)
+    """
+
 
 # Global configuration instance
 tracking_config = TrackingConfig()
@@ -1243,4 +1331,11 @@ def get_event_config():
         noteworthy_match_types=tracking_config.noteworthy_match_types,
 
         use_frame_timestamps=tracking_config.use_frame_timestamps,
+        
+        # Testing mode time scaling
+        testing_time_scale_factor=tracking_config.testing_time_scale_factor,
+        enable_auto_time_scaling=tracking_config.enable_auto_time_scaling,
+        auto_scaling_target_frame_time_ms=tracking_config.auto_scaling_target_frame_time_ms,
+        auto_scaling_warmup_frames=tracking_config.auto_scaling_warmup_frames,
+        auto_scaling_activation_threshold=tracking_config.auto_scaling_activation_threshold,
     )

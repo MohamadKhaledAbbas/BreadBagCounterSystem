@@ -91,6 +91,17 @@ Key configuration files:
 - `src/config/tracking_config.py`: Event tracking parameters
 - Environment variables: `LOG_LEVEL`, `ENABLE_JSON_LOGGING`, `LOG_DIR`, `ENABLE_UNKNOWN_PHASH_CLUSTERING`
 
+### Testing Mode Time Scaling
+
+When running on slower hardware (e.g., Windows PCs), the system automatically scales time-based thresholds to maintain equivalent behavior with production:
+
+- **Auto-enabled on Windows**: Measures processing speed and scales timeouts automatically
+- **Manual configuration**: Set `testing_time_scale_factor` in `tracking_config.py`
+- **No frame dropping**: All frames processed regardless of speed
+- **Equivalent behavior**: Event lifecycles match production timing
+
+See [docs/TESTING_TIME_SCALING.md](docs/TESTING_TIME_SCALING.md) for detailed configuration guide.
+
 ### Unknown Bag Handling
 
 The system now uses **stable Unknown aggregation** to avoid creating many noisy Unknown bag types:

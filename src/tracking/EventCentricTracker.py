@@ -297,6 +297,48 @@ class EventConfig:
     """Match types that are always logged as they indicate special recovery cases"""
 
     use_frame_timestamps: bool = False
+    
+    # ==========================================================================
+    # Testing Mode Time Scaling (for slower processing environments)
+    # ==========================================================================
+    testing_time_scale_factor: float = 1.0
+    """
+    Multiplier for all time-based thresholds when running in testing/development mode.
+    
+    When processing speed is slower than real-time (e.g., Windows without BPU acceleration),
+    this factor scales all millisecond-based timeouts to maintain equivalent behavior.
+    
+    For example, if testing processes at 5fps (200ms/frame) instead of production's 
+    25fps (40ms/frame), set this to 5.0 to scale all timeouts accordingly.
+    
+    Default: 1.0 (no scaling, production behavior)
+    """
+    
+    enable_auto_time_scaling: bool = False
+    """
+    Automatically calculate time scaling factor based on measured processing speed.
+    Enabled by default on Windows, disabled on RDK.
+    """
+    
+    # Auto-scaling configuration parameters
+    auto_scaling_target_frame_time_ms: float = 40.0
+    """
+    Target frame time in milliseconds for auto-scaling calculation (default: 40ms = 25fps).
+    The auto-scaling factor is calculated as: measured_frame_time / target_frame_time.
+    """
+    
+    auto_scaling_warmup_frames: int = 100
+    """
+    Number of frames to process before calculating auto-scaling factor.
+    Ensures stable measurements by allowing system to reach steady state.
+    """
+    
+    auto_scaling_activation_threshold: float = 1.2
+    """
+    Minimum scale factor to activate auto-scaling.
+    If calculated factor is below this threshold (processing close to real-time),
+    no scaling is applied. Range: 1.1 - 2.0, default: 1.2
+    """
 
 
 @dataclass
@@ -1282,15 +1324,141 @@ class EventCentricTracker:
             'total_detections_processed': 0,
         }
         
+        # Time scaling for testing mode
+        self._time_scale_factor = self.config.testing_time_scale_factor
+        self._enable_auto_scaling = self.config.enable_auto_time_scaling
+        self._frame_times = []  # Track recent frame processing times for auto-scaling
+        self._last_timestamp = None
+        self._auto_scale_warmup_frames = self.config.auto_scaling_warmup_frames
+        self._auto_scale_target_frame_time = self.config.auto_scaling_target_frame_time_ms
+        self._auto_scale_threshold = self.config.auto_scaling_activation_threshold
+        self._frame_count = 0
+        
+        # Apply time scaling to create effective thresholds
+        self._update_scaled_thresholds()
+        
         logger.info(
             f"[EventCentricTracker] Initialized with: "
             f"D={self.config.association_distance_px}px, "
-            f"T={self.config.association_time_ms}ms, "
-            f"G={self.config.ghost_timeout_ms}ms, "
+            f"T={self._scaled_association_time_ms}ms (base={self.config.association_time_ms}ms), "
+            f"G={self._scaled_ghost_timeout_ms}ms (base={self.config.ghost_timeout_ms}ms), "
             f"commit_idle_frames={self.config.commit_idle_frames}, "
             f"suppression_distance={self.config.suppression_distance_px}px, "
-            f"suppression_duration={self.config.suppression_duration_ms}ms"
+            f"suppression_duration={self._scaled_suppression_duration_ms}ms (base={self.config.suppression_duration_ms}ms), "
+            f"time_scale_factor={self._time_scale_factor}, auto_scaling={self._enable_auto_scaling}"
         )
+    
+    def _update_scaled_thresholds(self):
+        """
+        Apply time scaling factor to all millisecond-based parameters.
+        
+        This creates scaled versions of time thresholds that are used throughout
+        the tracker. The scaled values ensure that timing logic behaves equivalently
+        in testing mode (slower processing) and production mode (real-time).
+        """
+        scale = self._time_scale_factor
+        
+        # Association and ghost timeouts
+        self._scaled_association_time_ms = self.config.association_time_ms * scale
+        self._scaled_ghost_timeout_ms = self.config.ghost_timeout_ms * scale
+        self._scaled_max_event_lifetime_ms = self.config.max_event_lifetime_ms * scale
+        
+        # Suppression and cooldown
+        self._scaled_suppression_duration_ms = self.config.suppression_duration_ms * scale
+        self._scaled_min_event_creation_interval_ms = self.config.min_event_creation_interval_ms * scale
+        
+        # State transition timing
+        self._scaled_open_to_closing_time_ms = self.config.open_to_closing_time_ms * scale
+        self._scaled_closing_stability_time_ms = self.config.closing_stability_time_ms * scale
+        self._scaled_closed_stability_time_ms = self.config.closed_stability_time_ms * scale
+        
+        # Velocity and prediction
+        self._scaled_max_prediction_time_ms = self.config.max_prediction_time_ms * scale
+        
+        # Logging thresholds
+        self._scaled_min_gap_duration_for_logging_ms = self.config.min_gap_duration_for_logging_ms * scale
+        
+        logger.debug(
+            f"[EventCentricTracker] Applied time scaling factor {scale:.2f}: "
+            f"association_time={self._scaled_association_time_ms:.1f}ms, "
+            f"ghost_timeout={self._scaled_ghost_timeout_ms:.1f}ms"
+        )
+    
+    def _get_scaled_config(self) -> EventConfig:
+        """
+        Create a config copy with scaled time parameters for BreadBagEvent instances.
+        
+        This allows events to use the scaled thresholds without modifying the
+        original config or requiring events to know about scaling.
+        
+        Returns:
+            EventConfig with scaled time parameters
+        """
+        from dataclasses import replace
+        
+        return replace(
+            self.config,
+            association_time_ms=self._scaled_association_time_ms,
+            ghost_timeout_ms=self._scaled_ghost_timeout_ms,
+            max_event_lifetime_ms=self._scaled_max_event_lifetime_ms,
+            suppression_duration_ms=self._scaled_suppression_duration_ms,
+            min_event_creation_interval_ms=self._scaled_min_event_creation_interval_ms,
+            open_to_closing_time_ms=self._scaled_open_to_closing_time_ms,
+            closing_stability_time_ms=self._scaled_closing_stability_time_ms,
+            closed_stability_time_ms=self._scaled_closed_stability_time_ms,
+            max_prediction_time_ms=self._scaled_max_prediction_time_ms,
+            min_gap_duration_for_logging_ms=self._scaled_min_gap_duration_for_logging_ms,
+        )
+    
+    def _update_auto_time_scaling(self, current_timestamp_ms: float):
+        """
+        Auto-calculate time scaling factor based on measured processing speed.
+        
+        After a warmup period, computes the ratio of actual frame time to target
+        frame time and updates the scaling factor accordingly.
+        
+        Args:
+            current_timestamp_ms: Current timestamp in milliseconds
+        """
+        if not self._enable_auto_scaling:
+            return
+        
+        self._frame_count += 1
+        
+        # Track frame intervals
+        if self._last_timestamp is not None:
+            frame_interval = current_timestamp_ms - self._last_timestamp
+            self._frame_times.append(frame_interval)
+            
+            # Keep only recent frames (up to warmup count)
+            if len(self._frame_times) > self._auto_scale_warmup_frames:
+                self._frame_times.pop(0)
+        
+        self._last_timestamp = current_timestamp_ms
+        
+        # After warmup, calculate and apply auto-scaling
+        if self._frame_count == self._auto_scale_warmup_frames and len(self._frame_times) > 50:
+            avg_frame_time = sum(self._frame_times) / len(self._frame_times)
+            
+            # Calculate scale factor using configured target frame time
+            new_scale_factor = avg_frame_time / self._auto_scale_target_frame_time
+            
+            # Only apply if significantly different from 1.0 (above activation threshold)
+            if new_scale_factor > self._auto_scale_threshold:
+                old_factor = self._time_scale_factor
+                self._time_scale_factor = new_scale_factor
+                self._update_scaled_thresholds()
+                
+                logger.info(
+                    f"[EventCentricTracker] Auto-scaling enabled: "
+                    f"avg_frame_time={avg_frame_time:.1f}ms, target={self._auto_scale_target_frame_time:.1f}ms, "
+                    f"scale_factor={new_scale_factor:.2f} (was {old_factor:.2f})"
+                )
+            else:
+                logger.info(
+                    f"[EventCentricTracker] Auto-scaling measured {new_scale_factor:.2f}x but keeping 1.0x "
+                    f"(processing close to real-time, threshold={self._auto_scale_threshold})"
+                )
     
     def update(self, 
                detections: List[Dict[str, Any]], 
@@ -1315,10 +1483,13 @@ class EventCentricTracker:
         ready_events = []
         frame_size = (frame_img.shape[1], frame_img.shape[0])
         
-        # Clean up old recently_committed entries based on suppression duration
+        # Update auto time scaling if enabled
+        self._update_auto_time_scaling(timestamp_ms)
+        
+        # Clean up old recently_committed entries based on suppression duration (use scaled)
         self.recently_committed = [
             rc for rc in self.recently_committed
-            if timestamp_ms - rc['timestamp_ms'] < self.config.suppression_duration_ms
+            if timestamp_ms - rc['timestamp_ms'] < self._scaled_suppression_duration_ms
         ]
         
         # Convert detections to evidence
@@ -1486,10 +1657,10 @@ class EventCentricTracker:
                 self.stats['events_suppressed'] += 1
                 continue
             
-            # Create new event
+            # Create new event with scaled config
             new_event = BreadBagEvent(
                 initial_detection=evidence,
-                config=self.config,
+                config=self._get_scaled_config(),
                 open_class_id=self.open_class_id,
                 closed_class_id=self.closed_class_id
             )
@@ -1604,13 +1775,13 @@ class EventCentricTracker:
             
             # TEMPORAL COOLDOWN CHECK: Hard temporal cooldown - no new events in same area for X ms
             # This is the most aggressive check and happens first
-            if time_since_commit < self.config.min_event_creation_interval_ms:
+            if time_since_commit < self._scaled_min_event_creation_interval_ms:
                 if distance < self.config.temporal_cooldown_distance_px:
                     # Within cooldown period and distance - suppress
                     logger.debug(
                         f"[EventCentricTracker] Suppressing new event: "
                         f"within temporal cooldown zone of recently committed {rc['event_id']} "
-                        f"(time_since_commit={time_since_commit:.0f}ms < {self.config.min_event_creation_interval_ms}ms, "
+                        f"(time_since_commit={time_since_commit:.0f}ms < {self._scaled_min_event_creation_interval_ms}ms, "
                         f"distance={distance:.1f}px < {self.config.temporal_cooldown_distance_px}px)"
                     )
                     return True
