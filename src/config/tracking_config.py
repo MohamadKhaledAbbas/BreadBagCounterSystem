@@ -1189,7 +1189,35 @@ class TrackingConfig:
     The auto-calculated factor is applied after a warm-up period (first 100 frames)
     to ensure stable measurements.
     
+    Precedence: If both `enable_auto_time_scaling=True` and a manual 
+    `testing_time_scale_factor` are set, the manual factor is used initially,
+    then replaced by the auto-calculated factor after warmup (if significantly
+    different). To maintain a fixed manual factor, set `enable_auto_time_scaling=False`.
+    
     Default: True on Windows, False on RDK (production)
+    """
+    
+    auto_scaling_target_frame_time_ms: float = 40.0
+    """
+    Target frame time in milliseconds for auto-scaling calculation.
+    Default: 40ms (25fps). The auto-scaling factor is calculated as:
+    measured_frame_time / target_frame_time.
+    """
+    
+    auto_scaling_warmup_frames: int = 100
+    """
+    Number of frames to process before calculating auto-scaling factor.
+    Ensures stable measurements by allowing system to reach steady state.
+    Default: 100 frames
+    """
+    
+    auto_scaling_activation_threshold: float = 1.2
+    """
+    Minimum scale factor to activate auto-scaling.
+    If calculated factor is below this threshold (processing close to real-time),
+    no scaling is applied.
+    Range: 1.1 - 2.0
+    Default: 1.2 (20% slower than target)
     """
 
 
@@ -1307,4 +1335,7 @@ def get_event_config():
         # Testing mode time scaling
         testing_time_scale_factor=tracking_config.testing_time_scale_factor,
         enable_auto_time_scaling=tracking_config.enable_auto_time_scaling,
+        auto_scaling_target_frame_time_ms=tracking_config.auto_scaling_target_frame_time_ms,
+        auto_scaling_warmup_frames=tracking_config.auto_scaling_warmup_frames,
+        auto_scaling_activation_threshold=tracking_config.auto_scaling_activation_threshold,
     )

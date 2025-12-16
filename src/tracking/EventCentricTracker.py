@@ -319,6 +319,26 @@ class EventConfig:
     Automatically calculate time scaling factor based on measured processing speed.
     Enabled by default on Windows, disabled on RDK.
     """
+    
+    # Auto-scaling configuration parameters
+    auto_scaling_target_frame_time_ms: float = 40.0
+    """
+    Target frame time in milliseconds for auto-scaling calculation (default: 40ms = 25fps).
+    The auto-scaling factor is calculated as: measured_frame_time / target_frame_time.
+    """
+    
+    auto_scaling_warmup_frames: int = 100
+    """
+    Number of frames to process before calculating auto-scaling factor.
+    Ensures stable measurements by allowing system to reach steady state.
+    """
+    
+    auto_scaling_activation_threshold: float = 1.2
+    """
+    Minimum scale factor to activate auto-scaling.
+    If calculated factor is below this threshold (processing close to real-time),
+    no scaling is applied. Range: 1.1 - 2.0, default: 1.2
+    """
 
 
 @dataclass
@@ -1309,7 +1329,9 @@ class EventCentricTracker:
         self._enable_auto_scaling = self.config.enable_auto_time_scaling
         self._frame_times = []  # Track recent frame processing times for auto-scaling
         self._last_timestamp = None
-        self._auto_scale_warmup_frames = 100
+        self._auto_scale_warmup_frames = self.config.auto_scaling_warmup_frames
+        self._auto_scale_target_frame_time = self.config.auto_scaling_target_frame_time_ms
+        self._auto_scale_threshold = self.config.auto_scaling_activation_threshold
         self._frame_count = 0
         
         # Apply time scaling to create effective thresholds
@@ -1408,8 +1430,8 @@ class EventCentricTracker:
             frame_interval = current_timestamp_ms - self._last_timestamp
             self._frame_times.append(frame_interval)
             
-            # Keep only recent frames (last 100)
-            if len(self._frame_times) > 100:
+            # Keep only recent frames (up to warmup count)
+            if len(self._frame_times) > self._auto_scale_warmup_frames:
                 self._frame_times.pop(0)
         
         self._last_timestamp = current_timestamp_ms
@@ -1418,27 +1440,24 @@ class EventCentricTracker:
         if self._frame_count == self._auto_scale_warmup_frames and len(self._frame_times) > 50:
             avg_frame_time = sum(self._frame_times) / len(self._frame_times)
             
-            # Assume target is 25fps (40ms per frame) - this is configurable
-            target_frame_time = 40.0  # milliseconds
+            # Calculate scale factor using configured target frame time
+            new_scale_factor = avg_frame_time / self._auto_scale_target_frame_time
             
-            # Calculate scale factor
-            new_scale_factor = avg_frame_time / target_frame_time
-            
-            # Only apply if significantly different from 1.0 (> 20% difference)
-            if new_scale_factor > 1.2:
+            # Only apply if significantly different from 1.0 (above activation threshold)
+            if new_scale_factor > self._auto_scale_threshold:
                 old_factor = self._time_scale_factor
                 self._time_scale_factor = new_scale_factor
                 self._update_scaled_thresholds()
                 
                 logger.info(
                     f"[EventCentricTracker] Auto-scaling enabled: "
-                    f"avg_frame_time={avg_frame_time:.1f}ms, target={target_frame_time:.1f}ms, "
+                    f"avg_frame_time={avg_frame_time:.1f}ms, target={self._auto_scale_target_frame_time:.1f}ms, "
                     f"scale_factor={new_scale_factor:.2f} (was {old_factor:.2f})"
                 )
             else:
                 logger.info(
                     f"[EventCentricTracker] Auto-scaling measured {new_scale_factor:.2f}x but keeping 1.0x "
-                    f"(processing close to real-time)"
+                    f"(processing close to real-time, threshold={self._auto_scale_threshold})"
                 )
     
     def update(self, 
