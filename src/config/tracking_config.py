@@ -394,7 +394,7 @@ class TrackingConfig:
     # Association Parameters (D, T from requirements)
     # --------------------------------------------------------------------------
     
-    association_distance_px: float = 100.0
+    association_distance_px: float = 80.0
     """
     D: Maximum centroid distance (pixels) to associate a detection with an event.
     
@@ -403,9 +403,10 @@ class TrackingConfig:
     - Higher values: More lenient, may incorrectly merge nearby bags
     
     Tuning: Based on expected bag movement per frame at your FPS.
-    At 25fps with typical human manipulation speed, 100px works well.
+    At 25fps with typical human manipulation speed, 80px reduces teleportation
+    when multiple bags are on the table.
     
-    Default: 100.0
+    Default: 80.0 (reduced from 100.0 to prevent teleportation in crowded scenes)
     """
     
     association_time_ms: float = 400.0
@@ -449,7 +450,7 @@ class TrackingConfig:
     Default: True
     """
     
-    iou_association_threshold: float = 0.3
+    iou_association_threshold: float = 0.4
     """
     Minimum IoU value to associate a detection with an event.
     
@@ -466,7 +467,7 @@ class TrackingConfig:
     - Values below 0.2 may cause false associations
     - Values above 0.5 may miss legitimate flip associations
     
-    Default: 0.3
+    Default: 0.4 (increased from 0.3 to prevent teleportation to nearby bags)
     """
     
     iou_box_margin_enabled: bool = True
@@ -549,14 +550,14 @@ class TrackingConfig:
     Default: 2.5
     """
     
-    max_association_distance_px: float = 250.0
+    max_association_distance_px: float = 180.0
     """
     Absolute maximum association distance regardless of velocity.
     
     Range: 150 - 400
     Prevents association distance from growing too large.
     
-    Default: 250.0
+    Default: 180.0 (reduced from 250.0 to prevent teleportation to distant bags)
     """
     
     min_velocity_threshold: float = 0.01
@@ -826,27 +827,29 @@ class TrackingConfig:
     # Work Zone Configuration
     # --------------------------------------------------------------------------
     
-    work_zone_enabled: bool = False
+    work_zone_enabled: bool = True
     """
     Enable work zone filtering for event creation.
     
     When True: Only create events for detections inside work zone
     When False: Entire frame is valid for event creation
     
-    Default: False (use entire frame)
+    Default: True (enabled to suppress events outside main work area)
     """
     
     work_zone_x1: int = 0
     work_zone_y1: int = 0
     work_zone_x2: int = 1280
-    work_zone_y2: int = 720
+    work_zone_y2: int = 620
     """
     Work zone boundaries (pixels): [x1, y1] to [x2, y2]
     
     Only used when work_zone_enabled is True.
+    Bottom boundary (y2) set to 620 (was 720) to move the work zone up and
+    suppress events near the bottom of the frame where bags may pile up.
     """
     
-    exit_boundary_margin_px: int = 50
+    exit_boundary_margin_px: int = 100
     """
     Exit boundary margin in pixels for visualization.
     
@@ -855,7 +858,7 @@ class TrackingConfig:
     Note: Exit boundary logic for commitment has been removed; this is
     purely for visualization purposes.
     
-    Default: 50
+    Default: 100 (increased from 50 to show a larger exit zone aligned with work area)
     """
     
     # --------------------------------------------------------------------------
