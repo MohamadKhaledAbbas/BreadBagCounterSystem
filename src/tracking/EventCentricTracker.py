@@ -1097,7 +1097,8 @@ class BreadBagEvent:
                     self.out_of_zone_since_ms = self.last_detection_time_ms
                     self.frames_out_of_zone = 0
                 
-                self.frames_out_of_zone = self.frames_without_detection
+                # Increment out-of-zone counter (independent of frames_without_detection)
+                self.frames_out_of_zone += 1
                 
                 # Expire faster if out of zone for grace period
                 if self.frames_out_of_zone >= self.config.out_of_zone_grace_frames:
