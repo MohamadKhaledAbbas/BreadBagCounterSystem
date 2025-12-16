@@ -560,6 +560,59 @@ class TrackingConfig:
     Default: 180.0 (reduced from 250.0 to prevent teleportation to distant bags)
     """
     
+    # --------------------------------------------------------------------------
+    # Hard Constraints for Preventing Teleportation (ISSUE #1 FIX)
+    # --------------------------------------------------------------------------
+    
+    max_jump_distance_px: float = 200.0
+    """
+    ISSUE #1 FIX: Hard cap on centroid jump distance per association.
+    
+    Even if IoU or expanded IoU passes, associations are rejected if the
+    centroid moves more than this distance. This prevents events from
+    teleporting to distant detections during crowded scenes with multiple bags.
+    
+    Range: 150 - 300 pixels
+    - Lower values: Stricter, may lose track during very fast movements
+    - Higher values: More lenient, may allow teleportation
+    
+    Tuning: Should be slightly larger than max_association_distance_px to
+    allow velocity-scaled associations, but still provide a hard upper limit.
+    
+    Default: 200.0
+    """
+    
+    require_centroid_proximity_for_expanded_iou: bool = True
+    """
+    ISSUE #1 FIX: Require reasonable centroid proximity for expanded IoU associations.
+    
+    When True: Expanded IoU associations still require the centroid to be
+    within max_centroid_distance_for_expanded_iou. This prevents expanded
+    IoU from matching detections that are too far away.
+    
+    When False: Expanded IoU alone can trigger association regardless of
+    centroid distance (not recommended in crowded scenes).
+    
+    Default: True
+    """
+    
+    max_centroid_distance_for_expanded_iou: float = 250.0
+    """
+    ISSUE #1 FIX: Maximum centroid distance for expanded IoU associations.
+    
+    When require_centroid_proximity_for_expanded_iou is True, expanded IoU
+    associations are only allowed if the centroid distance is within this limit.
+    
+    Range: 200 - 400 pixels
+    - Lower values: Stricter expanded IoU matching
+    - Higher values: More lenient, but may cause teleportation
+    
+    Should be larger than max_association_distance_px but not too large to
+    allow unreasonable jumps.
+    
+    Default: 250.0
+    """
+    
     min_velocity_threshold: float = 0.01
     """
     Minimum velocity (pixels per millisecond) to trigger velocity scaling.
@@ -660,6 +713,56 @@ class TrackingConfig:
     as a new event.
     
     Default: 1000.0
+    """
+    
+    # --------------------------------------------------------------------------
+    # Conditional Suppression (ISSUE #3 FIX)
+    # --------------------------------------------------------------------------
+    
+    suppression_require_box_overlap: bool = True
+    """
+    ISSUE #3 FIX: Require box overlap with last committed box for suppression.
+    
+    When True: Suppression requires BOTH:
+      1. Centroid proximity (within suppression_distance_px)
+      2. Box overlap with last committed box (IoU >= suppression_iou_threshold)
+    
+    When False: Only centroid proximity is required (legacy behavior)
+    
+    This allows workers to start a new bag immediately at the same location
+    after removing the previous bag, as there will be no box overlap between
+    the new detection and the removed bag.
+    
+    Benefits:
+    - Reduces false suppression when worker starts new bag quickly
+    - Still prevents double-counting of the same physical bag
+    - More tolerant of fast workflows
+    
+    Default: True
+    """
+    
+    suppression_iou_threshold: float = 0.15
+    """
+    ISSUE #3 FIX: Minimum IoU with last committed box to trigger suppression.
+    
+    Only used when suppression_require_box_overlap is True.
+    
+    If a new detection has:
+    - Centroid within suppression_distance_px of last commit, AND
+    - IoU >= this threshold with last committed box
+    Then suppression is triggered (likely the same bag re-detected).
+    
+    If IoU < this threshold despite proximity, the new detection is allowed
+    (likely a new bag at the same location).
+    
+    Range: 0.1 - 0.3
+    - Lower values (0.1): More aggressive suppression, catches slight movements
+    - Higher values (0.3): More lenient, allows more variation
+    
+    Tuning: Lower than iou_association_threshold since we're looking for
+    overlap with a bag that may have moved slightly before commitment.
+    
+    Default: 0.15
     """
     
     # --------------------------------------------------------------------------
@@ -849,6 +952,33 @@ class TrackingConfig:
     suppress events near the bottom of the frame where bags may pile up.
     """
     
+    enforce_work_zone_associations: bool = True
+    """
+    ISSUE #2 FIX: Prevent associations for detections outside work zone.
+    
+    When True: Detections outside work zone won't associate with active events
+    When False: Only event creation is filtered by work zone
+    
+    This prevents events from "following" bags that drift outside the work area.
+    
+    Range: True/False
+    Default: True
+    """
+    
+    out_of_zone_grace_frames: int = 5
+    """
+    ISSUE #2 FIX: Number of frames an event can remain outside work zone.
+    
+    After an event's last detection was outside the work zone for this many
+    frames without new detections, it will be expired (faster than ghost_timeout).
+    
+    This ensures events don't stay alive indefinitely when bags drift outside
+    the designated work area.
+    
+    Range: 3 - 20 frames
+    Default: 5 (at 25fps = 200ms grace period)
+    """
+    
     exit_boundary_margin_px: int = 100
     """
     Exit boundary margin in pixels for visualization.
@@ -922,6 +1052,8 @@ def get_event_config():
         work_zone_y1=tracking_config.work_zone_y1,
         work_zone_x2=tracking_config.work_zone_x2,
         work_zone_y2=tracking_config.work_zone_y2,
+        enforce_work_zone_associations=tracking_config.enforce_work_zone_associations,
+        out_of_zone_grace_frames=tracking_config.out_of_zone_grace_frames,
         
         # Association (D, T)
         association_distance_px=tracking_config.association_distance_px,
@@ -943,6 +1075,11 @@ def get_event_config():
         min_velocity_threshold=tracking_config.min_velocity_threshold,
         max_prediction_time_ms=tracking_config.max_prediction_time_ms,
         
+        # Hard constraints for preventing teleportation (Issue #1)
+        max_jump_distance_px=tracking_config.max_jump_distance_px,
+        require_centroid_proximity_for_expanded_iou=tracking_config.require_centroid_proximity_for_expanded_iou,
+        max_centroid_distance_for_expanded_iou=tracking_config.max_centroid_distance_for_expanded_iou,
+        
         # Ghost (G)
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
         
@@ -956,6 +1093,8 @@ def get_event_config():
         # Anti-double-counting suppression
         suppression_distance_px=tracking_config.suppression_distance_px,
         suppression_duration_ms=tracking_config.suppression_duration_ms,
+        suppression_require_box_overlap=tracking_config.suppression_require_box_overlap,
+        suppression_iou_threshold=tracking_config.suppression_iou_threshold,
         
         # State transition timing
         open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,

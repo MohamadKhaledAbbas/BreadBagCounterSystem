@@ -101,6 +101,13 @@ class EventConfig:
     work_zone_x2: int = 1280   # Bottom-right X of work zone
     work_zone_y2: int = 620    # Bottom-right Y of work zone (moved up from 720)
     
+    # Work zone enforcement during association (Issue #2 fix)
+    enforce_work_zone_associations: bool = True
+    """Prevent associations for detections outside work zone even for active events"""
+    
+    out_of_zone_grace_frames: int = 5
+    """Number of frames an event can remain outside work zone before faster expiration"""
+    
     # ==========================================================================
     # Event Association Parameters (D, T from requirements)
     # ==========================================================================
@@ -133,6 +140,18 @@ class EventConfig:
     min_velocity_threshold: float = 0.01    # Min velocity (px/ms) to trigger scaling
     max_prediction_time_ms: float = 500.0   # Max time ahead to predict centroid
     
+    # Hard constraints for preventing teleportation (Issue #1 fix)
+    max_jump_distance_px: float = 200.0
+    """Hard cap on centroid jump distance, even if IoU/expanded IoU passes.
+    Prevents events from teleporting to distant detections during crowded scenes."""
+    
+    require_centroid_proximity_for_expanded_iou: bool = True
+    """When True, expanded IoU associations still require reasonable centroid distance.
+    Prevents expanded IoU from matching detections that are too far away."""
+    
+    max_centroid_distance_for_expanded_iou: float = 250.0
+    """Maximum centroid distance allowed for expanded IoU associations (px)."""
+    
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
     # ==========================================================================
@@ -153,6 +172,15 @@ class EventConfig:
     # temporarily lost then re-detected after commitment.
     suppression_distance_px: float = 150.0   # Distance within which new events are suppressed
     suppression_duration_ms: float = 1000.0  # Duration to suppress new events after commit
+    
+    # Conditional suppression (Issue #3 fix)
+    suppression_require_box_overlap: bool = True
+    """When True, suppression requires IoU overlap with last committed box.
+    Allows new bags to start immediately at same location if no box overlap."""
+    
+    suppression_iou_threshold: float = 0.15
+    """Minimum IoU with last committed box to trigger suppression.
+    Lower values = more aggressive suppression."""
     
     # ==========================================================================
     # State Transition Parameters (temporal stability)
@@ -366,6 +394,10 @@ class BreadBagEvent:
         # Frame-based idle tracking for center commit
         self.frames_without_detection = 0
         self.last_detection_frame_index = initial_detection.frame_index
+        
+        # Out-of-zone tracking (Issue #2 fix)
+        self.frames_out_of_zone = 0
+        self.out_of_zone_since_ms: Optional[float] = None
         
         # Log event creation
         structured_logger.event_created(
@@ -617,9 +649,25 @@ class BreadBagEvent:
             # Note: Detailed IoU calculation debug removed to reduce log flooding
             # IoU values are logged in the hybrid_association_attempt call below
         
+        # ISSUE #1 FIX: Hard cap on centroid jump distance
+        # This prevents teleportation even if IoU/expanded IoU allows it
+        if distance_to_last > self.config.max_jump_distance_px:
+            match_type = "jump_distance_exceeded"
+            metrics_detail = (
+                f"dist={distance_to_last:.1f}px > max_jump={self.config.max_jump_distance_px}px"
+            )
+            reason = f"{match_type} ({metrics_detail})"
+            return False, distance_to_last, reason, iou_value
+        
         # Check both criteria
         centroid_match = distance <= scaled_threshold
         iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
+        
+        # ISSUE #1 FIX: Expanded IoU still requires reasonable centroid proximity
+        if self.config.require_centroid_proximity_for_expanded_iou and expanded_iou_match:
+            if distance_to_last > self.config.max_centroid_distance_for_expanded_iou:
+                # Expanded IoU passed but centroid is too far - reject to prevent teleportation
+                expanded_iou_match = False
         
         # Determine time windows for association
         # - within_association_window: normal matching (higher reliability)
@@ -775,6 +823,11 @@ class BreadBagEvent:
         self.total_frames_observed += 1
         self.frames_without_detection = 0  # Reset idle counter
         self.last_detection_frame_index = detection.frame_index
+        
+        # ISSUE #2 FIX: Reset out-of-zone tracking when detection is received
+        # (Detection was associated, so event is being tracked)
+        self.out_of_zone_since_ms = None
+        self.frames_out_of_zone = 0
         
         # Process state transitions based on evidence
         self._process_state_transition(detection)
@@ -1032,6 +1085,34 @@ class BreadBagEvent:
                 )
                 return False, 'waiting'
         
+        # ISSUE #2 FIX: Check if event is out of work zone and expire faster
+        if self.config.work_zone_enabled and self.config.enforce_work_zone_associations:
+            # Check if centroid is out of zone
+            in_zone = (self.config.work_zone_x1 <= self.last_centroid[0] <= self.config.work_zone_x2 and
+                      self.config.work_zone_y1 <= self.last_centroid[1] <= self.config.work_zone_y2)
+            
+            if not in_zone:
+                # Track how long event has been out of zone
+                if self.out_of_zone_since_ms is None:
+                    self.out_of_zone_since_ms = self.last_detection_time_ms
+                    self.frames_out_of_zone = 0
+                
+                # Increment out-of-zone counter (independent of frames_without_detection)
+                self.frames_out_of_zone += 1
+                
+                # Expire faster if out of zone for grace period
+                if self.frames_out_of_zone >= self.config.out_of_zone_grace_frames:
+                    logger.info(
+                        f"[Event:{self.id}] Expired: out of work zone for {self.frames_out_of_zone} frames "
+                        f"(grace={self.config.out_of_zone_grace_frames} frames, "
+                        f"centroid={self.last_centroid})"
+                    )
+                    return False, 'expire'
+            else:
+                # Back in zone - reset tracking
+                self.out_of_zone_since_ms = None
+                self.frames_out_of_zone = 0
+        
         # SECOND: For non-CLOSED events, check if ghost timeout exceeded
         if time_since_detection_ms > self.config.ghost_timeout_ms:
             # Event expired without reaching CLOSED state or meeting commit criteria
@@ -1228,18 +1309,24 @@ class EventCentricTracker:
         # Track which detections were associated
         associated_detection_indices = set()
         
-        # 1. Associate detections with existing events
-        # FIX: Use hybrid scoring that considers BOTH IoU and centroid distance
-        # Previous bug: Only considered distance, ignoring IoU completely
+        # ISSUE #1 FIX: Build association candidates for one-to-one matching (greedy assignment)
+        # Instead of greedily associating detections as we iterate, we now:
+        # 1. Collect all possible (detection, event, score) tuples
+        # 2. Sort by score (best first)
+        # 3. Assign greedily ensuring one-to-one mapping
+        
+        # List of (det_idx, event_id, score, distance, iou_value, evidence) tuples
+        association_candidates = []
+        
+        # 1. Build all possible associations
         for det_idx, evidence in enumerate(detection_evidences):
-            best_event = None
-            best_score = -float('inf')  # Higher score is better
-            best_distance = float('inf')
-            best_iou = 0.0
+            # ISSUE #2 FIX: Check work zone for associations
+            if self.config.work_zone_enabled and self.config.enforce_work_zone_associations:
+                if not self._is_in_work_zone(evidence.centroid_x, evidence.centroid_y):
+                    # Skip detections outside work zone during association
+                    continue
             
-            # Track all candidates for debug logging
-            candidates = []
-            
+            # Track all candidates for this detection
             for event in self.active_events.values():
                 if event.state == EventState.COMMITTED:
                     continue
@@ -1279,42 +1366,37 @@ class EventCentricTracker:
                     # Low IoU: Trust distance more (30% IoU, 70% distance)
                     score = 0.3 * iou_value + 0.7 * normalized_distance
                 
-                # Build candidate info for debug logging (only if debug enabled)
-                if logger.isEnabledFor(logging.DEBUG):
-                    candidates.append({
-                        'event_id': event.id,
-                        'distance': distance,
-                        'iou': iou_value,
-                        'score': score,
-                        'reason': reason
-                    })
-                
-                if score > best_score:
-                    best_event = event
-                    best_score = score
-                    best_distance = distance
-                    best_iou = iou_value
+                # Store candidate for greedy assignment
+                association_candidates.append((
+                    det_idx, event.id, score, distance, iou_value, evidence
+                ))
+        
+        # 2. Greedy one-to-one assignment: Sort by score and assign best matches first
+        # This ensures that the best detection-event pair is always chosen, and each
+        # detection/event is matched at most once per frame
+        association_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score descending
+        
+        assigned_detections = set()
+        assigned_events = set()
+        
+        for det_idx, event_id, score, distance, iou_value, evidence in association_candidates:
+            # Skip if already assigned
+            if det_idx in assigned_detections or event_id in assigned_events:
+                continue
             
-            # Two-tier logging strategy for associations:
-            # 1. Log full candidate list when truly ambiguous (min_candidates_for_logging, default 3+)
-            # 2. Log selected association when noteworthy (low score OR any choice between 2+ candidates)
-            # This provides context without flooding logs
-            if len(candidates) >= self.config.min_candidates_for_logging:
+            # Assign this detection to this event
+            event = self.active_events[event_id]
+            event.add_detection(evidence, frame_img)
+            assigned_detections.add(det_idx)
+            assigned_events.add(event_id)
+            associated_detection_indices.add(det_idx)
+            
+            # Log if noteworthy (low score or multiple candidates competed)
+            if score < self.config.low_score_threshold:
                 logger.debug(
-                    f"[ASSOCIATION_CANDIDATES] detection_idx={det_idx}, "
-                    f"candidates={len(candidates)}, best_event={candidates[0]['event_id'] if candidates else None}"
+                    f"[ASSOCIATION_SELECTED] det={det_idx} -> event={event_id}, "
+                    f"score={score:.3f}, iou={iou_value:.2f}, dist={distance:.1f}px (low_confidence)"
                 )
-            
-            if best_event is not None:
-                # Log selected association if noteworthy: low confidence OR had to choose between options
-                if best_score < self.config.low_score_threshold or len(candidates) >= 2:
-                    pass
-                    # logger.debug(
-                    #     f"[ASSOCIATION_SELECTED] det={det_idx} -> event={best_event.id}, "
-                    #     f"score={best_score:.3f}, iou={best_iou:.2f}, dist={best_distance:.1f}px"
-                    # )
-                best_event.add_detection(evidence, frame_img)
-                associated_detection_indices.add(det_idx)
         
         # 2. Create new events for unassociated open detections
         for det_idx, evidence in enumerate(detection_evidences):
@@ -1374,9 +1456,10 @@ class EventCentricTracker:
                     events_to_remove.append(event_id)
                     self.stats['events_committed'] += 1
                     
-                    # Add to recently committed
+                    # Add to recently committed (Issue #3: include box for conditional suppression)
                     self.recently_committed.append({
                         'centroid': event.last_centroid,
+                        'box': event.last_box,
                         'timestamp_ms': timestamp_ms,
                         'event_id': event_id
                     })
@@ -1434,6 +1517,13 @@ class EventCentricTracker:
         lost then re-detected after commitment. This ensures each physical bag
         is counted exactly once.
         
+        ISSUE #3 FIX: Conditional suppression using box overlap
+        - If suppression_require_box_overlap is True, suppression requires both:
+          1. Centroid proximity (within suppression_distance_px)
+          2. Box overlap with last committed box (IoU >= suppression_iou_threshold)
+        - This allows new bags to start immediately at the same location if there's
+          no box overlap (worker starts new bag after removing the last one)
+        
         Args:
             evidence: Detection evidence for potential new event
             
@@ -1445,16 +1535,66 @@ class EventCentricTracker:
             dy = evidence.centroid_y - rc['centroid'][1]
             distance = math.sqrt(dx*dx + dy*dy)
             
-            # Use configurable suppression distance for anti-double-counting
-            if distance < self.config.suppression_distance_px:
-                logger.debug(
-                    f"[EventCentricTracker] Suppressing new event: "
-                    f"too close to recently committed {rc['event_id']} "
-                    f"(distance={distance:.1f}px < suppression_threshold={self.config.suppression_distance_px}px)"
-                )
-                return True
+            # Check centroid distance first
+            if distance >= self.config.suppression_distance_px:
+                # Too far away, no suppression
+                continue
+            
+            # ISSUE #3 FIX: If box overlap is required, check IoU with last committed box
+            if self.config.suppression_require_box_overlap:
+                if 'box' in rc:
+                    # Compute IoU between new detection and last committed box
+                    iou = self._compute_iou_static(rc['box'], evidence.box)
+                    
+                    if iou < self.config.suppression_iou_threshold:
+                        # No significant box overlap - allow new event
+                        # This handles the case where worker starts a new bag at the same location
+                        logger.debug(
+                            f"[EventCentricTracker] Allowing new event despite proximity: "
+                            f"no box overlap with recently committed {rc['event_id']} "
+                            f"(distance={distance:.1f}px, iou={iou:.3f} < threshold={self.config.suppression_iou_threshold})"
+                        )
+                        continue
+            
+            # Suppress: close proximity and (if required) box overlap detected
+            logger.debug(
+                f"[EventCentricTracker] Suppressing new event: "
+                f"too close to recently committed {rc['event_id']} "
+                f"(distance={distance:.1f}px < suppression_threshold={self.config.suppression_distance_px}px)"
+            )
+            return True
         
         return False
+    
+    def _compute_iou_static(self, box1: Tuple[float, float, float, float], 
+                           box2: Tuple[float, float, float, float]) -> float:
+        """
+        Static method to compute IoU between two boxes.
+        Used for suppression logic.
+        """
+        # Compute intersection
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+        # Check if there is an intersection
+        if x2_inter <= x1_inter or y2_inter <= y1_inter:
+            return 0.0
+        
+        inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+        
+        # Compute areas of both boxes
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        # Compute union
+        union_area = area1 + area2 - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+        
+        return inter_area / union_area
     
     def _prepare_event_output(self, event: BreadBagEvent) -> Dict[str, Any]:
         """
