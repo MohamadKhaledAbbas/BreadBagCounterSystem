@@ -99,7 +99,7 @@ class EventConfig:
     work_zone_x1: int = 0      # Top-left X of work zone
     work_zone_y1: int = 0      # Top-left Y of work zone
     work_zone_x2: int = 1280   # Bottom-right X of work zone
-    work_zone_y2: int = 620    # Bottom-right Y of work zone (moved up from 720)
+    work_zone_y2: int = 650    # Bottom-right Y of work zone (moved up from 720)
     
     # Work zone enforcement during association (Issue #2 fix)
     enforce_work_zone_associations: bool = True
@@ -107,6 +107,8 @@ class EventConfig:
     
     out_of_zone_grace_frames: int = 5
     """Number of frames an event can remain outside work zone before faster expiration"""
+
+    fast_commit_on_out_of_zone: bool = True  # Commit (count) instead of expire if CLOSED
     
     # ==========================================================================
     # Event Association Parameters (D, T from requirements)
@@ -170,7 +172,7 @@ class EventConfig:
     # ==========================================================================
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
-    suppression_distance_px: float = 120.0   # Distance within which new events are suppressed (reduced from 150.0)
+    suppression_distance_px: float = 100.0   # Distance within which new events are suppressed (reduced from 150.0)
     suppression_duration_ms: float = 1500.0  # Duration to suppress new events after commit (increased from 1000.0)
     
     # Conditional suppression (Issue #3 fix)
@@ -1126,15 +1128,27 @@ class BreadBagEvent:
                 
                 # Increment out-of-zone counter (independent of frames_without_detection)
                 self.frames_out_of_zone += 1
-                
-                # Expire faster if out of zone for grace period
+
                 if self.frames_out_of_zone >= self.config.out_of_zone_grace_frames:
-                    logger.info(
-                        f"[Event:{self.id}] Expired: out of work zone for {self.frames_out_of_zone} frames "
-                        f"(grace={self.config.out_of_zone_grace_frames} frames, "
-                        f"centroid={self.last_centroid})"
-                    )
-                    return False, 'expire'
+                    if self.state == EventState.CLOSED and getattr(self.config, 'fast_commit_on_out_of_zone', False):
+                        # Commit instead of expire!
+                        self._transition_to(EventState.COMMITTED, current_time_ms,
+                                            f"out_of_zone_commit (frames={self.frames_out_of_zone})")
+                        self.commit_reason = "out_of_zone_commit"
+                        logger.info(
+                            f"[Event:{self.id}] COMMITTED: out of work zone for {self.frames_out_of_zone} frames "
+                            f"(grace={self.config.out_of_zone_grace_frames} frames, "
+                            f"centroid={self.last_centroid})"
+                        )
+                        return True, 'commit'
+                    else:
+                        # Other states: expire as before
+                        logger.info(
+                            f"[Event:{self.id}] Expired: out of work zone for {self.frames_out_of_zone} frames "
+                            f"(grace={self.config.out_of_zone_grace_frames} frames, "
+                            f"centroid={self.last_centroid})"
+                        )
+                        return False, 'expire'
             else:
                 # Back in zone - reset tracking
                 self.out_of_zone_since_ms = None

@@ -196,6 +196,7 @@ class Visualizer:
             margin: Exit boundary margin in pixels (uses self.exit_margin if None)
         """
         h, w = frame.shape[:2]
+        h = 650
         if margin is None:
             margin = self.exit_margin
         

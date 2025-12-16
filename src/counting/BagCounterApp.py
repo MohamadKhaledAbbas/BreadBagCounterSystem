@@ -64,7 +64,7 @@ class BagCounterApp:
     """
     
     # Queue configuration constants - V3: Optimized for 25fps at 720p
-    INPUT_QUEUE_SIZE = 30  # Reduced buffer for lower latency (was 100)
+    INPUT_QUEUE_SIZE = 100  # Reduced buffer for lower latency (was 100)
     CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
     QUEUE_WARNING_THRESHOLD = 70  # Lower threshold for earlier warnings (was 80)
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds

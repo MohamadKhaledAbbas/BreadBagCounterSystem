@@ -961,7 +961,7 @@ class TrackingConfig:
     # Max Event Lifetime (Force Expiration)
     # --------------------------------------------------------------------------
     
-    max_event_lifetime_ms: float = 10000.0
+    max_event_lifetime_ms: float = 5000.0
     """
     Maximum lifetime for an event in milliseconds.
     
