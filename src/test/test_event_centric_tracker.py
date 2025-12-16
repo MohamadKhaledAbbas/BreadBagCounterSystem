@@ -973,11 +973,11 @@ class TestParallelHybridAssociation:
         can_assoc, distance, reason, iou_value = event.can_associate(far_detection)
         
         assert can_assoc is False
-        assert 'no_match' in reason
-        # Both metrics should be reported
+        # With max_jump_distance_px check, very far detections are rejected before normal checks
+        # So reason may be 'jump_distance_exceeded' OR 'no_match'
+        assert ('no_match' in reason or 'jump_distance_exceeded' in reason)
+        # Distance should be reported
         assert 'dist=' in reason
-        assert 'iou=' in reason
-        assert 'thresh=' in reason
     
     def test_time_exceeded_reports_both_metrics(self, default_config):
         """
@@ -2012,7 +2012,7 @@ class TestConditionalSuppression:
             frame_index=10,
         )
         
-        should_suppress = tracker._should_suppress(overlapping_detection)
+        should_suppress = tracker._should_suppress(overlapping_detection, 500.0)
         
         # Should be suppressed due to both proximity and box overlap
         assert should_suppress is True
@@ -2054,7 +2054,7 @@ class TestConditionalSuppression:
             frame_index=10,
         )
         
-        should_suppress = tracker._should_suppress(non_overlapping_detection)
+        should_suppress = tracker._should_suppress(non_overlapping_detection, 500.0)
         
         # Should NOT be suppressed - no box overlap
         assert should_suppress is False
@@ -2095,7 +2095,7 @@ class TestConditionalSuppression:
             frame_index=10,
         )
         
-        should_suppress = tracker._should_suppress(minimal_overlap_detection)
+        should_suppress = tracker._should_suppress(minimal_overlap_detection, 500.0)
         
         # Should NOT be suppressed if IoU is below threshold
         # (Actual result depends on exact IoU calculation)
@@ -2134,10 +2134,383 @@ class TestConditionalSuppression:
             frame_index=10,
         )
         
-        should_suppress = tracker._should_suppress(close_detection)
+        should_suppress = tracker._should_suppress(close_detection, 500.0)
         
         # Should be suppressed based on distance alone (legacy behavior)
         assert should_suppress is True
+
+
+# =============================================================================
+# Duplicate Event Prevention Tests (New Implementation)
+# =============================================================================
+
+class TestDuplicateEventPrevention:
+    """
+    Tests for the duplicate event prevention mechanisms.
+    
+    These tests validate the fixes for duplicate event creation when detections
+    flicker, split, or re-appear after brief gaps.
+    """
+    
+    def test_no_duplicate_events_rapid_detection(self):
+        """
+        Rapid detections at same location should not create duplicate events.
+        
+        Scenario: Detection flickers on/off rapidly (detection loss < 400ms)
+        Expected: Only one event should be created (temporal cooldown prevents duplicates)
+        """
+        config = EventConfig(
+            min_event_creation_interval_ms=400.0,
+            temporal_cooldown_distance_px=120.0,
+            suppression_distance_px=120.0,
+            suppression_duration_ms=1500.0,
+            suppression_require_box_overlap=True,  # Need to add this
+            suppression_iou_threshold=0.10,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # First detection at (640, 360) at t=0
+        det1 = [create_detection([590, 310, 690, 410], class_id=1, conf=0.8)]
+        tracker.update(det1, 0.0, frame_img, 0)
+        
+        assert len(tracker.active_events) == 1
+        event_id = list(tracker.active_events.keys())[0]
+        
+        # Force commit this event
+        event = tracker.active_events[event_id]
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0
+        event.closed_evidence_count = 5
+        event.last_detection_frame_index = 0
+        
+        # Wait and commit
+        tracker.update([], 600.0, frame_img, 30)
+        
+        # Event should be committed
+        assert event_id not in tracker.active_events
+        assert len(tracker.recently_committed) == 1
+        
+        # Now try to create new event at same location quickly (t=700ms, within 400ms cooldown)
+        det2 = [create_detection([595, 315, 695, 415], class_id=1, conf=0.8)]
+        tracker.update(det2, 700.0, frame_img, 31)
+        
+        # Should NOT create new event (temporal cooldown active)
+        assert len(tracker.active_events) == 0
+        assert tracker.stats['events_suppressed'] >= 1
+        
+        # Wait past cooldown period AND suppression duration (t=2200ms, > 1500ms past commit at 600ms)
+        det3 = [create_detection([598, 318, 698, 418], class_id=1, conf=0.8)]
+        tracker.update(det3, 2200.0, frame_img, 32)
+        
+        # Now should create new event (both cooldown and suppression expired)
+        assert len(tracker.active_events) == 1
+    
+    def test_suppression_after_commit_enhanced(self):
+        """
+        Suppression should work correctly with enhanced parameters.
+        
+        Tests the tightened suppression thresholds:
+        - Distance: 120px (down from 150px)
+        - IoU: 0.10 (down from 0.15)
+        - Duration: 1500ms (up from 1000ms)
+        """
+        config = EventConfig(
+            suppression_distance_px=120.0,
+            suppression_iou_threshold=0.10,
+            suppression_duration_ms=1500.0,
+            suppression_require_box_overlap=True,
+            min_event_creation_interval_ms=400.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Create and commit first event
+        det1 = [create_detection([590, 310, 690, 410], class_id=1, conf=0.8)]
+        tracker.update(det1, 0.0, frame_img, 0)
+        
+        event_id = list(tracker.active_events.keys())[0]
+        event = tracker.active_events[event_id]
+        event.state = EventState.CLOSED
+        event.state_enter_time_ms = 0.0  # Set to 0 so stability time passes
+        event.closed_evidence_count = 5
+        event.open_evidence_count = 1
+        event.last_detection_frame_index = 0
+        
+        # Commit at t=300ms (past stability time of 200ms)
+        tracker.update([], 300.0, frame_img, 30)
+        assert len(tracker.recently_committed) == 1
+        
+        # Try to create event with overlap at t=500ms (within temporal cooldown of 400ms from commit)
+        det2 = [create_detection([600, 315, 700, 415], class_id=1, conf=0.8)]
+        tracker.update(det2, 500.0, frame_img, 31)
+        
+        # Should be suppressed (temporal cooldown active: 500-300=200ms < 400ms)
+        assert len(tracker.active_events) == 0
+        
+        # Try after temporal cooldown but within suppression window (t=900ms, > 400ms but < 1500ms from commit at 300ms)
+        det3 = [create_detection([605, 318, 705, 418], class_id=1, conf=0.8)]
+        tracker.update(det3, 900.0, frame_img, 32)
+        
+        # Should still be suppressed (IoU overlap + within suppression duration: 900-300=600ms < 1500ms)
+        assert len(tracker.active_events) == 0
+        
+        # Try after full suppression duration (t=1900ms, > 1500ms from commit at 300ms)
+        det4 = [create_detection([608, 320, 708, 420], class_id=1, conf=0.8)]
+        tracker.update(det4, 1900.0, frame_img, 33)
+        
+        # Now should create new event (suppression expired, cleanup should have happened: 1900-300=1600ms > 1500ms)
+        assert len(tracker.active_events) == 1
+    
+    def test_spatial_deduplication_active_events(self):
+        """
+        New events should not be created if active events already cover the area.
+        
+        Scenario: Detection temporarily lost then immediately re-detected
+        Expected: Should associate with existing event, not create new one
+        """
+        config = EventConfig(
+            active_event_exclusion_distance_px=60.0,
+            active_event_exclusion_iou=0.25,
+            association_distance_px=100.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Create first event
+        det1 = [create_detection([590, 310, 690, 410], class_id=1, conf=0.8)]
+        tracker.update(det1, 0.0, frame_img, 0)
+        
+        assert len(tracker.active_events) == 1
+        initial_event_id = list(tracker.active_events.keys())[0]
+        
+        # Try to create another event very close by (within exclusion distance)
+        # This would happen if detection splits or flickers
+        det2 = [create_detection([630, 350, 730, 450], class_id=1, conf=0.8)]
+        tracker.update(det2, 50.0, frame_img, 1)
+        
+        # Should still have only one event (spatial deduplication blocked new event)
+        assert len(tracker.active_events) == 1
+        # And it should be the same event (possibly updated with new detection)
+        assert initial_event_id in tracker.active_events
+    
+    def test_detection_clustering_merges_nearby(self):
+        """
+        Nearby detections should be clustered before event creation.
+        
+        Scenario: Multiple detections of same bag (detection splitting)
+        Expected: Only one event created from clustered detections
+        """
+        config = EventConfig(
+            detection_cluster_distance_px=80.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Create multiple detections very close together (e.g., detection split)
+        # Detection 1: (640, 360)
+        # Detection 2: (680, 370) - 42px away
+        # Detection 3: (660, 350) - 22px away from det1
+        detections = [
+            create_detection([590, 310, 690, 410], class_id=1, conf=0.7),  # Lower conf
+            create_detection([630, 320, 730, 420], class_id=1, conf=0.9),  # Highest conf
+            create_detection([610, 300, 710, 400], class_id=1, conf=0.8),  # Medium conf
+        ]
+        
+        tracker.update(detections, 0.0, frame_img, 0)
+        
+        # Should create only ONE event (detections clustered)
+        # The event should be created from the highest confidence detection
+        assert len(tracker.active_events) == 1
+        event = list(tracker.active_events.values())[0]
+        
+        # The event's initial confidence should be from the highest conf detection
+        assert event.evidence_history[0].confidence == 0.9
+    
+    def test_detection_clustering_preserves_distant_bags(self):
+        """
+        Detection clustering should not merge genuinely different bags.
+        
+        Scenario: Multiple bags on table, far apart
+        Expected: Each bag gets its own event
+        """
+        config = EventConfig(
+            detection_cluster_distance_px=80.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Create detections far apart (different bags)
+        # Bag 1: (400, 360)
+        # Bag 2: (800, 360) - 400px away
+        detections = [
+            create_detection([350, 310, 450, 410], class_id=1, conf=0.8),
+            create_detection([750, 310, 850, 410], class_id=1, conf=0.8),
+        ]
+        
+        tracker.update(detections, 0.0, frame_img, 0)
+        
+        # Should create TWO events (bags far apart, not clustered)
+        assert len(tracker.active_events) == 2
+    
+    def test_temporal_cooldown_distance_threshold(self):
+        """
+        Temporal cooldown should only apply within specified distance.
+        
+        Scenario: New bag started far from recently committed bag
+        Expected: New event allowed even within cooldown period
+        """
+        config = EventConfig(
+            min_event_creation_interval_ms=400.0,
+            temporal_cooldown_distance_px=120.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        
+        # Add recently committed event at (400, 360)
+        tracker.recently_committed.append({
+            'centroid': (400, 360),
+            'box': (350, 310, 450, 410),
+            'timestamp_ms': 0.0,
+            'event_id': 1,
+        })
+        
+        # Try to create event at (600, 360) at t=200ms (within cooldown time)
+        # Distance = 200px > 120px threshold
+        far_detection = DetectionEvidence(
+            timestamp_ms=200.0,
+            centroid_x=600,  # 200px away
+            centroid_y=360,
+            box=(550, 310, 650, 410),
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=5,
+        )
+        
+        # Should NOT be suppressed (outside cooldown distance)
+        should_suppress = tracker._should_suppress(far_detection, 200.0)
+        assert should_suppress is False
+    
+    def test_iou_exclusion_prevents_overlapping_events(self):
+        """
+        IoU-based exclusion should prevent new events that overlap with active events.
+        
+        Scenario: Detection with significant IoU overlap with active event
+        Expected: New event blocked by IoU exclusion
+        """
+        config = EventConfig(
+            active_event_exclusion_distance_px=60.0,
+            active_event_exclusion_iou=0.25,
+        )
+        
+        # Create evidence and event directly
+        evidence = create_evidence(0.0, 640, 360, is_open=True, w=100, h=100)
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        tracker.active_events[event.id] = event
+        
+        # Create detection with high IoU overlap but beyond distance threshold
+        # Original box: (590, 310, 690, 410)
+        # New box shifted to overlap significantly
+        overlapping_detection = DetectionEvidence(
+            timestamp_ms=100.0,
+            centroid_x=680,  # 40px away, but box overlaps
+            centroid_y=360,
+            box=(630, 310, 730, 410),  # Overlaps with (590,310,690,410)
+            is_open=True,
+            is_closed=False,
+            confidence=0.8,
+            frame_index=2,
+        )
+        
+        # Should be covered (IoU overlap exceeds threshold)
+        is_covered = tracker._is_covered_by_active_event(overlapping_detection)
+        assert is_covered is True
+    
+    def test_full_duplicate_prevention_pipeline(self):
+        """
+        Integration test: Full duplicate prevention pipeline.
+        
+        Tests all mechanisms together:
+        1. Detection clustering
+        2. Spatial deduplication
+        3. Temporal cooldown
+        4. Enhanced suppression
+        """
+        config = EventConfig(
+            # Clustering
+            detection_cluster_distance_px=80.0,
+            # Spatial deduplication
+            active_event_exclusion_distance_px=60.0,
+            active_event_exclusion_iou=0.25,
+            # Temporal cooldown
+            min_event_creation_interval_ms=400.0,
+            temporal_cooldown_distance_px=120.0,
+            # Enhanced suppression
+            suppression_distance_px=120.0,
+            suppression_iou_threshold=0.10,
+            suppression_duration_ms=1500.0,
+            # Association
+            association_distance_px=100.0,
+        )
+        
+        tracker = EventCentricTracker(config=config, open_class_id=1, closed_class_id=0)
+        frame_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # Step 1: Create initial event with multiple nearby detections (test clustering)
+        initial_detections = [
+            create_detection([590, 310, 690, 410], class_id=1, conf=0.7),
+            create_detection([610, 320, 710, 420], class_id=1, conf=0.9),  # Highest - should win
+        ]
+        tracker.update(initial_detections, 0.0, frame_img, 0)
+        
+        # Should create only 1 event (clustering worked)
+        assert len(tracker.active_events) == 1
+        event_id = list(tracker.active_events.keys())[0]
+        
+        # Step 2: Try to create duplicate while event is active (test spatial deduplication)
+        duplicate_attempt = [create_detection([630, 340, 730, 440], class_id=1, conf=0.8)]
+        tracker.update(duplicate_attempt, 100.0, frame_img, 2)
+        
+        # Should still have only 1 event (spatial deduplication worked)
+        assert len(tracker.active_events) == 1
+        
+        # Step 3: Commit the event
+        event = tracker.active_events[event_id]
+        event.state = EventState.CLOSED
+        event.closed_evidence_count = 5
+        event.last_detection_frame_index = 2
+        
+        tracker.update([], 600.0, frame_img, 30)
+        assert event_id not in tracker.active_events  # Committed
+        
+        # Step 4: Try to create event immediately after commit (test temporal cooldown)
+        immediate_detection = [create_detection([595, 315, 695, 415], class_id=1, conf=0.8)]
+        tracker.update(immediate_detection, 700.0, frame_img, 31)
+        
+        # Should be blocked by temporal cooldown
+        assert len(tracker.active_events) == 0
+        
+        # Step 5: Try after cooldown but within suppression (test enhanced suppression)
+        later_detection = [create_detection([598, 318, 698, 418], class_id=1, conf=0.8)]
+        tracker.update(later_detection, 1200.0, frame_img, 35)
+        
+        # Should still be blocked by suppression (IoU overlap + within 1500ms)
+        assert len(tracker.active_events) == 0
+        
+        # Step 6: Finally, after full suppression duration
+        final_detection = [create_detection([600, 320, 700, 420], class_id=1, conf=0.8)]
+        tracker.update(final_detection, 2200.0, frame_img, 50)
+        
+        # Now should create new event (all cooldowns/suppressions expired)
+        assert len(tracker.active_events) == 1
 
 
 if __name__ == '__main__':
