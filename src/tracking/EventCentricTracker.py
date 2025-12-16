@@ -95,16 +95,16 @@ class EventConfig:
     # ==========================================================================
     # Work Zone Configuration
     # ==========================================================================
-    work_zone_enabled: bool = False
+    work_zone_enabled: bool = True
     work_zone_x1: int = 0      # Top-left X of work zone
     work_zone_y1: int = 0      # Top-left Y of work zone
     work_zone_x2: int = 1280   # Bottom-right X of work zone
-    work_zone_y2: int = 720    # Bottom-right Y of work zone
+    work_zone_y2: int = 620    # Bottom-right Y of work zone (moved up from 720)
     
     # ==========================================================================
     # Event Association Parameters (D, T from requirements)
     # ==========================================================================
-    association_distance_px: float = 100.0  # D: Max centroid distance for association
+    association_distance_px: float = 80.0   # D: Max centroid distance for association (reduced from 100.0)
     association_time_ms: float = 400.0      # T: Max time gap for association
     
     # ==========================================================================
@@ -113,7 +113,7 @@ class EventConfig:
     # IoU provides robustness when centroid distance alone may fail (e.g., during
     # partial occlusion where box overlaps but centroid shifts significantly)
     iou_association_enabled: bool = True    # Enable IoU as additional association criterion
-    iou_association_threshold: float = 0.3  # Min IoU to associate (if centroid fails)
+    iou_association_threshold: float = 0.4  # Min IoU to associate (increased from 0.3)
     
     # ==========================================================================
     # IoU Box Margin Expansion (for flip/spin scenarios)
@@ -129,7 +129,7 @@ class EventConfig:
     # ==========================================================================
     velocity_scaling_enabled: bool = True   # Enable velocity-based distance scaling
     velocity_scale_factor: float = 2.5      # Max multiplier for association distance
-    max_association_distance_px: float = 250.0  # Absolute max association distance
+    max_association_distance_px: float = 180.0  # Absolute max association distance (reduced from 250.0)
     min_velocity_threshold: float = 0.01    # Min velocity (px/ms) to trigger scaling
     max_prediction_time_ms: float = 500.0   # Max time ahead to predict centroid
     
