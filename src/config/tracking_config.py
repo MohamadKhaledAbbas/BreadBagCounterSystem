@@ -315,6 +315,66 @@ class TrackingConfig:
     """
 
     # ============================================================================
+    # Degraded Mode Parameters (Overload Handling)
+    # ============================================================================
+    
+    degraded_mode_enabled: bool = True
+    """
+    Enable degraded mode to handle overload gracefully.
+    
+    When True: Automatically reduce non-critical work under overload
+    When False: Continue normal operation regardless of load
+    
+    Default: True
+    """
+    
+    degraded_mode_queue_threshold: float = 0.7
+    """
+    Queue utilization threshold to trigger degraded mode.
+    
+    Range: 0.5 - 0.9
+    When input queue utilization exceeds this value, degraded mode activates.
+    
+    Default: 0.7 (70% full)
+    """
+    
+    degraded_mode_delay_threshold_ms: float = 100.0
+    """
+    Average queue delay (milliseconds) to trigger degraded mode.
+    
+    Range: 50 - 300
+    When average time frames spend in queue exceeds this, degraded mode activates.
+    
+    Default: 100.0 ms
+    """
+    
+    degraded_mode_disable_roi_saving: bool = True
+    """
+    Disable ROI image saving in degraded mode.
+    
+    Default: True (saves disk I/O)
+    """
+    
+    degraded_mode_disable_visualization: bool = False
+    """
+    Disable visualization work in degraded mode.
+    
+    Note: Set to False by default to maintain UI visibility.
+    Set to True if visualization is not critical and you need maximum throughput.
+    
+    Default: False (keep visualization enabled)
+    """
+    
+    degraded_mode_skip_low_detection_frames: bool = True
+    """
+    Skip processing frames with no detections in degraded mode.
+    
+    This is safe because frames without detections don't contribute to tracking.
+    
+    Default: True
+    """
+    
+    # ============================================================================
     # V5: Event-Centric Tracking Parameters
     # ============================================================================
     # These parameters control the new event-centric tracking system that replaces
