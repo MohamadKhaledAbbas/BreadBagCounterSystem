@@ -543,7 +543,7 @@ class BreadBagEvent:
         dt = target_time_ms - self.last_detection_time_ms
         
         # Limit prediction to configurable max time ahead
-        dt = min(dt, self._scaled_max_prediction_time_ms)
+        dt = min(dt, self.config.max_prediction_time_ms)
         
         pred_x = self.last_centroid[0] + vx * dt
         pred_y = self.last_centroid[1] + vy * dt
@@ -723,8 +723,8 @@ class BreadBagEvent:
         # Determine time windows for association
         # - within_association_window: normal matching (higher reliability)
         # - within_ghost_window: ghost reattachment allowed (event is "alive but lost")
-        within_association_window = time_gap_ms <= self._scaled_association_time_ms
-        within_ghost_window = time_gap_ms <= self._scaled_ghost_timeout_ms
+        within_association_window = time_gap_ms <= self.config.association_time_ms
+        within_ghost_window = time_gap_ms <= self.config.ghost_timeout_ms
         
         # Determine match type for structured logging
         # Priority:
@@ -800,8 +800,8 @@ class BreadBagEvent:
         metrics_detail = (
             f"dist={distance:.1f}px (thresh={scaled_threshold:.1f}px), "
             f"iou={iou_value:.2f} (thresh={self.config.iou_association_threshold}), "
-            f"time_gap={time_gap_ms:.1f}ms (assoc_thresh={self._scaled_association_time_ms}ms, "
-            f"ghost_thresh={self._scaled_ghost_timeout_ms}ms)"
+            f"time_gap={time_gap_ms:.1f}ms (assoc_thresh={self.config.association_time_ms}ms, "
+            f"ghost_thresh={self.config.ghost_timeout_ms}ms)"
         )
         
         # Include expanded IoU info if relevant
@@ -812,7 +812,7 @@ class BreadBagEvent:
             metrics_detail += f", velocity={velocity_mag:.3f}px/ms"
         
         if match_type == "time_exceeded":
-            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self._scaled_ghost_timeout_ms}ms) | {metrics_detail}"
+            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {self.config.ghost_timeout_ms}ms) | {metrics_detail}"
         else:
             reason = f"{match_type} ({metrics_detail})"
         
@@ -832,7 +832,7 @@ class BreadBagEvent:
             self.detection_gaps.append((self.current_gap_start, detection.timestamp_ms))
             self.current_gap_start = None
             # Only log significant detection gaps to reduce log flooding
-            if gap_duration > self._scaled_min_gap_duration_for_logging_ms:
+            if gap_duration > self.config.min_gap_duration_for_logging_ms:
                 logger.debug(
                     f"[Event:{self.id}] Detection gap closed: {gap_duration:.1f}ms"
                 )
@@ -900,7 +900,7 @@ class BreadBagEvent:
         if self.state == EventState.OPEN:
             # Can transition to CLOSING if closed evidence starts accumulating
             # Requires: min time in OPEN + closed evidence
-            if (time_in_state_ms >= self._scaled_open_to_closing_time_ms and
+            if (time_in_state_ms >= self.config.open_to_closing_time_ms and
                 self.closed_evidence_count >= 1 and
                 self.open_evidence_count >= self.config.min_open_evidence_count):
                 self._transition_to(EventState.CLOSING, detection.timestamp_ms, 
@@ -929,7 +929,7 @@ class BreadBagEvent:
                     return
             
             # Check for progression to CLOSED
-            if (time_in_state_ms >= self._scaled_closing_stability_time_ms and
+            if (time_in_state_ms >= self.config.closing_stability_time_ms and
                 self.closed_evidence_count >= self.config.min_closed_evidence_count):
                 # Also check geometric stability
                 stability = self.get_centroid_stability()
@@ -1064,7 +1064,7 @@ class BreadBagEvent:
         # PRIORITY CHECK: Max event lifetime exceeded - force commit/expire
         # This prevents events from staying active indefinitely when bags aren't removed
         event_lifetime_ms = current_time_ms - self.created_at_ms
-        if event_lifetime_ms > self._scaled_max_event_lifetime_ms:
+        if event_lifetime_ms > self.config.max_event_lifetime_ms:
             # Force commit if we have reasonable evidence, otherwise expire
             if self.state == EventState.CLOSED or self.closed_evidence_count >= self.config.min_closed_evidence_count:
                 # Has closed evidence - commit it
@@ -1073,7 +1073,7 @@ class BreadBagEvent:
                 self.commit_reason = "max_lifetime"
                 logger.info(
                     f"[Event:{self.id}] Max lifetime commit: bag counted after max lifetime "
-                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self._scaled_max_event_lifetime_ms:.0f}ms, "
+                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms, "
                     f"state={self.state.name})"
                 )
                 return True, 'commit'
@@ -1081,7 +1081,7 @@ class BreadBagEvent:
                 # No closed evidence - just expire
                 logger.info(
                     f"[Event:{self.id}] Max lifetime expired: no closed evidence "
-                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self._scaled_max_event_lifetime_ms:.0f}ms)"
+                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms)"
                 )
                 return False, 'expire'
         
@@ -1097,7 +1097,7 @@ class BreadBagEvent:
                     # Check closed ratio threshold
                     if closed_ratio >= self.config.commit_min_closed_ratio:
                         # Optional: Check time in CLOSED state for extra stability
-                        if time_in_state_ms >= self._scaled_closed_stability_time_ms:
+                        if time_in_state_ms >= self.config.closed_stability_time_ms:
                             self._transition_to(EventState.COMMITTED, current_time_ms,
                                                 f"idle_commit (idle={self.frames_without_detection} frames, "
                                                 f"closed_ratio={closed_ratio:.2f}, "
@@ -1116,7 +1116,7 @@ class BreadBagEvent:
                             logger.debug(
                                 f"[Event:{self.id}] CLOSED but waiting for stability "
                                 f"(time_in_closed={time_in_state_ms:.0f}ms, "
-                                f"required={self._scaled_closed_stability_time_ms}ms)"
+                                f"required={self.config.closed_stability_time_ms}ms)"
                             )
                             return False, 'waiting'
                     else:
@@ -1177,12 +1177,12 @@ class BreadBagEvent:
                 self.frames_out_of_zone = 0
         
         # SECOND: For non-CLOSED events, check if ghost timeout exceeded
-        if time_since_detection_ms > self._scaled_ghost_timeout_ms:
+        if time_since_detection_ms > self.config.ghost_timeout_ms:
             # Event expired without reaching CLOSED state or meeting commit criteria
             logger.debug(
                 f"[Event:{self.id}] Expired in state {self.state.name} "
                 f"after {time_since_detection_ms:.0f}ms without detection "
-                f"(ghost_timeout={self._scaled_ghost_timeout_ms}ms)"
+                f"(ghost_timeout={self.config.ghost_timeout_ms}ms)"
             )
             return False, 'expire'
         
