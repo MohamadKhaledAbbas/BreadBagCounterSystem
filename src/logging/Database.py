@@ -81,12 +81,30 @@ class DatabaseManager:
                     "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
                     (config_key, '0')
                 )
+            
+            # Migration: Add confidence_tier column if it doesn't exist (backward compatible)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(bag_events)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'confidence_tier' not in columns:
+                    logger.info("[DatabaseManager] Adding confidence_tier column to bag_events table")
+                    conn.execute("""
+                        ALTER TABLE bag_events 
+                        ADD COLUMN confidence_tier TEXT DEFAULT 'high'
+                    """)
+                    logger.info("[DatabaseManager] confidence_tier column added successfully")
+            except Exception as e:
+                logger.error(f"[DatabaseManager] Error adding confidence_tier column: {e}")
 
     def get_or_create_bag_type(self, label: str, phash_obj, image_path: str = None) -> int:
         """
-        If label is 'Unknown', tries to find a matching pHash.
-        If found, returns that ID. If not, creates 'unknown_X'.
+        If label is 'Unknown', creates or returns a single stable Unknown bag type by default.
         If label is known (e.g. 'red_bag'), simply returns/creates it.
+        
+        For Unknown bags:
+        - By default, all Unknowns map to a single "Unknown" bag type record
+        - Optional: Set ENABLE_UNKNOWN_PHASH_CLUSTERING=1 to enable legacy pHash-based clustering
         """
         phash_str = str(phash_obj) if phash_obj else None
 
@@ -107,51 +125,94 @@ class DatabaseManager:
                 """, (label, image_path))
                 return cursor.lastrowid
 
-            # 2. Handle UNKNOWN classes (pHash logic)
-            # Fetch all unknown bag types to compare hashes
-            cursor.execute("SELECT id, name, phash FROM bag_types WHERE is_known = 0")
-            unknowns = cursor.fetchall()
+            # 2. Handle UNKNOWN classes
+            # Check if pHash-based clustering is enabled via environment variable
+            import os as os_module
+            enable_phash_clustering = os_module.environ.get('ENABLE_UNKNOWN_PHASH_CLUSTERING', '0') == '1'
+            
+            if enable_phash_clustering and phash_str and phash_str != "unknown":
+                # Legacy behavior: pHash-based clustering
+                try:
+                    # Validate phash_str is valid hex before attempting conversion
+                    if not all(c in '0123456789abcdefABCDEF' for c in phash_str):
+                        logger.warning(f"[DatabaseManager] Invalid phash hex string: {phash_str}, using stable Unknown")
+                        enable_phash_clustering = False
+                    else:
+                        # Fetch all unknown bag types to compare hashes
+                        cursor.execute("SELECT id, name, phash FROM bag_types WHERE is_known = 0")
+                        unknowns = cursor.fetchall()
 
-            current_hash = imagehash.hex_to_hash(phash_str)
+                        current_hash = imagehash.hex_to_hash(phash_str)
 
-            # Threshold for "similarity" (0-5 is usually the same object)
-            best_match_id = None
-            min_dist = 20
+                        # Threshold for "similarity" (0-8 is usually the same object)
+                        best_match_id = None
+                        min_dist = 20
 
-            for uid, uname, uhash in unknowns:
-                if uhash:
-                    stored_hash = imagehash.hex_to_hash(uhash)
-                    dist = current_hash - stored_hash
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_match_id = uid
+                        for uid, uname, uhash in unknowns:
+                            if uhash:
+                                try:
+                                    stored_hash = imagehash.hex_to_hash(uhash)
+                                    dist = current_hash - stored_hash
+                                    if dist < min_dist:
+                                        min_dist = dist
+                                        best_match_id = uid
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"[DatabaseManager] Failed to parse stored phash for {uname}: {e}")
+                                    continue
 
-            if best_match_id:  # 8 is a safe threshold
-                return best_match_id
+                        if best_match_id and min_dist < 8:  # 8 is a safe threshold
+                            return best_match_id
 
-            # 3. Create NEW Unknown Type
-            # Generate name like unknown_1, unknown_2
-            new_count = len(unknowns) + 1
-            new_name = f"unknown_bag_{new_count}"
+                        # Create NEW Unknown Type with pHash clustering
+                        new_count = len(unknowns) + 1
+                        new_name = f"unknown_bag_{new_count}"
 
+                        cursor.execute("""
+                            INSERT INTO bag_types (name, is_known, phash, image_path) 
+                            VALUES (?, 0, ?, ?)
+                        """, (new_name, phash_str, image_path))
+
+                        return cursor.lastrowid
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"[DatabaseManager] Failed to process phash for Unknown: {e}, using stable Unknown")
+                    enable_phash_clustering = False
+            
+            # Default behavior: Single stable "Unknown" bag type
+            # Check if stable "Unknown" already exists
+            cursor.execute("SELECT id FROM bag_types WHERE name = ? AND is_known = 0", ("Unknown",))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+            
+            # Create stable "Unknown" bag type
             cursor.execute("""
                 INSERT INTO bag_types (name, is_known, phash, image_path) 
-                VALUES (?, 0, ?, ?)
-            """, (new_name, phash_str, image_path))
-
+                VALUES (?, 0, NULL, ?)
+            """, ("Unknown", image_path))
+            
             return cursor.lastrowid
 
-    def log_event(self, bag_type_id: int, track_id: int, confidence: float = 1.0):
+    def log_event(self, bag_type_id: int, track_id: int, confidence: float = 1.0, confidence_tier: str = 'high'):
+        """
+        Log a bag counting event with confidence tier information.
+        
+        Args:
+            bag_type_id: ID of the bag type
+            track_id: Tracking ID
+            confidence: Classification confidence score
+            confidence_tier: Either 'high' or 'low' (default: 'high')
+        """
         with self.get_connection() as conn:
             conn.execute("""
-                INSERT INTO bag_events (bag_type_id, track_id, confidence)
-                VALUES (?, ?, ?)
-            """, (bag_type_id, track_id, confidence))
+                INSERT INTO bag_events (bag_type_id, track_id, confidence, confidence_tier)
+                VALUES (?, ?, ?, ?)
+            """, (bag_type_id, track_id, confidence, confidence_tier))
 
     def get_aggregated_stats(self, start_time, end_time):
         with self.get_connection() as conn:
             conn.row_factory = sqlite3.Row
 
+            # Get counts per bag type with confidence tier breakdown
             bag_type_stats = conn.execute("""
                 SELECT
                     bt.id,
@@ -161,7 +222,9 @@ class DatabaseManager:
                     bt.arabic_name,
                     bt.number_of_breads,
                     bt.weight,
-                    COUNT(be.id) AS count
+                    COUNT(be.id) AS count,
+                    SUM(CASE WHEN be.confidence_tier = 'high' THEN 1 ELSE 0 END) AS high_count,
+                    SUM(CASE WHEN be.confidence_tier = 'low' THEN 1 ELSE 0 END) AS low_count
                 FROM bag_types bt
                 LEFT JOIN bag_events be
                     ON bt.id = be.bag_type_id AND be.timestamp BETWEEN ? AND ?
@@ -180,11 +243,22 @@ class DatabaseManager:
                 JOIN bag_types bt ON be.bag_type_id = bt.id
                 WHERE be.timestamp BETWEEN ? AND ?;
             """, (start_time, end_time)).fetchone()[0]
+            
+            # Get high/low counts for totals
+            tier_totals = conn.execute("""
+                SELECT 
+                    SUM(CASE WHEN confidence_tier = 'high' THEN 1 ELSE 0 END) AS high_total,
+                    SUM(CASE WHEN confidence_tier = 'low' THEN 1 ELSE 0 END) AS low_total
+                FROM bag_events
+                WHERE timestamp BETWEEN ? AND ?;
+            """, (start_time, end_time)).fetchone()
 
         stats = {
             "total": {
                 "count": total_count,
-                "weight": (total_weight or 0) / 1000
+                "weight": (total_weight or 0) / 1000,
+                "high_count": tier_totals["high_total"] if tier_totals else 0,
+                "low_count": tier_totals["low_total"] if tier_totals else 0
             },
             "classifications": [
                 {
@@ -196,6 +270,8 @@ class DatabaseManager:
                     "thumb": row["image_path"],
                     "is_known": bool(row["is_known"]),
                     "count": row["count"],
+                    "high_count": row["high_count"] if row["high_count"] else 0,
+                    "low_count": row["low_count"] if row["low_count"] else 0,
                 } for row in bag_type_stats
             ]
         }

@@ -447,6 +447,17 @@ class ClassifierService:
             # Include rejection reason in metadata for callbacks
             if rejection_reason:
                 metadata["rejection_reason"] = rejection_reason
+                
+                # Add unknown_kind for Unknown classifications
+                if final_label == "Unknown":
+                    unknown_kind = "structural"  # default
+                    if "low_evidence" in rejection_reason:
+                        unknown_kind = "low_evidence"
+                    elif "ambiguous" in rejection_reason:
+                        unknown_kind = "ambiguous"
+                    elif "too_few_rois" in rejection_reason or "track_too_short" in rejection_reason or "no_valid_classifications" in rejection_reason:
+                        unknown_kind = "structural"
+                    metadata["unknown_kind"] = unknown_kind
             
             # Save ROI and invoke callbacks
             self._save_and_callback(
@@ -507,14 +518,24 @@ class ClassifierService:
 
     def _invoke_unknown_result(self, track_id: int, reason: str, context: Optional[Dict]):
         """Invoke callbacks with Unknown result for structural failures."""
+        # Determine unknown_kind based on reason
+        unknown_kind = "structural"  # default for structural issues like no_candidates
+        if reason and ("low_evidence" in reason or "insufficient" in reason):
+            unknown_kind = "low_evidence"
+        elif reason and ("ambiguous" in reason):
+            unknown_kind = "ambiguous"
+        
         result_data = {
             "label": "Unknown",
-            "phash": "unknown",
+            "phash": None,  # Changed from "unknown" to None to avoid hex conversion crashes
             "image_path": None,
             "confidence": 0.0,
             "candidates_evaluated": 0,
             "context": context,
-            "metadata": {"rejection_reason": reason},
+            "metadata": {
+                "rejection_reason": reason,
+                "unknown_kind": unknown_kind  # Added machine-readable category
+            },
         }
         
         for cb in self.callbacks:
@@ -531,13 +552,14 @@ class ClassifierService:
             logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
             return
         
-        # Compute phash
+        # Compute phash (only for non-Unknown or when we have actual ROI data)
         phash_obj = compute_phash(best_roi)
-        phash_str = str(phash_obj)
+        phash_str = str(phash_obj) if phash_obj else None
         
         # Determine save path
         if label == "Unknown":
-            target_dir = os.path.join(self.data_root, "unknown", phash_str)
+            # For Unknown, use a single directory instead of per-phash directories
+            target_dir = os.path.join(self.data_root, "unknown", "unknown_samples")
         else:
             target_dir = os.path.join(self.data_root, "classes", label)
         

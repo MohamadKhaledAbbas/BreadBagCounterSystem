@@ -230,6 +230,20 @@ class TrackingConfig:
     Default: 5
     """
     
+    high_confidence_threshold: float = 0.5
+    """
+    Confidence threshold for "high" vs "low" confidence tier.
+    
+    Range: 0.3 - 0.7
+    Confidence >= this value is considered "high confidence"
+    Confidence < this value is considered "low confidence"
+    
+    This enables analytics to show separate counts for high vs low confidence
+    detections, providing better visibility into classification quality.
+    
+    Default: 0.5
+    """
+    
     min_total_evidence_score: float = 0.3
     """
     Minimum total evidence score required to accept a classification.

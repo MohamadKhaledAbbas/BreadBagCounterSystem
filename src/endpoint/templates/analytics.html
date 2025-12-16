@@ -41,6 +41,10 @@
             <div class="hero-metric primary">
                 <div class="hero-label">عدد الربطات الإجمالي</div>
                 <div class="hero-value">{{ total.count or 0 }}</div>
+                <div class="hero-breakdown">
+                    <span class="tier-badge high-tier">دقة عالية: {{ total.high_count or 0 }}</span>
+                    <span class="tier-badge low-tier">دقة منخفضة: {{ total.low_count or 0 }}</span>
+                </div>
             </div>
 
             <div class="hero-metric">
@@ -64,6 +68,17 @@
                 </div>
 
                 <div class="card-metric-large">{{ c.count }}</div>
+                
+                <div class="confidence-breakdown">
+                    <div class="conf-item high">
+                        <span class="conf-label">دقة عالية</span>
+                        <span class="conf-value">{{ c.high_count or 0 }}</span>
+                    </div>
+                    <div class="conf-item low">
+                        <span class="conf-label">دقة منخفضة</span>
+                        <span class="conf-value">{{ c.low_count or 0 }}</span>
+                    </div>
+                </div>
 
                 <div class="card-footer">
                     <span>الوزن</span>

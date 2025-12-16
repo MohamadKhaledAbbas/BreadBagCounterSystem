@@ -364,8 +364,11 @@ class BagCounterApp:
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
 
+        # Determine confidence tier based on tracking_config threshold
+        confidence_tier = 'high' if conf >= tracking_config.high_confidence_threshold else 'low'
+        
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
-        self.db.log_event(bag_type_id, track_id, conf)
+        self.db.log_event(bag_type_id, track_id, conf, confidence_tier)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
         
@@ -375,7 +378,7 @@ class BagCounterApp:
             new_count=self.ui_counts[label],
             track_id=track_id,
             confidence=conf,
-            phash=phash,
+            phash=phash if phash else "None",
             candidates_evaluated=candidates_count
         )
 
