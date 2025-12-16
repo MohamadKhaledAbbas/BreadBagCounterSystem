@@ -170,17 +170,44 @@ class EventConfig:
     # ==========================================================================
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
-    suppression_distance_px: float = 150.0   # Distance within which new events are suppressed
-    suppression_duration_ms: float = 1000.0  # Duration to suppress new events after commit
+    suppression_distance_px: float = 120.0   # Distance within which new events are suppressed (reduced from 150.0)
+    suppression_duration_ms: float = 1500.0  # Duration to suppress new events after commit (increased from 1000.0)
     
     # Conditional suppression (Issue #3 fix)
     suppression_require_box_overlap: bool = True
     """When True, suppression requires IoU overlap with last committed box.
     Allows new bags to start immediately at same location if no box overlap."""
     
-    suppression_iou_threshold: float = 0.15
+    suppression_iou_threshold: float = 0.10
     """Minimum IoU with last committed box to trigger suppression.
-    Lower values = more aggressive suppression."""
+    Lower values = more aggressive suppression (reduced from 0.15)."""
+    
+    # ==========================================================================
+    # Temporal Cooldown for New Event Creation
+    # ==========================================================================
+    # Prevents rapid event creation at the same location after commitment
+    min_event_creation_interval_ms: float = 400.0
+    """Minimum time (ms) before allowing new event creation at same location after commit."""
+    
+    temporal_cooldown_distance_px: float = 120.0
+    """Distance within which temporal cooldown applies."""
+    
+    # ==========================================================================
+    # Active Event Spatial Exclusion
+    # ==========================================================================
+    # Prevents creating new events when another active event already covers the area
+    active_event_exclusion_distance_px: float = 60.0
+    """Distance within which new events are blocked if an active event exists."""
+    
+    active_event_exclusion_iou: float = 0.25
+    """IoU threshold - if detection overlaps active event by this much, don't create new event."""
+    
+    # ==========================================================================
+    # Detection Clustering Parameters
+    # ==========================================================================
+    # Groups nearby unassociated detections to prevent duplicate event creation
+    detection_cluster_distance_px: float = 80.0
+    """Distance within which detections are clustered together."""
     
     # ==========================================================================
     # State Transition Parameters (temporal stability)
@@ -1399,6 +1426,8 @@ class EventCentricTracker:
                 )
         
         # 2. Create new events for unassociated open detections
+        # First, collect unassociated open detections
+        unassociated_open_detections = []
         for det_idx, evidence in enumerate(detection_evidences):
             if det_idx in associated_detection_indices:
                 continue
@@ -1416,6 +1445,13 @@ class EventCentricTracker:
             if evidence.confidence < self.config.min_detection_confidence:
                 continue
             
+            unassociated_open_detections.append(evidence)
+        
+        # Cluster nearby detections to prevent duplicate event creation
+        clustered_detections = self._cluster_detections(unassociated_open_detections)
+        
+        # Now create events from clustered detections
+        for evidence in clustered_detections:
             # Check max active events
             if len(self.active_events) >= self.config.max_active_events:
                 logger.warning(
@@ -1423,8 +1459,16 @@ class EventCentricTracker:
                 )
                 break
             
-            # Check suppression against recently committed events
-            if self._should_suppress(evidence):
+            # Check if detection is already covered by an active event
+            if self._is_covered_by_active_event(evidence):
+                logger.debug(
+                    f"[EventCentricTracker] Skipping event creation: detection covered by active event"
+                )
+                self.stats['events_suppressed'] += 1
+                continue
+            
+            # Check suppression against recently committed events (includes temporal cooldown)
+            if self._should_suppress(evidence, timestamp_ms):
                 self.stats['events_suppressed'] += 1
                 continue
             
@@ -1508,7 +1552,7 @@ class EventCentricTracker:
         return (self.config.work_zone_x1 <= x <= self.config.work_zone_x2 and
                 self.config.work_zone_y1 <= y <= self.config.work_zone_y2)
     
-    def _should_suppress(self, evidence: DetectionEvidence) -> bool:
+    def _should_suppress(self, evidence: DetectionEvidence, timestamp_ms: float) -> bool:
         """
         Check if new event should be suppressed.
         
@@ -1524,8 +1568,14 @@ class EventCentricTracker:
         - This allows new bags to start immediately at the same location if there's
           no box overlap (worker starts new bag after removing the last one)
         
+        TEMPORAL COOLDOWN: Hard temporal cooldown zone
+        - No new events allowed within temporal_cooldown_distance_px for
+          min_event_creation_interval_ms after commit
+        - This catches detection flickering and rapid re-detections
+        
         Args:
             evidence: Detection evidence for potential new event
+            timestamp_ms: Current timestamp in milliseconds
             
         Returns:
             True if event should be suppressed, False otherwise
@@ -1535,7 +1585,23 @@ class EventCentricTracker:
             dy = evidence.centroid_y - rc['centroid'][1]
             distance = math.sqrt(dx*dx + dy*dy)
             
-            # Check centroid distance first
+            # Calculate time since this event was committed
+            time_since_commit = timestamp_ms - rc['timestamp_ms']
+            
+            # TEMPORAL COOLDOWN CHECK: Hard temporal cooldown - no new events in same area for X ms
+            # This is the most aggressive check and happens first
+            if time_since_commit < self.config.min_event_creation_interval_ms:
+                if distance < self.config.temporal_cooldown_distance_px:
+                    # Within cooldown period and distance - suppress
+                    logger.debug(
+                        f"[EventCentricTracker] Suppressing new event: "
+                        f"within temporal cooldown zone of recently committed {rc['event_id']} "
+                        f"(time_since_commit={time_since_commit:.0f}ms < {self.config.min_event_creation_interval_ms}ms, "
+                        f"distance={distance:.1f}px < {self.config.temporal_cooldown_distance_px}px)"
+                    )
+                    return True
+            
+            # Check centroid distance for standard suppression
             if distance >= self.config.suppression_distance_px:
                 # Too far away, no suppression
                 continue
@@ -1595,6 +1661,110 @@ class EventCentricTracker:
             return 0.0
         
         return inter_area / union_area
+    
+    def _is_covered_by_active_event(self, evidence: DetectionEvidence) -> bool:
+        """
+        Check if a detection is already covered by an active event.
+        
+        This prevents creating new events when another active event already
+        covers the detection area. Helps prevent duplicates from:
+        - Detection flickering/splitting
+        - Temporarily lost detections that immediately return
+        - Multiple detections of same bag in one frame
+        
+        Args:
+            evidence: Detection evidence to check
+            
+        Returns:
+            True if detection is covered by an active event, False otherwise
+        """
+        for event in self.active_events.values():
+            # Skip committed events (they're handled by suppression)
+            if event.state == EventState.COMMITTED:
+                continue
+            
+            # Check centroid proximity
+            dx = evidence.centroid_x - event.last_centroid[0]
+            dy = evidence.centroid_y - event.last_centroid[1]
+            distance = math.sqrt(dx*dx + dy*dy)
+            
+            if distance < self.config.active_event_exclusion_distance_px:
+                logger.debug(
+                    f"[EventCentricTracker] Detection covered by active event {event.id}: "
+                    f"centroid distance={distance:.1f}px < threshold={self.config.active_event_exclusion_distance_px}px"
+                )
+                return True
+            
+            # Also check IoU with active event's box
+            if event.last_box is not None:
+                iou = self._compute_iou_static(event.last_box, evidence.box)
+                if iou > self.config.active_event_exclusion_iou:
+                    logger.debug(
+                        f"[EventCentricTracker] Detection covered by active event {event.id}: "
+                        f"IoU={iou:.3f} > threshold={self.config.active_event_exclusion_iou}"
+                    )
+                    return True
+        
+        return False
+    
+    def _cluster_detections(self, evidences: List[DetectionEvidence]) -> List[DetectionEvidence]:
+        """
+        Cluster nearby detections and return representative detection per cluster.
+        
+        Before creating new events, nearby unassociated detections are clustered
+        together. Only the highest confidence detection from each cluster is used
+        to create an event. This prevents duplicate events from:
+        - Detection flickering (same bag detected multiple times)
+        - Detection splitting (one bag split into multiple boxes)
+        - Noisy detections around the same physical bag
+        
+        Args:
+            evidences: List of detection evidences to cluster
+            
+        Returns:
+            List of representative detections (one per cluster)
+        """
+        if len(evidences) <= 1:
+            return evidences
+        
+        clustered = []
+        used = set()
+        
+        for i, ev1 in enumerate(evidences):
+            if i in used:
+                continue
+            
+            # Start a new cluster with this detection
+            cluster = [ev1]
+            used.add(i)
+            
+            # Find all nearby detections to add to this cluster
+            for j, ev2 in enumerate(evidences):
+                if j in used:
+                    continue
+                
+                # Calculate distance between detections
+                dx = ev1.centroid_x - ev2.centroid_x
+                dy = ev1.centroid_y - ev2.centroid_y
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                if dist < self.config.detection_cluster_distance_px:
+                    cluster.append(ev2)
+                    used.add(j)
+            
+            # Pick highest confidence detection as representative of this cluster
+            representative = max(cluster, key=lambda e: e.confidence)
+            clustered.append(representative)
+            
+            # Log if we clustered multiple detections
+            if len(cluster) > 1:
+                logger.debug(
+                    f"[EventCentricTracker] Clustered {len(cluster)} nearby detections "
+                    f"at ({representative.centroid_x:.0f}, {representative.centroid_y:.0f}), "
+                    f"using highest confidence detection (conf={representative.confidence:.2f})"
+                )
+        
+        return clustered
     
     def _prepare_event_output(self, event: BreadBagEvent) -> Dict[str, Any]:
         """
