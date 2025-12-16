@@ -424,15 +424,27 @@ class LogAnalyzer:
     def _compute_percentile_stats(self, values: List[float], name: str) -> Dict[str, Any]:
         """Compute avg, p50, p95, max for a list of values."""
         if not values:
-            return {"name": name, "count": 0}
+            return {
+                "name": name,
+                "count": 0,
+                "avg": 0,
+                "p50": 0,
+                "p95": 0,
+                "max": 0,
+                "min": 0
+            }
         
         sorted_values = sorted(values)
+        n = len(sorted_values)
+        # Proper percentile calculation: position = percentile * (n-1)
+        p95_index = int(0.95 * (n - 1))
+        
         return {
             "name": name,
-            "count": len(values),
+            "count": n,
             "avg": statistics.mean(values),
-            "p50": sorted_values[len(sorted_values) // 2],
-            "p95": sorted_values[int(len(sorted_values) * 0.95)] if len(sorted_values) > 20 else sorted_values[-1],
+            "p50": sorted_values[n // 2],
+            "p95": sorted_values[p95_index],
             "max": max(values),
             "min": min(values)
         }
