@@ -2164,7 +2164,7 @@ class TestDuplicateEventPrevention:
             temporal_cooldown_distance_px=120.0,
             suppression_distance_px=120.0,
             suppression_duration_ms=1500.0,
-            suppression_require_box_overlap=True,  # Need to add this
+            suppression_require_box_overlap=True,
             suppression_iou_threshold=0.10,
         )
         

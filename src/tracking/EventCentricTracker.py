@@ -1672,6 +1672,9 @@ class EventCentricTracker:
         - Temporarily lost detections that immediately return
         - Multiple detections of same bag in one frame
         
+        Performance: O(n) where n is number of active events (typically 1-5, max 15).
+        Linear search is efficient for this scale and avoids complexity of spatial indexing.
+        
         Args:
             evidence: Detection evidence to check
             
@@ -1717,6 +1720,11 @@ class EventCentricTracker:
         - Detection flickering (same bag detected multiple times)
         - Detection splitting (one bag split into multiple boxes)
         - Noisy detections around the same physical bag
+        
+        Performance: O(n²) complexity, but acceptable for this use case since:
+        - Typically 0-5 unassociated detections per frame
+        - Most detections associate with existing events
+        - Only runs on the small subset of unassociated detections
         
         Args:
             evidences: List of detection evidences to cluster
