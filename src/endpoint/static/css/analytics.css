@@ -588,3 +588,74 @@ main {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
 }
+
+/* 🎯 Confidence Tier Styling */
+.hero-breakdown {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-top: 1rem;
+    flex-wrap: wrap;
+}
+
+.tier-badge {
+    padding: 0.4rem 1rem;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+}
+
+.tier-badge.high-tier {
+    background: rgba(45, 212, 191, 0.15);
+    color: #2dd4bf;
+    border: 1px solid rgba(45, 212, 191, 0.3);
+}
+
+.tier-badge.low-tier {
+    background: rgba(251, 191, 36, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+/* Confidence breakdown in cards */
+.confidence-breakdown {
+    display: flex;
+    gap: 0.75rem;
+    margin: 1rem 0;
+    padding: 0.75rem;
+    background: rgba(15, 23, 42, 0.4);
+    border-radius: var(--radius-md);
+    justify-content: space-around;
+}
+
+.conf-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.conf-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    opacity: 0.8;
+}
+
+.conf-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+
+.conf-item.high .conf-label,
+.conf-item.high .conf-value {
+    color: #2dd4bf;
+}
+
+.conf-item.low .conf-label,
+.conf-item.low .conf-value {
+    color: #fbbf24;
+}
+}

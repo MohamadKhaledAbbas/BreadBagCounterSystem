@@ -169,6 +169,12 @@ class BagCounterApp:
         self._recent_frame_times: deque = deque(maxlen=30)  # Last 30 total frame times
         self._frames_skipped = 0
         self._adaptive_skip_enabled = True
+        
+        # Degraded mode tracking
+        self._degraded_mode_active = False
+        self._recent_queue_delays: deque = deque(maxlen=20)  # Track queue delay
+        self._last_degraded_mode_check = time.perf_counter()
+        self._degraded_mode_check_interval = 2.0  # Check every 2 seconds
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -241,6 +247,70 @@ class BagCounterApp:
         # Now toggle flag based on config key
         self.is_recording = (new_value == "1" or new_value is True or new_value == 1)
         logger.info(f"[BagCounterApp] is_recording set to {self.is_recording}")
+    
+    def _check_degraded_mode(self, queue_utilization: float) -> bool:
+        """
+        Check if system should enter degraded mode based on load metrics.
+        
+        Degraded mode reduces non-critical work to maintain tracking reliability.
+        
+        Args:
+            queue_utilization: Current input queue utilization (0.0 - 1.0)
+            
+        Returns:
+            True if degraded mode should be active
+        """
+        if not tracking_config.degraded_mode_enabled:
+            return False
+        
+        current_time = time.perf_counter()
+        
+        # Only check periodically to avoid overhead
+        if current_time - self._last_degraded_mode_check < self._degraded_mode_check_interval:
+            return self._degraded_mode_active
+        
+        self._last_degraded_mode_check = current_time
+        
+        # Check queue utilization threshold
+        queue_overload = queue_utilization > tracking_config.degraded_mode_queue_threshold
+        
+        # Check average queue delay if we have enough samples
+        delay_overload = False
+        if len(self._recent_queue_delays) >= 10:
+            avg_delay_ms = sum(self._recent_queue_delays) / len(self._recent_queue_delays)
+            delay_overload = avg_delay_ms > tracking_config.degraded_mode_delay_threshold_ms
+        
+        # Activate degraded mode if either condition is met
+        should_activate = queue_overload or delay_overload
+        
+        # Log state transitions
+        if should_activate and not self._degraded_mode_active:
+            logger.warning(
+                f"[BagCounterApp] ENTERING DEGRADED MODE: "
+                f"queue_util={queue_utilization:.1%}, "
+                f"avg_delay={sum(self._recent_queue_delays) / len(self._recent_queue_delays) if self._recent_queue_delays else 0:.1f}ms"
+            )
+            structured_logger.pipeline_error(
+                component="BagCounterApp",
+                operation="degraded_mode_activation",
+                error_type="PerformanceDegradation",
+                error_message="System entering degraded mode due to overload",
+                affected_ids=None,
+                context={
+                    "queue_utilization": queue_utilization,
+                    "avg_queue_delay_ms": sum(self._recent_queue_delays) / len(self._recent_queue_delays) if self._recent_queue_delays else 0,
+                    "queue_threshold": tracking_config.degraded_mode_queue_threshold,
+                    "delay_threshold_ms": tracking_config.degraded_mode_delay_threshold_ms
+                }
+            )
+        elif not should_activate and self._degraded_mode_active:
+            logger.info(
+                f"[BagCounterApp] EXITING DEGRADED MODE: "
+                f"queue_util={queue_utilization:.1%}, system recovered"
+            )
+        
+        self._degraded_mode_active = should_activate
+        return self._degraded_mode_active
 
     # --- Snapshot helpers ---
     def _annotate_frame(self, frame, detections, label, conf, event_box=None):
@@ -364,8 +434,11 @@ class BagCounterApp:
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
 
+        # Determine confidence tier based on tracking_config threshold
+        confidence_tier = 'high' if conf >= tracking_config.high_confidence_threshold else 'low'
+        
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
-        self.db.log_event(bag_type_id, track_id, conf)
+        self.db.log_event(bag_type_id, track_id, conf, confidence_tier)
 
         self.ui_counts[label] = self.ui_counts.get(label, 0) + 1
         
@@ -375,7 +448,7 @@ class BagCounterApp:
             new_count=self.ui_counts[label],
             track_id=track_id,
             confidence=conf,
-            phash=phash,
+            phash=phash if phash else "None",
             candidates_evaluated=candidates_count
         )
 
@@ -613,6 +686,10 @@ class BagCounterApp:
                 
                 # V3: Check if we should skip processing due to backpressure
                 queue_utilization = self.input_queue.qsize() / self.INPUT_QUEUE_SIZE
+                
+                # Check for degraded mode
+                in_degraded_mode = self._check_degraded_mode(queue_utilization)
+                
                 # V3: Compute average detection time efficiently (deque sum is O(n) but n is small)
                 avg_detection_time = (
                     sum(self._recent_detection_times) / len(self._recent_detection_times)
@@ -658,6 +735,14 @@ class BagCounterApp:
                         current_frame_detections.append(
                             {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
                         )
+                
+                # Degraded mode: skip frames with no detections and no active events
+                if (in_degraded_mode and 
+                    tracking_config.degraded_mode_skip_low_detection_frames and
+                    len(current_frame_detections) == 0 and
+                    len(self.monitor.active_events) == 0):
+                    # Skip this frame to save processing time
+                    continue
 
                 # Record detection metrics
                 pipeline_metrics.record_detection(
@@ -679,8 +764,13 @@ class BagCounterApp:
                 if ready_events:
                     enqueue_start = time.perf_counter()
                     for event_id, candidates, event_box, event_stats in ready_events:
-                        # V3: Only copy frame if recording is enabled (save memory bandwidth)
-                        if self.is_recording:
+                        # Determine if we should save snapshot based on recording flag and degraded mode
+                        should_save_snapshot = self.is_recording and not (
+                            in_degraded_mode and tracking_config.degraded_mode_disable_roi_saving
+                        )
+                        
+                        # V3: Only copy frame if snapshot saving is enabled
+                        if should_save_snapshot:
                             det_copy = []
                             for d in current_frame_detections:
                                 det_copy.append({
@@ -702,7 +792,7 @@ class BagCounterApp:
                                 "timestamp": time.time(),
                             }
                         else:
-                            # V3: Lightweight context when recording is off
+                            # V3: Lightweight context when recording is off or in degraded mode
                             context = {
                                 "frame": None,
                                 "detections": [],
@@ -719,7 +809,12 @@ class BagCounterApp:
 
                 # 4. Publishing logic
                 publish_time = 0.0
-                if self.is_publishing:
+                # Skip visualization in degraded mode if configured
+                should_visualize = self.is_publishing and not (
+                    in_degraded_mode and tracking_config.degraded_mode_disable_visualization
+                )
+                
+                if should_visualize:
                     publish_start = time.perf_counter()
 
                     # V3: Visualize directly on frame (avoid copy when not recording)
