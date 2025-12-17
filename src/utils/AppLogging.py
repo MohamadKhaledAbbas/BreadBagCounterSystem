@@ -455,6 +455,29 @@ class StructuredLogger:
             **kwargs
         )
     
+    def classification_history_vote(self, track_id: int, current_label: str, current_confidence: float,
+                                   history_label: str, history_confidence: float, vote_count: int, 
+                                   history_size: int, history_buffer: list, **kwargs):
+        """Log when classification uses history vote instead of current classification."""
+        msg = (
+            f"[HISTORY_VOTE] track={track_id}, current={current_label}({current_confidence:.2f}), "
+            f"history={history_label}({history_confidence:.2f}), votes={vote_count}/{history_size}"
+        )
+        self._log_structured(
+            logging.INFO,
+            msg,
+            component="ClassifierService",
+            track_id=track_id,
+            current_label=current_label,
+            current_confidence=current_confidence,
+            history_label=history_label,
+            history_confidence=history_confidence,
+            vote_count=vote_count,
+            history_size=history_size,
+            history_buffer=history_buffer,
+            **kwargs
+        )
+    
     def count_updated(self, bag_type: str, new_count: int, track_id: int, 
                      confidence: float, phash: str = None, **kwargs):
         """Log count updates for bag types."""
