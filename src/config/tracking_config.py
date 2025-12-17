@@ -17,6 +17,7 @@ V5 Event-Centric Tracking Notes:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 from src.utils.platform import IS_WINDOWS
 
@@ -638,18 +639,27 @@ class TrackingConfig:
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
     
-    ghost_timeout_ms: float = 1000.0
+    ghost_timeout_ms: Optional[float] = None
     """
-    G: Time (milliseconds) to keep event alive without detections.
+    G: Time (milliseconds) to keep event alive without detections (DEPRECATED - use ghost_timeout_frames).
     
-    Range: 500 - 2000
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    ghost_timeout_frames: int = 25
+    """
+    G: Frames to keep event alive without detections (frame-based threshold).
+    
+    Range: 12 - 50 frames
     - Lower values: Faster cleanup of lost events
     - Higher values: Survives longer occlusions (hand over bag)
     
     Tuning: Should cover typical hand occlusion duration during tying.
-    1000ms (1 second) handles most manipulation scenarios.
+    25 frames @ 25fps = 1000ms (1 second) handles most manipulation scenarios.
     
-    Default: 1000.0
+    Default: 25 frames
     """
     
     # --------------------------------------------------------------------------
@@ -701,18 +711,27 @@ class TrackingConfig:
     Default: 120.0 (reduced from 150.0 for tighter suppression zone)
     """
     
-    suppression_duration_ms: float = 1500.0
+    suppression_duration_ms: Optional[float] = None
     """
-    Duration (milliseconds) to suppress new events after a commit.
+    Duration (milliseconds) to suppress new events after a commit (DEPRECATED - use suppression_duration_frames).
     
-    Range: 500 - 2000
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    suppression_duration_frames: int = 38
+    """
+    Frames to suppress new events after a commit (frame-based threshold).
+    
+    Range: 12 - 50 frames
     - Lower values: Allow new events sooner after commit
     - Higher values: Longer suppression window, prevents double-counting
     
     Should be long enough that a temporarily lost bag won't be re-detected
     as a new event.
     
-    Default: 1500.0 (increased from 1000.0 for longer suppression window)
+    Default: 38 frames @ 25fps = 1520ms (increased from 25 for longer suppression window)
     """
     
     # --------------------------------------------------------------------------
@@ -769,22 +788,31 @@ class TrackingConfig:
     # Temporal Cooldown for New Event Creation
     # --------------------------------------------------------------------------
     
-    min_event_creation_interval_ms: float = 400.0
+    min_event_creation_interval_ms: Optional[float] = None
     """
-    Minimum time (milliseconds) before allowing new event creation at same location.
+    Minimum time (milliseconds) before allowing new event creation at same location (DEPRECATED - use temporal_cooldown_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    temporal_cooldown_frames: int = 10
+    """
+    Minimum frames before allowing new event creation at same location (frame-based threshold).
     
     After an event is committed, this cooldown prevents rapid creation of new events
     at the same spatial location. This catches detection flickering and momentary
     re-detections of the same bag.
     
-    Range: 200 - 800
+    Range: 5 - 20 frames
     - Lower values: Allow new events sooner (more responsive)
     - Higher values: More aggressive duplicate prevention
     
     Works in conjunction with temporal_cooldown_distance_px to define a
     space-time exclusion zone around recently committed events.
     
-    Default: 400.0
+    Default: 10 frames @ 25fps = 400ms
     """
     
     temporal_cooldown_distance_px: float = 120.0
@@ -869,34 +897,61 @@ class TrackingConfig:
     # State Transition Temporal Stability
     # --------------------------------------------------------------------------
     
-    open_to_closing_time_ms: float = 100.0
+    open_to_closing_time_ms: Optional[float] = None
     """
-    Minimum time (milliseconds) in OPEN state before transitioning to CLOSING.
+    Minimum time (milliseconds) in OPEN state before transitioning to CLOSING (DEPRECATED - use open_to_closing_frames).
     
-    Range: 50 - 300
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    open_to_closing_frames: int = 3
+    """
+    Minimum frames in OPEN state before transitioning to CLOSING (frame-based threshold).
+    
+    Range: 2 - 8 frames
     Prevents noise from immediately triggering state changes.
     
-    Default: 100.0
+    Default: 3 frames @ 25fps = 120ms
     """
     
-    closing_stability_time_ms: float = 150.0
+    closing_stability_time_ms: Optional[float] = None
     """
-    Time (milliseconds) closed detections must persist for CLOSED state.
+    Time (milliseconds) closed detections must persist for CLOSED state (DEPRECATED - use closing_stability_frames).
     
-    Range: 100 - 400
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    closing_stability_frames: int = 4
+    """
+    Frames closed detections must persist for CLOSED state (frame-based threshold).
+    
+    Range: 3 - 10 frames
     Ensures bag is actually closing, not just a detection artifact.
     
-    Default: 150.0
+    Default: 4 frames @ 25fps = 160ms
     """
     
-    closed_stability_time_ms: float = 200.0
+    closed_stability_time_ms: Optional[float] = None
     """
-    Minimum time (milliseconds) in CLOSED state before COMMIT is eligible.
+    Minimum time (milliseconds) in CLOSED state before COMMIT is eligible (DEPRECATED - use closed_stability_frames).
     
-    Range: 100 - 500
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    closed_stability_frames: int = 5
+    """
+    Minimum frames in CLOSED state before COMMIT is eligible (frame-based threshold).
+    
+    Range: 3 - 12 frames
     Gives time to collect ROIs and stabilize classification.
     
-    Default: 200.0
+    Default: 5 frames @ 25fps = 200ms
     """
     
     centroid_stability_px: float = 30.0
@@ -961,24 +1016,59 @@ class TrackingConfig:
     # Max Event Lifetime (Force Expiration)
     # --------------------------------------------------------------------------
     
-    max_event_lifetime_ms: float = 5000.0
+    max_event_lifetime_ms: Optional[float] = None
     """
-    Maximum lifetime for an event in milliseconds.
+    Maximum lifetime for an event in milliseconds (DEPRECATED - use max_event_lifetime_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+    
+    max_event_lifetime_frames: int = 250
+    """
+    Maximum lifetime for an event in frames (frame-based threshold).
     
     After this duration, the event will be expired and counted regardless of
     whether it's still on screen. This prevents events from staying active
     indefinitely when workers don't remove bags fast enough.
     
-    Range: 5000 - 30000 (5-30 seconds)
+    Range: 125 - 750 frames (5-30 seconds @ 25fps)
     - Lower values: More aggressive cleanup, may count prematurely
     - Higher values: More patient, but events may accumulate
     
-    At 25fps:
-    - 5000ms = 125 frames (~5 seconds)
-    - 10000ms = 250 frames (~10 seconds)
-    - 15000ms = 375 frames (~15 seconds)
+    Default: 250 frames @ 25fps = 10 seconds
+    """
     
-    Default: 10000.0 (10 seconds)
+    # State-specific maximum lifetimes (stuck event fail-safes)
+    max_open_state_frames: int = 150
+    """
+    Maximum frames an event can stay in OPEN state before forced transition.
+    
+    Range: 75 - 300 frames (3-12 seconds @ 25fps)
+    Prevents events from getting stuck in OPEN state indefinitely.
+    
+    Default: 150 frames @ 25fps = 6 seconds
+    """
+    
+    max_closing_state_frames: int = 75
+    """
+    Maximum frames an event can stay in CLOSING state before forced transition.
+    
+    Range: 50 - 150 frames (2-6 seconds @ 25fps)
+    Prevents events from getting stuck in CLOSING state indefinitely.
+    
+    Default: 75 frames @ 25fps = 3 seconds
+    """
+    
+    max_closed_state_frames: int = 100
+    """
+    Maximum frames an event can stay in CLOSED state before forced commit.
+    
+    Range: 50 - 200 frames (2-8 seconds @ 25fps)
+    Prevents events from getting stuck in CLOSED state indefinitely.
+    
+    Default: 100 frames @ 25fps = 4 seconds
     """
     
     # --------------------------------------------------------------------------
@@ -1219,6 +1309,18 @@ class TrackingConfig:
     Range: 1.1 - 2.0
     Default: 1.2 (20% slower than target)
     """
+    
+    # Target FPS for ms-to-frames conversion
+    target_fps: float = 25.0
+    """
+    Target FPS for converting millisecond thresholds to frame-based thresholds.
+    
+    This is a configuration constant (not measured FPS) used to ensure consistent
+    behavior across different processing speeds. When time-based (ms) parameters
+    are provided, they are converted to frames using this target FPS.
+    
+    Default: 25.0 fps (matches production frame rate)
+    """
 
 
 # Global configuration instance
@@ -1268,24 +1370,31 @@ def get_event_config():
         require_centroid_proximity_for_expanded_iou=tracking_config.require_centroid_proximity_for_expanded_iou,
         max_centroid_distance_for_expanded_iou=tracking_config.max_centroid_distance_for_expanded_iou,
         
-        # Ghost (G)
+        # Ghost (G) - frame-based with ms migration
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
+        ghost_timeout_frames=tracking_config.ghost_timeout_frames,
         
-        # Max event lifetime
+        # Max event lifetime - frame-based with ms migration
         max_event_lifetime_ms=tracking_config.max_event_lifetime_ms,
+        max_event_lifetime_frames=tracking_config.max_event_lifetime_frames,
+        max_open_state_frames=tracking_config.max_open_state_frames,
+        max_closing_state_frames=tracking_config.max_closing_state_frames,
+        max_closed_state_frames=tracking_config.max_closed_state_frames,
         
         # Timeout-based commitment (exclusive method)
         commit_idle_frames=tracking_config.commit_idle_frames,
         commit_min_closed_ratio=tracking_config.commit_min_closed_ratio,
         
-        # Anti-double-counting suppression
+        # Anti-double-counting suppression - frame-based with ms migration
         suppression_distance_px=tracking_config.suppression_distance_px,
         suppression_duration_ms=tracking_config.suppression_duration_ms,
+        suppression_duration_frames=tracking_config.suppression_duration_frames,
         suppression_require_box_overlap=tracking_config.suppression_require_box_overlap,
         suppression_iou_threshold=tracking_config.suppression_iou_threshold,
         
-        # Temporal cooldown for new event creation
+        # Temporal cooldown for new event creation - frame-based with ms migration
         min_event_creation_interval_ms=tracking_config.min_event_creation_interval_ms,
+        temporal_cooldown_frames=tracking_config.temporal_cooldown_frames,
         temporal_cooldown_distance_px=tracking_config.temporal_cooldown_distance_px,
         
         # Active event spatial exclusion
@@ -1295,10 +1404,13 @@ def get_event_config():
         # Detection clustering
         detection_cluster_distance_px=tracking_config.detection_cluster_distance_px,
         
-        # State transition timing
+        # State transition timing - frame-based with ms migration
         open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,
+        open_to_closing_frames=tracking_config.open_to_closing_frames,
         closing_stability_time_ms=tracking_config.closing_stability_time_ms,
+        closing_stability_frames=tracking_config.closing_stability_frames,
         closed_stability_time_ms=tracking_config.closed_stability_time_ms,
+        closed_stability_frames=tracking_config.closed_stability_frames,
         centroid_stability_px=tracking_config.centroid_stability_px,
         
         # State reversion (anti-oscillation)
@@ -1338,4 +1450,7 @@ def get_event_config():
         auto_scaling_target_frame_time_ms=tracking_config.auto_scaling_target_frame_time_ms,
         auto_scaling_warmup_frames=tracking_config.auto_scaling_warmup_frames,
         auto_scaling_activation_threshold=tracking_config.auto_scaling_activation_threshold,
+        
+        # Target FPS for ms-to-frames conversion
+        target_fps=tracking_config.target_fps,
     )

@@ -378,6 +378,19 @@ class StructuredLogger:
             **kwargs
         )
     
+    def event_forced_close(self, event_id: int, state: str, reason: str, **kwargs):
+        """Log forced event closure (stuck event fail-safe)."""
+        msg = f"[EVENT_FORCED_CLOSE] id={event_id}, state={state}, reason={reason}"
+        self._log_structured(
+            logging.WARNING,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            state=state,
+            forced_close_reason=reason,
+            **kwargs
+        )
+    
     def roi_added(self, event_id: int, is_open: bool, sharpness: float, 
                   frame_index: int, confidence: float, total_rois: int, **kwargs):
         """Log ROI addition with quality metrics."""
@@ -439,6 +452,29 @@ class StructuredLogger:
             sharpness=sharpness,
             relative_time=relative_time,
             contribution=contribution,
+            **kwargs
+        )
+    
+    def classification_history_vote(self, track_id: int, current_label: str, current_confidence: float,
+                                   history_label: str, history_confidence: float, vote_count: int, 
+                                   history_size: int, history_buffer: list, **kwargs):
+        """Log when classification uses history vote instead of current classification."""
+        msg = (
+            f"[HISTORY_VOTE] track={track_id}, current={current_label}({current_confidence:.2f}), "
+            f"history={history_label}({history_confidence:.2f}), votes={vote_count}/{history_size}"
+        )
+        self._log_structured(
+            logging.INFO,
+            msg,
+            component="ClassifierService",
+            track_id=track_id,
+            current_label=current_label,
+            current_confidence=current_confidence,
+            history_label=history_label,
+            history_confidence=history_confidence,
+            vote_count=vote_count,
+            history_size=history_size,
+            history_buffer=history_buffer,
             **kwargs
         )
     
