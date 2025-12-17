@@ -378,6 +378,19 @@ class StructuredLogger:
             **kwargs
         )
     
+    def event_forced_close(self, event_id: int, state: str, reason: str, **kwargs):
+        """Log forced event closure (stuck event fail-safe)."""
+        msg = f"[EVENT_FORCED_CLOSE] id={event_id}, state={state}, reason={reason}"
+        self._log_structured(
+            logging.WARNING,
+            msg,
+            component="EventCentricTracker",
+            event_id=event_id,
+            state=state,
+            forced_close_reason=reason,
+            **kwargs
+        )
+    
     def roi_added(self, event_id: int, is_open: bool, sharpness: float, 
                   frame_index: int, confidence: float, total_rois: int, **kwargs):
         """Log ROI addition with quality metrics."""
