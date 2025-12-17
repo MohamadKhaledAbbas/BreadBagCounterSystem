@@ -39,7 +39,7 @@ import math
 import uuid
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging  # Only for DEBUG level constant
 import numpy as np
 import cv2
@@ -407,7 +407,6 @@ class EventConfig:
         
         # Log conversions if any were performed
         if conversions:
-            from src.utils.AppLogging import logger
             logger.info(
                 f"[EventConfig] Converted time-based thresholds to frame-based (target_fps={self.target_fps}):"
             )
@@ -1619,8 +1618,6 @@ class EventCentricTracker:
         Returns:
             EventConfig with scaled time parameters
         """
-        from dataclasses import replace
-        
         return replace(
             self.config,
             association_time_ms=self._scaled_association_time_ms,

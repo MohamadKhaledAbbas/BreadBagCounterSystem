@@ -17,6 +17,7 @@ V5 Event-Centric Tracking Notes:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 from src.utils.platform import IS_WINDOWS
 
@@ -638,7 +639,7 @@ class TrackingConfig:
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
     
-    ghost_timeout_ms: float = None
+    ghost_timeout_ms: Optional[float] = None
     """
     G: Time (milliseconds) to keep event alive without detections (DEPRECATED - use ghost_timeout_frames).
     
@@ -710,7 +711,7 @@ class TrackingConfig:
     Default: 120.0 (reduced from 150.0 for tighter suppression zone)
     """
     
-    suppression_duration_ms: float = None
+    suppression_duration_ms: Optional[float] = None
     """
     Duration (milliseconds) to suppress new events after a commit (DEPRECATED - use suppression_duration_frames).
     
@@ -787,7 +788,7 @@ class TrackingConfig:
     # Temporal Cooldown for New Event Creation
     # --------------------------------------------------------------------------
     
-    min_event_creation_interval_ms: float = None
+    min_event_creation_interval_ms: Optional[float] = None
     """
     Minimum time (milliseconds) before allowing new event creation at same location (DEPRECATED - use temporal_cooldown_frames).
     
@@ -896,7 +897,7 @@ class TrackingConfig:
     # State Transition Temporal Stability
     # --------------------------------------------------------------------------
     
-    open_to_closing_time_ms: float = None
+    open_to_closing_time_ms: Optional[float] = None
     """
     Minimum time (milliseconds) in OPEN state before transitioning to CLOSING (DEPRECATED - use open_to_closing_frames).
     
@@ -915,7 +916,7 @@ class TrackingConfig:
     Default: 3 frames @ 25fps = 120ms
     """
     
-    closing_stability_time_ms: float = None
+    closing_stability_time_ms: Optional[float] = None
     """
     Time (milliseconds) closed detections must persist for CLOSED state (DEPRECATED - use closing_stability_frames).
     
@@ -934,7 +935,7 @@ class TrackingConfig:
     Default: 4 frames @ 25fps = 160ms
     """
     
-    closed_stability_time_ms: float = None
+    closed_stability_time_ms: Optional[float] = None
     """
     Minimum time (milliseconds) in CLOSED state before COMMIT is eligible (DEPRECATED - use closed_stability_frames).
     
@@ -1015,7 +1016,7 @@ class TrackingConfig:
     # Max Event Lifetime (Force Expiration)
     # --------------------------------------------------------------------------
     
-    max_event_lifetime_ms: float = None
+    max_event_lifetime_ms: Optional[float] = None
     """
     Maximum lifetime for an event in milliseconds (DEPRECATED - use max_event_lifetime_frames).
     
