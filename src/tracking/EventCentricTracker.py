@@ -157,7 +157,8 @@ class EventConfig:
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
     # ==========================================================================
-    ghost_timeout_ms: float = 1000.0  # G: Keep event alive without detections
+    ghost_timeout_ms: Optional[float] = None  # G: Keep event alive without detections (deprecated - use frames)
+    ghost_timeout_frames: int = 25  # Frame-based ghost timeout (default 25 frames @ 25fps = 1000ms)
     
     # ==========================================================================
     # Timeout-Based Commitment Parameters (Exclusive Method)
@@ -173,7 +174,8 @@ class EventConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     suppression_distance_px: float = 100.0   # Distance within which new events are suppressed (reduced from 150.0)
-    suppression_duration_ms: float = 1500.0  # Duration to suppress new events after commit (increased from 1000.0)
+    suppression_duration_ms: Optional[float] = None  # Duration to suppress (deprecated - use frames)
+    suppression_duration_frames: int = 38  # Frame-based suppression duration (38 frames @ 25fps = 1500ms)
     
     # Conditional suppression (Issue #3 fix)
     suppression_require_box_overlap: bool = True
@@ -188,8 +190,9 @@ class EventConfig:
     # Temporal Cooldown for New Event Creation
     # ==========================================================================
     # Prevents rapid event creation at the same location after commitment
-    min_event_creation_interval_ms: float = 400.0
-    """Minimum time (ms) before allowing new event creation at same location after commit."""
+    min_event_creation_interval_ms: Optional[float] = None  # Deprecated - use frames
+    temporal_cooldown_frames: int = 10  # Frame-based cooldown (10 frames @ 25fps = 400ms)
+    """Minimum frames before allowing new event creation at same location after commit."""
     
     temporal_cooldown_distance_px: float = 120.0
     """Distance within which temporal cooldown applies."""
@@ -214,9 +217,12 @@ class EventConfig:
     # ==========================================================================
     # State Transition Parameters (temporal stability)
     # ==========================================================================
-    open_to_closing_time_ms: float = 100.0   # Min time in OPEN before CLOSING
-    closing_stability_time_ms: float = 150.0  # Closed detections must persist this long
-    closed_stability_time_ms: float = 200.0   # Min time in CLOSED before COMMIT eligible
+    open_to_closing_time_ms: Optional[float] = None  # Deprecated - use frames
+    open_to_closing_frames: int = 3  # Min frames in OPEN before CLOSING (3 frames @ 25fps = 120ms)
+    closing_stability_time_ms: Optional[float] = None  # Deprecated - use frames  
+    closing_stability_frames: int = 4  # Closed detections must persist (4 frames @ 25fps = 160ms)
+    closed_stability_time_ms: Optional[float] = None  # Deprecated - use frames
+    closed_stability_frames: int = 5  # Min frames in CLOSED before COMMIT eligible (5 frames @ 25fps = 200ms)
     
     # Geometric stability thresholds
     centroid_stability_px: float = 30.0  # Max centroid movement for "stable"
@@ -257,22 +263,28 @@ class EventConfig:
     max_active_events: int = 4
     
     # ==========================================================================
-    # Max Event Lifetime (Force Expiration)
+    # Max Event Lifetime (Force Expiration) - Stuck Event Fail-safe
     # ==========================================================================
-    max_event_lifetime_ms: float = 10000.0  # Max time event can exist (10 seconds default)
+    max_event_lifetime_ms: Optional[float] = None  # Deprecated - use frames
+    max_event_lifetime_frames: int = 250  # Max frames event can exist (250 @ 25fps = 10 seconds)
     """
-    Maximum lifetime for an event in milliseconds.
+    Maximum lifetime for an event in frames.
     
     After this duration, the event will be expired and counted regardless of
     whether it's still on screen. This prevents events from staying active
     indefinitely when workers don't remove bags fast enough.
     
-    Range: 5000 - 30000 (5-30 seconds)
+    Range: 125 - 750 frames (5-30 seconds @ 25fps)
     - Lower values: More aggressive cleanup, may count prematurely
     - Higher values: More patient, but events may accumulate
     
-    Default: 10000.0 (10 seconds)
+    Default: 250 frames (10 seconds @ 25fps)
     """
+    
+    # State-specific maximum lifetimes (stuck event fail-safes)
+    max_open_state_frames: int = 150  # Max frames in OPEN state (150 @ 25fps = 6 seconds)
+    max_closing_state_frames: int = 75  # Max frames in CLOSING state (75 @ 25fps = 3 seconds)
+    max_closed_state_frames: int = 100  # Max frames in CLOSED state (100 @ 25fps = 4 seconds)
     
     # ==========================================================================
     # Logging Control Parameters
@@ -339,6 +351,68 @@ class EventConfig:
     If calculated factor is below this threshold (processing close to real-time),
     no scaling is applied. Range: 1.1 - 2.0, default: 1.2
     """
+    
+    # Target FPS for ms-to-frames conversion
+    target_fps: float = 25.0
+    """Target FPS for converting millisecond thresholds to frame-based thresholds."""
+    
+    def __post_init__(self):
+        """
+        Post-initialization to handle migration compatibility.
+        
+        If any _ms parameters are provided (not None), convert them to frame-based
+        equivalents and log the conversion for transparency.
+        """
+        conversions = []
+        
+        # Ghost timeout conversion
+        if self.ghost_timeout_ms is not None:
+            frames = int(round(self.ghost_timeout_ms / (1000.0 / self.target_fps)))
+            self.ghost_timeout_frames = frames
+            conversions.append(f"ghost_timeout: {self.ghost_timeout_ms}ms → {frames} frames")
+        
+        # Suppression duration conversion
+        if self.suppression_duration_ms is not None:
+            frames = int(round(self.suppression_duration_ms / (1000.0 / self.target_fps)))
+            self.suppression_duration_frames = frames
+            conversions.append(f"suppression_duration: {self.suppression_duration_ms}ms → {frames} frames")
+        
+        # Temporal cooldown conversion
+        if self.min_event_creation_interval_ms is not None:
+            frames = int(round(self.min_event_creation_interval_ms / (1000.0 / self.target_fps)))
+            self.temporal_cooldown_frames = frames
+            conversions.append(f"temporal_cooldown: {self.min_event_creation_interval_ms}ms → {frames} frames")
+        
+        # State transition timeouts
+        if self.open_to_closing_time_ms is not None:
+            frames = int(round(self.open_to_closing_time_ms / (1000.0 / self.target_fps)))
+            self.open_to_closing_frames = frames
+            conversions.append(f"open_to_closing: {self.open_to_closing_time_ms}ms → {frames} frames")
+        
+        if self.closing_stability_time_ms is not None:
+            frames = int(round(self.closing_stability_time_ms / (1000.0 / self.target_fps)))
+            self.closing_stability_frames = frames
+            conversions.append(f"closing_stability: {self.closing_stability_time_ms}ms → {frames} frames")
+        
+        if self.closed_stability_time_ms is not None:
+            frames = int(round(self.closed_stability_time_ms / (1000.0 / self.target_fps)))
+            self.closed_stability_frames = frames
+            conversions.append(f"closed_stability: {self.closed_stability_time_ms}ms → {frames} frames")
+        
+        # Max event lifetime conversion
+        if self.max_event_lifetime_ms is not None:
+            frames = int(round(self.max_event_lifetime_ms / (1000.0 / self.target_fps)))
+            self.max_event_lifetime_frames = frames
+            conversions.append(f"max_event_lifetime: {self.max_event_lifetime_ms}ms → {frames} frames")
+        
+        # Log conversions if any were performed
+        if conversions:
+            from src.utils.AppLogging import logger
+            logger.info(
+                f"[EventConfig] Converted time-based thresholds to frame-based (target_fps={self.target_fps}):"
+            )
+            for conv in conversions:
+                logger.info(f"  - {conv}")
 
 
 @dataclass
