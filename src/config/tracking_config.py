@@ -202,14 +202,14 @@ class TrackingConfig:
     Default: 300 (V3: reduced from 400)
     """
 
-    min_mean_brightness: int = 80  # V3: Reduced from 100 for darker environments
+    min_mean_brightness: int = 60  # V3: Reduced from 100 for darker environments
     """
     Minimum mean brightness for a valid ROI.
     
     Default: 80 (V3: reduced from 100)
     """
 
-    max_mean_brightness: int = 220  # V3: Increased from 200 for brighter environments
+    max_mean_brightness: int = 240  # V3: Increased from 200 for brighter environments
     """
     Maximum mean brightness for a valid ROI.
     
@@ -395,7 +395,7 @@ class TrackingConfig:
     # Association Parameters (D, T from requirements)
     # --------------------------------------------------------------------------
     
-    association_distance_px: float = 80.0
+    association_distance_px: float = 40.0
     """
     D: Maximum centroid distance (pixels) to associate a detection with an event.
     
@@ -451,7 +451,7 @@ class TrackingConfig:
     Default: True
     """
     
-    iou_association_threshold: float = 0.4
+    iou_association_threshold: float = 0.45
     """
     Minimum IoU value to associate a detection with an event.
     
@@ -488,7 +488,7 @@ class TrackingConfig:
     Default: True
     """
     
-    iou_box_margin_ratio: float = 0.25
+    iou_box_margin_ratio: float = 0.15
     """
     Ratio to expand the bounding box for margin-based IoU computation.
     
@@ -508,7 +508,7 @@ class TrackingConfig:
     Default: 0.25
     """
     
-    iou_expanded_threshold: float = 0.15
+    iou_expanded_threshold: float = 0.35
     """
     Minimum IoU value with expanded box to associate a detection with an event.
     
@@ -565,7 +565,7 @@ class TrackingConfig:
     # Hard Constraints for Preventing Teleportation (ISSUE #1 FIX)
     # --------------------------------------------------------------------------
     
-    max_jump_distance_px: float = 200.0
+    max_jump_distance_px: float = 160.0
     """
     ISSUE #1 FIX: Hard cap on centroid jump distance per association.
     
@@ -648,7 +648,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    ghost_timeout_frames: int = 25
+    ghost_timeout_frames: int = 40
     """
     G: Frames to keep event alive without detections (frame-based threshold).
     
@@ -668,7 +668,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 25
+    commit_idle_frames: int = 18
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -697,7 +697,7 @@ class TrackingConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     
-    suppression_distance_px: float = 120.0
+    suppression_distance_px: float = 100.0
     """
     Distance (pixels) within which new events are suppressed near recent commits.
     
@@ -720,7 +720,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    suppression_duration_frames: int = 38
+    suppression_duration_frames: int = 10
     """
     Frames to suppress new events after a commit (frame-based threshold).
     
@@ -797,7 +797,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 10
+    temporal_cooldown_frames: int = 12
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
