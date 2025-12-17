@@ -39,7 +39,7 @@ import math
 import uuid
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging  # Only for DEBUG level constant
 import numpy as np
 import cv2
@@ -157,7 +157,8 @@ class EventConfig:
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
     # ==========================================================================
-    ghost_timeout_ms: float = 1000.0  # G: Keep event alive without detections
+    ghost_timeout_ms: Optional[float] = None  # G: Keep event alive without detections (deprecated - use frames)
+    ghost_timeout_frames: int = 25  # Frame-based ghost timeout (default 25 frames @ 25fps = 1000ms)
     
     # ==========================================================================
     # Timeout-Based Commitment Parameters (Exclusive Method)
@@ -173,7 +174,8 @@ class EventConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     suppression_distance_px: float = 100.0   # Distance within which new events are suppressed (reduced from 150.0)
-    suppression_duration_ms: float = 1500.0  # Duration to suppress new events after commit (increased from 1000.0)
+    suppression_duration_ms: Optional[float] = None  # Duration to suppress (deprecated - use frames)
+    suppression_duration_frames: int = 38  # Frame-based suppression duration (38 frames @ 25fps = 1500ms)
     
     # Conditional suppression (Issue #3 fix)
     suppression_require_box_overlap: bool = True
@@ -188,8 +190,9 @@ class EventConfig:
     # Temporal Cooldown for New Event Creation
     # ==========================================================================
     # Prevents rapid event creation at the same location after commitment
-    min_event_creation_interval_ms: float = 400.0
-    """Minimum time (ms) before allowing new event creation at same location after commit."""
+    min_event_creation_interval_ms: Optional[float] = None  # Deprecated - use frames
+    temporal_cooldown_frames: int = 10  # Frame-based cooldown (10 frames @ 25fps = 400ms)
+    """Minimum frames before allowing new event creation at same location after commit."""
     
     temporal_cooldown_distance_px: float = 120.0
     """Distance within which temporal cooldown applies."""
@@ -214,9 +217,12 @@ class EventConfig:
     # ==========================================================================
     # State Transition Parameters (temporal stability)
     # ==========================================================================
-    open_to_closing_time_ms: float = 100.0   # Min time in OPEN before CLOSING
-    closing_stability_time_ms: float = 150.0  # Closed detections must persist this long
-    closed_stability_time_ms: float = 200.0   # Min time in CLOSED before COMMIT eligible
+    open_to_closing_time_ms: Optional[float] = None  # Deprecated - use frames
+    open_to_closing_frames: int = 3  # Min frames in OPEN before CLOSING (3 frames @ 25fps = 120ms)
+    closing_stability_time_ms: Optional[float] = None  # Deprecated - use frames  
+    closing_stability_frames: int = 4  # Closed detections must persist (4 frames @ 25fps = 160ms)
+    closed_stability_time_ms: Optional[float] = None  # Deprecated - use frames
+    closed_stability_frames: int = 5  # Min frames in CLOSED before COMMIT eligible (5 frames @ 25fps = 200ms)
     
     # Geometric stability thresholds
     centroid_stability_px: float = 30.0  # Max centroid movement for "stable"
@@ -257,22 +263,28 @@ class EventConfig:
     max_active_events: int = 4
     
     # ==========================================================================
-    # Max Event Lifetime (Force Expiration)
+    # Max Event Lifetime (Force Expiration) - Stuck Event Fail-safe
     # ==========================================================================
-    max_event_lifetime_ms: float = 10000.0  # Max time event can exist (10 seconds default)
+    max_event_lifetime_ms: Optional[float] = None  # Deprecated - use frames
+    max_event_lifetime_frames: int = 250  # Max frames event can exist (250 @ 25fps = 10 seconds)
     """
-    Maximum lifetime for an event in milliseconds.
+    Maximum lifetime for an event in frames.
     
     After this duration, the event will be expired and counted regardless of
     whether it's still on screen. This prevents events from staying active
     indefinitely when workers don't remove bags fast enough.
     
-    Range: 5000 - 30000 (5-30 seconds)
+    Range: 125 - 750 frames (5-30 seconds @ 25fps)
     - Lower values: More aggressive cleanup, may count prematurely
     - Higher values: More patient, but events may accumulate
     
-    Default: 10000.0 (10 seconds)
+    Default: 250 frames (10 seconds @ 25fps)
     """
+    
+    # State-specific maximum lifetimes (stuck event fail-safes)
+    max_open_state_frames: int = 150  # Max frames in OPEN state (150 @ 25fps = 6 seconds)
+    max_closing_state_frames: int = 75  # Max frames in CLOSING state (75 @ 25fps = 3 seconds)
+    max_closed_state_frames: int = 100  # Max frames in CLOSED state (100 @ 25fps = 4 seconds)
     
     # ==========================================================================
     # Logging Control Parameters
@@ -339,6 +351,67 @@ class EventConfig:
     If calculated factor is below this threshold (processing close to real-time),
     no scaling is applied. Range: 1.1 - 2.0, default: 1.2
     """
+    
+    # Target FPS for ms-to-frames conversion
+    target_fps: float = 25.0
+    """Target FPS for converting millisecond thresholds to frame-based thresholds."""
+    
+    def __post_init__(self):
+        """
+        Post-initialization to handle migration compatibility.
+        
+        If any _ms parameters are provided (not None), convert them to frame-based
+        equivalents and log the conversion for transparency.
+        """
+        conversions = []
+        
+        # Ghost timeout conversion
+        if self.ghost_timeout_ms is not None:
+            frames = int(round(self.ghost_timeout_ms / (1000.0 / self.target_fps)))
+            self.ghost_timeout_frames = frames
+            conversions.append(f"ghost_timeout: {self.ghost_timeout_ms}ms → {frames} frames")
+        
+        # Suppression duration conversion
+        if self.suppression_duration_ms is not None:
+            frames = int(round(self.suppression_duration_ms / (1000.0 / self.target_fps)))
+            self.suppression_duration_frames = frames
+            conversions.append(f"suppression_duration: {self.suppression_duration_ms}ms → {frames} frames")
+        
+        # Temporal cooldown conversion
+        if self.min_event_creation_interval_ms is not None:
+            frames = int(round(self.min_event_creation_interval_ms / (1000.0 / self.target_fps)))
+            self.temporal_cooldown_frames = frames
+            conversions.append(f"temporal_cooldown: {self.min_event_creation_interval_ms}ms → {frames} frames")
+        
+        # State transition timeouts
+        if self.open_to_closing_time_ms is not None:
+            frames = int(round(self.open_to_closing_time_ms / (1000.0 / self.target_fps)))
+            self.open_to_closing_frames = frames
+            conversions.append(f"open_to_closing: {self.open_to_closing_time_ms}ms → {frames} frames")
+        
+        if self.closing_stability_time_ms is not None:
+            frames = int(round(self.closing_stability_time_ms / (1000.0 / self.target_fps)))
+            self.closing_stability_frames = frames
+            conversions.append(f"closing_stability: {self.closing_stability_time_ms}ms → {frames} frames")
+        
+        if self.closed_stability_time_ms is not None:
+            frames = int(round(self.closed_stability_time_ms / (1000.0 / self.target_fps)))
+            self.closed_stability_frames = frames
+            conversions.append(f"closed_stability: {self.closed_stability_time_ms}ms → {frames} frames")
+        
+        # Max event lifetime conversion
+        if self.max_event_lifetime_ms is not None:
+            frames = int(round(self.max_event_lifetime_ms / (1000.0 / self.target_fps)))
+            self.max_event_lifetime_frames = frames
+            conversions.append(f"max_event_lifetime: {self.max_event_lifetime_ms}ms → {frames} frames")
+        
+        # Log conversions if any were performed
+        if conversions:
+            logger.info(
+                f"[EventConfig] Converted time-based thresholds to frame-based (target_fps={self.target_fps}):"
+            )
+            for conv in conversions:
+                logger.info(f"  - {conv}")
 
 
 @dataclass
@@ -417,10 +490,12 @@ class BreadBagEvent:
         # State machine
         self.state = EventState.OPEN
         self.state_enter_time_ms = initial_detection.timestamp_ms
+        self.state_enter_frame_index = initial_detection.frame_index  # Frame-based state tracking
         self.state_enter_evidence_idx = 0  # Track which evidence index we entered current state
         
         # Temporal tracking
         self.created_at_ms = initial_detection.timestamp_ms
+        self.created_at_frame_index = initial_detection.frame_index  # Frame-based creation tracking
         self.last_detection_time_ms = initial_detection.timestamp_ms
         self.last_update_time_ms = initial_detection.timestamp_ms
         
@@ -919,12 +994,13 @@ class BreadBagEvent:
         
         if self.state == EventState.OPEN:
             # Can transition to CLOSING if closed evidence starts accumulating
-            # Requires: min time in OPEN + closed evidence
-            if (time_in_state_ms >= self.config.open_to_closing_time_ms and
+            # Requires: min frames in OPEN + closed evidence
+            frames_in_state = detection.frame_index - self.state_enter_frame_index
+            if (frames_in_state >= self.config.open_to_closing_frames and
                 self.closed_evidence_count >= 1 and
                 self.open_evidence_count >= self.config.min_open_evidence_count):
                 self._transition_to(EventState.CLOSING, detection.timestamp_ms, 
-                                    "closed_evidence_detected")
+                                    "closed_evidence_detected", detection.frame_index)
         
         elif self.state == EventState.CLOSING:
             # Can transition to CLOSED if closed evidence is stable
@@ -945,32 +1021,37 @@ class BreadBagEvent:
                 
                 if recent_open >= revert_threshold:
                     self._transition_to(EventState.OPEN, detection.timestamp_ms,
-                                        f"open_evidence_resumed ({recent_open}/{len(recent_evidence)} open)")
+                                        f"open_evidence_resumed ({recent_open}/{len(recent_evidence)} open)",
+                                        detection.frame_index)
                     return
             
-            # Check for progression to CLOSED
-            if (time_in_state_ms >= self.config.closing_stability_time_ms and
+            # Check for progression to CLOSED using frames
+            frames_in_state = detection.frame_index - self.state_enter_frame_index
+            if (frames_in_state >= self.config.closing_stability_frames and
                 self.closed_evidence_count >= self.config.min_closed_evidence_count):
                 # Also check geometric stability
                 stability = self.get_centroid_stability()
                 if stability <= self.config.centroid_stability_px:
                     self._transition_to(EventState.CLOSED, detection.timestamp_ms,
-                                        f"closing_stable (stability={stability:.1f}px)")
+                                        f"closing_stable (stability={stability:.1f}px)",
+                                        detection.frame_index)
         
         elif self.state == EventState.CLOSED:
             # CLOSED state - collecting ROIs, waiting for exit
             # Can only go to COMMITTED via update_ghost_state
             pass
     
-    def _transition_to(self, new_state: EventState, timestamp_ms: float, trigger: str):
+    def _transition_to(self, new_state: EventState, timestamp_ms: float, trigger: str, frame_index: int = -1):
         """Record state transition with logging."""
         old_state = self.state
         self.state = new_state
         self.state_enter_time_ms = timestamp_ms
+        self.state_enter_frame_index = frame_index if frame_index >= 0 else self.last_detection_frame_index
         self.state_enter_evidence_idx = len(self.evidence_history) - 1  # Track evidence index
         
         transition_record = {
             'timestamp_ms': timestamp_ms,
+            'frame_index': self.state_enter_frame_index,
             'from_state': old_state.name,
             'to_state': new_state.name,
             'trigger': trigger
@@ -1081,27 +1162,135 @@ class BreadBagEvent:
         # Calculate time in current state
         time_in_state_ms = current_time_ms - self.state_enter_time_ms
         
-        # PRIORITY CHECK: Max event lifetime exceeded - force commit/expire
+        # PRIORITY CHECK: Max event lifetime exceeded - force commit/expire (stuck event fail-safe)
         # This prevents events from staying active indefinitely when bags aren't removed
-        event_lifetime_ms = current_time_ms - self.created_at_ms
-        if event_lifetime_ms > self.config.max_event_lifetime_ms:
+        event_lifetime_frames = current_frame_index - self.created_at_frame_index if current_frame_index >= 0 else 0
+        if event_lifetime_frames > self.config.max_event_lifetime_frames:
             # Force commit if we have reasonable evidence, otherwise expire
             if self.state == EventState.CLOSED or self.closed_evidence_count >= self.config.min_closed_evidence_count:
                 # Has closed evidence - commit it
                 self._transition_to(EventState.COMMITTED, current_time_ms,
-                                    f"max_lifetime_exceeded (lifetime={event_lifetime_ms:.0f}ms)")
+                                    f"max_lifetime_exceeded (lifetime={event_lifetime_frames} frames)")
                 self.commit_reason = "max_lifetime"
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state=self.state.name,
+                    reason="max_lifetime",
+                    lifetime_frames=event_lifetime_frames,
+                    max_allowed_frames=self.config.max_event_lifetime_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
                 logger.info(
                     f"[Event:{self.id}] Max lifetime commit: bag counted after max lifetime "
-                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms, "
+                    f"(lifetime={event_lifetime_frames} frames, max={self.config.max_event_lifetime_frames} frames, "
                     f"state={self.state.name})"
                 )
                 return True, 'commit'
             else:
                 # No closed evidence - just expire
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state=self.state.name,
+                    reason="max_lifetime_no_evidence",
+                    lifetime_frames=event_lifetime_frames,
+                    max_allowed_frames=self.config.max_event_lifetime_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
                 logger.info(
                     f"[Event:{self.id}] Max lifetime expired: no closed evidence "
-                    f"(lifetime={event_lifetime_ms:.0f}ms, max={self.config.max_event_lifetime_ms:.0f}ms)"
+                    f"(lifetime={event_lifetime_frames} frames, max={self.config.max_event_lifetime_frames} frames)"
+                )
+                return False, 'expire'
+        
+        # CHECK: State-specific stuck event fail-safes
+        # Force transitions if event is stuck in a state for too long
+        frames_in_state = current_frame_index - self.state_enter_frame_index if current_frame_index >= 0 else 0
+        
+        if self.state == EventState.OPEN and frames_in_state > self.config.max_open_state_frames:
+            # Stuck in OPEN - force expire (unlikely to be a valid bag)
+            structured_logger.event_forced_close(
+                event_id=self.id,
+                state="OPEN",
+                reason="max_open_state_exceeded",
+                frames_in_state=frames_in_state,
+                max_allowed_frames=self.config.max_open_state_frames,
+                evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+            )
+            logger.info(
+                f"[Event:{self.id}] Stuck event expired: exceeded max OPEN state duration "
+                f"(frames_in_state={frames_in_state}, max={self.config.max_open_state_frames})"
+            )
+            return False, 'expire'
+        
+        elif self.state == EventState.CLOSING and frames_in_state > self.config.max_closing_state_frames:
+            # Stuck in CLOSING - force to CLOSED if sufficient evidence, otherwise expire
+            if self.closed_evidence_count >= self.config.min_closed_evidence_count:
+                self._transition_to(EventState.CLOSED, current_time_ms,
+                                    f"max_closing_state_exceeded (frames={frames_in_state})")
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state="CLOSING",
+                    reason="max_closing_state_exceeded_to_closed",
+                    frames_in_state=frames_in_state,
+                    max_allowed_frames=self.config.max_closing_state_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
+                logger.info(
+                    f"[Event:{self.id}] Stuck event forced to CLOSED: exceeded max CLOSING duration "
+                    f"(frames_in_state={frames_in_state}, max={self.config.max_closing_state_frames})"
+                )
+                # Continue processing in CLOSED state
+            else:
+                # Not enough evidence - expire
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state="CLOSING",
+                    reason="max_closing_state_exceeded_expire",
+                    frames_in_state=frames_in_state,
+                    max_allowed_frames=self.config.max_closing_state_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
+                logger.info(
+                    f"[Event:{self.id}] Stuck event expired: exceeded max CLOSING duration without sufficient evidence "
+                    f"(frames_in_state={frames_in_state}, max={self.config.max_closing_state_frames})"
+                )
+                return False, 'expire'
+        
+        elif self.state == EventState.CLOSED and frames_in_state > self.config.max_closed_state_frames:
+            # Stuck in CLOSED - force commit if sufficient evidence
+            total_evidence = self.open_evidence_count + self.closed_evidence_count
+            closed_ratio = self.closed_evidence_count / total_evidence if total_evidence > 0 else 0
+            
+            if closed_ratio >= self.config.commit_min_closed_ratio:
+                self._transition_to(EventState.COMMITTED, current_time_ms,
+                                    f"max_closed_state_exceeded (frames={frames_in_state})")
+                self.commit_reason = "max_closed_state"
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state="CLOSED",
+                    reason="max_closed_state_exceeded_commit",
+                    frames_in_state=frames_in_state,
+                    max_allowed_frames=self.config.max_closed_state_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
+                logger.info(
+                    f"[Event:{self.id}] Stuck event committed: exceeded max CLOSED duration "
+                    f"(frames_in_state={frames_in_state}, max={self.config.max_closed_state_frames})"
+                )
+                return True, 'commit'
+            else:
+                # Not enough evidence - expire
+                structured_logger.event_forced_close(
+                    event_id=self.id,
+                    state="CLOSED",
+                    reason="max_closed_state_exceeded_expire",
+                    frames_in_state=frames_in_state,
+                    max_allowed_frames=self.config.max_closed_state_frames,
+                    evidence={'open': self.open_evidence_count, 'closed': self.closed_evidence_count}
+                )
+                logger.info(
+                    f"[Event:{self.id}] Stuck event expired: exceeded max CLOSED duration without sufficient evidence "
+                    f"(frames_in_state={frames_in_state}, max={self.config.max_closed_state_frames})"
                 )
                 return False, 'expire'
         
@@ -1196,15 +1385,50 @@ class BreadBagEvent:
                 self.out_of_zone_since_ms = None
                 self.frames_out_of_zone = 0
         
-        # SECOND: For non-CLOSED events, check if ghost timeout exceeded
-        if time_since_detection_ms > self.config.ghost_timeout_ms:
-            # Event expired without reaching CLOSED state or meeting commit criteria
-            logger.debug(
-                f"[Event:{self.id}] Expired in state {self.state.name} "
-                f"after {time_since_detection_ms:.0f}ms without detection "
-                f"(ghost_timeout={self.config.ghost_timeout_ms}ms)"
-            )
-            return False, 'expire'
+        # SECOND: Check ghost timeout using frame-based threshold
+        if self.frames_without_detection >= self.config.ghost_timeout_frames:
+            # Ghost timeout exceeded - decide whether to commit or expire
+            
+            # Commit-on-ghost-expire for finalization states (CLOSING/CLOSED)
+            # This treats ghost timeout as a throw-finalization window
+            if self.state in [EventState.CLOSING, EventState.CLOSED]:
+                # Safety gating: only commit if sufficient evidence exists
+                total_evidence = self.open_evidence_count + self.closed_evidence_count
+                has_sufficient_evidence = (
+                    total_evidence >= 3 and  # At least 3 total detections
+                    self.closed_evidence_count >= 1 and  # At least 1 closed detection
+                    self.open_evidence_count >= self.config.min_open_evidence_count  # Saw it as open
+                )
+                
+                if has_sufficient_evidence:
+                    # Commit the event - bag likely thrown/removed
+                    self._transition_to(EventState.COMMITTED, current_time_ms,
+                                        f"ghost_commit (state={self.state.name}, "
+                                        f"idle={self.frames_without_detection} frames, "
+                                        f"open_ev={self.open_evidence_count}, closed_ev={self.closed_evidence_count})")
+                    self.commit_reason = "ghost_finalization"
+                    logger.info(
+                        f"[Event:{self.id}] Ghost-finalization commit: bag counted after ghost timeout in {self.state.name} state "
+                        f"(idle={self.frames_without_detection} frames, ghost_timeout={self.config.ghost_timeout_frames} frames, "
+                        f"open_ev={self.open_evidence_count}, closed_ev={self.closed_evidence_count})"
+                    )
+                    return True, 'commit'
+                else:
+                    # Insufficient evidence - expire instead of commit
+                    logger.debug(
+                        f"[Event:{self.id}] Ghost expired in {self.state.name}: insufficient evidence "
+                        f"(idle={self.frames_without_detection} frames, "
+                        f"open_ev={self.open_evidence_count}, closed_ev={self.closed_evidence_count})"
+                    )
+                    return False, 'expire'
+            else:
+                # OPEN state: simply expire after ghost timeout
+                logger.debug(
+                    f"[Event:{self.id}] Ghost expired in state {self.state.name} "
+                    f"after {self.frames_without_detection} frames without detection "
+                    f"(ghost_timeout={self.config.ghost_timeout_frames} frames)"
+                )
+                return False, 'expire'
         
         # Event is still alive in ghost state, waiting for detection or state change
         return False, 'keep_alive'
@@ -1394,8 +1618,6 @@ class EventCentricTracker:
         Returns:
             EventConfig with scaled time parameters
         """
-        from dataclasses import replace
-        
         return replace(
             self.config,
             association_time_ms=self._scaled_association_time_ms,

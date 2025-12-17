@@ -89,11 +89,18 @@ class ClassifierService:
         self._unknown_structural = 0
         self._unknown_low_evidence = 0
         self._unknown_ambiguous = 0
+        
+        # V5: Classification smoothing with history (for sequential bags of same type)
+        self.history_size = 5  # Last N bag classifications to maintain
+        self.history_vote_threshold = 3  # K out of N required for stable vote
+        self.high_conf_threshold = tracking_config.high_confidence_threshold
+        self._recent_classifications: List[Tuple[str, float]] = []  # (label, confidence) for recent bags
 
         logger.info(
-            f"[ClassifierService] Initialized V4 (Evidence-Based): "
+            f"[ClassifierService] Initialized V4 (Evidence-Based) with V5 Classification Smoothing: "
             f"top_k={self.top_k}, min_evidence={self.min_total_evidence}, "
-            f"ratio_threshold={self.ratio_threshold}, min_candidates={self.min_candidates}"
+            f"ratio_threshold={self.ratio_threshold}, min_candidates={self.min_candidates}, "
+            f"history_size={self.history_size}, history_vote_threshold={self.history_vote_threshold}"
         )
 
     def register_callback(self, callback: ResultCallback):
@@ -124,6 +131,91 @@ class ClassifierService:
                 context={"candidate_idx": idx}
             )
             return "Unknown", 0.0
+    
+    def _apply_classification_smoothing(self, label: str, confidence: float) -> Tuple[str, float, Optional[str]]:
+        """
+        Apply classification smoothing using recent bag classification history.
+        
+        Exploits the fact that bags are often provided in sequences of the same type.
+        
+        Decision rules:
+        1. If current confidence >= high_conf_threshold, use current label
+        2. Else if history has stable vote (>= K out of N agree on same label), use that label
+        3. Else use current label
+        
+        Args:
+            label: Current classification label
+            confidence: Current classification confidence
+            
+        Returns:
+            Tuple of (final_label, final_confidence, reason):
+            - final_label: Label after smoothing
+            - final_confidence: Confidence after smoothing
+            - reason: Reason for decision ('high_conf', 'history_vote', or 'current')
+        """
+        # Decision Rule 1: High confidence - use current, no smoothing needed
+        if confidence >= self.high_conf_threshold:
+            # Still add to history for future low-confidence classifications
+            self._recent_classifications.append((label, confidence))
+            if len(self._recent_classifications) > self.history_size:
+                self._recent_classifications.pop(0)
+            return label, confidence, 'high_conf'
+        
+        # Decision Rule 2: Check if history has stable vote
+        if len(self._recent_classifications) >= self.history_vote_threshold:
+            # Count votes for each label (from recent history)
+            label_votes = defaultdict(int)
+            label_confidences = defaultdict(list)
+            
+            for hist_label, hist_conf in self._recent_classifications:
+                label_votes[hist_label] += 1
+                label_confidences[hist_label].append(hist_conf)
+            
+            # Find most voted label
+            max_votes = 0
+            winning_label = None
+            for lbl, votes in label_votes.items():
+                if votes > max_votes:
+                    max_votes = votes
+                    winning_label = lbl
+            
+            # Check if winning label has stable vote (K out of N)
+            if max_votes >= self.history_vote_threshold and winning_label != label:
+                # Use winning label with average confidence from history
+                avg_confidence = sum(label_confidences[winning_label]) / len(label_confidences[winning_label])
+                
+                # Log history vote usage
+                structured_logger.classification_history_vote(
+                    track_id=-1,  # Not track-specific, global history
+                    current_label=label,
+                    current_confidence=confidence,
+                    history_label=winning_label,
+                    history_confidence=avg_confidence,
+                    vote_count=max_votes,
+                    history_size=len(self._recent_classifications),
+                    history_buffer=[(lbl, conf) for lbl, conf in self._recent_classifications]
+                )
+                
+                logger.info(
+                    f"[ClassifierService] Using history vote: {winning_label} "
+                    f"({max_votes}/{len(self._recent_classifications)} votes, avg_conf={avg_confidence:.2f}) "
+                    f"instead of current low-confidence: {label} (conf={confidence:.2f})"
+                )
+                
+                # Add history winner to recent classifications (for continuity)
+                self._recent_classifications.append((winning_label, avg_confidence))
+                if len(self._recent_classifications) > self.history_size:
+                    self._recent_classifications.pop(0)
+                
+                return winning_label, avg_confidence, 'history_vote'
+        
+        # Decision Rule 3: Use current label (not enough history or no stable vote)
+        # Add current to history
+        self._recent_classifications.append((label, confidence))
+        if len(self._recent_classifications) > self.history_size:
+            self._recent_classifications.pop(0)
+        
+        return label, confidence, 'current'
 
     def _compute_sharpness_weight(self, sharpness: float) -> float:
         """
@@ -428,6 +520,29 @@ class ClassifierService:
             final_label, final_conf, rejection_reason, metadata = self._finalize_classification(
                 evidence, event_stats
             )
+            
+            # Step 3.5: Apply classification smoothing (V5)
+            # Only smooth non-Unknown classifications
+            if final_label != "Unknown":
+                smoothed_label, smoothed_conf, smooth_reason = self._apply_classification_smoothing(
+                    final_label, final_conf
+                )
+                
+                # Update if smoothing changed the result
+                if smoothed_label != final_label or abs(smoothed_conf - final_conf) > 0.01:
+                    metadata["smoothing_applied"] = True
+                    metadata["original_label"] = final_label
+                    metadata["original_confidence"] = final_conf
+                    metadata["smoothing_reason"] = smooth_reason
+                    
+                    final_label = smoothed_label
+                    final_conf = smoothed_conf
+                    
+                    logger.info(
+                        f"[ClassifierService] Track {track_id}: Smoothing changed result: "
+                        f"{metadata['original_label']}({metadata['original_confidence']:.2f}) -> "
+                        f"{final_label}({final_conf:.2f}), reason={smooth_reason}"
+                    )
             
             # Step 4: Select best representative ROI
             if final_label != "Unknown":

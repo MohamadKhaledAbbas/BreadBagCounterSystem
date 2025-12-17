@@ -91,6 +91,66 @@ Key configuration files:
 - `src/config/tracking_config.py`: Event tracking parameters
 - Environment variables: `LOG_LEVEL`, `ENABLE_JSON_LOGGING`, `LOG_DIR`, `ENABLE_UNKNOWN_PHASH_CLUSTERING`
 
+### Frame-Based Thresholds (V6 Reliability Improvements)
+
+The system now uses **frame-based thresholds** instead of millisecond-based timeouts for consistent behavior across different processing speeds:
+
+**Why Frame-Based?**
+- Consistent behavior regardless of processing speed (Windows vs. Production)
+- Eliminates FPS measurement drift and timing variability
+- Simpler configuration with predictable outcomes
+
+**Migration Compatibility:**
+- Legacy millisecond parameters are still accepted for backward compatibility
+- If provided, they are automatically converted to frames using `target_fps` (default 25fps)
+- Conversion is logged at startup for transparency
+
+**Key Frame-Based Parameters** (in `src/config/tracking_config.py`):
+```python
+# Ghost timeout (bag throw finalization)
+ghost_timeout_frames = 25  # 25 frames @ 25fps = 1 second
+
+# Temporal cooldown (duplicate prevention)
+temporal_cooldown_frames = 10  # 10 frames @ 25fps = 400ms
+
+# Suppression duration (after counting)
+suppression_duration_frames = 38  # 38 frames @ 25fps = 1.5 seconds
+
+# State transition stability
+open_to_closing_frames = 3  # Min frames in OPEN before CLOSING
+closing_stability_frames = 4  # Frames closed must persist
+closed_stability_frames = 5  # Min frames in CLOSED before commit
+
+# Stuck event fail-safes
+max_event_lifetime_frames = 250  # Max total lifetime (10 seconds @ 25fps)
+max_open_state_frames = 150  # Max frames in OPEN state (6 seconds)
+max_closing_state_frames = 75  # Max frames in CLOSING state (3 seconds)
+max_closed_state_frames = 100  # Max frames in CLOSED state (4 seconds)
+
+# Target FPS for conversions
+target_fps = 25.0  # Reference frame rate for ms-to-frames conversion
+```
+
+**Recommended Values:**
+- For 25fps production: Use defaults
+- For 30fps systems: Scale proportionally (e.g., `ghost_timeout_frames = 30`)
+- For slower testing: Frame-based thresholds scale naturally with frame rate
+
+**Ghost Timeout as Finalization Window:**
+When an event enters CLOSING or CLOSED state and loses detection (ghost state):
+- The system waits `ghost_timeout_frames` for the bag to reappear
+- If it doesn't reappear and has sufficient evidence, it's committed (counted)
+- This treats ghost timeout as a "throw/removal finalization window"
+
+**Stuck Event Fail-Safes:**
+Maximum frame limits prevent events from staying active indefinitely:
+- OPEN state: Force expire after `max_open_state_frames`
+- CLOSING state: Force to CLOSED or expire after `max_closing_state_frames`
+- CLOSED state: Force commit or expire after `max_closed_state_frames`
+- Total lifetime: Force commit/expire after `max_event_lifetime_frames`
+
+All forced transitions are logged with structured `forced_close_reason` for debugging.
+
 ### Testing Mode Time Scaling
 
 When running on slower hardware (e.g., Windows PCs), the system automatically scales time-based thresholds to maintain equivalent behavior with production:
@@ -127,6 +187,36 @@ Analytics UI displays both high and low counts per bag type:
 - **Gold badge**: Low confidence detections
 
 This helps identify which bag types need better training data or improved detection conditions.
+
+### Classification Smoothing (V6)
+
+The system now uses **classification history smoothing** to improve accuracy for sequential bags:
+
+**How It Works:**
+- Maintains a buffer of the last 5 bag classifications
+- When current classification has low confidence, checks recent history
+- If history shows stable vote (3+ out of 5 agree on same type), uses that instead
+
+**Example:**
+```
+Recent history: [WholeWheat, WholeWheat, WholeWheat, WholeWheat, WholeWheat]
+Current bag: Bran (confidence 0.35)  ← Low confidence
+Decision: Use WholeWheat from history vote (5/5 votes, avg conf 0.68)
+Reason: Bags are often provided in sequences, history provides context
+```
+
+**Configuration** (in `ClassifierService`):
+- History size: 5 classifications
+- Vote threshold: 3 out of 5 must agree
+- High confidence threshold: 0.5 (uses current if above this)
+
+**When It Helps:**
+- Workers processing batches of the same bag type
+- Temporary lighting changes causing misclassification
+- Camera angle variations during fast manipulation
+- Partial occlusions that reduce confidence
+
+All smoothing decisions are logged with full history context for debugging.
 
 ### Degraded Mode (Overload Protection)
 
