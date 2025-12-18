@@ -279,14 +279,14 @@ class ClassifierService:
             return current_label, current_confidence, None
         
         # Guard (b): Check if there's a higher-confidence conflicting candidate
-        # Sort evidence by score
-        sorted_evidence = sorted(evidence.items(), key=lambda x: x[1]["score"], reverse=True)
+        # Sort evidence by score (use .get() for safe access)
+        sorted_evidence = sorted(evidence.items(), key=lambda x: x[1].get("score", 0), reverse=True)
         
         # If current label is not the top candidate, there's a higher-confidence alternative
         # Check if that alternative is the prev_label
         if sorted_evidence:
             top_candidate_label = sorted_evidence[0][0]
-            top_candidate_conf = sorted_evidence[0][1]["best_confidence"]
+            top_candidate_conf = sorted_evidence[0][1].get("best_confidence", 0)
             
             # If top candidate is different from prev_label and has higher confidence, don't reuse
             if top_candidate_label != prev_label and top_candidate_conf > current_confidence:
@@ -316,8 +316,8 @@ class ClassifierService:
         streak_confidences = [conf for _, conf in self._recent_classifications[-self.streak_min_length:]]
         reused_confidence = sum(streak_confidences) / len(streak_confidences)
         
-        # Get top candidate labels for logging
-        candidate_tops = [(label, data["best_confidence"]) for label, data in sorted_evidence[:3]]
+        # Get top candidate labels for logging (use .get() for safe access)
+        candidate_tops = [(label, data.get("best_confidence", 0)) for label, data in sorted_evidence[:3]]
         
         # Log the override decision
         structured_logger.label_reuse_override(

@@ -1309,6 +1309,61 @@ def _generate_per_label_rows(stats: Dict[str, Any]) -> str:
     return ''.join(rows)
 
 
+def _generate_reuse_events_table(stats: Dict[str, Any]) -> str:
+    """Generate HTML table for label reuse events."""
+    events = stats['classification']['stability_heuristics']['label_reuse_events'][:10]
+    
+    rows = []
+    for evt in events:
+        dom_label = evt.get('dominance_label', 'N/A')
+        dom_ratio = evt.get('dominance_ratio', 0)
+        row = (
+            f"<tr>"
+            f"<td>{evt['track_id']}</td>"
+            f"<td>{evt['prev_label']}</td>"
+            f"<td>{evt['new_label']}</td>"
+            f"<td>{evt['new_confidence']:.3f}</td>"
+            f"<td>{evt['streak_len']}</td>"
+            f"<td>{dom_label} ({dom_ratio:.2f})</td>"
+            f"</tr>"
+        )
+        rows.append(row)
+    
+    table = (
+        '<table>'
+        '<tr><th>Track ID</th><th>Prev Label</th><th>New Label</th>'
+        '<th>Confidence</th><th>Streak</th><th>Dominance</th></tr>'
+        f"{''.join(rows)}"
+        '</table>'
+    )
+    return table
+
+
+def _generate_volatility_table(stats: Dict[str, Any]) -> str:
+    """Generate HTML table for high volatility tracks."""
+    tracks = stats['classification']['stability_heuristics']['volatility_details'][:10]
+    
+    rows = []
+    for track in tracks:
+        row = (
+            f"<tr>"
+            f"<td>{track['track_id']}</td>"
+            f"<td>{track['label_changes']}</td>"
+            f"<td>{track['lifespan']}</td>"
+            f"<td>{track['volatility_score']:.3f}</td>"
+            f"</tr>"
+        )
+        rows.append(row)
+    
+    table = (
+        '<table>'
+        '<tr><th>Track ID</th><th>Label Changes</th><th>Lifespan</th><th>Volatility Score</th></tr>'
+        f"{''.join(rows)}"
+        '</table>'
+    )
+    return table
+
+
 def generate_html_report(stats: Dict[str, Any], output_path: str):
     """Generate HTML report with embedded CSS and Chart.js visualizations."""
 
@@ -1775,10 +1830,10 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
         </table>
 
         {'<h3>📋 Recent Label Reuse Events</h3>' if stats['classification']['stability_heuristics']['label_reuse_events'] else ''}
-        {'<table><tr><th>Track ID</th><th>Prev Label</th><th>New Label</th><th>Confidence</th><th>Streak</th><th>Dominance</th></tr>' + ''.join([f"<tr><td>{evt['track_id']}</td><td>{evt['prev_label']}</td><td>{evt['new_label']}</td><td>{evt['new_confidence']:.3f}</td><td>{evt['streak_len']}</td><td>{evt.get('dominance_label', 'N/A')} ({evt.get('dominance_ratio', 0):.2f})</td></tr>" for evt in stats['classification']['stability_heuristics']['label_reuse_events'][:10]]) + '</table>' if stats['classification']['stability_heuristics']['label_reuse_events'] else ''}
+        {_generate_reuse_events_table(stats) if stats['classification']['stability_heuristics']['label_reuse_events'] else ''}
 
         {'<h3>⚠️ High Volatility Tracks</h3>' if stats['classification']['stability_heuristics']['volatility_details'] else ''}
-        {'<table><tr><th>Track ID</th><th>Label Changes</th><th>Lifespan</th><th>Volatility Score</th></tr>' + ''.join([f"<tr><td>{track['track_id']}</td><td>{track['label_changes']}</td><td>{track['lifespan']}</td><td>{track['volatility_score']:.3f}</td></tr>" for track in stats['classification']['stability_heuristics']['volatility_details'][:10]]) + '</table>' if stats['classification']['stability_heuristics']['volatility_details'] else ''}
+        {_generate_volatility_table(stats) if stats['classification']['stability_heuristics']['volatility_details'] else ''}
 
         <h2>📈 Streak Analysis & Burst Anomalies</h2>
         <table>
