@@ -56,6 +56,7 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 - **[EVENT_CENTRIC_TRACKING_ARCHITECTURE.md](EVENT_CENTRIC_TRACKING_ARCHITECTURE.md)**: Event tracking design
 - **[PLATFORM_COMPATIBILITY.md](PLATFORM_COMPATIBILITY.md)**: Platform support information
 - **[docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md)**: Log analyzer tool documentation
+- **[docs/STRUCTURED_LOGGING_SCHEMA.md](docs/STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
 
 ## Key Components
 
@@ -75,14 +76,18 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 
 ## Log Analysis
 
-The log analyzer provides:
+The log analyzer provides comprehensive analysis with frame-based threshold awareness:
 
+- **Frame-Based Threshold Analysis**: Tracks frame-based thresholds with FPS-aware conversions
+- **Event Lifecycle Metrics**: Created/committed/expired counts, average and max lifetime
 - **Performance Metrics**: Frame processing times, FPS, detection/monitor breakdown
-- **Counting Accuracy**: Event lifecycle, expiration analysis, duplicate detection
-- **Classification Quality**: Unknown rate, rejection reasons, confidence distribution
-- **Issue Detection**: Automatic identification of 7 common problems with remediation advice
-- **HTML Reports**: Self-contained reports with charts (Chart.js via CDN)
-- **Time Series**: Per-minute trends for errors, warnings, FPS, unknown rate
+- **ROI Quality Analysis**: Added/rejected counts, sharpness distribution, rejection reasons
+- **Classification Quality**: Unknown rate, rejection reasons, confidence distribution, voting rate
+- **Counting Accuracy**: Event lifecycle, suppression analysis, duplicate detection
+- **Issue Detection**: Automatic identification of common problems with frame-based remediation advice
+- **HTML Reports**: Self-contained reports with embedded charts and 9 KPI cards
+- **JSON Reports**: Machine-readable metrics for integration and automation
+- **Time Series**: Per-minute trends for events, errors, warnings, FPS, ROI activity
 
 ## Configuration
 
