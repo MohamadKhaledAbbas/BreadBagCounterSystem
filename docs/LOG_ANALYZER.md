@@ -13,6 +13,8 @@ The Log Analyzer is a Windows-friendly tool that parses rotated JSON log files f
 - 🎨 **HTML Reports**: Self-contained HTML reports with embedded charts (Chart.js via CDN)
 - 🚨 **Issue Detection**: Automatic detection of common issues with suggested fixes
 - ⚡ **Streaming Parser**: Memory-efficient streaming for multi-GB log files
+- 🎯 **Frame-Based Analysis**: Tracks frame-based thresholds with FPS-aware conversions
+- 📊 **Enhanced Metrics**: Event lifecycle, ROI quality, classification details, and system health
 
 ## Installation
 
@@ -71,14 +73,17 @@ The analyzer generates two files in the output directory:
 
 A comprehensive, self-contained HTML report including:
 
-- **Summary KPIs**: Total entries, errors, warnings, unknown rate, FPS, bags counted
-- **Time Range Information**: Start/end times and duration
+- **Summary KPIs**: 9 cards showing total entries, errors, bags counted, suppressed events, FPS, unknown rate, events created/committed, average event lifetime
+- **Frame-Based Threshold Configuration**: Table showing frame-based thresholds with FPS-aware time conversions
+- **Event Suppression Analysis**: Breakdown by suppression type (spatial, temporal, active event exclusion)
+- **Event Lifecycle Metrics**: Created/committed/expired counts, average and max lifetime in frames and seconds
+- **ROI Collection Metrics**: Added/rejected counts, rejection rate, sharpness distribution, average ROIs per event
+- **Classification Quality**: Unknown rate, confidence stats, candidates per classification, voting rate, processing times
+- **Bag Type Distribution**: Counts by bag type
 - **Issue Findings**: Automatic detection of problems with severity levels, descriptions, likely causes, and remediation advice
 - **Frame Performance**: Charts and tables showing processing times (avg, p50, p95, max)
-- **Counting Metrics**: Event lifecycle statistics, bag type distribution
-- **Classification Quality**: Unknown rate, rejection reasons, confidence statistics
-- **Error/Warning Analysis**: Top repeating errors and warnings
-- **Time Series Charts**: Per-minute trends for errors, warnings, FPS, unknown rate
+- **Error/Warning Analysis**: Top repeating errors and warnings grouped by component
+- **Time Series Charts**: Per-minute trends for events created/committed/expired, errors, warnings, FPS, ROI activity
 
 The HTML report can be opened directly in any web browser (Chrome, Firefox, Edge, Safari).
 
@@ -88,6 +93,10 @@ A machine-readable JSON file containing all computed metrics and statistics for 
 
 ## Metrics Computed
 
+### Metadata
+- App start time and version
+- Report generation timestamp
+
 ### Error & Warning Analysis
 - Total error/warning counts
 - Top repeating messages by (component, message)
@@ -96,30 +105,58 @@ A machine-readable JSON file containing all computed metrics and statistics for 
 ### Backpressure Metrics
 - Total frame drops
 - Total frames skipped
-- Queue utilization statistics
+- Queue utilization statistics (avg, max)
 
 ### Frame Performance
-- Detection time: avg, p50, p95, max
-- Monitor time: avg, p50, p95, max
-- Total frame time: avg, p50, p95, max
-- FPS: avg, p50, p95, max
+- Detection time: avg, p50, p95, max, min
+- Monitor time: avg, p50, p95, max, min
+- Total frame time: avg, p50, p95, max, min
+- FPS: avg, p50, p95, max, min
+
+### Frame-Based Thresholds
+- Ghost timeout (frames → ms conversion)
+- Temporal cooldown (frames → ms conversion)
+- Suppression duration (frames → ms conversion)
+- Average FPS for conversions
+
+### Event Lifecycle
+- Total created, committed, expired
+- Expired by state breakdown
+- Total suppressed
+- Average lifetime (frames and seconds)
+- Lifetime statistics (avg, p50, p95, max, min)
+
+### Event Creation Blockers
+- Total blocked
+- Breakdown by reason (covered_by_active_event, suppression_spatial, suppression_temporal, active_event_exclusion)
+- Suppression distance statistics
+- Cooldown time statistics
 
 ### Counting Signals
-- EVENT_CREATED count
-- EVENT_EXPIRED count (by state)
-- EVENT_SUPPRESSED count
-- COUNT_UPDATE count
+- Total bags counted
 - Bag type distribution
 
-### Overcount Indicators
-- Duplicate track_id in COUNT_UPDATE events
-- Repeated phash values
+### Track Statistics
+- Total created, duplicates, expired
+- Average lifetime in frames
+- Unique tracks counted
+- Duplicate track_id and phash indicators
+
+### ROI Quality
+- Total added/rejected
+- Rejection rate
+- Rejection reasons breakdown
+- Sharpness statistics (avg, p50, p95, max, min)
+- Average ROIs per event
 
 ### Classification Quality
 - Total classifications
 - Unknown count and rate
 - Rejection reason breakdown
-- Confidence distribution (avg, p50, p95)
+- Confidence distribution (avg, p50, p95, max, min)
+- Average candidates per classification
+- Voting usage rate
+- Average processing time
 
 ### Time Series
 Per-minute aggregation of:
@@ -128,25 +165,40 @@ Per-minute aggregation of:
 - Backpressure drops
 - Unknown classifications
 - Average FPS
+- Events created, committed, expired
+- Suppressed events
+- ROI added, ROI rejected
 
 ## Issue Detection
 
-The analyzer automatically detects common issues and provides actionable diagnostics:
+The analyzer automatically detects common issues and provides actionable diagnostics with frame-based threshold awareness:
 
-### 1. High Unknown Classification Rate (>10%)
+### 1. High Event Suppression Rate (>5%)
+- **Severity**: Warning
+- **Likely Cause**: Temporal cooldown or suppression thresholds may be too aggressive
+- **Where to Look**: Review `temporal_cooldown_frames` in config (default: 10 frames). Consider reducing to 5-8 frames for faster workflows
+- **Recommendation**: Frame-based thresholds scale naturally with FPS. Adjust thresholds in frame units, not milliseconds
+
+### 2. High Unknown Classification Rate (>10%)
 - **Severity**: Warning
 - **Likely Cause**: Poor ROI quality, model uncertainty, or inadequate training data
-- **Where to Look**: Check rejection_reasons breakdown, review ROI sharpness values
+- **Where to Look**: Check rejection_reasons breakdown (shows top 3), review ROI sharpness and rejection rate
+- **Recommendation**: Includes ROI metrics showing average sharpness and rejection rate
 
-### 2. Frame Drops Due to Backpressure
+### 3. Frame Drops Due to Backpressure
 - **Severity**: Error
 - **Likely Cause**: System cannot keep up with input frame rate (CPU/GPU overload)
 - **Where to Look**: Check frame processing times, consider reducing input FPS or optimizing models
 
-### 3. High Frame Processing Time (P95 > 50ms)
+### 4. High Frame Processing Time (P95 > 50ms)
 - **Severity**: Warning
 - **Likely Cause**: Detection or monitoring bottleneck, hardware limitations
 - **Where to Look**: Compare detection_time_ms vs monitor_time_ms to identify bottleneck
+
+### 5. Low FPS Throughput (<20 FPS)
+- **Severity**: Warning
+- **Likely Cause**: System overload, slow detection model, or hardware limitations
+- **Where to Look**: Check backpressure events, frame processing times, and queue utilization
 
 ### 4. Low FPS Throughput (<20 FPS)
 - **Severity**: Warning
