@@ -478,6 +478,59 @@ class StructuredLogger:
             **kwargs
         )
     
+    def label_reuse_override(self, track_id: int, prev_label: str, new_label: str, 
+                            new_confidence: float, streak_len: int, 
+                            dominance_label: str = None, dominance_ratio: float = None,
+                            candidate_tops: list = None, reason: str = None, **kwargs):
+        """Log when previous label is reused instead of current low-confidence classification."""
+        msg_parts = [
+            f"[LABEL_REUSE] track={track_id}",
+            f"prev={prev_label}",
+            f"new={new_label}({new_confidence:.2f})",
+            f"streak={streak_len}"
+        ]
+        
+        if dominance_label and dominance_ratio is not None:
+            msg_parts.append(f"dom={dominance_label}({dominance_ratio:.2f})")
+        
+        if reason:
+            msg_parts.append(f"reason={reason}")
+        
+        self._log_structured(
+            logging.INFO,
+            ", ".join(msg_parts),
+            component="ClassifierService",
+            track_id=track_id,
+            prev_label=prev_label,
+            new_label=new_label,
+            new_confidence=new_confidence,
+            streak_len=streak_len,
+            dominance_label=dominance_label,
+            dominance_ratio=dominance_ratio,
+            candidate_tops=candidate_tops,
+            reuse_reason=reason,
+            **kwargs
+        )
+    
+    def label_volatility_flag(self, track_id: int, label_changes: int, lifespan: int,
+                             volatility_score: float, label_history: list, **kwargs):
+        """Log high-volatility track detection."""
+        msg = (
+            f"[HIGH_VOLATILITY] track={track_id}, changes={label_changes}, "
+            f"lifespan={lifespan}, volatility={volatility_score:.3f}"
+        )
+        self._log_structured(
+            logging.WARNING,
+            msg,
+            component="ClassifierService",
+            track_id=track_id,
+            label_changes=label_changes,
+            lifespan=lifespan,
+            volatility_score=volatility_score,
+            label_history=label_history,
+            **kwargs
+        )
+    
     def count_updated(self, bag_type: str, new_count: int, track_id: int, 
                      confidence: float, phash: str = None, **kwargs):
         """Log count updates for bag types."""

@@ -276,6 +276,39 @@ def parse_text_log_line(line: str) -> Optional[Dict[str, Any]]:
                 "trigger": m.group(4).strip()
             }
     
+    # Extract label reuse: [LABEL_REUSE]
+    elif "[LABEL_REUSE]" in message:
+        component = "ClassifierService"
+        reuse_pattern = r'track=(\d+).*?prev=(\w+).*?new=(\w+)\(([\d.]+)\).*?streak=(\d+)'
+        m = re.search(reuse_pattern, message)
+        if m:
+            data = {
+                "track_id": int(m.group(1)),
+                "prev_label": m.group(2),
+                "new_label": m.group(3),
+                "new_confidence": float(m.group(4)),
+                "streak_len": int(m.group(5))
+            }
+            # Extract dominance if present
+            dom_pattern = r'dom=(\w+)\(([\d.]+)\)'
+            m_dom = re.search(dom_pattern, message)
+            if m_dom:
+                data["dominance_label"] = m_dom.group(1)
+                data["dominance_ratio"] = float(m_dom.group(2))
+    
+    # Extract high volatility: [HIGH_VOLATILITY]
+    elif "[HIGH_VOLATILITY]" in message:
+        component = "ClassifierService"
+        vol_pattern = r'track=(\d+).*?changes=(\d+).*?lifespan=(\d+).*?volatility=([\d.]+)'
+        m = re.search(vol_pattern, message)
+        if m:
+            data = {
+                "track_id": int(m.group(1)),
+                "label_changes": int(m.group(2)),
+                "lifespan": int(m.group(3)),
+                "volatility_score": float(m.group(4))
+            }
+    
     return {
         "timestamp": timestamp_iso,
         "level": level,
@@ -424,6 +457,12 @@ class LogAnalyzer:
         
         # Minute-level dominant label analysis
         self.minute_label_distribution = defaultdict(Counter)  # minute_key -> {label: count}
+        
+        # V6: Stability heuristics tracking
+        self.label_reuse_count = 0
+        self.label_reuse_events = []  # detailed reuse events
+        self.high_volatility_tracks = []  # tracks with high volatility
+        self.volatility_scores = []  # all volatility scores
         
         # Forced closes and lifecycle details
         self.forced_close_count = 0
@@ -740,6 +779,34 @@ class LogAnalyzer:
             # Track individual candidate contributions
             pass  # Already captured in classification aggregates
         
+        # V6: Label reuse tracking
+        if "LABEL_REUSE" in message:
+            self.label_reuse_count += 1
+            if data:
+                self.label_reuse_events.append({
+                    "track_id": data.get("track_id"),
+                    "prev_label": data.get("prev_label"),
+                    "new_label": data.get("new_label"),
+                    "new_confidence": data.get("new_confidence"),
+                    "streak_len": data.get("streak_len"),
+                    "dominance_label": data.get("dominance_label"),
+                    "dominance_ratio": data.get("dominance_ratio")
+                })
+        
+        # V6: High volatility tracking
+        if "HIGH_VOLATILITY" in message:
+            if data:
+                volatility_score = data.get("volatility_score")
+                if volatility_score is not None:
+                    self.volatility_scores.append(volatility_score)
+                
+                self.high_volatility_tracks.append({
+                    "track_id": data.get("track_id"),
+                    "label_changes": data.get("label_changes"),
+                    "lifespan": data.get("lifespan"),
+                    "volatility_score": volatility_score
+                })
+        
         # Track statistics (if we add track-level logging)
         # For now, track_id in COUNT_UPDATE gives us track lifecycle info
 
@@ -844,6 +911,16 @@ class LogAnalyzer:
                 },
                 "confusion_pairs": dict(self.confusion_pairs.most_common(20)),
                 "top_label_flips": [(f"{l1}→{l2}", count) for (l1, l2), count in self.confusion_pairs.most_common(10)],
+                # V6: Stability heuristics
+                "stability_heuristics": {
+                    "label_reuse_count": self.label_reuse_count,
+                    "label_reuse_rate": self.label_reuse_count / self.classification_count if self.classification_count > 0 else 0,
+                    "label_reuse_events": self.label_reuse_events[:20],  # Top 20 for report
+                    "high_volatility_tracks": len(self.high_volatility_tracks),
+                    "avg_volatility": statistics.mean(self.volatility_scores) if self.volatility_scores else 0,
+                    "max_volatility": max(self.volatility_scores) if self.volatility_scores else 0,
+                    "volatility_details": self.high_volatility_tracks[:20],  # Top 20 for report
+                },
             },
             "streak_analysis": {
                 "total_streaks": len(self.classification_streaks),
@@ -1230,6 +1307,61 @@ def _generate_per_label_rows(stats: Dict[str, Any]) -> str:
         )
         rows.append(row)
     return ''.join(rows)
+
+
+def _generate_reuse_events_table(stats: Dict[str, Any]) -> str:
+    """Generate HTML table for label reuse events."""
+    events = stats['classification']['stability_heuristics']['label_reuse_events'][:10]
+    
+    rows = []
+    for evt in events:
+        dom_label = evt.get('dominance_label', 'N/A')
+        dom_ratio = evt.get('dominance_ratio', 0)
+        row = (
+            f"<tr>"
+            f"<td>{evt['track_id']}</td>"
+            f"<td>{evt['prev_label']}</td>"
+            f"<td>{evt['new_label']}</td>"
+            f"<td>{evt['new_confidence']:.3f}</td>"
+            f"<td>{evt['streak_len']}</td>"
+            f"<td>{dom_label} ({dom_ratio:.2f})</td>"
+            f"</tr>"
+        )
+        rows.append(row)
+    
+    table = (
+        '<table>'
+        '<tr><th>Track ID</th><th>Prev Label</th><th>New Label</th>'
+        '<th>Confidence</th><th>Streak</th><th>Dominance</th></tr>'
+        f"{''.join(rows)}"
+        '</table>'
+    )
+    return table
+
+
+def _generate_volatility_table(stats: Dict[str, Any]) -> str:
+    """Generate HTML table for high volatility tracks."""
+    tracks = stats['classification']['stability_heuristics']['volatility_details'][:10]
+    
+    rows = []
+    for track in tracks:
+        row = (
+            f"<tr>"
+            f"<td>{track['track_id']}</td>"
+            f"<td>{track['label_changes']}</td>"
+            f"<td>{track['lifespan']}</td>"
+            f"<td>{track['volatility_score']:.3f}</td>"
+            f"</tr>"
+        )
+        rows.append(row)
+    
+    table = (
+        '<table>'
+        '<tr><th>Track ID</th><th>Label Changes</th><th>Lifespan</th><th>Volatility Score</th></tr>'
+        f"{''.join(rows)}"
+        '</table>'
+    )
+    return table
 
 
 def generate_html_report(stats: Dict[str, Any], output_path: str):
@@ -1668,6 +1800,40 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
             </tr>
             {''.join([f"<tr><td>{flip}</td><td>{count}</td></tr>" for flip, count in stats['classification']['top_label_flips']])}
         </table>
+
+        <h2>🛡️ Classification Stability Heuristics (V6)</h2>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Label Reuse Events</td>
+                <td>{stats['classification']['stability_heuristics']['label_reuse_count']}</td>
+            </tr>
+            <tr>
+                <td>Label Reuse Rate</td>
+                <td>{stats['classification']['stability_heuristics']['label_reuse_rate']:.1%}</td>
+            </tr>
+            <tr>
+                <td>High Volatility Tracks</td>
+                <td><strong>{stats['classification']['stability_heuristics']['high_volatility_tracks']}</strong></td>
+            </tr>
+            <tr>
+                <td>Average Track Volatility</td>
+                <td>{stats['classification']['stability_heuristics']['avg_volatility']:.3f}</td>
+            </tr>
+            <tr>
+                <td>Max Track Volatility</td>
+                <td>{stats['classification']['stability_heuristics']['max_volatility']:.3f}</td>
+            </tr>
+        </table>
+
+        {'<h3>📋 Recent Label Reuse Events</h3>' if stats['classification']['stability_heuristics']['label_reuse_events'] else ''}
+        {_generate_reuse_events_table(stats) if stats['classification']['stability_heuristics']['label_reuse_events'] else ''}
+
+        {'<h3>⚠️ High Volatility Tracks</h3>' if stats['classification']['stability_heuristics']['volatility_details'] else ''}
+        {_generate_volatility_table(stats) if stats['classification']['stability_heuristics']['volatility_details'] else ''}
 
         <h2>📈 Streak Analysis & Burst Anomalies</h2>
         <table>

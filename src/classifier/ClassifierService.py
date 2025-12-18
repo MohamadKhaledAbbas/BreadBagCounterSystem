@@ -95,6 +95,18 @@ class ClassifierService:
         self.history_vote_threshold = 3  # K out of N required for stable vote
         self.high_conf_threshold = tracking_config.high_confidence_threshold
         self._recent_classifications: List[Tuple[str, float]] = []  # (label, confidence) for recent bags
+        
+        # V6: Production-grade classification stability heuristics
+        self.enable_label_reuse = tracking_config.enable_label_reuse
+        self.low_conf_threshold = tracking_config.low_conf_threshold
+        self.streak_min_length = tracking_config.streak_min_length
+        self.burst_dominance_min_ratio = tracking_config.burst_dominance_min_ratio
+        self.burst_window_size = tracking_config.burst_window_size
+        self.track_volatility_threshold = tracking_config.track_volatility_threshold
+        self.enable_volatility_logging = tracking_config.enable_volatility_logging
+        
+        # Track per-track label history for volatility analysis
+        self._track_label_history: Dict[int, List[Tuple[str, float]]] = defaultdict(list)  # track_id -> [(label, conf)]
 
         logger.info(
             f"[ClassifierService] Initialized V4 (Evidence-Based) with V5 Classification Smoothing: "
@@ -216,6 +228,174 @@ class ClassifierService:
             self._recent_classifications.pop(0)
         
         return label, confidence, 'current'
+    
+    def _check_label_reuse(self, track_id: int, current_label: str, current_confidence: float,
+                          evidence: Dict[str, Dict[str, Any]]) -> Tuple[str, float, Optional[str]]:
+        """
+        Check if previous label should be reused instead of current low-confidence classification.
+        
+        Guards:
+        (a) Strong streak exists (length >= STREAK_MIN)
+        (b) No higher-confidence conflicting candidate
+        (c) Matches burst dominance if available
+        (d) Current confidence is below LOW_CONF_THRESHOLD
+        
+        Args:
+            track_id: Track ID (for logging)
+            current_label: Current classification label
+            current_confidence: Current classification confidence
+            evidence: Evidence dict with candidate labels and scores
+            
+        Returns:
+            Tuple of (final_label, final_confidence, reason)
+            - If reuse: returns previous label with reason
+            - If not: returns current label with None reason
+        """
+        # Feature flag check
+        if not self.enable_label_reuse:
+            return current_label, current_confidence, None
+        
+        # Guard (d): Check if confidence is low enough to consider reuse
+        if current_confidence >= self.low_conf_threshold:
+            return current_label, current_confidence, None
+        
+        # Check if we have enough history to determine a streak
+        if len(self._recent_classifications) < self.streak_min_length:
+            return current_label, current_confidence, None
+        
+        # Guard (a): Check for strong streak in recent classifications
+        # Look at last N classifications to see if they form a consistent streak
+        recent_labels = [label for label, _ in self._recent_classifications[-self.streak_min_length:]]
+        
+        # Check if all recent labels are the same (forming a streak)
+        if len(set(recent_labels)) != 1:
+            # No consistent streak
+            return current_label, current_confidence, None
+        
+        prev_label = recent_labels[0]  # The label from the streak
+        
+        # If current label matches the streak, no override needed
+        if current_label == prev_label:
+            return current_label, current_confidence, None
+        
+        # Guard (b): Check if there's a higher-confidence conflicting candidate
+        # Sort evidence by score (use .get() for safe access)
+        sorted_evidence = sorted(evidence.items(), key=lambda x: x[1].get("score", 0), reverse=True)
+        
+        # If current label is not the top candidate, there's a higher-confidence alternative
+        # Check if that alternative is the prev_label
+        if sorted_evidence:
+            top_candidate_label = sorted_evidence[0][0]
+            top_candidate_conf = sorted_evidence[0][1].get("best_confidence", 0)
+            
+            # If top candidate is different from prev_label and has higher confidence, don't reuse
+            if top_candidate_label != prev_label and top_candidate_conf > current_confidence:
+                return current_label, current_confidence, None
+        
+        # Guard (c): Check burst dominance if we have enough history
+        dominance_label = None
+        dominance_ratio = None
+        
+        if len(self._recent_classifications) >= self.burst_window_size:
+            # Analyze last N classifications for burst dominance
+            burst_window = self._recent_classifications[-self.burst_window_size:]
+            label_counts = Counter([label for label, _ in burst_window])
+            
+            if label_counts:
+                dominant = label_counts.most_common(1)[0]
+                dominance_label = dominant[0]
+                dominance_ratio = dominant[1] / len(burst_window)
+                
+                # If burst dominance exists but doesn't match prev_label, don't reuse
+                if dominance_ratio >= self.burst_dominance_min_ratio:
+                    if dominance_label != prev_label:
+                        return current_label, current_confidence, None
+        
+        # All guards passed: reuse previous label
+        # Use average confidence from streak as the reused confidence
+        streak_confidences = [conf for _, conf in self._recent_classifications[-self.streak_min_length:]]
+        reused_confidence = sum(streak_confidences) / len(streak_confidences)
+        
+        # Get top candidate labels for logging (use .get() for safe access)
+        candidate_tops = [(label, data.get("best_confidence", 0)) for label, data in sorted_evidence[:3]]
+        
+        # Log the override decision
+        structured_logger.label_reuse_override(
+            track_id=track_id,
+            prev_label=prev_label,
+            new_label=current_label,
+            new_confidence=current_confidence,
+            streak_len=len(recent_labels),
+            dominance_label=dominance_label,
+            dominance_ratio=dominance_ratio,
+            candidate_tops=candidate_tops,
+            reason="low_confidence_with_strong_streak"
+        )
+        
+        logger.info(
+            f"[ClassifierService] Track {track_id}: Reusing label {prev_label} "
+            f"(streak={len(recent_labels)}, avg_conf={reused_confidence:.2f}) "
+            f"instead of low-confidence {current_label} (conf={current_confidence:.2f})"
+        )
+        
+        return prev_label, reused_confidence, "label_reuse"
+    
+    def _calculate_track_volatility(self, track_id: int) -> Optional[float]:
+        """
+        Calculate label volatility score for a track.
+        
+        Volatility = (number of label changes) / (track lifespan)
+        
+        Args:
+            track_id: Track identifier
+            
+        Returns:
+            Volatility score (0.0-1.0) or None if track has insufficient history
+        """
+        label_history = self._track_label_history.get(track_id, [])
+        
+        if len(label_history) < 2:
+            return None
+        
+        # Count label changes
+        label_changes = 0
+        for i in range(1, len(label_history)):
+            if label_history[i][0] != label_history[i-1][0]:
+                label_changes += 1
+        
+        # Calculate volatility
+        lifespan = len(label_history)
+        volatility = label_changes / lifespan
+        
+        return volatility
+    
+    def _check_and_log_volatility(self, track_id: int):
+        """Check track volatility and log if threshold exceeded."""
+        if not self.enable_volatility_logging:
+            return
+        
+        volatility = self._calculate_track_volatility(track_id)
+        
+        if volatility is None:
+            return
+        
+        if volatility > self.track_volatility_threshold:
+            label_history = self._track_label_history[track_id]
+            label_changes = sum(1 for i in range(1, len(label_history)) 
+                              if label_history[i][0] != label_history[i-1][0])
+            
+            structured_logger.label_volatility_flag(
+                track_id=track_id,
+                label_changes=label_changes,
+                lifespan=len(label_history),
+                volatility_score=volatility,
+                label_history=[(label, round(conf, 3)) for label, conf in label_history]
+            )
+            
+            logger.warning(
+                f"[ClassifierService] High volatility detected for track {track_id}: "
+                f"volatility={volatility:.3f}, changes={label_changes}/{len(label_history)}"
+            )
 
     def _compute_sharpness_weight(self, sharpness: float) -> float:
         """
@@ -544,6 +724,35 @@ class ClassifierService:
                         f"{final_label}({final_conf:.2f}), reason={smooth_reason}"
                     )
             
+            # Step 3.6: Check for label reuse (V6 Production-grade stability heuristics)
+            # Only apply to non-Unknown classifications with low confidence
+            if final_label != "Unknown":
+                reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
+                    track_id, final_label, final_conf, evidence
+                )
+                
+                # Update if label reuse changed the result
+                if reuse_label != final_label:
+                    metadata["label_reuse_applied"] = True
+                    metadata["pre_reuse_label"] = final_label
+                    metadata["pre_reuse_confidence"] = final_conf
+                    metadata["reuse_reason"] = reuse_reason
+                    
+                    final_label = reuse_label
+                    final_conf = reuse_conf
+                    
+                    logger.info(
+                        f"[ClassifierService] Track {track_id}: Label reuse changed result: "
+                        f"{metadata['pre_reuse_label']}({metadata['pre_reuse_confidence']:.2f}) -> "
+                        f"{final_label}({final_conf:.2f}), reason={reuse_reason}"
+                    )
+            
+            # Step 3.7: Track label history for volatility analysis (V6)
+            self._track_label_history[track_id].append((final_label, final_conf))
+            
+            # Step 3.8: Check and log track volatility (V6)
+            self._check_and_log_volatility(track_id)
+            
             # Step 4: Select best representative ROI
             if final_label != "Unknown":
                 best_roi = self._select_best_representative(evidence, final_label)
@@ -734,8 +943,21 @@ class ClassifierService:
         Get classification statistics for monitoring.
         
         Returns:
-            Dictionary with classification statistics
+            Dictionary with classification statistics including stability heuristics
         """
+        # Calculate volatility statistics across all tracks
+        volatility_scores = []
+        high_volatility_count = 0
+        
+        for track_id, label_history in self._track_label_history.items():
+            volatility = self._calculate_track_volatility(track_id)
+            if volatility is not None:
+                volatility_scores.append(volatility)
+                if volatility > self.track_volatility_threshold:
+                    high_volatility_count += 1
+        
+        avg_volatility = sum(volatility_scores) / len(volatility_scores) if volatility_scores else 0
+        
         return {
             "total_classified": self._total_classified,
             "unknown_structural": self._unknown_structural,
@@ -744,4 +966,16 @@ class ClassifierService:
             "successful": self._total_classified - (
                 self._unknown_structural + self._unknown_low_evidence + self._unknown_ambiguous
             ),
+            # V6: Stability heuristics
+            "stability_heuristics": {
+                "enable_label_reuse": self.enable_label_reuse,
+                "low_conf_threshold": self.low_conf_threshold,
+                "streak_min_length": self.streak_min_length,
+                "burst_dominance_min_ratio": self.burst_dominance_min_ratio,
+                "burst_window_size": self.burst_window_size,
+                "track_volatility_threshold": self.track_volatility_threshold,
+                "tracks_analyzed": len(self._track_label_history),
+                "avg_volatility": avg_volatility,
+                "high_volatility_tracks": high_volatility_count,
+            },
         }
