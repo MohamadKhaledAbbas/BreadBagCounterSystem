@@ -18,8 +18,39 @@ V5 Event-Centric Tracking Notes:
 
 from dataclasses import dataclass
 from typing import Optional
+import os
 
 from src.utils.platform import IS_WINDOWS
+
+
+def _parse_bool_env(env_var: str, default: bool) -> bool:
+    """Parse boolean from environment variable."""
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    return value.lower() in ('true', '1', 'yes', 'on')
+
+
+def _parse_float_env(env_var: str, default: float) -> float:
+    """Parse float from environment variable."""
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_int_env(env_var: str, default: int) -> int:
+    """Parse int from environment variable."""
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 
 @dataclass
@@ -313,6 +344,130 @@ class TrackingConfig:
     Prevents one very confident ROI from overwhelming all other evidence.
     
     Default: 0.6
+    """
+    
+    # ============================================================================
+    # Classification Stability Heuristics (Production-Grade)
+    # ============================================================================
+    
+    enable_label_reuse: bool = _parse_bool_env("ENABLE_LABEL_REUSE", False)
+    """
+    Enable previous-label reuse when confidence is low but evidence is strong.
+    
+    When True: Allows reusing previous track classification if current confidence
+               is below LOW_CONF_THRESHOLD but there's strong historical evidence
+               (streak length >= STREAK_MIN, burst dominance, etc.)
+    When False: Always use current classification (default safe behavior)
+    
+    Feature-flagged for safe rollout. Can also be controlled via environment:
+        ENABLE_LABEL_REUSE=true
+    
+    Default: False (disabled for safety, opt-in only)
+    """
+    
+    low_conf_threshold: float = _parse_float_env("LOW_CONF_THRESHOLD", 0.65)
+    """
+    Confidence threshold below which previous-label reuse is considered.
+    
+    Range: 0.5 - 0.8
+    
+    Rationale: Classifications with confidence < 0.65 are considered "uncertain"
+    and may benefit from historical context. This threshold is set below the
+    high_confidence_threshold (0.7) but high enough to avoid reusing labels for
+    very low-confidence predictions that should be marked as Unknown.
+    
+    Tuning: 
+    - Lower values (0.5-0.6): More aggressive reuse, may mask genuine label changes
+    - Higher values (0.7-0.8): Conservative reuse, only for borderline cases
+    
+    Environment: LOW_CONF_THRESHOLD=0.65
+    
+    Default: 0.65 (between low and high confidence tiers)
+    """
+    
+    streak_min_length: int = _parse_int_env("STREAK_MIN_LENGTH", 3)
+    """
+    Minimum streak length required to allow previous-label reuse.
+    
+    Range: 2 - 10
+    
+    Rationale: A streak indicates consistent classification over multiple bags,
+    suggesting the previous label is reliable. Minimum of 3 ensures we're not
+    reusing labels from single-bag noise or isolated classifications.
+    
+    Tuning:
+    - Lower values (2-3): More responsive to short-term patterns
+    - Higher values (5-10): Only trust very stable long-term patterns
+    
+    Default: 3 (requires at least 3 consecutive bags of same type)
+    """
+    
+    burst_dominance_min_ratio: float = _parse_float_env("BURST_DOMINANCE_MIN_RATIO", 0.75)
+    """
+    Minimum ratio of dominant label in recent burst for reuse validation.
+    
+    Range: 0.6 - 0.9
+    
+    Rationale: If analyzing a recent time window (e.g., last minute), the dominant
+    label must represent at least 75% of classifications to be considered a valid
+    "burst pattern". This guards against reusing labels in mixed-variety scenarios.
+    
+    Tuning:
+    - Lower values (0.6-0.7): Allow reuse in more diverse scenarios
+    - Higher values (0.8-0.9): Only allow reuse in very homogeneous bursts
+    
+    This is checked along with streak length to ensure both sequential and
+    temporal consistency before reusing a previous label.
+    
+    Environment: BURST_DOMINANCE_MIN_RATIO=0.75
+    
+    Default: 0.75 (75% majority required)
+    """
+    
+    burst_window_size: int = _parse_int_env("BURST_WINDOW_SIZE", 10)
+    """
+    Number of recent classifications to analyze for burst dominance.
+    
+    Range: 5 - 20
+    
+    Defines the sliding window for burst dominance calculation. A larger window
+    provides more stable burst detection but is less responsive to variety changes.
+    
+    Default: 10 (last 10 classifications)
+    """
+    
+    track_volatility_threshold: float = _parse_float_env("TRACK_VOLATILITY_THRESHOLD", 0.3)
+    """
+    Label change rate above which a track is flagged as high-volatility.
+    
+    Range: 0.2 - 0.5
+    
+    Volatility = (number of label changes) / (track lifespan in bags)
+    
+    Rationale: A volatility score > 0.3 means the label changed more than once
+    every 3 bags, indicating classification instability. Such tracks should be
+    flagged for review as they may indicate:
+    - Poor model quality
+    - Ambiguous bag types
+    - Incorrect label reuse
+    
+    Tuning:
+    - Lower values (0.2): Flag more tracks, stricter stability requirement
+    - Higher values (0.4-0.5): Only flag very unstable tracks
+    
+    Environment: TRACK_VOLATILITY_THRESHOLD=0.3
+    
+    Default: 0.3 (one change per 3 bags)
+    """
+    
+    enable_volatility_logging: bool = _parse_bool_env("ENABLE_VOLATILITY_LOGGING", True)
+    """
+    Enable structured logging for high-volatility tracks.
+    
+    When True: Emits structured logs for tracks exceeding volatility threshold
+    When False: Only calculates volatility, no logging
+    
+    Default: True (enable for production monitoring)
     """
 
     # ============================================================================
