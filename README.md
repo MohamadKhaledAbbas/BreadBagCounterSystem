@@ -50,11 +50,11 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 
 ## Documentation
 
-- **[AUDIT_REPORT.md](AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
-- **[LOGGING_REFACTOR_SUMMARY.md](LOGGING_REFACTOR_SUMMARY.md)**: Logging architecture overview
-- **[LOGGING_SAMPLES.md](LOGGING_SAMPLES.md)**: Log format reference and debugging guide
-- **[EVENT_CENTRIC_TRACKING_ARCHITECTURE.md](EVENT_CENTRIC_TRACKING_ARCHITECTURE.md)**: Event tracking design
-- **[PLATFORM_COMPATIBILITY.md](PLATFORM_COMPATIBILITY.md)**: Platform support information
+- **[AUDIT_REPORT.md](docs/AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
+- **[LOGGING_REFACTOR_SUMMARY.md](docs/LOGGING_REFACTOR_SUMMARY.md)**: Logging architecture overview
+- **[LOGGING_SAMPLES.md](docs/LOGGING_SAMPLES.md)**: Log format reference and debugging guide
+- **[EVENT_CENTRIC_TRACKING_ARCHITECTURE.md](docs/EVENT_CENTRIC_TRACKING_ARCHITECTURE.md)**: Event tracking design
+- **[PLATFORM_COMPATIBILITY.md](docs/PLATFORM_COMPATIBILITY.md)**: Platform support information
 - **[docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md)**: Log analyzer tool documentation
 - **[docs/STRUCTURED_LOGGING_SCHEMA.md](docs/STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
 

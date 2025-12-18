@@ -374,9 +374,9 @@ foreach ($date in $dates) {
 
 ## Related Documentation
 
-- [LOGGING_SAMPLES.md](../LOGGING_SAMPLES.md) - Log format reference and examples
-- [LOGGING_REFACTOR_SUMMARY.md](../LOGGING_REFACTOR_SUMMARY.md) - Logging architecture overview
-- [AUDIT_REPORT.md](../AUDIT_REPORT.md) - System architecture and metrics
+- [LOGGING_SAMPLES.md](LOGGING_SAMPLES.md) - Log format reference and examples
+- [LOGGING_REFACTOR_SUMMARY.md](LOGGING_REFACTOR_SUMMARY.md) - Logging architecture overview
+- [AUDIT_REPORT.md](AUDIT_REPORT.md) - System architecture and metrics
 
 ## Support
 
