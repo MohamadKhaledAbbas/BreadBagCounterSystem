@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import glob
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
@@ -108,16 +109,181 @@ def discover_log_files(log_dir: str) -> List[str]:
 
 
 def parse_log_line(line: str) -> Optional[Dict[str, Any]]:
-    """Parse a single JSON log line."""
+    """Parse a single log line (JSON or text format)."""
     line = line.strip()
     if not line:
         return None
 
+    # Try JSON first
     try:
         entry = json.loads(line)
         return entry
     except json.JSONDecodeError:
+        pass
+    
+    # Fall back to regex parsing for text format logs
+    return parse_text_log_line(line)
+
+
+def parse_text_log_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parse text format log line using regex patterns."""
+    # Pattern: 2025-12-18 07:55:39.043 | INFO | BreadCounter | [MESSAGE] ...
+    log_pattern = r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*(.+)$'
+    match = re.match(log_pattern, line)
+    
+    if not match:
         return None
+    
+    timestamp_str, level, logger, message = match.groups()
+    
+    # Convert timestamp to ISO format
+    try:
+        dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
+        dt = dt.replace(tzinfo=timezone.utc)
+        timestamp_iso = dt.isoformat()
+    except ValueError:
+        return None
+    
+    # Extract data fields from message using patterns
+    data = {}
+    component = "Unknown"
+    
+    # Extract frame data: [FRAME] id=22740, detect=50.1ms, monitor=1.1ms, total=52.3ms, dets=5, ready=0
+    if "[FRAME]" in message:
+        component = "BagCounterApp"
+        frame_pattern = r'id=(\d+).*?detect=([\d.]+)ms.*?monitor=([\d.]+)ms.*?total=([\d.]+)ms.*?dets=(\d+).*?ready=(\d+)'
+        m = re.search(frame_pattern, message)
+        if m:
+            data = {
+                "frame_id": int(m.group(1)),
+                "detection_time_ms": float(m.group(2)),
+                "monitor_time_ms": float(m.group(3)),
+                "total_time_ms": float(m.group(4)),
+                "detections_count": int(m.group(5)),
+                "events_ready": int(m.group(6))
+            }
+    
+    # Extract event created: [EVENT_CREATED] id=3390011057, conf=0.418, frame=22731
+    elif "[EVENT_CREATED]" in message:
+        component = "EventCentricTracker"
+        event_pattern = r'id=(\d+).*?conf=([\d.]+).*?frame=(\d+)'
+        m = re.search(event_pattern, message)
+        if m:
+            data = {
+                "event_id": int(m.group(1)),
+                "confidence": float(m.group(2)),
+                "frame_id": int(m.group(3))
+            }
+    
+    # Extract event expired: [EVENT_EXPIRED] id=3390011057, state=OPEN, frames=1, open_hits=1, closed_hits=0, idle=40
+    elif "[EVENT_EXPIRED]" in message:
+        component = "EventCentricTracker"
+        exp_pattern = r'id=(\d+).*?state=(\w+).*?frames=(\d+).*?open_hits=(\d+).*?closed_hits=(\d+).*?idle=(\d+)'
+        m = re.search(exp_pattern, message)
+        if m:
+            data = {
+                "event_id": int(m.group(1)),
+                "state": m.group(2),
+                "frames_tracked": int(m.group(3)),
+                "open_hits": int(m.group(4)),
+                "closed_hits": int(m.group(5)),
+                "idle_frames": int(m.group(6))
+            }
+    
+    # Extract forced close: [EVENT_FORCED_CLOSE]
+    elif "[EVENT_FORCED_CLOSE]" in message:
+        component = "EventCentricTracker"
+        forced_pattern = r'id=(\d+).*?state=(\w+).*?reason=([\w_]+)'
+        m = re.search(forced_pattern, message)
+        if m:
+            data = {
+                "event_id": int(m.group(1)),
+                "state": m.group(2),
+                "forced_close_reason": m.group(3)
+            }
+    
+    # Extract classification: [CLASSIFICATION]
+    elif "[CLASSIFICATION]" in message or "CLASSIFICATION" in message:
+        component = "ClassifierService"
+        # Pattern varies, extract what we can
+        conf_pattern = r'conf(?:idence)?[=:]?\s*([\d.]+)'
+        label_pattern = r'label[=:]?\s*(\w+)'
+        m_conf = re.search(conf_pattern, message)
+        m_label = re.search(label_pattern, message)
+        if m_conf:
+            data["confidence"] = float(m_conf.group(1))
+        if m_label:
+            data["label"] = m_label.group(1)
+    
+    # Extract count update: [COUNT_UPDATE]
+    elif "[COUNT_UPDATE]" in message:
+        component = "BagCounterApp"
+        count_pattern = r'track[_-]?id[=:]?\s*(\d+)'
+        bag_pattern = r'bag[_-]?type[=:]?\s*(\w+)'
+        m_track = re.search(count_pattern, message)
+        m_bag = re.search(bag_pattern, message)
+        if m_track:
+            data["track_id"] = int(m_track.group(1))
+        if m_bag:
+            data["bag_type"] = m_bag.group(1)
+    
+    # Extract queue stats: [QueueStats]
+    elif "[QueueStats]" in message:
+        component = "BagCounterApp"
+        queue_pattern = r'Input:\s*(\d+)/(\d+).*?drops=(\d+).*?Classification:\s*(\d+)/(\d+).*?drops=(\d+)'
+        m = re.search(queue_pattern, message)
+        if m:
+            data = {
+                "input_queue_size": int(m.group(1)),
+                "input_queue_capacity": int(m.group(2)),
+                "input_drops": int(m.group(3)),
+                "classification_queue_size": int(m.group(4)),
+                "classification_queue_capacity": int(m.group(5)),
+                "classification_drops": int(m.group(6))
+            }
+    
+    # Extract KPI alerts: [PipelineMetrics]
+    elif "[PipelineMetrics]" in message:
+        component = "PipelineMetrics"
+        # Extract various metrics from the summary
+    
+    # Extract ROI added: [ROI_ADDED]
+    elif "[ROI_ADDED]" in message:
+        component = "EventCentricTracker"
+        sharp_pattern = r'sharpness[=:]?\s*([\d.]+)'
+        m = re.search(sharp_pattern, message)
+        if m:
+            data["sharpness"] = float(m.group(1))
+    
+    # Extract ROI rejected: [ROI_REJECTED]
+    elif "[ROI_REJECTED]" in message:
+        component = "EventCentricTracker"
+        reason_pattern = r'reason[=:]?\s*(\w+)'
+        m = re.search(reason_pattern, message)
+        if m:
+            data["reason"] = m.group(1)
+    
+    # Extract state transition: [STATE_TRANSITION]
+    elif "[STATE_TRANSITION]" in message:
+        component = "BagStateMonitor"
+        trans_pattern = r'id=(\d+).*?(\w+)\s*->\s*(\w+).*?trigger=([^,\(]+)'
+        m = re.search(trans_pattern, message)
+        if m:
+            data = {
+                "event_id": int(m.group(1)),
+                "old_state": m.group(2),
+                "new_state": m.group(3),
+                "trigger": m.group(4).strip()
+            }
+    
+    return {
+        "timestamp": timestamp_iso,
+        "level": level,
+        "logger": logger,
+        "message": message,
+        "component": component,
+        "data": data
+    }
 
 
 def parse_timestamp(ts_str: str) -> Optional[datetime]:
@@ -243,6 +409,28 @@ class LogAnalyzer:
         self.candidates_count = []
         self.voting_used_count = 0
         self.classification_times_ms = []
+        
+        # Enhanced classification reliability tracking
+        self.per_label_confidences = defaultdict(list)  # label -> [confidence values]
+        self.per_label_counts = Counter()  # label -> count
+        self.low_confidence_by_label = Counter()  # label -> count (conf < 0.7)
+        self.confusion_pairs = Counter()  # (prev_label, new_label) -> count
+        self.track_label_history = defaultdict(list)  # track_id -> [(frame, label, conf)]
+        
+        # Streak tracking and burst anomaly detection
+        self.classification_streaks = []  # [(label, start_frame, end_frame, count, min_conf)]
+        self.current_streak = None  # (label, start_frame, count, confidences)
+        self.burst_anomalies = []  # low-confidence flips on long streaks
+        
+        # Minute-level dominant label analysis
+        self.minute_label_distribution = defaultdict(Counter)  # minute_key -> {label: count}
+        
+        # Forced closes and lifecycle details
+        self.forced_close_count = 0
+        self.forced_close_reasons = Counter()
+        self.idle_commit_count = 0
+        self.detection_gap_closures = []
+        self.expiry_details = []  # detailed expiry info
 
         # ROI statistics
         self.roi_added_count = 0
@@ -333,6 +521,12 @@ class LogAnalyzer:
 
             if minute_key:
                 self.time_buckets[minute_key]["backpressure_drops"] += drops
+        
+        # Queue stats (extract drops from QueueStats message)
+        if "QueueStats" in message or "[QueueStats]" in message:
+            input_drops = data.get("input_drops", 0)
+            class_drops = data.get("classification_drops", 0)
+            self.total_drops += (input_drops + class_drops)
 
         # Frame performance
         if "FRAME" in message:
@@ -379,8 +573,37 @@ class LogAnalyzer:
             frames_tracked = data.get("frames_tracked")
             if frames_tracked:
                 self.event_lifetimes_frames.append(frames_tracked)
+            # Detailed expiry tracking
+            self.expiry_details.append({
+                "event_id": data.get("event_id"),
+                "state": state,
+                "frames_tracked": frames_tracked,
+                "reason": data.get("expiration_reason", "unknown")
+            })
             if minute_key:
                 self.time_buckets[minute_key]["event_expired"] += 1
+        
+        # Forced close tracking
+        if "EVENT_FORCED_CLOSE" in message or "FORCED_CLOSE" in message:
+            self.forced_close_count += 1
+            reason = data.get("forced_close_reason", data.get("reason", "unknown"))
+            self.forced_close_reasons[reason] += 1
+        
+        # Idle commit tracking (from "idle threshold" or similar messages)
+        if "idle" in message.lower() and "commit" in message.lower():
+            self.idle_commit_count += 1
+        
+        # Detection gap closure
+        if "Detection gap closed" in message or "gap closed" in message.lower():
+            gap_ms = data.get("gap_ms")
+            if gap_ms is None:
+                # Try to extract from message
+                gap_pattern = r'([\d.]+)\s*ms'
+                m = re.search(gap_pattern, message)
+                if m:
+                    gap_ms = float(m.group(1))
+            if gap_ms:
+                self.detection_gap_closures.append(gap_ms)
 
         if "EVENT_SUPPRESSED" in message:
             self.event_suppressed_count += 1
@@ -436,6 +659,8 @@ class LogAnalyzer:
             candidates = data.get("candidates")
             used_voting = data.get("used_voting")
             processing_time = data.get("processing_time_ms")
+            track_id = data.get("track_id")
+            frame_id = data.get("frame_id")
 
             if label == "Unknown":
                 self.unknown_count += 1
@@ -446,6 +671,57 @@ class LogAnalyzer:
 
             if confidence is not None:
                 self.confidence_values.append(confidence)
+                
+                # Per-label confidence tracking
+                if label:
+                    self.per_label_confidences[label].append(confidence)
+                    self.per_label_counts[label] += 1
+                    
+                    # Low-confidence tracking (threshold: 0.7)
+                    if confidence < 0.7:
+                        self.low_confidence_by_label[label] += 1
+                    
+                    # Track label history for confusion pairs
+                    if track_id:
+                        history = self.track_label_history[track_id]
+                        if history:
+                            prev_label = history[-1][1]
+                            if prev_label != label:
+                                self.confusion_pairs[(prev_label, label)] += 1
+                        history.append((frame_id or 0, label, confidence))
+                    
+                    # Streak tracking
+                    if self.current_streak and self.current_streak[0] == label:
+                        # Continue current streak
+                        self.current_streak = (
+                            label,
+                            self.current_streak[1],  # start_frame
+                            self.current_streak[2] + 1,  # count
+                            self.current_streak[3] + [confidence]  # confidences
+                        )
+                    else:
+                        # End current streak and start new one
+                        if self.current_streak:
+                            label_s, start_f, count, confs = self.current_streak
+                            min_conf = min(confs) if confs else 0
+                            end_f = frame_id or start_f + count
+                            self.classification_streaks.append((label_s, start_f, end_f, count, min_conf))
+                            
+                            # Detect burst anomaly: long streak with low-confidence flip
+                            if count >= 10 and min_conf < 0.7:
+                                self.burst_anomalies.append({
+                                    "label": label_s,
+                                    "start_frame": start_f,
+                                    "end_frame": end_f,
+                                    "count": count,
+                                    "min_confidence": min_conf
+                                })
+                        
+                        self.current_streak = (label, frame_id or 0, 1, [confidence])
+                    
+                    # Minute-level label distribution
+                    if minute_key:
+                        self.minute_label_distribution[minute_key][label] += 1
             
             if candidates is not None:
                 self.candidates_count.append(candidates)
@@ -557,6 +833,37 @@ class LogAnalyzer:
                 "voting_used_count": self.voting_used_count,
                 "voting_rate": self.voting_used_count / self.classification_count if self.classification_count > 0 else 0,
                 "avg_processing_time_ms": statistics.mean(self.classification_times_ms) if self.classification_times_ms else 0,
+                # Enhanced reliability metrics
+                "per_label_stats": self._compute_per_label_stats(),
+                "low_confidence_rate_by_label": {
+                    label: self.low_confidence_by_label[label] / self.per_label_counts[label]
+                    for label in self.per_label_counts.keys()
+                },
+                "confusion_pairs": dict(self.confusion_pairs.most_common(20)),
+                "top_label_flips": [(f"{l1}→{l2}", count) for (l1, l2), count in self.confusion_pairs.most_common(10)],
+            },
+            "streak_analysis": {
+                "total_streaks": len(self.classification_streaks),
+                "burst_anomalies": self.burst_anomalies,
+                "avg_streak_length": statistics.mean([s[3] for s in self.classification_streaks]) if self.classification_streaks else 0,
+                "longest_streak": max([s[3] for s in self.classification_streaks], default=0),
+            },
+            "minute_level_analysis": self._analyze_minute_level_labels(),
+            "lifecycle_details": {
+                "forced_closes": {
+                    "total": self.forced_close_count,
+                    "by_reason": dict(self.forced_close_reasons),
+                },
+                "idle_commits": self.idle_commit_count,
+                "detection_gap_closures": {
+                    "total": len(self.detection_gap_closures),
+                    "avg_gap_ms": statistics.mean(self.detection_gap_closures) if self.detection_gap_closures else 0,
+                    "max_gap_ms": max(self.detection_gap_closures) if self.detection_gap_closures else 0,
+                },
+                "expiry_details": {
+                    "total": len(self.expiry_details),
+                    "by_state": Counter([e["state"] for e in self.expiry_details]),
+                },
             },
             "roi": {
                 "total_added": self.roi_added_count,
@@ -568,6 +875,7 @@ class LogAnalyzer:
                 "avg_rois_per_event": statistics.mean(self.roi_per_event) if self.roi_per_event else 0,
             },
             "time_series": self._compute_time_series(),
+            "risk_heuristics": self._compute_risk_heuristics(),
             "issues": self._detect_issues()
         }
 
@@ -604,6 +912,146 @@ class LogAnalyzer:
         """Find items that appear more than once and return (item, count) pairs."""
         counts = Counter(items)
         return [(item, count) for item, count in counts.items() if count > 1]
+    
+    def _compute_per_label_stats(self) -> Dict[str, Dict[str, float]]:
+        """Compute per-label confidence statistics."""
+        stats = {}
+        for label, confidences in self.per_label_confidences.items():
+            if confidences:
+                stats[label] = {
+                    "count": len(confidences),
+                    "avg_confidence": statistics.mean(confidences),
+                    "min_confidence": min(confidences),
+                    "max_confidence": max(confidences),
+                    "p50_confidence": sorted(confidences)[len(confidences) // 2],
+                }
+        return stats
+    
+    def _analyze_minute_level_labels(self) -> Dict[str, Any]:
+        """Analyze minute-level label distributions to detect out-of-pattern labels."""
+        analysis = {
+            "total_minutes": len(self.minute_label_distribution),
+            "dominant_label_per_minute": {},
+            "out_of_pattern_labels": [],
+        }
+        
+        # Compute dominant label per minute
+        for minute_key, label_counts in self.minute_label_distribution.items():
+            if label_counts:
+                dominant_label = label_counts.most_common(1)[0]
+                analysis["dominant_label_per_minute"][minute_key] = {
+                    "label": dominant_label[0],
+                    "count": dominant_label[1],
+                    "total": sum(label_counts.values()),
+                    "percentage": dominant_label[1] / sum(label_counts.values()) * 100
+                }
+        
+        # Detect out-of-pattern: if we see a different label in a minute where one label dominates
+        # (e.g., in single-variant runs)
+        for minute_key, label_counts in self.minute_label_distribution.items():
+            total = sum(label_counts.values())
+            if total > 5:  # Only consider minutes with enough samples
+                dominant = label_counts.most_common(1)[0]
+                if dominant[1] / total > 0.9:  # If one label is >90% dominant
+                    # Check for outlier labels
+                    for label, count in label_counts.items():
+                        if label != dominant[0] and count > 0:
+                            analysis["out_of_pattern_labels"].append({
+                                "minute": minute_key,
+                                "dominant_label": dominant[0],
+                                "dominant_count": dominant[1],
+                                "outlier_label": label,
+                                "outlier_count": count,
+                            })
+        
+        return analysis
+    
+    def _compute_risk_heuristics(self) -> Dict[str, Any]:
+        """Compute risk heuristics for undercount and overcount."""
+        undercount_risk = 0
+        overcount_risk = 0
+        risk_factors = []
+        
+        # Undercount risk factors
+        total_potential_events = self.event_created_count + sum(self.event_creation_blockers.values())
+        if total_potential_events > 0:
+            suppression_rate = sum([
+                self.event_creation_blockers.get("suppression_spatial", 0),
+                self.event_creation_blockers.get("suppression_temporal", 0)
+            ]) / total_potential_events
+            
+            if suppression_rate > 0.10:
+                undercount_risk += 30
+                risk_factors.append(f"High suppression rate: {suppression_rate:.1%}")
+        
+        # High expiry rate (events not committed)
+        if self.event_created_count > 0:
+            expiry_rate = self.event_expired_count / self.event_created_count
+            if expiry_rate > 0.10:
+                undercount_risk += 20
+                risk_factors.append(f"High expiry rate: {expiry_rate:.1%}")
+        
+        # Queue drops (missed frames)
+        if self.total_drops > 0:
+            undercount_risk += min(30, self.total_drops)
+            risk_factors.append(f"Frame drops: {self.total_drops}")
+        
+        # Forced closes (potential missed counts)
+        if self.forced_close_count > 0:
+            undercount_risk += min(20, self.forced_close_count * 2)
+            risk_factors.append(f"Forced closes: {self.forced_close_count}")
+        
+        # Overcount risk factors
+        
+        # Duplicate track IDs
+        duplicate_tracks = self._find_duplicates(self.count_update_track_ids)
+        if duplicate_tracks:
+            overcount_risk += min(30, len(duplicate_tracks) * 5)
+            risk_factors.append(f"Duplicate track IDs: {len(duplicate_tracks)}")
+        
+        # Duplicate phashes
+        duplicate_phashes = self._find_duplicates(self.count_update_phashes)
+        if duplicate_phashes:
+            overcount_risk += min(20, len(duplicate_phashes) * 3)
+            risk_factors.append(f"Duplicate phashes: {len(duplicate_phashes)}")
+        
+        # Low average event lifetime (possible double-counting)
+        avg_lifetime_frames = statistics.mean(self.event_lifetimes_frames) if self.event_lifetimes_frames else 0
+        if avg_lifetime_frames > 0 and avg_lifetime_frames < 10:
+            overcount_risk += 15
+            risk_factors.append(f"Very short avg event lifetime: {avg_lifetime_frames:.1f} frames")
+        
+        # High classification unknown rate (misclassification risk)
+        if self.classification_count > 0:
+            unknown_rate = self.unknown_count / self.classification_count
+            if unknown_rate > 0.15:
+                # This affects both under and over count
+                undercount_risk += 10
+                overcount_risk += 10
+                risk_factors.append(f"High unknown classification rate: {unknown_rate:.1%}")
+        
+        # Confusion pairs (label flips indicate instability)
+        if len(self.confusion_pairs) > 10:
+            overcount_risk += 10
+            undercount_risk += 5
+            risk_factors.append(f"High label confusion: {len(self.confusion_pairs)} flip patterns")
+        
+        return {
+            "undercount_risk_score": min(100, undercount_risk),
+            "overcount_risk_score": min(100, overcount_risk),
+            "risk_factors": risk_factors,
+            "risk_level": self._assess_risk_level(undercount_risk, overcount_risk),
+        }
+    
+    def _assess_risk_level(self, undercount_risk: int, overcount_risk: int) -> str:
+        """Assess overall risk level based on scores."""
+        max_risk = max(undercount_risk, overcount_risk)
+        if max_risk >= 50:
+            return "HIGH"
+        elif max_risk >= 25:
+            return "MEDIUM"
+        else:
+            return "LOW"
 
     def _compute_time_series(self) -> List[Dict[str, Any]]:
         """Convert time bucket data to sorted time series."""
@@ -716,6 +1164,49 @@ class LogAnalyzer:
                     "likely_cause": "System overload, slow detection model, or hardware limitations",
                     "where_to_look": "Check backpressure events, frame processing times, and queue utilization"
                 })
+        
+        # Forced closes
+        if self.forced_close_count > 0:
+            issues.append({
+                "severity": "warning",
+                "title": "Forced Event Closes Detected",
+                "description": f"Total forced closes: {self.forced_close_count}",
+                "likely_cause": "Events stuck in CLOSED state exceeding max duration",
+                "where_to_look": f"Review forced_close_reasons: {dict(self.forced_close_reasons)}. Check max_closed_state_frames threshold.",
+                "recommendation": {
+                    "forced_close_reasons": dict(self.forced_close_reasons),
+                    "note": "Forced closes may indicate premature commits or missed transitions"
+                }
+            })
+        
+        # Burst anomalies (low-confidence flips on long streaks)
+        if self.burst_anomalies:
+            issues.append({
+                "severity": "warning",
+                "title": "Burst Anomalies Detected",
+                "description": f"Found {len(self.burst_anomalies)} classification streaks with low-confidence flips",
+                "likely_cause": "Inconsistent classification on similar bags or poor model quality",
+                "where_to_look": f"Review burst_anomalies in report. Top affected label: {self.burst_anomalies[0]['label'] if self.burst_anomalies else 'N/A'}",
+                "recommendation": {
+                    "burst_count": len(self.burst_anomalies),
+                    "note": "Long streaks with low confidence suggest model instability"
+                }
+            })
+        
+        # High confusion (label flips)
+        if len(self.confusion_pairs) > 10:
+            top_confusion = self.confusion_pairs.most_common(3)
+            issues.append({
+                "severity": "warning",
+                "title": "High Label Confusion",
+                "description": f"Detected {len(self.confusion_pairs)} distinct label flip patterns",
+                "likely_cause": "Model struggling to distinguish between certain bag types",
+                "where_to_look": f"Top confusion pairs: {[(f'{l1}→{l2}', c) for (l1, l2), c in top_confusion]}",
+                "recommendation": {
+                    "top_confusion_pairs": [(f"{l1}→{l2}", c) for (l1, l2), c in top_confusion],
+                    "note": "Consider retraining model with more diverse samples for confused classes"
+                }
+            })
 
         return issues
 
@@ -1135,6 +1626,114 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
             </tr>
             {''.join([f"<tr><td>{bag_type}</td><td>{count}</td></tr>" for bag_type, count in sorted(stats['counting']['bag_type_distribution'].items(), key=lambda x: x[1], reverse=True)])}
         </table>
+
+        <h3>📊 Per-Label Confidence Statistics</h3>
+        <table>
+            <tr>
+                <th>Label</th>
+                <th>Count</th>
+                <th>Avg Confidence</th>
+                <th>Min Confidence</th>
+                <th>Low-Conf Rate (&lt;0.7)</th>
+            </tr>
+            {''.join([f"<tr><td>{label}</td><td>{label_stats['count']}</td><td>{label_stats['avg_confidence']:.3f}</td><td>{label_stats['min_confidence']:.3f}</td><td>{stats['classification']['low_confidence_rate_by_label'].get(label, 0):.1%}</td></tr>" for label, label_stats in stats['classification']['per_label_stats'].items()])}
+        </table>
+
+        <h3>🔄 Top Label Confusion Pairs</h3>
+        <table>
+            <tr>
+                <th>Transition</th>
+                <th>Count</th>
+            </tr>
+            {''.join([f"<tr><td>{flip}</td><td>{count}</td></tr>" for flip, count in stats['classification']['top_label_flips']])}
+        </table>
+
+        <h2>📈 Streak Analysis & Burst Anomalies</h2>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Classification Streaks</td>
+                <td>{stats['streak_analysis']['total_streaks']}</td>
+            </tr>
+            <tr>
+                <td>Average Streak Length</td>
+                <td>{stats['streak_analysis']['avg_streak_length']:.1f}</td>
+            </tr>
+            <tr>
+                <td>Longest Streak</td>
+                <td>{stats['streak_analysis']['longest_streak']}</td>
+            </tr>
+            <tr>
+                <td>Burst Anomalies Detected</td>
+                <td><strong>{len(stats['streak_analysis']['burst_anomalies'])}</strong></td>
+            </tr>
+        </table>
+
+        {'<h3>⚠️ Burst Anomaly Details</h3>' if stats['streak_analysis']['burst_anomalies'] else ''}
+        {'<table><tr><th>Label</th><th>Frames</th><th>Count</th><th>Min Confidence</th></tr>' + ''.join([f"<tr><td>{anom['label']}</td><td>{anom['start_frame']}-{anom['end_frame']}</td><td>{anom['count']}</td><td>{anom['min_confidence']:.3f}</td></tr>" for anom in stats['streak_analysis']['burst_anomalies'][:10]]) + '</table>' if stats['streak_analysis']['burst_anomalies'] else ''}
+
+        <h2>📊 Lifecycle Details</h2>
+        <h3>Forced Closes</h3>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Forced Closes</td>
+                <td>{stats['lifecycle_details']['forced_closes']['total']}</td>
+            </tr>
+            <tr>
+                <td>Idle Commits</td>
+                <td>{stats['lifecycle_details']['idle_commits']}</td>
+            </tr>
+        </table>
+
+        {'<h4>Forced Close Reasons</h4><table><tr><th>Reason</th><th>Count</th></tr>' + ''.join([f"<tr><td>{reason}</td><td>{count}</td></tr>" for reason, count in stats['lifecycle_details']['forced_closes']['by_reason'].items()]) + '</table>' if stats['lifecycle_details']['forced_closes']['by_reason'] else ''}
+
+        <h3>Detection Gap Closures</h3>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Gap Closures</td>
+                <td>{stats['lifecycle_details']['detection_gap_closures']['total']}</td>
+            </tr>
+            <tr>
+                <td>Average Gap Duration</td>
+                <td>{stats['lifecycle_details']['detection_gap_closures']['avg_gap_ms']:.1f} ms</td>
+            </tr>
+            <tr>
+                <td>Max Gap Duration</td>
+                <td>{stats['lifecycle_details']['detection_gap_closures']['max_gap_ms']:.1f} ms</td>
+            </tr>
+        </table>
+
+        <h2>⚠️ Risk Heuristics</h2>
+        <div class="summary-grid">
+            <div class="kpi-card {'error' if stats['risk_heuristics']['risk_level'] == 'HIGH' else 'warning' if stats['risk_heuristics']['risk_level'] == 'MEDIUM' else 'success'}">
+                <div class="kpi-label">Risk Level</div>
+                <div class="kpi-value">{stats['risk_heuristics']['risk_level']}</div>
+            </div>
+            <div class="kpi-card {'warning' if stats['risk_heuristics']['undercount_risk_score'] >= 25 else 'success'}">
+                <div class="kpi-label">Undercount Risk</div>
+                <div class="kpi-value">{stats['risk_heuristics']['undercount_risk_score']}/100</div>
+            </div>
+            <div class="kpi-card {'warning' if stats['risk_heuristics']['overcount_risk_score'] >= 25 else 'success'}">
+                <div class="kpi-label">Overcount Risk</div>
+                <div class="kpi-value">{stats['risk_heuristics']['overcount_risk_score']}/100</div>
+            </div>
+        </div>
+
+        <h3>Risk Factors</h3>
+        <ul>
+            {''.join([f"<li>{factor}</li>" for factor in stats['risk_heuristics']['risk_factors']])}
+        </ul>
 
         <h2>🚨 Issue Findings</h2>
         {'<p><strong>✅ No critical issues detected! </strong></p>' if not stats['issues'] else ''}
