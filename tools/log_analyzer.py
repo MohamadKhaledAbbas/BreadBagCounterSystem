@@ -918,7 +918,7 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
         <div class="summary-grid">
             <div class="kpi-card">
                 <div class="kpi-label">Total Log Entries</div>
-                <div class="kpi-value">{stats['parsing']['total_entries']: ,}</div>
+                <div class="kpi-value">{stats['parsing']['total_entries']:,}</div>
             </div>
             <div class="kpi-card {'error' if stats['errors']['total'] > 100 else 'warning' if stats['errors']['total'] > 10 else 'success'}">
                 <div class="kpi-label">Errors</div>
@@ -926,11 +926,11 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
             </div>
             <div class="kpi-card">
                 <div class="kpi-label">Bags Counted</div>
-                <div class="kpi-value">{stats['counting']['count_update']}</div>
+                <div class="kpi-value">{stats['counting']['total_bags_counted']}</div>
             </div>
-            <div class="kpi-card {'warning' if stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed'] + stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone'] > stats['counting']['count_update'] * 0.05 else 'success'}">
-                <div class="kpi-label">Suppressed Detections</div>
-                <div class="kpi-value">{stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed'] + stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone']}</div>
+            <div class="kpi-card {'warning' if stats['event_creation_blockers']['total_blocked'] > stats['events']['total_created'] * 0.05 else 'success'}">
+                <div class="kpi-label">Suppressed Events</div>
+                <div class="kpi-value">{stats['event_creation_blockers']['total_blocked']}</div>
             </div>
             <div class="kpi-card {'success' if stats['fps']['count'] > 0 and stats['fps']['avg'] >= 20 else 'warning'}">
                 <div class="kpi-label">Avg FPS</div>
@@ -940,83 +940,200 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
                 <div class="kpi-label">Unknown Rate</div>
                 <div class="kpi-value">{stats['classification']['unknown_rate']:.1%}</div>
             </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Events Created</div>
+                <div class="kpi-value">{stats['events']['total_created']}</div>
+            </div>
+            <div class="kpi-card success">
+                <div class="kpi-label">Events Committed</div>
+                <div class="kpi-value">{stats['events']['total_committed']}</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Avg Event Lifetime</div>
+                <div class="kpi-value">{stats['events']['avg_lifetime_seconds']:.1f}s</div>
+            </div>
         </div>
 
-        <h2>🚨 CRITICAL:  Event Suppression Analysis</h2>
+        <h2>⚙️ Frame-Based Threshold Configuration</h2>
+        <div class="kpi-card">
+            <p><strong>System uses frame-based thresholds for consistent behavior across different processing speeds.</strong></p>
+            <p>FPS: {stats['fps']['avg']:.1f} | Frame Duration: {1000.0/stats['fps']['avg'] if stats['fps']['avg'] > 0 else 0:.1f}ms</p>
+        </div>
+        <table>
+            <tr>
+                <th>Threshold</th>
+                <th>Default (frames)</th>
+                <th>Time @ {stats['fps']['avg']:.1f} FPS</th>
+            </tr>
+            <tr>
+                <td>Ghost Timeout</td>
+                <td>25 frames</td>
+                <td>{25 * 1000.0 / stats['fps']['avg'] if stats['fps']['avg'] > 0 else 0:.0f} ms (~1 second)</td>
+            </tr>
+            <tr>
+                <td>Temporal Cooldown</td>
+                <td>10 frames</td>
+                <td>{10 * 1000.0 / stats['fps']['avg'] if stats['fps']['avg'] > 0 else 0:.0f} ms (~400ms)</td>
+            </tr>
+            <tr>
+                <td>Suppression Duration</td>
+                <td>38 frames</td>
+                <td>{38 * 1000.0 / stats['fps']['avg'] if stats['fps']['avg'] > 0 else 0:.0f} ms (~1.5 seconds)</td>
+            </tr>
+        </table>
+
+        <h2>🚨 Event Suppression Analysis</h2>
         <table>
             <tr>
                 <th>Suppression Type</th>
                 <th>Count</th>
-                <th>% of Total Created</th>
+                <th>% of Total</th>
             </tr>
             <tr>
-                <td>Covered by Active Event (Normal)</td>
-                <td>{stats['event_creation_blockers']['counts']['covered_by_active_event_context']}</td>
-                <td>{stats['event_creation_blockers']['counts']['covered_by_active_event_context'] / stats['counting']['event_created'] * 100 if stats['counting']['event_created'] > 0 else 0:.1f}%</td>
+                <td>Covered by Active Event</td>
+                <td>{stats['event_creation_blockers']['by_reason'].get('covered_by_active_event', 0)}</td>
+                <td>{stats['event_creation_blockers']['by_reason'].get('covered_by_active_event', 0) / stats['events']['total_created'] * 100 if stats['events']['total_created'] > 0 else 0:.1f}%</td>
             </tr>
             <tr>
-                <td><strong>Suppression:  Too Close (Over-count prevention)</strong></td>
-                <td><strong>{stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed']}</strong></td>
-                <td><strong>{stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed'] / stats['counting']['event_created'] * 100 if stats['counting']['event_created'] > 0 else 0:.1f}%</strong></td>
+                <td><strong>Suppression: Spatial (Distance)</strong></td>
+                <td><strong>{stats['event_creation_blockers']['by_reason'].get('suppression_spatial', 0)}</strong></td>
+                <td><strong>{stats['event_creation_blockers']['by_reason'].get('suppression_spatial', 0) / stats['events']['total_created'] * 100 if stats['events']['total_created'] > 0 else 0:.1f}%</strong></td>
             </tr>
             <tr>
-                <td><strong>Suppression: Temporal Cooldown (POTENTIAL ISSUE)</strong></td>
-                <td><strong>{stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone']}</strong></td>
-                <td><strong>{stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone'] / stats['counting']['event_created'] * 100 if stats['counting']['event_created'] > 0 else 0:.1f}%</strong></td>
+                <td><strong>Suppression: Temporal (Cooldown)</strong></td>
+                <td><strong>{stats['event_creation_blockers']['by_reason'].get('suppression_temporal', 0)}</strong></td>
+                <td><strong>{stats['event_creation_blockers']['by_reason'].get('suppression_temporal', 0) / stats['events']['total_created'] * 100 if stats['events']['total_created'] > 0 else 0:.1f}%</strong></td>
             </tr>
             <tr>
-                <td>Skip Creation:  Covered by Active</td>
-                <td>{stats['event_creation_blockers']['counts']['skip_creation_covered_by_active_event']}</td>
-                <td>{stats['event_creation_blockers']['counts']['skip_creation_covered_by_active_event'] / stats['counting']['event_created'] * 100 if stats['counting']['event_created'] > 0 else 0:.1f}%</td>
+                <td>Active Event Exclusion</td>
+                <td>{stats['event_creation_blockers']['by_reason'].get('active_event_exclusion', 0)}</td>
+                <td>{stats['event_creation_blockers']['by_reason'].get('active_event_exclusion', 0) / stats['events']['total_created'] * 100 if stats['events']['total_created'] > 0 else 0:.1f}%</td>
             </tr>
         </table>
 
-        <h3>Temporal Cooldown Metrics</h3>
+        <h3>Suppression Metrics</h3>
         <table>
             <tr>
                 <th>Metric</th>
                 <th>Value</th>
-            </tr>
-            <tr>
-                <td>Current Cooldown Threshold</td>
-                <td>400 ms <span class="badge warning">HIGH</span></td>
-            </tr>
-            <tr>
-                <td>Average Time Since Commit</td>
-                <td>{stats['event_creation_blockers']['cooldown_time_since_commit_ms']['avg']:.0f} ms</td>
-            </tr>
-            <tr>
-                <td>P95 Time Since Commit</td>
-                <td>{stats['event_creation_blockers']['cooldown_time_since_commit_ms']['p95']:.0f} ms</td>
-            </tr>
-            <tr>
-                <td>Recommended New Threshold</td>
-                <td>150-200 ms <span class="badge success">LOWER</span></td>
-            </tr>
-        </table>
-
-        <h3>Suppression Distance Metrics</h3>
-        <table>
-            <tr>
-                <th>Metric</th>
-                <th>Value</th>
-            </tr>
-            <tr>
-                <td>Current Distance Threshold</td>
-                <td>120 px</td>
             </tr>
             <tr>
                 <td>Average Suppression Distance</td>
-                <td>{stats['event_creation_blockers']['suppression_distance_px']['avg']:.1f} px</td>
+                <td>{stats['event_creation_blockers']['suppression_distance_stats']['avg']:.1f} px</td>
             </tr>
             <tr>
-                <td>P95 Distance</td>
-                <td>{stats['event_creation_blockers']['suppression_distance_px']['p95']:.1f} px</td>
+                <td>P95 Suppression Distance</td>
+                <td>{stats['event_creation_blockers']['suppression_distance_stats']['p95']:.1f} px</td>
             </tr>
             <tr>
-                <td>Recommended New Threshold</td>
-                <td>80-100 px (stricter) <span class="badge success">TIGHTER</span></td>
+                <td>Average Cooldown Time</td>
+                <td>{stats['event_creation_blockers']['cooldown_time_ms_stats']['avg']:.0f} ms</td>
             </tr>
+            <tr>
+                <td>P95 Cooldown Time</td>
+                <td>{stats['event_creation_blockers']['cooldown_time_ms_stats']['p95']:.0f} ms</td>
+            </tr>
+        </table>
+
+        <h3>Event Lifecycle Metrics</h3>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Events Created</td>
+                <td>{stats['events']['total_created']}</td>
+            </tr>
+            <tr>
+                <td>Total Events Committed (Counted)</td>
+                <td>{stats['events']['total_committed']}</td>
+            </tr>
+            <tr>
+                <td>Total Events Expired</td>
+                <td>{stats['events']['total_expired']}</td>
+            </tr>
+            <tr>
+                <td>Average Event Lifetime</td>
+                <td>{stats['events']['avg_lifetime_frames']:.1f} frames ({stats['events']['avg_lifetime_seconds']:.2f}s)</td>
+            </tr>
+            <tr>
+                <td>Max Event Lifetime</td>
+                <td>{stats['events']['lifetime_frames_stats']['max']:.0f} frames ({stats['events']['lifetime_ms_stats']['max'] / 1000:.2f}s)</td>
+            </tr>
+        </table>
+
+        <h3>ROI Collection Metrics</h3>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total ROIs Added</td>
+                <td>{stats['roi']['total_added']}</td>
+            </tr>
+            <tr>
+                <td>Total ROIs Rejected</td>
+                <td>{stats['roi']['total_rejected']}</td>
+            </tr>
+            <tr>
+                <td>ROI Rejection Rate</td>
+                <td>{stats['roi']['rejection_rate']:.1%}</td>
+            </tr>
+            <tr>
+                <td>Average Sharpness</td>
+                <td>{stats['roi']['avg_sharpness']:.1f}</td>
+            </tr>
+            <tr>
+                <td>Avg ROIs per Event</td>
+                <td>{stats['roi']['avg_rois_per_event']:.1f}</td>
+            </tr>
+        </table>
+
+        <h2>🎯 Classification Quality</h2>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Classifications</td>
+                <td>{stats['classification']['total']}</td>
+            </tr>
+            <tr>
+                <td>Unknown Count</td>
+                <td>{stats['classification']['unknown_count']}</td>
+            </tr>
+            <tr>
+                <td>Unknown Rate</td>
+                <td>{stats['classification']['unknown_rate']:.1%}</td>
+            </tr>
+            <tr>
+                <td>Average Confidence</td>
+                <td>{stats['classification']['confidence_stats']['avg']:.3f}</td>
+            </tr>
+            <tr>
+                <td>Avg Candidates per Classification</td>
+                <td>{stats['classification']['avg_candidates_per_classification']:.1f}</td>
+            </tr>
+            <tr>
+                <td>Voting Usage Rate</td>
+                <td>{stats['classification']['voting_rate']:.1%}</td>
+            </tr>
+            <tr>
+                <td>Avg Classification Time</td>
+                <td>{stats['classification']['avg_processing_time_ms']:.1f} ms</td>
+            </tr>
+        </table>
+
+        <h3>Bag Type Distribution</h3>
+        <table>
+            <tr>
+                <th>Bag Type</th>
+                <th>Count</th>
+            </tr>
+            {''.join([f"<tr><td>{bag_type}</td><td>{count}</td></tr>" for bag_type, count in sorted(stats['counting']['bag_type_distribution'].items(), key=lambda x: x[1], reverse=True)])}
         </table>
 
         <h2>🚨 Issue Findings</h2>
@@ -1083,8 +1200,9 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
         </table>
 
         <div class="footer">
-            <p><strong>Report Generated: </strong> {datetime.now(timezone.utc).isoformat()}</p>
-            <p><strong>Total Entries Parsed:</strong> {stats['parsing']['total_entries']: ,} | <strong>Skipped: </strong> {stats['parsing']['skipped_entries']}</p>
+            <p><strong>Report Generated:</strong> {stats['metadata']['report_generated']}</p>
+            <p><strong>App Started:</strong> {stats['metadata'].get('app_start_time', 'N/A')} | <strong>Version:</strong> {stats['metadata']['app_version']}</p>
+            <p><strong>Total Entries Parsed:</strong> {stats['parsing']['total_entries']:,} | <strong>Skipped:</strong> {stats['parsing']['skipped_entries']}</p>
         </div>
     </div>
 
