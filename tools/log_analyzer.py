@@ -1345,25 +1345,33 @@ def main():
     print(f"   JSON Summary:  {json_path}")
 
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("SUMMARY - Frame-Based Threshold Analysis")
     print("=" * 70)
-    print(f"Total Bags Counted: {stats['counting']['count_update']}")
-    print(f"Events Created: {stats['counting']['event_created']}")
+    print(f"Total Bags Counted: {stats['counting']['total_bags_counted']}")
+    print(f"Events Created: {stats['events']['total_created']}")
+    print(f"Events Committed: {stats['events']['total_committed']}")
+    print(f"Events Expired: {stats['events']['total_expired']}")
+    print(f"Average Event Lifetime: {stats['events']['avg_lifetime_frames']:.1f} frames ({stats['events']['avg_lifetime_seconds']:.2f}s)")
     print(f"\nSuppression Breakdown:")
-    print(
-        f"  - Covered by Active Event: {stats['event_creation_blockers']['counts']['covered_by_active_event_context']}")
-    print(
-        f"  - Suppressed (Too Close): {stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed']}")
-    print(
-        f"  - Suppressed (Temporal Cooldown): {stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone']}")
-    total_suppressed = (stats['event_creation_blockers']['counts']['suppression_too_close_recently_committed'] +
-                        stats['event_creation_blockers']['counts']['suppression_temporal_cooldown_zone'])
-    suppression_pct = total_suppressed / stats['counting']['event_created'] * 100 if stats['counting'][
-                                                                                         'event_created'] > 0 else 0
-    print(f"\n⚠️  TOTAL SUPPRESSION RATE: {suppression_pct:.1f}% (at-risk bags)")
-    print(f"\n🔧 RECOMMENDATION:  Reduce cooldown from 400ms → 150-200ms")
-    print(f"                  Reduce distance from 120px → 80px")
-    print(f"                  Reduce idle frames from 25 → 15")
+    print(f"  - Covered by Active Event: {stats['event_creation_blockers']['by_reason'].get('covered_by_active_event', 0)}")
+    print(f"  - Suppressed (Spatial): {stats['event_creation_blockers']['by_reason'].get('suppression_spatial', 0)}")
+    print(f"  - Suppressed (Temporal): {stats['event_creation_blockers']['by_reason'].get('suppression_temporal', 0)}")
+    print(f"  - Active Event Exclusion: {stats['event_creation_blockers']['by_reason'].get('active_event_exclusion', 0)}")
+    
+    total_suppressed = stats['event_creation_blockers']['total_blocked']
+    suppression_pct = total_suppressed / stats['events']['total_created'] * 100 if stats['events']['total_created'] > 0 else 0
+    print(f"\nTotal Suppression Rate: {suppression_pct:.1f}% ({total_suppressed} blocked)")
+    
+    avg_fps = stats['fps']['avg'] if stats['fps']['avg'] > 0 else 25.0
+    print(f"\n🔧 Frame-Based Thresholds @ {avg_fps:.1f} FPS:")
+    print(f"   - Ghost Timeout: 25 frames ({25 * 1000.0 / avg_fps:.0f}ms)")
+    print(f"   - Temporal Cooldown: 10 frames ({10 * 1000.0 / avg_fps:.0f}ms)")
+    print(f"   - Suppression Duration: 38 frames ({38 * 1000.0 / avg_fps:.0f}ms)")
+    
+    if suppression_pct > 5:
+        print(f"\n⚠️  High suppression rate detected!")
+        print(f"   Consider reducing temporal_cooldown_frames from 10 to 5-8")
+    
     print("=" * 70)
 
 
