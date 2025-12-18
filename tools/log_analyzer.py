@@ -193,26 +193,43 @@ class LogAnalyzer:
         self.detection_times = []
         self.monitor_times = []
         self.fps_values = []
+        self.frame_indices = []
 
-        # Counting signals
+        # Event lifecycle tracking (frame-based)
         self.event_created_count = 0
+        self.event_committed_count = 0
         self.event_expired_count = 0
         self.event_expired_by_state = Counter()
         self.event_suppressed_count = 0
         self.count_update_count = 0
-
-        # NEW: Event creation blockers tracking
+        
+        # Event lifetime analysis (frame and time based)
+        self.event_lifetimes_frames = []
+        self.event_lifetimes_ms = []
+        self.event_states_at_close = Counter()
+        
+        # Frame-based threshold tracking
+        self.ghost_timeout_frames_observed = []
+        self.temporal_cooldown_frames_observed = []
+        self.suppression_duration_frames_observed = []
+        
+        # Event creation blockers
         self.event_creation_blockers = {
-            "covered_by_active_event_context": 0,
-            "skip_creation_covered_by_active_event": 0,
-            "suppression_too_close_recently_committed": 0,
-            "suppression_temporal_cooldown_zone": 0,
+            "covered_by_active_event": 0,
+            "suppression_spatial": 0,
+            "suppression_temporal": 0,
+            "active_event_exclusion": 0,
         }
         self.suppression_distances = []
-        self.cooldown_times = []
-        self.suppression_thresholds = Counter()
-        self.cooldown_thresholds = Counter()
+        self.cooldown_times_ms = []
+        self.suppression_frames_remaining = []
 
+        # Track statistics
+        self.track_created_count = 0
+        self.track_duplicate_count = 0
+        self.track_lifetime_frames = []
+        self.track_expired_count = 0
+        
         # Overcount indicators
         self.count_update_track_ids = []
         self.count_update_phashes = []
@@ -223,7 +240,21 @@ class LogAnalyzer:
         self.rejection_reasons = Counter()
         self.confidence_values = []
         self.bag_type_counts = Counter()
+        self.candidates_count = []
+        self.voting_used_count = 0
+        self.classification_times_ms = []
 
+        # ROI statistics
+        self.roi_added_count = 0
+        self.roi_rejected_count = 0
+        self.roi_reject_reasons = Counter()
+        self.roi_sharpness_values = []
+        self.roi_per_event = []
+        
+        # System metrics
+        self.app_start_time = None
+        self.app_version = None
+        
         # Time series (per-minute buckets)
         self.time_buckets = defaultdict(lambda: {
             "errors": 0,
@@ -232,8 +263,12 @@ class LogAnalyzer:
             "unknown_classifications": 0,
             "fps_samples": [],
             "event_created": 0,
+            "event_committed": 0,
+            "event_expired": 0,
             "suppressed": 0,
-            "skip_creation": 0
+            "skip_creation": 0,
+            "roi_added": 0,
+            "roi_rejected": 0,
         })
 
     def analyze_entry(self, entry: Dict[str, Any]):
@@ -256,6 +291,14 @@ class LogAnalyzer:
         else:
             minute_key = None
 
+        # App metadata tracking
+        if "Initialized" in message or "AppLogging" in message:
+            if not self.app_start_time:
+                self.app_start_time = timestamp_str
+            # Try to extract version if present
+            if "version" in data:
+                self.app_version = data.get("version")
+
         # Error tracking
         if level == "ERROR":
             self.errors.append((component, message, data))
@@ -277,7 +320,7 @@ class LogAnalyzer:
                 self.time_buckets[minute_key]["warnings"] += 1
 
         # Backpressure detection
-        if "BACKPRESSURE" in message or "backpressure" in message.lower():
+        if "BACKPRESSURE" in message:
             self.backpressure_events.append(entry)
             drops = data.get("drops", 0)
             frames_skipped = data.get("frames_skipped", 0)
@@ -292,7 +335,11 @@ class LogAnalyzer:
                 self.time_buckets[minute_key]["backpressure_drops"] += drops
 
         # Frame performance
-        if "FRAME" in message or data.get("frame_id") is not None:
+        if "FRAME" in message:
+            frame_id = data.get("frame_id")
+            if frame_id is not None:
+                self.frame_indices.append(frame_id)
+            
             if "total_time_ms" in data:
                 self.frame_times.append(data["total_time_ms"])
             if "detection_time_ms" in data:
@@ -305,50 +352,66 @@ class LogAnalyzer:
                 if minute_key:
                     self.time_buckets[minute_key]["fps_samples"].append(fps)
 
-        # NEW: Event creation blocker tracking
-        if "Suppressing new event" in message or "Detection covered by active event" in message:
-            if "covered by active event" in message:
-                self.event_creation_blockers["covered_by_active_event_context"] += 1
-                if minute_key:
-                    self.time_buckets[minute_key]["skip_creation"] += 1
-            elif "too close to recently committed" in message:
-                self.event_creation_blockers["suppression_too_close_recently_committed"] += 1
-                distance = data.get("distance_px")
-                if distance:
-                    self.suppression_distances.append(distance)
-                threshold = data.get("suppression_threshold_px")
-                if threshold:
-                    self.suppression_thresholds[threshold] += 1
-                if minute_key:
-                    self.time_buckets[minute_key]["suppressed"] += 1
-            elif "temporal cooldown zone" in message:
-                self.event_creation_blockers["suppression_temporal_cooldown_zone"] += 1
-                cooldown_time = data.get("time_since_commit_ms")
-                if cooldown_time:
-                    self.cooldown_times.append(cooldown_time)
-                threshold = data.get("cooldown_threshold_ms")
-                if threshold:
-                    self.cooldown_thresholds[threshold] += 1
-                if minute_key:
-                    self.time_buckets[minute_key]["suppressed"] += 1
-            elif "Skipping event creation" in message:
-                self.event_creation_blockers["skip_creation_covered_by_active_event"] += 1
-                if minute_key:
-                    self.time_buckets[minute_key]["skip_creation"] += 1
-
-        # Event lifecycle tracking
+        # Event lifecycle tracking (frame-based)
         if "EVENT_CREATED" in message:
             self.event_created_count += 1
             if minute_key:
                 self.time_buckets[minute_key]["event_created"] += 1
 
+        if "EVENT_COMMITTED" in message:
+            self.event_committed_count += 1
+            # Track event lifetime
+            lifespan_ms = data.get("lifespan_ms")
+            if lifespan_ms:
+                self.event_lifetimes_ms.append(lifespan_ms)
+            # Track ROI count per event
+            roi_count = data.get("roi_count")
+            if roi_count:
+                self.roi_per_event.append(roi_count)
+            if minute_key:
+                self.time_buckets[minute_key]["event_committed"] += 1
+
         if "EVENT_EXPIRED" in message:
             self.event_expired_count += 1
             state = data.get("state", "unknown")
             self.event_expired_by_state[state] += 1
+            # Track lifetime
+            frames_tracked = data.get("frames_tracked")
+            if frames_tracked:
+                self.event_lifetimes_frames.append(frames_tracked)
+            if minute_key:
+                self.time_buckets[minute_key]["event_expired"] += 1
 
         if "EVENT_SUPPRESSED" in message:
             self.event_suppressed_count += 1
+            reason = data.get("reason", "unknown")
+            if "spatial" in reason.lower() or "distance" in reason.lower():
+                self.event_creation_blockers["suppression_spatial"] += 1
+                distance = data.get("center_distance")
+                if distance:
+                    self.suppression_distances.append(distance)
+            elif "temporal" in reason.lower() or "cooldown" in reason.lower():
+                self.event_creation_blockers["suppression_temporal"] += 1
+            elif "overlap" in reason.lower() or "iou" in reason.lower():
+                self.event_creation_blockers["covered_by_active_event"] += 1
+            if minute_key:
+                self.time_buckets[minute_key]["suppressed"] += 1
+
+        # ROI tracking
+        if "ROI_ADDED" in message:
+            self.roi_added_count += 1
+            sharpness = data.get("sharpness")
+            if sharpness:
+                self.roi_sharpness_values.append(sharpness)
+            if minute_key:
+                self.time_buckets[minute_key]["roi_added"] += 1
+        
+        if "ROI_REJECTED" in message:
+            self.roi_rejected_count += 1
+            reason = data.get("reason", "unknown")
+            self.roi_reject_reasons[reason] += 1
+            if minute_key:
+                self.time_buckets[minute_key]["roi_rejected"] += 1
 
         # Count updates
         if "COUNT_UPDATE" in message:
@@ -370,6 +433,9 @@ class LogAnalyzer:
             label = data.get("label", "")
             confidence = data.get("confidence")
             rejection_reason = data.get("rejection_reason")
+            candidates = data.get("candidates")
+            used_voting = data.get("used_voting")
+            processing_time = data.get("processing_time_ms")
 
             if label == "Unknown":
                 self.unknown_count += 1
@@ -380,14 +446,41 @@ class LogAnalyzer:
 
             if confidence is not None:
                 self.confidence_values.append(confidence)
+            
+            if candidates is not None:
+                self.candidates_count.append(candidates)
+            
+            if used_voting:
+                self.voting_used_count += 1
+            
+            if processing_time:
+                self.classification_times_ms.append(processing_time)
+
+        # Classification candidate details
+        if "CANDIDATE" in message:
+            # Track individual candidate contributions
+            pass  # Already captured in classification aggregates
+        
+        # Track statistics (if we add track-level logging)
+        # For now, track_id in COUNT_UPDATE gives us track lifecycle info
 
     def compute_statistics(self) -> Dict[str, Any]:
-        """Compute final statistics and metrics."""
+        """Compute final statistics and metrics with frame-based threshold analysis."""
+        
+        # Compute average FPS for frame-to-time conversions
+        avg_fps = statistics.mean(self.fps_values) if self.fps_values else 25.0
+        
         stats = {
+            "metadata": {
+                "app_start_time": self.app_start_time,
+                "app_version": self.app_version or "unknown",
+                "report_generated": datetime.now(timezone.utc).isoformat(),
+            },
             "time_range": {
                 "start": self.start_time.isoformat(),
                 "end": self.end_time.isoformat(),
-                "duration_hours": (self.end_time - self.start_time).total_seconds() / 3600
+                "duration_hours": (self.end_time - self.start_time).total_seconds() / 3600,
+                "duration_seconds": (self.end_time - self.start_time).total_seconds()
             },
             "parsing": {
                 "total_entries": self.total_entries,
@@ -397,42 +490,60 @@ class LogAnalyzer:
             },
             "errors": {
                 "total": len(self.errors),
-                "top_errors": self.error_counts.most_common(10),
-                "pipeline_error_groups": self.pipeline_error_groups.most_common(10)
+                "top_errors": [(f"{comp}::{msg}", count) for (comp, msg), count in self.error_counts.most_common(10)],
+                "pipeline_error_groups": [(f"{comp}/{op}/{etype}", count) for (comp, op, etype), count in self.pipeline_error_groups.most_common(10)]
             },
             "warnings": {
                 "total": len(self.warnings),
-                "top_warnings": self.warning_counts.most_common(10)
+                "top_warnings": [(f"{comp}::{msg}", count) for (comp, msg), count in self.warning_counts.most_common(10)]
             },
             "backpressure": {
                 "total_events": len(self.backpressure_events),
                 "total_drops": self.total_drops,
                 "total_frames_skipped": self.total_frames_skipped,
-                "avg_queue_utilization": statistics.mean(
-                    self.queue_utilization_samples) if self.queue_utilization_samples else 0
+                "avg_queue_utilization": statistics.mean(self.queue_utilization_samples) if self.queue_utilization_samples else 0,
+                "max_queue_utilization": max(self.queue_utilization_samples) if self.queue_utilization_samples else 0
             },
             "frame_performance": self._compute_percentile_stats(self.frame_times, "total_time_ms"),
             "detection_performance": self._compute_percentile_stats(self.detection_times, "detection_time_ms"),
             "monitor_performance": self._compute_percentile_stats(self.monitor_times, "monitor_time_ms"),
             "fps": self._compute_percentile_stats(self.fps_values, "fps"),
+            "events": {
+                "total_created": self.event_created_count,
+                "total_committed": self.event_committed_count,
+                "total_expired": self.event_expired_count,
+                "expired_by_state": dict(self.event_expired_by_state),
+                "total_suppressed": self.event_suppressed_count,
+                "avg_lifetime_frames": statistics.mean(self.event_lifetimes_frames) if self.event_lifetimes_frames else 0,
+                "avg_lifetime_ms": statistics.mean(self.event_lifetimes_ms) if self.event_lifetimes_ms else 0,
+                "avg_lifetime_seconds": statistics.mean(self.event_lifetimes_ms) / 1000.0 if self.event_lifetimes_ms else 0,
+                "lifetime_frames_stats": self._compute_percentile_stats(self.event_lifetimes_frames, "lifetime_frames"),
+                "lifetime_ms_stats": self._compute_percentile_stats(self.event_lifetimes_ms, "lifetime_ms"),
+            },
             "counting": {
-                "event_created": self.event_created_count,
-                "event_expired": self.event_expired_count,
-                "event_expired_by_state": dict(self.event_expired_by_state),
-                "event_suppressed": self.event_suppressed_count,
-                "count_update": self.count_update_count,
-                "bag_type_counts": dict(self.bag_type_counts)
+                "total_bags_counted": self.count_update_count,
+                "bag_type_distribution": dict(self.bag_type_counts)
             },
             "event_creation_blockers": {
-                "counts": dict(self.event_creation_blockers),
-                "suppression_distance_px": self._compute_percentile_stats(self.suppression_distances,
-                                                                          "suppression_distance_px"),
-                "suppression_thresholds_px": dict(self.suppression_thresholds),
-                "cooldown_time_since_commit_ms": self._compute_percentile_stats(self.cooldown_times,
-                                                                                "cooldown_time_since_commit_ms"),
-                "cooldown_time_thresholds_ms": dict(self.cooldown_thresholds)
+                "total_blocked": sum(self.event_creation_blockers.values()),
+                "by_reason": dict(self.event_creation_blockers),
+                "suppression_distance_stats": self._compute_percentile_stats(self.suppression_distances, "suppression_distance_px"),
+                "cooldown_time_ms_stats": self._compute_percentile_stats(self.cooldown_times_ms, "cooldown_time_ms"),
             },
-            "overcount_indicators": {
+            "frame_based_thresholds": {
+                "note": "System uses frame-based thresholds. Typical values @ 25fps:",
+                "ghost_timeout_frames": "25 frames (1000ms)",
+                "temporal_cooldown_frames": "10 frames (400ms)",
+                "suppression_duration_frames": "38 frames (1520ms)",
+                "avg_fps": avg_fps,
+                "frame_to_ms_conversion": f"1 frame = {1000.0/avg_fps:.1f}ms @ {avg_fps:.1f}fps"
+            },
+            "tracks": {
+                "total_created": self.track_created_count,
+                "total_duplicates": self.track_duplicate_count,
+                "total_expired": self.track_expired_count,
+                "avg_lifetime_frames": statistics.mean(self.track_lifetime_frames) if self.track_lifetime_frames else 0,
+                "unique_tracks_counted": len(set(self.count_update_track_ids)),
                 "duplicate_track_ids": self._find_duplicates(self.count_update_track_ids),
                 "duplicate_phashes": self._find_duplicates(self.count_update_phashes)
             },
@@ -441,7 +552,20 @@ class LogAnalyzer:
                 "unknown_count": self.unknown_count,
                 "unknown_rate": self.unknown_count / self.classification_count if self.classification_count > 0 else 0,
                 "rejection_reasons": dict(self.rejection_reasons),
-                "confidence_stats": self._compute_percentile_stats(self.confidence_values, "confidence")
+                "confidence_stats": self._compute_percentile_stats(self.confidence_values, "confidence"),
+                "avg_candidates_per_classification": statistics.mean(self.candidates_count) if self.candidates_count else 0,
+                "voting_used_count": self.voting_used_count,
+                "voting_rate": self.voting_used_count / self.classification_count if self.classification_count > 0 else 0,
+                "avg_processing_time_ms": statistics.mean(self.classification_times_ms) if self.classification_times_ms else 0,
+            },
+            "roi": {
+                "total_added": self.roi_added_count,
+                "total_rejected": self.roi_rejected_count,
+                "rejection_rate": self.roi_rejected_count / (self.roi_added_count + self.roi_rejected_count) if (self.roi_added_count + self.roi_rejected_count) > 0 else 0,
+                "reject_reasons": dict(self.roi_reject_reasons),
+                "avg_sharpness": statistics.mean(self.roi_sharpness_values) if self.roi_sharpness_values else 0,
+                "sharpness_stats": self._compute_percentile_stats(self.roi_sharpness_values, "roi_sharpness"),
+                "avg_rois_per_event": statistics.mean(self.roi_per_event) if self.roi_per_event else 0,
             },
             "time_series": self._compute_time_series(),
             "issues": self._detect_issues()
@@ -495,43 +619,46 @@ class LogAnalyzer:
                 "unknown_classifications": bucket["unknown_classifications"],
                 "avg_fps": avg_fps,
                 "event_created": bucket["event_created"],
+                "event_committed": bucket["event_committed"],
+                "event_expired": bucket["event_expired"],
                 "suppressed": bucket["suppressed"],
-                "skip_creation": bucket["skip_creation"]
+                "skip_creation": bucket["skip_creation"],
+                "roi_added": bucket["roi_added"],
+                "roi_rejected": bucket["roi_rejected"]
             })
         return series
 
     def _detect_issues(self) -> List[Dict[str, Any]]:
-        """Detect issues based on thresholds and return actionable findings."""
+        """Detect issues based on thresholds and return actionable findings (frame-based)."""
         issues = []
+        
+        avg_fps = statistics.mean(self.fps_values) if self.fps_values else 25.0
 
-        # NEW: Detection blocker analysis
-        total_potential_events = (self.event_created_count +
-                                  self.event_creation_blockers["covered_by_active_event_context"] +
-                                  self.event_creation_blockers["skip_creation_covered_by_active_event"] +
-                                  self.event_creation_blockers["suppression_too_close_recently_committed"] +
-                                  self.event_creation_blockers["suppression_temporal_cooldown_zone"])
+        # Event suppression analysis (frame-based)
+        total_potential_events = self.event_created_count + sum(self.event_creation_blockers.values())
 
         if total_potential_events > 0:
-            suppression_rate = ((self.event_creation_blockers["suppression_too_close_recently_committed"] +
-                                 self.event_creation_blockers["suppression_temporal_cooldown_zone"]) /
-                                total_potential_events * 100)
+            total_suppressed = (self.event_creation_blockers.get("suppression_spatial", 0) +
+                               self.event_creation_blockers.get("suppression_temporal", 0))
+            suppression_rate = (total_suppressed / total_potential_events * 100)
 
             if suppression_rate > 5:
-                avg_cooldown = statistics.mean(self.cooldown_times) if self.cooldown_times else 0
-
+                # Convert frame thresholds to ms for recommendations
+                temporal_cooldown_frames = 10  # Default from config
+                temporal_cooldown_ms = temporal_cooldown_frames * (1000.0 / avg_fps)
+                
                 issues.append({
                     "severity": "warning",
                     "title": "High Event Suppression Rate (Potential Undercounting)",
-                    "description": f"Suppression rate:  {suppression_rate:.1f}% (~{suppression_rate / 100 * 8384:.0f} bags at risk from {suppression_rate:.0f}% detection skip)",
-                    "likely_cause": "Temporal cooldown (400ms) + idle timeout stacking creates cumulative suppression window",
-                    "where_to_look": f"Reduce cooldown from 400ms to 150-200ms, reduce idle timeout from 25→15 frames, reduce distance threshold from 120→80px. Current avg cooldown time: {avg_cooldown:.0f}ms",
+                    "description": f"Suppression rate: {suppression_rate:.1f}% ({total_suppressed} of {total_potential_events} detections suppressed)",
+                    "likely_cause": f"Temporal cooldown ({temporal_cooldown_frames} frames @ {avg_fps:.1f}fps = {temporal_cooldown_ms:.0f}ms) may be too aggressive",
+                    "where_to_look": f"Review temporal_cooldown_frames in config. Current: ~{temporal_cooldown_frames} frames. Consider reducing to 5-8 frames for faster workflows.",
                     "recommendation": {
-                        "temporal_cooldown_ms_current": 400,
-                        "temporal_cooldown_ms_recommended": 150,
-                        "distance_threshold_px_current": 120,
-                        "distance_threshold_px_recommended": 80,
-                        "min_idle_frames_current": 25,
-                        "min_idle_frames_recommended": 15
+                        "temporal_cooldown_frames_current": temporal_cooldown_frames,
+                        "temporal_cooldown_frames_recommended": "5-8",
+                        "suppression_distance_px_current": 100,
+                        "suppression_distance_px_recommended": "80-100",
+                        "note": "Frame-based thresholds scale naturally with FPS"
                     }
                 })
 
@@ -539,12 +666,18 @@ class LogAnalyzer:
         if self.classification_count > 0:
             unknown_rate = self.unknown_count / self.classification_count
             if unknown_rate > 0.10:
+                top_reasons = dict(Counter(self.rejection_reasons).most_common(3))
                 issues.append({
                     "severity": "warning",
                     "title": "High Unknown Classification Rate",
-                    "description": f"Unknown rate is {unknown_rate:.1%} (threshold: 10%)",
+                    "description": f"Unknown rate is {unknown_rate:.1%} ({self.unknown_count}/{self.classification_count} classifications)",
                     "likely_cause": "Poor ROI quality, model uncertainty, or inadequate training data",
-                    "where_to_look": "Check rejection_reasons breakdown, review ROI sharpness values in logs"
+                    "where_to_look": f"Check rejection_reasons: {top_reasons}. Review ROI sharpness and collection quality.",
+                    "recommendation": {
+                        "top_rejection_reasons": top_reasons,
+                        "avg_roi_sharpness": statistics.mean(self.roi_sharpness_values) if self.roi_sharpness_values else 0,
+                        "roi_rejection_rate": f"{self.roi_rejected_count / (self.roi_added_count + self.roi_rejected_count) * 100:.1f}%" if (self.roi_added_count + self.roi_rejected_count) > 0 else "N/A"
+                    }
                 })
 
         # Backpressure drops
