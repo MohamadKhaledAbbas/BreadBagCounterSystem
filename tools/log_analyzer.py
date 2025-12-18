@@ -362,11 +362,11 @@ class LogAnalyzer:
             self.event_committed_count += 1
             # Track event lifetime
             lifespan_ms = data.get("lifespan_ms")
-            if lifespan_ms:
+            if lifespan_ms is not None:
                 self.event_lifetimes_ms.append(lifespan_ms)
             # Track ROI count per event
             roi_count = data.get("roi_count")
-            if roi_count:
+            if roi_count is not None:
                 self.roi_per_event.append(roi_count)
             if minute_key:
                 self.time_buckets[minute_key]["event_committed"] += 1
@@ -401,7 +401,7 @@ class LogAnalyzer:
         if "ROI_ADDED" in message:
             self.roi_added_count += 1
             sharpness = data.get("sharpness")
-            if sharpness:
+            if sharpness is not None:
                 self.roi_sharpness_values.append(sharpness)
             if minute_key:
                 self.time_buckets[minute_key]["roi_added"] += 1
