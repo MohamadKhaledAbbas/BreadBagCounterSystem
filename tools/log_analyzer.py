@@ -245,7 +245,7 @@ def parse_text_log_line(line: str) -> Optional[Dict[str, Any]]:
     # Extract KPI alerts: [PipelineMetrics]
     elif "[PipelineMetrics]" in message:
         component = "PipelineMetrics"
-        # Extract various metrics from the summary
+        # PipelineMetrics messages are complex summaries - we track them via level (WARNING/INFO)
     
     # Extract ROI added: [ROI_ADDED]
     elif "[ROI_ADDED]" in message:
@@ -523,10 +523,13 @@ class LogAnalyzer:
                 self.time_buckets[minute_key]["backpressure_drops"] += drops
         
         # Queue stats (extract drops from QueueStats message)
+        # Note: QueueStats logs cumulative drops, so we only count them once per unique log entry
         if "QueueStats" in message or "[QueueStats]" in message:
             input_drops = data.get("input_drops", 0)
             class_drops = data.get("classification_drops", 0)
-            self.total_drops += (input_drops + class_drops)
+            # Only add drops if this appears to be a periodic stats dump (not double-counted with BACKPRESSURE events)
+            if input_drops > 0 or class_drops > 0:
+                self.total_drops += (input_drops + class_drops)
 
         # Frame performance
         if "FRAME" in message:
@@ -597,9 +600,9 @@ class LogAnalyzer:
         if "Detection gap closed" in message or "gap closed" in message.lower():
             gap_ms = data.get("gap_ms")
             if gap_ms is None:
-                # Try to extract from message
-                gap_pattern = r'([\d.]+)\s*ms'
-                m = re.search(gap_pattern, message)
+                # Try to extract from message with more specific pattern
+                gap_pattern = r'gap[^:]*:\s*([\d.]+)\s*ms'
+                m = re.search(gap_pattern, message, re.IGNORECASE)
                 if m:
                     gap_ms = float(m.group(1))
             if gap_ms:
@@ -1211,6 +1214,24 @@ class LogAnalyzer:
         return issues
 
 
+def _generate_per_label_rows(stats: Dict[str, Any]) -> str:
+    """Generate HTML table rows for per-label statistics."""
+    rows = []
+    for label, label_stats in stats['classification']['per_label_stats'].items():
+        low_conf_rate = stats['classification']['low_confidence_rate_by_label'].get(label, 0)
+        row = (
+            f"<tr>"
+            f"<td>{label}</td>"
+            f"<td>{label_stats['count']}</td>"
+            f"<td>{label_stats['avg_confidence']:.3f}</td>"
+            f"<td>{label_stats['min_confidence']:.3f}</td>"
+            f"<td>{low_conf_rate:.1%}</td>"
+            f"</tr>"
+        )
+        rows.append(row)
+    return ''.join(rows)
+
+
 def generate_html_report(stats: Dict[str, Any], output_path: str):
     """Generate HTML report with embedded CSS and Chart.js visualizations."""
 
@@ -1636,7 +1657,7 @@ def generate_html_report(stats: Dict[str, Any], output_path: str):
                 <th>Min Confidence</th>
                 <th>Low-Conf Rate (&lt;0.7)</th>
             </tr>
-            {''.join([f"<tr><td>{label}</td><td>{label_stats['count']}</td><td>{label_stats['avg_confidence']:.3f}</td><td>{label_stats['min_confidence']:.3f}</td><td>{stats['classification']['low_confidence_rate_by_label'].get(label, 0):.1%}</td></tr>" for label, label_stats in stats['classification']['per_label_stats'].items()])}
+            {_generate_per_label_rows(stats)}
         </table>
 
         <h3>🔄 Top Label Confusion Pairs</h3>
