@@ -250,6 +250,8 @@ class EventConfig:
     min_roi_sharpness: float = 300.0    # Min Laplacian variance
     min_brightness: int = 80
     max_brightness: int = 220
+    max_open_roi_samples: int = 15        # Max ROIs to collect while open
+    max_closed_roi_samples: int = 5       # Max ROIs to collect while closed
     
     # ==========================================================================
     # Classification Voting Parameters
@@ -462,6 +464,8 @@ class ROICandidate:
     frame_index: int
     centroid_stability: float  # How stable the centroid was when captured
     confidence: float
+    is_open: bool  # label the ROI as coming from open evidence
+    is_closed: bool  # label the ROI as coming from closed evidence
 
 
 class BreadBagEvent:
@@ -995,9 +999,9 @@ class BreadBagEvent:
         
         # Process state transitions based on evidence
         self._process_state_transition(detection)
-        
-        # Collect ROI if in CLOSED state
-        if self.state == (EventState.OPEN or EventState.CLOSED) and frame_img is not None:
+
+        # Collect ROI if in OPEN or CLOSED state
+        if self.state in (EventState.OPEN, EventState.CLOSED) and frame_img is not None:
             self._try_collect_roi(detection, frame_img)
     
     def _process_state_transition(self, detection: DetectionEvidence):
@@ -1085,10 +1089,16 @@ class BreadBagEvent:
             closed_hits=self.closed_evidence_count
         )
 
+
     def _try_collect_roi(self, detection: DetectionEvidence, frame_img: np.ndarray):
-        if len(self.roi_candidates) >= self.config.max_roi_samples:
-            # Optionally track cap rejects:
-            # pipeline_metrics.record_roi_quality(False, 0.0, "cap")
+        # Determine class-specific caps (fallback to legacy max_roi_samples)
+        max_open_cap = getattr(self.config, "max_open_roi_samples", self.config.max_roi_samples)
+        max_closed_cap = getattr(self.config, "max_closed_roi_samples", self.config.max_roi_samples)
+
+        # Decide ROI class; skip if neither open nor closed
+        roi_is_open = detection.is_open
+        roi_is_closed = detection.is_closed
+        if not (roi_is_open or roi_is_closed):
             return
 
         x1, y1, x2, y2 = map(int, detection.box)
@@ -1115,12 +1125,11 @@ class BreadBagEvent:
         # Sharpness check
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
         if sharpness < self.config.min_roi_sharpness:
             pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             return
 
-        # Accept
+        # Passed quality checks
         pipeline_metrics.record_roi_quality(True, sharpness, None)
 
         candidate = ROICandidate(
@@ -1130,10 +1139,37 @@ class BreadBagEvent:
             timestamp_ms=detection.timestamp_ms,
             frame_index=detection.frame_index,
             centroid_stability=self.get_centroid_stability(),
-            confidence=detection.confidence
+            confidence=detection.confidence,
+            is_open=roi_is_open,
+            is_closed=roi_is_closed
         )
+
+        # Insert and keep best-per-class by sharpness
         self.roi_candidates.append(candidate)
         self.roi_candidates.sort(key=lambda x: x.sharpness, reverse=True)
+
+        # Recompute counts
+        self.open_roi_count = sum(1 for c in self.roi_candidates if c.is_open)
+        self.closed_roi_count = sum(1 for c in self.roi_candidates if c.is_closed)
+
+        # Enforce class caps by dropping the lowest-sharpness ROI of that class if over cap
+        if roi_is_open and self.open_roi_count > max_open_cap:
+            # drop worst open ROI
+            worst_idx = max(
+                (i for i, c in enumerate(self.roi_candidates) if c.is_open),
+                key=lambda i: self.roi_candidates[i].sharpness * -1  # smallest sharpness
+            )
+            self.roi_candidates.pop(worst_idx)
+            self.open_roi_count -= 1
+
+        if roi_is_closed and self.closed_roi_count > max_closed_cap:
+            # drop worst closed ROI
+            worst_idx = max(
+                (i for i, c in enumerate(self.roi_candidates) if c.is_closed),
+                key=lambda i: self.roi_candidates[i].sharpness * -1
+            )
+            self.roi_candidates.pop(worst_idx)
+            self.closed_roi_count -= 1
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
                            current_frame_index: int = -1) -> Tuple[bool, str]:
@@ -1450,12 +1486,8 @@ class BreadBagEvent:
         Returns candidates formatted for ClassifierService.
         """
         candidates = []
-        track_duration = len(self.evidence_history)
-        
         for idx, roi_cand in enumerate(self.roi_candidates):
-            # Calculate relative time (0.0 = start, 1.0 = end of track)
             relative_time = idx / max(1, len(self.roi_candidates) - 1) if len(self.roi_candidates) > 1 else 0.5
-            
             candidates.append({
                 'roi': roi_cand.roi,
                 'sharpness': roi_cand.sharpness,
@@ -1463,8 +1495,8 @@ class BreadBagEvent:
                 'bbox_area': roi_cand.size[0] * roi_cand.size[1],
                 'confidence': roi_cand.confidence,
                 'relative_time': relative_time,
+                'state': 'open' if roi_cand.is_open else 'closed'
             })
-        
         return candidates
     
     def get_debug_info(self) -> Dict[str, Any]:
@@ -2229,12 +2261,11 @@ class EventCentricTracker:
         """
         candidates = event.get_roi_candidates()
         debug_info = event.get_debug_info()
-        
-        # Format stats for ClassifierService
+
         event_stats = {
             'total': len(candidates),
-            'open_count': len([c for c in candidates]),  # All candidates counted
-            'closed_count': len(candidates),
+            'open_count': event.open_roi_count,
+            'closed_count': event.closed_roi_count,
             'open_hits': event.open_evidence_count,
             'closed_hits': event.closed_evidence_count,
             'total_frames_tracked': event.total_frames_observed,
@@ -2246,7 +2277,6 @@ class EventCentricTracker:
                 if event.roi_candidates else 0.0
             ),
         }
-        
         return {
             'event_id': event.id,
             'candidates': candidates,

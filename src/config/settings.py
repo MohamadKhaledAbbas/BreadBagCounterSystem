@@ -71,9 +71,9 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2025-12-17-v1.3.0"
+    APP_VERSION: str = "2025-12-19-v1.4.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_And_BrownOverlay20251128040005_20251128050005.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Small_2025_11_29_06_07_02.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
@@ -84,8 +84,8 @@ class AppConfig:
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
-        "data/model/classify_yolo_small_v5_bayese_224x224_nv12.bin" if IS_RDK
-        else "data/model/classify_yolo_small_v5.pt"
+        "data/model/classify_yolo_small_v6_bayese_224x224_nv12.bin" if IS_RDK
+        else "data/model/classify_yolo_small_v6.pt"
     )
 
     db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")

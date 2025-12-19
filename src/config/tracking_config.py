@@ -185,7 +185,7 @@ class TrackingConfig:
     # ROI Collection Parameters (BagEvent)
     # ============================================================================
     
-    max_open_samples: int = 9  # V3: Reduced from 6 for memory efficiency
+    max_open_samples: int = 15  # V3: Reduced from 6 for memory efficiency
     """
     Maximum number of ROI samples to collect during the 'open' phase.
     
@@ -195,7 +195,7 @@ class TrackingConfig:
     Default: 5 (V3: reduced from 6)
     """
     
-    max_closed_samples: int = 3  # V3: Reduced from 4 for memory efficiency
+    max_closed_samples: int = 5  # V3: Reduced from 4 for memory efficiency
     """
     Maximum number of ROI samples to collect during the 'closed' phase.
     
@@ -1340,7 +1340,7 @@ class TrackingConfig:
     # Event-Centric ROI Collection
     # --------------------------------------------------------------------------
     
-    event_max_roi_samples: int = 12
+    event_max_roi_samples: int = 20
     """
     Maximum ROIs to collect during CLOSED state for classification.
     
@@ -1583,6 +1583,8 @@ def get_event_config():
         min_roi_sharpness=tracking_config.min_roi_sharpness,
         min_brightness=tracking_config.min_mean_brightness,
         max_brightness=tracking_config.max_mean_brightness,
+        max_open_roi_samples=tracking_config.max_open_samples,
+        max_closed_roi_samples=tracking_config.max_closed_samples,
         
         # Classification voting
         min_voting_agreement_pct=tracking_config.voting_agreement_threshold_pct,

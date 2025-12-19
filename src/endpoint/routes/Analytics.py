@@ -108,23 +108,39 @@ async def analytics(
         stats = get_stats(start_dt, end_dt)
         logger.debug(f"[Analytics] Stats retrieved: {stats}")
         for c in stats["data"]["classifications"]:
-            c["thumb"] = c["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
-                                                                                       "unknown_classes/")
+            thumb = c.get("thumb")
+            if isinstance(thumb, str):
+                c["thumb"] = (thumb.replace("data/classes/","known_classes/")
+                              .replace("data/unknown/","unknown_classes/"))
+            else:
+                c["thumb"] = ""
 
         # Fix image paths for timeline events
         for event in stats["timeline"]["ordered_events"]:
-            event["thumb"] = event["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
-                                                                                               "unknown_classes/")
+            thumb = event.get("thumb")
+            if isinstance(thumb, str):
+                event["thumb"] = (thumb.replace("data/classes/", "known_classes/")
+                                  .replace("data/unknown/","unknown_classes/"))
+            else:
+                event["thumb"] = ""
 
         # Fix image paths for per-class windows
         for class_id, class_data in stats["timeline"]["per_class_windows"].items():
-            class_data["thumb"] = class_data["thumb"].replace("data/classes/", "known_classes/").replace(
-                "data/unknown/", "unknown_classes/")
+            thumb = class_data.get("thumb")
+            if isinstance(thumb, str):
+                class_data["thumb"] = (thumb.replace("data/classes/", "known_classes/")
+                                       .replace("data/unknown/","unknown_classes/"))
+            else:
+                class_data["thumb"] = ""
 
         # Fix image paths for consecutive runs
         for run in stats["timeline"].get("runs", []):
-            run["thumb"] = run["thumb"].replace("data/classes/", "known_classes/").replace("data/unknown/",
-                                                                                           "unknown_classes/")
+            thumb = run.get("thumb")
+            if isinstance(thumb, str):
+                run["thumb"] = (thumb.replace("data/classes/", "known_classes/")
+                                .replace("data/unknown/","unknown_classes/"))
+            else:
+                run["thumb"] = ""
 
         # Adjusting timezone for preview +3
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
