@@ -41,7 +41,7 @@ if __name__ == "__main__":
     # Configuration
     db_manager = DatabaseManager(config.db_path)
     detector = Detector(config.detection_model, config.detector_classes)
-    classifier = Classifier(config.classification_model, config.classifier_classes)
+    classifier = Classifier(config.classification_model,  config.classifier_classes)
 
     is_development = db_manager.get_config_value(constants.is_development_key) == "1"
     logger.info(f"[Startup] Development mode: {is_development}")

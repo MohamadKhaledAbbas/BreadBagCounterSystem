@@ -185,7 +185,7 @@ class TrackingConfig:
     # ROI Collection Parameters (BagEvent)
     # ============================================================================
     
-    max_open_samples: int = 5  # V3: Reduced from 6 for memory efficiency
+    max_open_samples: int = 9  # V3: Reduced from 6 for memory efficiency
     """
     Maximum number of ROI samples to collect during the 'open' phase.
     
@@ -350,7 +350,7 @@ class TrackingConfig:
     # Classification Stability Heuristics (Production-Grade)
     # ============================================================================
     
-    enable_label_reuse: bool = _parse_bool_env("ENABLE_LABEL_REUSE", False)
+    enable_label_reuse: bool = _parse_bool_env("ENABLE_LABEL_REUSE", True)
     """
     Enable previous-label reuse when confidence is low but evidence is strong.
     
@@ -1340,7 +1340,7 @@ class TrackingConfig:
     # Event-Centric ROI Collection
     # --------------------------------------------------------------------------
     
-    event_max_roi_samples: int = 8
+    event_max_roi_samples: int = 12
     """
     Maximum ROIs to collect during CLOSED state for classification.
     

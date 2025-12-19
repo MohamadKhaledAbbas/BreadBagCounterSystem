@@ -267,7 +267,10 @@ class StructuredLogger:
         """Log classification result with structured data."""
         msg_parts = [f"[CLASSIFICATION] track={track_id}, label={label}, conf={confidence:.3f}"]
         if rejection_reason:
-            msg_parts.append(f"reason={rejection_reason}")
+            if kwargs["has_previous_label_reused"]:
+                msg_parts.append(f"reused_reason={rejection_reason}")
+            else:
+                msg_parts.append(f"reason={rejection_reason}")
         if winner_ratio is not None:
             msg_parts.append(f"ratio={winner_ratio:.2f}")
         

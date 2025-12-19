@@ -161,7 +161,7 @@ class Visualizer:
             
             # Add ROI count if available and in CLOSED state
             roi_count = getattr(event, 'roi_count', 0)
-            if roi_count and 'CLOSED' in state_str.upper():
+            if roi_count and ('CLOSED' in state_str.upper() or 'OPEN' in state_str.upper()):
                 event_label += f" ROI:{roi_count}"
             
             (text_w, text_h), _ = cv2.getTextSize(event_label, font, font_scale * 0.8, text_thickness)

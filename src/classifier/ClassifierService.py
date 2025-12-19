@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Callable, List, Dict, Any, Tuple, Optional
+from typing import Callable, List, Dict, Any, Tuple, Optional, Counter
 
 import cv2
 
@@ -228,117 +228,124 @@ class ClassifierService:
             self._recent_classifications.pop(0)
         
         return label, confidence, 'current'
-    
-    def _check_label_reuse(self, track_id: int, current_label: str, current_confidence: float,
-                          evidence: Dict[str, Dict[str, Any]]) -> Tuple[str, float, Optional[str]]:
+
+    def _check_label_reuse(
+            self,
+            track_id: int,
+            current_label: str,
+            current_confidence: float,
+            evidence: Dict[str, Dict[str, Any]],
+            allow_unknown: bool = True,
+    ) -> Tuple[str, float, Optional[str]]:
         """
-        Check if previous label should be reused instead of current low-confidence classification.
-        
-        Guards:
-        (a) Strong streak exists (length >= STREAK_MIN)
-        (b) No higher-confidence conflicting candidate
-        (c) Matches burst dominance if available
-        (d) Current confidence is below LOW_CONF_THRESHOLD
-        
+        Robust label reuse logic for both known and unknown labels.
+        - For known classes: reuse only on low confidence and strong streak.
+        - For unknowns: reuse only if streak exists for a known label, burst dominance supports it, and no better candidate exists.
+
         Args:
             track_id: Track ID (for logging)
             current_label: Current classification label
             current_confidence: Current classification confidence
-            evidence: Evidence dict with candidate labels and scores
-            
+            evidence: Evidence dict
+            allow_unknown: Whether to allow Unknown-to-known re-labeling
+
         Returns:
-            Tuple of (final_label, final_confidence, reason)
-            - If reuse: returns previous label with reason
-            - If not: returns current label with None reason
+            Tuple (final_label, final_confidence, reason)
         """
         # Feature flag check
         if not self.enable_label_reuse:
             return current_label, current_confidence, None
-        
-        # Guard (d): Check if confidence is low enough to consider reuse
-        if current_confidence >= self.low_conf_threshold:
-            return current_label, current_confidence, None
-        
-        # Check if we have enough history to determine a streak
+
         if len(self._recent_classifications) < self.streak_min_length:
             return current_label, current_confidence, None
-        
-        # Guard (a): Check for strong streak in recent classifications
-        # Look at last N classifications to see if they form a consistent streak
+
+        # Which label type is this?
+        is_unknown = current_label == "Unknown"
+        allow_unknown_reuse = getattr(self, "enable_label_reuse_for_unknown", True)
+
         recent_labels = [label for label, _ in self._recent_classifications[-self.streak_min_length:]]
-        
-        # Check if all recent labels are the same (forming a streak)
-        if len(set(recent_labels)) != 1:
-            # No consistent streak
-            return current_label, current_confidence, None
-        
-        prev_label = recent_labels[0]  # The label from the streak
-        
-        # If current label matches the streak, no override needed
-        if current_label == prev_label:
-            return current_label, current_confidence, None
-        
-        # Guard (b): Check if there's a higher-confidence conflicting candidate
-        # Sort evidence by score (use .get() for safe access)
-        sorted_evidence = sorted(evidence.items(), key=lambda x: x[1].get("score", 0), reverse=True)
-        
-        # If current label is not the top candidate, there's a higher-confidence alternative
-        # Check if that alternative is the prev_label
-        if sorted_evidence:
-            top_candidate_label = sorted_evidence[0][0]
-            top_candidate_conf = sorted_evidence[0][1].get("best_confidence", 0)
-            
-            # If top candidate is different from prev_label and has higher confidence, don't reuse
-            if top_candidate_label != prev_label and top_candidate_conf > current_confidence:
-                return current_label, current_confidence, None
-        
-        # Guard (c): Check burst dominance if we have enough history
-        dominance_label = None
-        dominance_ratio = None
-        
-        if len(self._recent_classifications) >= self.burst_window_size:
-            # Analyze last N classifications for burst dominance
-            burst_window = self._recent_classifications[-self.burst_window_size:]
-            label_counts = Counter([label for label, _ in burst_window])
-            
-            if label_counts:
+
+        # Check for streak
+        unique_recent = set(recent_labels)
+        has_streak = len(unique_recent) == 1 and unique_recent.pop() != "Unknown"
+        prev_label = recent_labels[0] if has_streak else None
+
+        # Guard for known class (low confidence only)
+        if not is_unknown and current_confidence < self.low_conf_threshold and has_streak:
+            # Check burst dominance
+            dominance_label, dominance_ratio = None, None
+            if len(self._recent_classifications) >= self.burst_window_size:
+                burst_window = self._recent_classifications[-self.burst_window_size:]
+                label_counts = Counter(label for label, _ in burst_window)
                 dominant = label_counts.most_common(1)[0]
-                dominance_label = dominant[0]
-                dominance_ratio = dominant[1] / len(burst_window)
-                
-                # If burst dominance exists but doesn't match prev_label, don't reuse
-                if dominance_ratio >= self.burst_dominance_min_ratio:
-                    if dominance_label != prev_label:
-                        return current_label, current_confidence, None
-        
-        # All guards passed: reuse previous label
-        # Use average confidence from streak as the reused confidence
-        streak_confidences = [conf for _, conf in self._recent_classifications[-self.streak_min_length:]]
-        reused_confidence = sum(streak_confidences) / len(streak_confidences)
-        
-        # Get top candidate labels for logging (use .get() for safe access)
-        candidate_tops = [(label, data.get("best_confidence", 0)) for label, data in sorted_evidence[:3]]
-        
-        # Log the override decision
-        structured_logger.label_reuse_override(
-            track_id=track_id,
-            prev_label=prev_label,
-            new_label=current_label,
-            new_confidence=current_confidence,
-            streak_len=len(recent_labels),
-            dominance_label=dominance_label,
-            dominance_ratio=dominance_ratio,
-            candidate_tops=candidate_tops,
-            reason="low_confidence_with_strong_streak"
-        )
-        
-        logger.info(
-            f"[ClassifierService] Track {track_id}: Reusing label {prev_label} "
-            f"(streak={len(recent_labels)}, avg_conf={reused_confidence:.2f}) "
-            f"instead of low-confidence {current_label} (conf={current_confidence:.2f})"
-        )
-        
-        return prev_label, reused_confidence, "label_reuse"
+                dominance_label, dominance_ratio = dominant[0], dominant[1] / len(burst_window)
+                if dominance_ratio >= self.burst_dominance_min_ratio and dominance_label != prev_label:
+                    return current_label, current_confidence, None
+
+            # Check evidence top candidate
+            sorted_evidence = sorted(evidence.items(), key=lambda x: x[1].get("score", 0), reverse=True)
+            if sorted_evidence:
+                top_candidate_label = sorted_evidence[0][0]
+                top_candidate_conf = sorted_evidence[0][1].get("best_confidence", 0)
+                if top_candidate_label != prev_label and top_candidate_conf > current_confidence:
+                    return current_label, current_confidence, None
+
+            # Override known label: log, return streak label
+            streak_confidences = [conf for _, conf in self._recent_classifications[-self.streak_min_length:]]
+            reused_confidence = sum(streak_confidences) / len(streak_confidences)
+            structured_logger.label_reuse_override(
+                track_id=track_id,
+                prev_label=prev_label,
+                new_label=current_label,
+                new_confidence=current_confidence,
+                streak_len=self.streak_min_length,
+                dominance_label=dominance_label,
+                dominance_ratio=dominance_ratio,
+                candidate_tops=[(l, d.get("best_confidence", 0)) for l, d in sorted_evidence[:3]],
+                reason="low_confidence_with_strong_streak"
+            )
+            logger.info(
+                f"[ClassifierService] Track {track_id}: Reusing label {prev_label} (streak={self.streak_min_length}, avg_conf={reused_confidence:.2f}) "
+                f"instead of low-confidence {current_label} (conf={current_confidence:.2f})"
+            )
+            return prev_label, reused_confidence, "label_reuse_known"
+
+        # Guard for Unknown: allow override if streak supports it & config allows
+        if is_unknown and allow_unknown and allow_unknown_reuse and has_streak:
+            # Check burst dominance
+            dominance_label, dominance_ratio = None, None
+            if len(self._recent_classifications) >= self.burst_window_size:
+                burst_window = self._recent_classifications[-self.burst_window_size:]
+                label_counts = Counter(label for label, _ in burst_window)
+                dominant = label_counts.most_common(1)[0]
+                dominance_label, dominance_ratio = dominant[0], dominant[1] / len(burst_window)
+                if dominance_ratio >= self.burst_dominance_min_ratio and dominance_label != prev_label:
+                    return current_label, current_confidence, None
+
+            # Also check that no top evidence candidate is higher/conflicting
+            sorted_evidence = sorted(evidence.items(), key=lambda x: x[1].get("score", 0), reverse=True)
+
+            streak_confidences = [conf for _, conf in self._recent_classifications[-self.streak_min_length:]]
+            reused_confidence = sum(streak_confidences) / len(streak_confidences)
+            structured_logger.label_reuse_override(
+                track_id=track_id,
+                prev_label=prev_label,
+                new_label=current_label,
+                new_confidence=current_confidence,
+                streak_len=self.streak_min_length,
+                dominance_label=dominance_label,
+                dominance_ratio=dominance_ratio,
+                candidate_tops=[(l, d.get("best_confidence", 0)) for l, d in sorted_evidence[:3]],
+                reason="unknown_with_streak_override"
+            )
+            logger.info(
+                f"[ClassifierService] Track {track_id}: Reusing label {prev_label} (streak={self.streak_min_length}, avg_conf={reused_confidence:.2f}) "
+                f"to override Unknown"
+            )
+            return prev_label, reused_confidence, "label_reuse_unknown"
+
+        # No reuse - return as is
+        return current_label, current_confidence, None
     
     def _calculate_track_volatility(self, track_id: int) -> Optional[float]:
         """
@@ -723,29 +730,24 @@ class ClassifierService:
                         f"{metadata['original_label']}({metadata['original_confidence']:.2f}) -> "
                         f"{final_label}({final_conf:.2f}), reason={smooth_reason}"
                     )
-            
-            # Step 3.6: Check for label reuse (V6 Production-grade stability heuristics)
-            # Only apply to non-Unknown classifications with low confidence
-            if final_label != "Unknown":
-                reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
-                    track_id, final_label, final_conf, evidence
+
+            # Step 3.6: Apply label reuse smoothing ALWAYS
+            reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
+                track_id, final_label, final_conf, evidence
+            )
+            if reuse_label != final_label:
+                metadata["label_reuse_applied"] = True
+                metadata["pre_reuse_label"] = final_label
+                metadata["pre_reuse_confidence"] = final_conf
+                metadata["reuse_reason"] = reuse_reason
+                final_label = reuse_label
+                final_conf = reuse_conf
+                logger.info(
+                    f"[ClassifierService] Track {track_id}: Label reuse changed result: "
+                    f"{metadata['pre_reuse_label']}({metadata['pre_reuse_confidence']:.2f}) -> "
+                    f"{final_label}({final_conf:.2f}), reason={reuse_reason}"
                 )
-                
-                # Update if label reuse changed the result
-                if reuse_label != final_label:
-                    metadata["label_reuse_applied"] = True
-                    metadata["pre_reuse_label"] = final_label
-                    metadata["pre_reuse_confidence"] = final_conf
-                    metadata["reuse_reason"] = reuse_reason
-                    
-                    final_label = reuse_label
-                    final_conf = reuse_conf
-                    
-                    logger.info(
-                        f"[ClassifierService] Track {track_id}: Label reuse changed result: "
-                        f"{metadata['pre_reuse_label']}({metadata['pre_reuse_confidence']:.2f}) -> "
-                        f"{final_label}({final_conf:.2f}), reason={reuse_reason}"
-                    )
+
             
             # Step 3.7: Track label history for volatility analysis (V6)
             self._track_label_history[track_id].append((final_label, final_conf))
@@ -817,6 +819,7 @@ class ClassifierService:
         """
         evidence_summary = metadata.get("evidence_per_label", {})
         winner_ratio = metadata.get("winner_ratio", "N/A")
+        has_previous_label_reused = metadata.get("label_reuse_applied", False)
         
         # Structured logging for analysis
         # Validate winner_ratio for logging (handle float, int, inf, and NaN)
@@ -837,7 +840,8 @@ class ClassifierService:
             rejection_reason=rejection_reason,
             evidence_scores=evidence_summary,
             winner_ratio=valid_ratio,
-            processing_time_ms=classify_time_ms
+            processing_time_ms=classify_time_ms,
+            has_previous_label_reused=has_previous_label_reused,
         )
 
     def _invoke_unknown_result(self, track_id: int, reason: str, context: Optional[Dict]):

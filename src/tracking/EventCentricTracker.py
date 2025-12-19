@@ -533,7 +533,7 @@ class BreadBagEvent:
         self.detection_gaps: List[Tuple[float, float]] = []  # (start_ms, end_ms)
         self.current_gap_start: Optional[float] = None
         
-        # ROI collection (during CLOSED state)
+        # ROI collection (during OPEN or CLOSED state)
         self.roi_candidates: List[ROICandidate] = []
         
         # State transition history for debugging
@@ -997,7 +997,7 @@ class BreadBagEvent:
         self._process_state_transition(detection)
         
         # Collect ROI if in CLOSED state
-        if self.state == EventState.CLOSED and frame_img is not None:
+        if self.state == (EventState.OPEN or EventState.CLOSED) and frame_img is not None:
             self._try_collect_roi(detection, frame_img)
     
     def _process_state_transition(self, detection: DetectionEvidence):
@@ -1084,45 +1084,45 @@ class BreadBagEvent:
             open_hits=self.open_evidence_count,
             closed_hits=self.closed_evidence_count
         )
-    
+
     def _try_collect_roi(self, detection: DetectionEvidence, frame_img: np.ndarray):
-        """
-        Try to collect an ROI candidate during CLOSED state.
-        
-        ROIs are scored for quality (sharpness, size, stability).
-        """
         if len(self.roi_candidates) >= self.config.max_roi_samples:
+            # Optionally track cap rejects:
+            # pipeline_metrics.record_roi_quality(False, 0.0, "cap")
             return
-        
+
         x1, y1, x2, y2 = map(int, detection.box)
         h, w = frame_img.shape[:2]
-        
-        # Clamp to frame bounds
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
-        
+
         roi_width = x2 - x1
         roi_height = y2 - y1
-        
+
         # Size check
         if roi_width < self.config.min_roi_size or roi_height < self.config.min_roi_size:
+            pipeline_metrics.record_roi_quality(False, 0.0, "size")
             return
-        
+
         roi = frame_img[y1:y2, x1:x2].copy()
-        
+
         # Brightness check
         mean_brightness = roi.mean()
         if not (self.config.min_brightness <= mean_brightness <= self.config.max_brightness):
+            pipeline_metrics.record_roi_quality(False, 0.0, "brightness")
             return
-        
+
         # Sharpness check
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        
+
         if sharpness < self.config.min_roi_sharpness:
+            pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             return
-        
-        # Create ROI candidate
+
+        # Accept
+        pipeline_metrics.record_roi_quality(True, sharpness, None)
+
         candidate = ROICandidate(
             roi=roi,
             sharpness=sharpness,
@@ -1132,16 +1132,8 @@ class BreadBagEvent:
             centroid_stability=self.get_centroid_stability(),
             confidence=detection.confidence
         )
-        
         self.roi_candidates.append(candidate)
-        
-        # Keep sorted by quality (sharpness primary)
         self.roi_candidates.sort(key=lambda x: x.sharpness, reverse=True)
-        
-        logger.debug(
-            f"[Event:{self.id}] ROI collected: sharpness={sharpness:.1f}, "
-            f"size={roi_width}x{roi_height}, total={len(self.roi_candidates)}"
-        )
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
                            current_frame_index: int = -1) -> Tuple[bool, str]:
