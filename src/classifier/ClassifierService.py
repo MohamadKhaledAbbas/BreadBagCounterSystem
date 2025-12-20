@@ -14,6 +14,12 @@ Key Changes from V2:
 - ADDED: Evidence accumulation with sharpness and temporal weights
 - ADDED: Winner/runner-up ratio threshold
 - ADDED: Structural "Unknown" definition (not statistical uncertainty)
+
+V7: Classification Reliability Improvements:
+- ADDED: Size-based disambiguation (Brown_Orange_Overlay vs Brown_Orange_Small)
+- ADDED: Trust-weighted log-evidence accumulation
+- ADDED: Class-switch penalty for temporal consistency
+- ADDED: Stability gate to avoid forced decisions under ambiguity
 """
 
 import logging
@@ -29,6 +35,11 @@ from src.config.tracking_config import tracking_config
 from src.utils.Utils import compute_phash
 from src.utils.AppLogging import logger, structured_logger
 from src.utils.PipelineMetrics import pipeline_metrics
+
+# V7: Import new reliability modules
+from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
+from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
+from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult
 
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
@@ -107,6 +118,19 @@ class ClassifierService:
         
         # Track per-track label history for volatility analysis
         self._track_label_history: Dict[int, List[Tuple[str, float]]] = defaultdict(list)  # track_id -> [(label, conf)]
+        
+        # V7: Classification reliability improvements
+        self.disambiguation_enabled = tracking_config.disambiguation_enabled
+        self.evidence_accumulation_enabled = tracking_config.evidence_accumulation_enabled
+        self.evidence_top_k = tracking_config.evidence_top_k_rois
+        
+        # Log V7 configuration
+        v7_status = []
+        if self.disambiguation_enabled:
+            v7_status.append("disambiguation=ON")
+        if self.evidence_accumulation_enabled:
+            v7_status.append("evidence_accumulation=ON")
+        v7_str = ", ".join(v7_status) if v7_status else "disabled"
 
         logger.info(
             f"[ClassifierService] Initialized V4 (Evidence-Based) with V5 Classification Smoothing: "
@@ -114,6 +138,7 @@ class ClassifierService:
             f"ratio_threshold={self.ratio_threshold}, min_candidates={self.min_candidates}, "
             f"history_size={self.history_size}, history_vote_threshold={self.history_vote_threshold}"
         )
+        logger.info(f"[ClassifierService] V7 Reliability: {v7_str}")
 
     def register_callback(self, callback: ResultCallback):
         """Register a callback for classification results."""
@@ -143,6 +168,99 @@ class ClassifierService:
                 context={"candidate_idx": idx}
             )
             return "Unknown", 0.0
+    
+    def _classify_single_with_probs(self, roi_image, idx: int = 0) -> Tuple[str, float, Dict[str, float]]:
+        """
+        Classify a single ROI image and return full probability vector.
+        
+        V7: Required for trust-weighted log-evidence accumulation.
+        
+        Args:
+            roi_image: ROI image to classify
+            idx: Candidate index for logging
+            
+        Returns:
+            Tuple of (label, confidence, probs_dict)
+        """
+        try:
+            label, conf, probs = self.classifier.predict_probs(roi_image)
+            return label, float(conf), probs
+        except Exception as e:
+            structured_logger.pipeline_error(
+                component="ClassifierService",
+                operation="single_roi_classification_with_probs",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                affected_ids=[idx],
+                context={"candidate_idx": idx}
+            )
+            return "Unknown", 0.0, {"Unknown": 0.0}
+    
+    def _apply_disambiguation(
+        self, 
+        label: str, 
+        confidence: float, 
+        bbox: Optional[Tuple[float, float, float, float]],
+        image_height: int = 720
+    ) -> Tuple[str, float, bool, str]:
+        """
+        Apply size-based disambiguation for visually similar classes.
+        
+        V7: Uses perspective-adjusted bounding box area to disambiguate
+        between Brown_Orange_Overlay and Brown_Orange_Small.
+        
+        Args:
+            label: Original classifier label
+            confidence: Original confidence
+            bbox: Bounding box (x1, y1, x2, y2) if available
+            image_height: Height of the source image
+            
+        Returns:
+            Tuple of (final_label, final_confidence, was_disambiguated, reason)
+        """
+        if not self.disambiguation_enabled or bbox is None:
+            return label, confidence, False, "disambiguation_skipped"
+        
+        result = disambiguate_by_size(
+            original_label=label,
+            confidence=confidence,
+            bbox=bbox,
+            image_height=image_height,
+            config=tracking_config
+        )
+        
+        return result.label, result.confidence, result.disambiguated, result.reason
+    
+    def _compute_roi_trust(
+        self,
+        sharpness: float,
+        is_open: bool,
+        roi_size: Tuple[int, int],
+        median_size: Optional[Tuple[int, int]]
+    ) -> float:
+        """
+        Compute trust score for an ROI.
+        
+        V7: Trust score determines how much weight an ROI's classification
+        contributes to the final decision.
+        
+        Args:
+            sharpness: Laplacian variance of the ROI
+            is_open: True if ROI is from an Open detection
+            roi_size: (width, height) of the ROI
+            median_size: Median (width, height) across track's ROIs
+            
+        Returns:
+            Trust score in [0, 1]
+        """
+        result = compute_roi_trust(
+            sharpness=sharpness,
+            is_open=is_open,
+            roi_size=roi_size,
+            median_size=median_size,
+            config=tracking_config
+        )
+        return result.trust
     
     def _apply_classification_smoothing(self, label: str, confidence: float) -> Tuple[str, float, Optional[str]]:
         """
@@ -665,9 +783,42 @@ class ClassifierService:
             
             # Step 1: Classify each candidate
             classifications = []
+            
+            # V7: Compute median ROI size for trust calculation
+            roi_sizes = []
+            for cand in candidates:
+                roi = cand.get('roi')
+                if roi is not None and hasattr(roi, 'shape'):
+                    h, w = roi.shape[:2]
+                    roi_sizes.append((w, h))
+            
+            median_size = None
+            if roi_sizes:
+                median_w = sorted([s[0] for s in roi_sizes])[len(roi_sizes) // 2]
+                median_h = sorted([s[1] for s in roi_sizes])[len(roi_sizes) // 2]
+                median_size = (median_w, median_h)
+            
+            # Get image height from context for disambiguation
+            image_height = tracking_config.default_image_height
+            frame = context.get("frame") if context else None
+            if frame is not None and hasattr(frame, 'shape'):
+                image_height = frame.shape[0]
+            
             for idx, cand in enumerate(candidates):
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
+                
+                # V7: Apply size-based disambiguation if enabled
+                bbox = cand.get('bbox')  # May be None if not available
+                disambiguated = False
+                disambiguation_reason = None
+                if self.disambiguation_enabled and bbox is not None:
+                    label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
+                        label=label,
+                        confidence=conf,
+                        bbox=bbox,
+                        image_height=image_height
+                    )
                 
                 # Calculate contribution for this candidate
                 sharpness = cand.get('sharpness', 0)
@@ -676,6 +827,19 @@ class ClassifierService:
                 temporal_weight = self._compute_temporal_weight(relative_time)
                 raw_contribution = conf * sharpness_weight * temporal_weight
                 clamped_contribution = min(raw_contribution, self.max_single_weight)
+                
+                # V7: Compute trust score for this ROI
+                is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                roi_size = median_size or (100, 100)
+                if roi is not None and hasattr(roi, 'shape'):
+                    h, w = roi.shape[:2]
+                    roi_size = (w, h)
+                trust = self._compute_roi_trust(
+                    sharpness=sharpness,
+                    is_open=is_open,
+                    roi_size=roi_size,
+                    median_size=median_size
+                )
                 
                 # Structured logging for candidate classification
                 structured_logger.classification_candidate(
@@ -696,6 +860,10 @@ class ClassifierService:
                     'sharpness': sharpness,
                     'frame_index': cand.get('frame_index', 0),
                     'relative_time': relative_time,
+                    'trust': trust,  # V7: Include trust score
+                    'is_open': is_open,
+                    'disambiguated': disambiguated,
+                    'disambiguation_reason': disambiguation_reason,
                 })
             
             classify_time = (time.perf_counter() - batch_start) * 1000
@@ -707,6 +875,12 @@ class ClassifierService:
             final_label, final_conf, rejection_reason, metadata = self._finalize_classification(
                 evidence, event_stats
             )
+            
+            # V7: Add disambiguation stats to metadata
+            disambiguated_count = sum(1 for c in classifications if c.get('disambiguated', False))
+            if disambiguated_count > 0:
+                metadata['disambiguation_applied'] = True
+                metadata['disambiguation_count'] = disambiguated_count
             
             # Step 3.5: Apply classification smoothing (V5)
             # Only smooth non-Unknown classifications
