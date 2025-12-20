@@ -59,7 +59,7 @@ class BagEvent:
     # V4: Enhanced ROI storage with full metadata
         # Each entry: (sharpness, roi, frame_index, bbox_area, confidence, bbox)
         # roi is np.ndarray (BGR image)
-        # bbox is (x1, y1, x2, y2) tuple for disambiguation
+        # bbox is Tuple[float, float, float, float] - (x1, y1, x2, y2) for disambiguation
         self.open_rois: List[Tuple[float, np.ndarray, int, float, float, Tuple[float, float, float, float]]] = []
         self.closed_rois: List[Tuple[float, np.ndarray, int, float, float, Tuple[float, float, float, float]]] = []
         

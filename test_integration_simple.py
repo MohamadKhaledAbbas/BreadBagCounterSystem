@@ -2,18 +2,27 @@
 """
 Simple integration test to verify bbox and evidence accumulation changes.
 This can be run without pytest to validate basic functionality.
+
+Note: This test requires the BreadBagCounterSystem package to be properly installed
+or the src directory to be in PYTHONPATH.
 """
 
 import sys
+import os
 import numpy as np
 from dataclasses import dataclass
 
-# Add src to path
-sys.path.insert(0, 'src')
-
-from classifier.evidence_accumulator import accumulate_track_evidence
-from classifier.disambiguation import disambiguate_by_size
-from config.tracking_config import tracking_config
+# Use proper package import if available, otherwise add to path
+try:
+    from src.classifier.evidence_accumulator import accumulate_track_evidence
+    from src.classifier.disambiguation import disambiguate_by_size
+    from src.config.tracking_config import tracking_config
+except ImportError:
+    # Fallback: add src to path (for local testing)
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+    from classifier.evidence_accumulator import accumulate_track_evidence
+    from classifier.disambiguation import disambiguate_by_size
+    from config.tracking_config import tracking_config
 
 
 @dataclass
@@ -184,7 +193,7 @@ def test_metadata_structure():
     for key in required_keys:
         assert key in metadata, f"Required key '{key}' missing from metadata!"
     
-    assert metadata['evidence_accumulation_used'] == True, "Should indicate evidence accumulation was used!"
+    assert metadata['evidence_accumulation_used'] is True, "Should indicate evidence accumulation was used!"
     
     print("✓ Metadata structure is complete")
     print(f"  Keys present: {len(metadata)}")

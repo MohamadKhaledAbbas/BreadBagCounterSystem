@@ -39,7 +39,7 @@ from src.utils.PipelineMetrics import pipeline_metrics
 # V7: Import new reliability modules
 from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
 from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
-from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult
+from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
@@ -938,7 +938,6 @@ class ClassifierService:
                     })
                 
                 # Use accumulate_track_evidence convenience function
-                from src.classifier.evidence_accumulator import accumulate_track_evidence
                 accumulator_result = accumulate_track_evidence(classifications_with_probs, tracking_config)
                 
                 # Extract final result
@@ -1051,7 +1050,7 @@ class ClassifierService:
                     best_roi = self._select_best_representative(evidence, final_label)
             else:
                 # For Unknown/Uncertain, use the ROI with highest individual confidence
-                if self.evidence_accumulation_enabled and 'classifications_with_probs' in locals():
+                if self.evidence_accumulation_enabled:
                     best_classification = max(classifications_with_probs, key=lambda x: x['confidence'])
                     best_roi = best_classification['roi']
                     final_conf = best_classification['confidence']
