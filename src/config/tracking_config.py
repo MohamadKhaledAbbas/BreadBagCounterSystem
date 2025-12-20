@@ -1375,6 +1375,305 @@ class TrackingConfig:
     Default: 0.15
     """
 
+    # ============================================================================
+    # Part 1: Size-Based Disambiguation (Brown_Orange_Overlay vs Brown_Orange_Small)
+    # ============================================================================
+    # These parameters control the post-detection disambiguation between visually
+    # similar classes using perspective-adjusted bounding box area.
+    
+    disambiguation_enabled: bool = _parse_bool_env("DISAMBIGUATION_ENABLED", True)
+    """
+    Enable/disable size-based disambiguation between Brown_Orange_Overlay and Brown_Orange_Small.
+    
+    When True: Uses perspective-adjusted bbox area to disambiguate similar classes
+    When False: Relies solely on YOLO classifier predictions
+    
+    Default: True
+    """
+    
+    disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
+    """
+    Class pair to disambiguate using size-based logic.
+    First element = "regular/larger" class, Second = "small" class.
+    """
+    
+    disambiguation_y_feature: str = 'cy'
+    """
+    Which Y coordinate feature to use for perspective calculation.
+    Options:
+    - 'cy': Use bbox center y-coordinate (y1 + y2) / 2
+    - 'y2': Use bbox bottom y-coordinate
+    
+    Default: 'cy' (center y)
+    """
+    
+    disambiguation_scaling_model: str = 'linear'
+    """
+    Perspective scaling model to adjust apparent area.
+    Options:
+    - 'linear': scale = a + b * y_norm
+    - 'power': scale = (a + b * y_norm) ** p  
+    - 'inverse': scale = 1 / (a + b * (1 - y_norm))
+    
+    Default: 'linear'
+    """
+    
+    disambiguation_scale_a: float = _parse_float_env("DISAMBIGUATION_SCALE_A", 0.5)
+    """
+    Scaling coefficient 'a' for perspective adjustment.
+    
+    For linear model: scale = a + b * y_norm
+    Range: 0.3 - 1.0
+    
+    Default: 0.5
+    """
+    
+    disambiguation_scale_b: float = _parse_float_env("DISAMBIGUATION_SCALE_B", 1.0)
+    """
+    Scaling coefficient 'b' for perspective adjustment.
+    
+    For linear model: scale = a + b * y_norm
+    Range: 0.5 - 2.0
+    
+    Default: 1.0
+    """
+    
+    disambiguation_scale_p: float = _parse_float_env("DISAMBIGUATION_SCALE_P", 1.5)
+    """
+    Power exponent 'p' for power-law scaling model.
+    
+    Only used when disambiguation_scaling_model='power'
+    Range: 1.0 - 3.0
+    
+    Default: 1.5
+    """
+    
+    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 15000.0)
+    """
+    Adjusted area threshold below which a detection is classified as "small".
+    
+    If adjusted_area < small_threshold => force class to Brown_Orange_Small
+    
+    Range: 10000 - 25000 (depends on camera setup)
+    Tuning: Plot adjusted_area vs true label to find optimal threshold.
+    
+    Default: 15000.0 (pixels^2)
+    """
+    
+    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 25000.0)
+    """
+    Adjusted area threshold above which a detection is classified as "regular/overlay".
+    
+    If adjusted_area > regular_threshold => force class to Brown_Orange_Overlay
+    
+    Range: 20000 - 40000 (depends on camera setup)
+    Tuning: Plot adjusted_area vs true label to find optimal threshold.
+    
+    Default: 25000.0 (pixels^2)
+    """
+    
+    disambiguation_gray_zone_behavior: str = 'keep_original'
+    """
+    Behavior when adjusted_area falls in the gray zone (between small and regular thresholds).
+    Options:
+    - 'keep_original': Keep YOLO's original prediction
+    - 'uncertain': Return "Uncertain" classification
+    - 'prefer_small': Prefer small classification in gray zone
+    - 'prefer_regular': Prefer regular/overlay classification in gray zone
+    
+    Default: 'keep_original'
+    """
+    
+    disambiguation_debug_logging: bool = _parse_bool_env("DISAMBIGUATION_DEBUG", False)
+    """
+    Enable detailed debug logging for disambiguation tuning.
+    
+    When True: Logs raw area, adjusted area, y_norm, scale factor, and decision
+    
+    Default: False
+    """
+    
+    # ============================================================================
+    # Part 2: Trust-Weighted Temporal Evidence Accumulation
+    # ============================================================================
+    # These parameters control the noise-resistant track-level classification
+    # using trust-weighted log evidence aggregation.
+    
+    evidence_accumulation_enabled: bool = _parse_bool_env("EVIDENCE_ACCUMULATION_ENABLED", True)
+    """
+    Enable trust-weighted log-evidence accumulation for classification.
+    
+    When True: Uses weighted log-evidence across ROIs
+    When False: Uses legacy evidence-based classification
+    
+    Default: True
+    """
+    
+    # --------------------------------------------------------------------------
+    # Trust Scoring Parameters
+    # --------------------------------------------------------------------------
+    
+    trust_open_max: float = _parse_float_env("TRUST_OPEN_MAX", 1.0)
+    """
+    Maximum trust score for Open ROIs.
+    
+    Open ROIs typically have better view of bag details.
+    Range: 0.8 - 1.0
+    
+    Default: 1.0
+    """
+    
+    trust_closed_max: float = _parse_float_env("TRUST_CLOSED_MAX", 0.7)
+    """
+    Maximum trust score for Closed ROIs (capped).
+    
+    Closed ROIs may have caps/deformation but still provide regularization.
+    Range: 0.5 - 0.8
+    
+    Default: 0.7
+    """
+    
+    trust_sharpness_min: float = _parse_float_env("TRUST_SHARPNESS_MIN", 100.0)
+    """
+    Minimum sharpness value for trust normalization.
+    
+    Sharpness below this value gets lowest trust component.
+    Range: 50 - 200
+    
+    Default: 100.0
+    """
+    
+    trust_sharpness_max: float = _parse_float_env("TRUST_SHARPNESS_MAX", 800.0)
+    """
+    Maximum sharpness value for trust normalization.
+    
+    Sharpness above this value gets highest trust component.
+    Range: 500 - 1500
+    
+    Default: 800.0
+    """
+    
+    trust_blur_penalty: float = _parse_float_env("TRUST_BLUR_PENALTY", 0.3)
+    """
+    Penalty factor for blurry ROIs (low sharpness).
+    
+    Applied as: trust = trust * (1 - blur_penalty) when sharpness is low.
+    Range: 0.1 - 0.5
+    
+    Default: 0.3
+    """
+    
+    trust_size_stability_tolerance: float = _parse_float_env("TRUST_SIZE_TOLERANCE", 0.3)
+    """
+    Tolerance for ROI size variation from median (as fraction).
+    
+    ROIs with size deviation > tolerance are penalized.
+    Range: 0.2 - 0.5
+    
+    Default: 0.3
+    """
+    
+    trust_min_for_support: float = _parse_float_env("TRUST_MIN_FOR_SUPPORT", 0.4)
+    """
+    Minimum trust score for an ROI to count as "supporting" evidence.
+    
+    Used in stability gate to count trusted ROIs.
+    Range: 0.3 - 0.6
+    
+    Default: 0.4
+    """
+    
+    # --------------------------------------------------------------------------
+    # Evidence Accumulation Parameters
+    # --------------------------------------------------------------------------
+    
+    evidence_epsilon: float = _parse_float_env("EVIDENCE_EPSILON", 1e-6)
+    """
+    Small constant to avoid log(0) in evidence calculation.
+    
+    Range: 1e-9 to 1e-4
+    
+    Default: 1e-6
+    """
+    
+    evidence_top_k_rois: int = _parse_int_env("EVIDENCE_TOP_K_ROIS", 7)
+    """
+    Number of top ROIs (by trust) to use for evidence accumulation.
+    
+    Quality-first selection: pick best K ROIs regardless of total count.
+    Range: 3 - 10
+    
+    Default: 7
+    """
+    
+    # --------------------------------------------------------------------------
+    # Temporal Consistency Parameters (Class Switch Penalty)
+    # --------------------------------------------------------------------------
+    
+    temporal_inertia_enabled: bool = _parse_bool_env("TEMPORAL_INERTIA_ENABLED", True)
+    """
+    Enable class-switch penalty to reduce flip-flopping within tracks.
+    
+    When True: Penalizes late class switches unless evidence is overwhelming
+    When False: Each classification decision is independent
+    
+    Default: True
+    """
+    
+    temporal_inertia_strength: float = _parse_float_env("TEMPORAL_INERTIA_STRENGTH", 0.15)
+    """
+    Strength of the inertia/penalty for class switching.
+    
+    Applied as a log-evidence bonus to the previously leading class.
+    Range: 0.1 - 0.3
+    
+    Default: 0.15
+    """
+    
+    temporal_inertia_decay: float = _parse_float_env("TEMPORAL_INERTIA_DECAY", 0.8)
+    """
+    Decay factor for inertia over subsequent ROIs.
+    
+    Each new ROI reduces inertia by this factor, allowing legitimate switches.
+    Range: 0.6 - 0.95
+    
+    Default: 0.8
+    """
+    
+    # --------------------------------------------------------------------------
+    # Stability Gate Parameters
+    # --------------------------------------------------------------------------
+    
+    stability_gate_enabled: bool = _parse_bool_env("STABILITY_GATE_ENABLED", True)
+    """
+    Enable stability gate to prevent forced decisions under ambiguity.
+    
+    When True: Returns "Uncertain" when evidence is insufficient
+    When False: Always returns best available prediction
+    
+    Default: True
+    """
+    
+    stability_margin_threshold: float = _parse_float_env("STABILITY_MARGIN_THRESHOLD", 0.5)
+    """
+    Minimum log-evidence margin between winner and runner-up.
+    
+    If margin < threshold, result is marked as "Uncertain".
+    Range: 0.2 - 1.0
+    
+    Default: 0.5
+    """
+    
+    stability_min_trusted_rois: int = _parse_int_env("STABILITY_MIN_TRUSTED_ROIS", 2)
+    """
+    Minimum number of trusted ROIs (trust >= trust_min_for_support) required.
+    
+    If fewer trusted ROIs, result is marked as "Uncertain".
+    Range: 1 - 5
+    
+    Default: 2
+    """
+
     use_frame_timestamps: bool = IS_WINDOWS
 
     # ==========================================================================

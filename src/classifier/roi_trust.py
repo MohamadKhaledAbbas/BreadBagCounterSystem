@@ -1,0 +1,335 @@
+"""
+ROI Trust Scoring Module for Evidence-Weighted Classification.
+
+This module computes trust scores for ROI candidates based on quality metrics
+that are independent of the predicted class. The trust score determines how
+much weight an ROI's classification contributes to the final track-level decision.
+
+Trust Score Composition:
+- Sharpness: Primary component - sharper images are more reliable
+- State (Open/Closed): Open ROIs can reach max trust; Closed are capped
+- Motion blur: Penalty for blurry ROIs (inferred from sharpness)
+- Size stability: Penalty for outlier sizes vs track median
+
+The goal is to ensure that quantity of ROIs is irrelevant - only quality matters.
+Low-quality ROIs cannot outweigh high-quality ones in evidence accumulation.
+
+Usage:
+    from src.classifier.roi_trust import compute_roi_trust, ROITrustResult
+    
+    result = compute_roi_trust(
+        sharpness=450.0,
+        is_open=True,
+        roi_size=(100, 80),
+        median_size=(95, 82),
+        config=tracking_config
+    )
+    
+    trust_score = result.trust  # Use for evidence weighting
+
+All parameters are centralized in tracking_config.py for easy tuning.
+"""
+
+import math
+from typing import Dict, Any, Optional, Tuple, List
+from dataclasses import dataclass
+
+from src.utils.AppLogging import logger
+
+
+@dataclass
+class ROITrustResult:
+    """Result of ROI trust scoring."""
+    trust: float  # Final trust score in [0, 1]
+    sharpness_component: float  # Contribution from sharpness
+    state_cap: float  # Maximum allowed (open vs closed)
+    size_penalty: float  # Penalty from size instability (0 = no penalty)
+    blur_penalty: float  # Penalty from detected blur
+    is_trusted: bool  # True if trust >= min_for_support threshold
+    reason: str  # Human-readable explanation
+
+
+def normalize_sharpness(
+    sharpness: float,
+    sharpness_min: float = 100.0,
+    sharpness_max: float = 800.0
+) -> float:
+    """
+    Normalize sharpness to [0, 1] range.
+    
+    Args:
+        sharpness: Raw sharpness value (Laplacian variance)
+        sharpness_min: Minimum expected sharpness
+        sharpness_max: Maximum expected sharpness
+        
+    Returns:
+        Normalized sharpness in [0, 1]
+    """
+    if sharpness <= sharpness_min:
+        return 0.0
+    elif sharpness >= sharpness_max:
+        return 1.0
+    else:
+        return (sharpness - sharpness_min) / (sharpness_max - sharpness_min)
+
+
+def compute_size_deviation(
+    roi_size: Tuple[int, int],
+    median_size: Optional[Tuple[int, int]]
+) -> float:
+    """
+    Compute size deviation from median as a fraction.
+    
+    Args:
+        roi_size: (width, height) of the ROI
+        median_size: (width, height) median size of track's ROIs
+        
+    Returns:
+        Deviation as fraction (0 = same size, 0.5 = 50% different)
+    """
+    if median_size is None:
+        return 0.0
+    
+    roi_area = roi_size[0] * roi_size[1]
+    median_area = median_size[0] * median_size[1]
+    
+    if median_area <= 0:
+        return 0.0
+    
+    deviation = abs(roi_area - median_area) / median_area
+    return min(deviation, 1.0)  # Cap at 1.0
+
+
+def compute_roi_trust(
+    sharpness: float,
+    is_open: bool,
+    roi_size: Tuple[int, int],
+    median_size: Optional[Tuple[int, int]],
+    config: Any
+) -> ROITrustResult:
+    """
+    Compute trust score for a single ROI based on quality metrics.
+    
+    The trust score is class-independent - it measures how reliable
+    the ROI is as evidence, regardless of what class it predicts.
+    
+    Args:
+        sharpness: Laplacian variance (higher = sharper)
+        is_open: True if ROI is from an Open detection
+        roi_size: (width, height) of the ROI in pixels
+        median_size: Median (width, height) across track's ROIs (for stability)
+        config: TrackingConfig object with trust parameters
+        
+    Returns:
+        ROITrustResult with trust score and component breakdown
+        
+    Trust Calculation:
+        1. Normalize sharpness to [0, 1]
+        2. Apply state cap (Open vs Closed)
+        3. Apply size stability penalty
+        4. Apply blur penalty (implicit in low sharpness)
+        5. Clamp final trust to [0, 1]
+    """
+    # Get configuration parameters
+    open_max = getattr(config, 'trust_open_max', 1.0)
+    closed_max = getattr(config, 'trust_closed_max', 0.7)
+    sharpness_min = getattr(config, 'trust_sharpness_min', 100.0)
+    sharpness_max = getattr(config, 'trust_sharpness_max', 800.0)
+    blur_penalty = getattr(config, 'trust_blur_penalty', 0.3)
+    size_tolerance = getattr(config, 'trust_size_stability_tolerance', 0.3)
+    trust_min_for_support = getattr(config, 'trust_min_for_support', 0.4)
+    
+    # 1. Normalize sharpness
+    sharpness_norm = normalize_sharpness(
+        sharpness=sharpness,
+        sharpness_min=sharpness_min,
+        sharpness_max=sharpness_max
+    )
+    
+    # 2. Determine state cap
+    state_cap = open_max if is_open else closed_max
+    
+    # 3. Compute size deviation penalty
+    size_deviation = compute_size_deviation(roi_size, median_size)
+    size_penalty = 0.0
+    if size_deviation > size_tolerance:
+        # Penalize ROIs with unusual size
+        excess = size_deviation - size_tolerance
+        size_penalty = min(excess * 0.5, 0.3)  # Max 30% penalty
+    
+    # 4. Compute blur penalty (applied when sharpness is very low)
+    applied_blur_penalty = 0.0
+    if sharpness_norm < 0.3:  # Below 30% normalized sharpness
+        applied_blur_penalty = blur_penalty * (1.0 - sharpness_norm / 0.3)
+    
+    # 5. Calculate final trust
+    # Start with sharpness as base
+    base_trust = sharpness_norm
+    
+    # Apply state cap
+    trust = min(base_trust, state_cap)
+    
+    # Apply penalties (multiplicative reduction)
+    trust = trust * (1.0 - size_penalty)
+    trust = trust * (1.0 - applied_blur_penalty)
+    
+    # Clamp to [0, 1]
+    trust = max(0.0, min(1.0, trust))
+    
+    # Determine if this ROI is "trusted" (meets support threshold)
+    is_trusted = trust >= trust_min_for_support
+    
+    # Build reason string
+    reasons = []
+    if sharpness_norm < 0.5:
+        reasons.append(f"low_sharpness({sharpness:.0f})")
+    if not is_open:
+        reasons.append(f"closed_cap({closed_max})")
+    if size_penalty > 0:
+        reasons.append(f"size_outlier({size_deviation:.2f})")
+    if applied_blur_penalty > 0:
+        reasons.append(f"blur_penalty({applied_blur_penalty:.2f})")
+    
+    reason = ", ".join(reasons) if reasons else "good_quality"
+    
+    return ROITrustResult(
+        trust=trust,
+        sharpness_component=sharpness_norm,
+        state_cap=state_cap,
+        size_penalty=size_penalty,
+        blur_penalty=applied_blur_penalty,
+        is_trusted=is_trusted,
+        reason=reason
+    )
+
+
+def compute_track_trust_scores(
+    roi_candidates: List[Dict[str, Any]],
+    config: Any
+) -> List[Dict[str, Any]]:
+    """
+    Compute trust scores for all ROI candidates in a track.
+    
+    Also computes the median size for stability analysis.
+    
+    Args:
+        roi_candidates: List of ROI candidate dicts with 'sharpness', 'size', 'is_open' keys
+        config: TrackingConfig object
+        
+    Returns:
+        List of candidates with 'trust' and 'trust_result' added
+    """
+    if not roi_candidates:
+        return []
+    
+    # Compute median size across all candidates
+    sizes = [(c.get('size', (100, 100))[0], c.get('size', (100, 100))[1]) 
+             for c in roi_candidates]
+    
+    if sizes:
+        median_width = sorted([s[0] for s in sizes])[len(sizes) // 2]
+        median_height = sorted([s[1] for s in sizes])[len(sizes) // 2]
+        median_size = (median_width, median_height)
+    else:
+        median_size = None
+    
+    results = []
+    for candidate in roi_candidates:
+        sharpness = candidate.get('sharpness', 0.0)
+        is_open = candidate.get('is_open', True) or candidate.get('state') == 'open'
+        roi_size = candidate.get('size', (100, 100))
+        
+        trust_result = compute_roi_trust(
+            sharpness=sharpness,
+            is_open=is_open,
+            roi_size=roi_size,
+            median_size=median_size,
+            config=config
+        )
+        
+        # Add trust score to candidate
+        updated = {
+            **candidate,
+            'trust': trust_result.trust,
+            'trust_result': trust_result
+        }
+        results.append(updated)
+    
+    return results
+
+
+def select_top_k_by_trust(
+    roi_candidates: List[Dict[str, Any]],
+    k: int,
+    config: Any
+) -> List[Dict[str, Any]]:
+    """
+    Select top-K ROI candidates by trust score (quality-first selection).
+    
+    This ensures that the best quality ROIs are used for classification,
+    regardless of how many total ROIs were collected.
+    
+    Args:
+        roi_candidates: List of ROI candidate dicts
+        k: Number of top candidates to select
+        config: TrackingConfig object
+        
+    Returns:
+        Top-K candidates sorted by trust (highest first)
+    """
+    # Compute trust scores if not already present
+    candidates_with_trust = []
+    for candidate in roi_candidates:
+        if 'trust' not in candidate:
+            # Need to compute trust
+            sharpness = candidate.get('sharpness', 0.0)
+            is_open = candidate.get('is_open', True) or candidate.get('state') == 'open'
+            roi_size = candidate.get('size', (100, 100))
+            
+            trust_result = compute_roi_trust(
+                sharpness=sharpness,
+                is_open=is_open,
+                roi_size=roi_size,
+                median_size=None,  # Individual computation
+                config=config
+            )
+            candidate = {**candidate, 'trust': trust_result.trust}
+        
+        candidates_with_trust.append(candidate)
+    
+    # Sort by trust descending
+    sorted_candidates = sorted(
+        candidates_with_trust,
+        key=lambda x: x.get('trust', 0.0),
+        reverse=True
+    )
+    
+    # Return top K
+    return sorted_candidates[:k]
+
+
+def count_trusted_rois(
+    roi_candidates: List[Dict[str, Any]],
+    config: Any
+) -> int:
+    """
+    Count number of ROIs that meet the minimum trust threshold.
+    
+    Used for stability gate to ensure sufficient high-quality evidence.
+    
+    Args:
+        roi_candidates: List of ROI candidates with 'trust' scores
+        config: TrackingConfig object
+        
+    Returns:
+        Number of trusted ROIs
+    """
+    trust_min = getattr(config, 'trust_min_for_support', 0.4)
+    
+    count = 0
+    for candidate in roi_candidates:
+        trust = candidate.get('trust', 0.0)
+        if trust >= trust_min:
+            count += 1
+    
+    return count
