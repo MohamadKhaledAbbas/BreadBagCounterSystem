@@ -56,6 +56,7 @@ class MockConfig:
     disambiguation_regular_threshold: float = 25000.0
     disambiguation_gray_zone_behavior: str = 'keep_original'
     disambiguation_debug_logging: bool = False
+    disambiguation_family_name: str = 'Brown_Orange_Family'
     
     # Trust parameters
     trust_open_max: float = 1.0
@@ -177,7 +178,7 @@ class TestDisambiguation:
     """Tests for the main disambiguation function."""
     
     def test_non_target_class_unchanged(self, default_config):
-        """Classes not in target pair should be unchanged."""
+        """Classes not in target family should be unchanged."""
         result = disambiguate_by_size(
             original_label="Blue_Yellow",
             confidence=0.8,
@@ -188,7 +189,7 @@ class TestDisambiguation:
         
         assert result.label == "Blue_Yellow"
         assert result.disambiguated is False
-        assert result.reason == "not_target_class"
+        assert result.reason == "not_target_family"
     
     def test_disabled_disambiguation(self, default_config):
         """When disabled, original label should be kept."""
@@ -207,7 +208,7 @@ class TestDisambiguation:
         assert result.reason == "disambiguation_disabled"
     
     def test_small_area_forces_small_class(self, default_config):
-        """Very small adjusted area should force small class."""
+        """Family member with small adjusted area should be classified as small."""
         # Small box near top of frame
         small_bbox = (300, 50, 360, 110)  # 60x60 = 3600 px²
         
@@ -220,14 +221,14 @@ class TestDisambiguation:
         )
         
         # Adjusted area should be < small_threshold (15000)
-        # Result should be forced to Small class
+        # Result should be Small class based on SIZE, not classifier
         assert result.adjusted_area < default_config.disambiguation_small_threshold
         assert result.label == "Brown_Orange_Small"
         assert result.disambiguated is True
-        assert "area_below_small_threshold" in result.reason
+        assert "family_size_small" in result.reason
     
     def test_large_area_forces_regular_class(self, default_config):
-        """Very large adjusted area should force regular class."""
+        """Family member with large adjusted area should be classified as regular."""
         # Large box near bottom of frame
         large_bbox = (100, 500, 300, 700)  # 200x200 = 40000 px²
         
@@ -240,14 +241,14 @@ class TestDisambiguation:
         )
         
         # Adjusted area should be > regular_threshold (25000)
-        # Result should be forced to Regular class
+        # Result should be Regular class based on SIZE, not classifier
         assert result.adjusted_area > default_config.disambiguation_regular_threshold
         assert result.label == "Brown_Orange_Overlay"
         assert result.disambiguated is True
-        assert "area_above_regular_threshold" in result.reason
+        assert "family_size_regular" in result.reason
     
-    def test_gray_zone_keeps_original(self, default_config):
-        """Gray zone with 'keep_original' should preserve classifier label."""
+    def test_gray_zone_default_regular(self, default_config):
+        """Gray zone with 'keep_original' defaults to regular for family members."""
         # Medium box that falls in gray zone
         medium_bbox = (200, 300, 350, 430)  # 150x130 = 19500 px²
         
@@ -259,10 +260,11 @@ class TestDisambiguation:
             config=default_config
         )
         
-        # If in gray zone, should keep original
+        # For family members in gray zone with 'keep_original', defaults to regular
         if default_config.disambiguation_small_threshold <= result.adjusted_area <= default_config.disambiguation_regular_threshold:
-            assert result.label == "Brown_Orange_Overlay"
-            assert "gray_zone_keep_original" in result.reason
+            assert result.label == "Brown_Orange_Overlay"  # Regular class
+            assert "family_gray_zone_default_regular" in result.reason
+            assert result.disambiguated is True  # Always disambiguated for family
     
     def test_gray_zone_uncertain(self, default_config):
         """Gray zone with 'uncertain' behavior."""
@@ -282,7 +284,43 @@ class TestDisambiguation:
         # Verify result based on actual area calculation
         if default_config.disambiguation_small_threshold <= result.adjusted_area <= default_config.disambiguation_regular_threshold:
             assert result.label == "Uncertain"
-            assert "gray_zone_uncertain" in result.reason
+            assert "family_gray_zone_uncertain" in result.reason
+    
+    def test_family_name_recognized(self, default_config):
+        """Future classifier returning family name should be recognized."""
+        # Test that Brown_Orange_Family is recognized as a family member
+        large_bbox = (100, 500, 300, 700)  # Large box -> regular
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Family",  # Future classifier output
+            confidence=0.8,
+            bbox=large_bbox,
+            image_height=720,
+            config=default_config
+        )
+        
+        # Family name should be recognized and processed
+        assert result.disambiguated is True
+        assert result.label in ["Brown_Orange_Overlay", "Brown_Orange_Small"]
+        assert "family_" in result.reason
+    
+    def test_all_family_members_always_disambiguated(self, default_config):
+        """All family members should have disambiguated=True regardless of size match."""
+        # Even if classifier guesses correctly, disambiguated should be True
+        # because we're treating all family members the same way
+        large_bbox = (100, 500, 300, 700)
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Overlay",  # Classifier guessed regular
+            confidence=0.7,
+            bbox=large_bbox,
+            image_height=720,
+            config=default_config
+        )
+        
+        # Size confirms regular, but disambiguated is True because it's family-based
+        assert result.disambiguated is True
+        assert result.label == "Brown_Orange_Overlay"
     
     def test_batch_disambiguation(self, default_config):
         """Test batch disambiguation."""
@@ -297,7 +335,7 @@ class TestDisambiguation:
         assert len(results) == 3
         # Second item (Blue_Yellow) should be unchanged
         assert results[1]['disambiguation']['applied'] is False
-        assert results[1]['disambiguation']['reason'] == 'not_target_class'
+        assert results[1]['disambiguation']['reason'] == 'not_target_family'
 
 
 # =============================================================================

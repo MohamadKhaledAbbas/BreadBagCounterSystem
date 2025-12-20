@@ -1393,8 +1393,24 @@ class TrackingConfig:
     
     disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
     """
-    Class pair to disambiguate using size-based logic.
+    Class pair (family members) to disambiguate using size-based logic.
     First element = "regular/larger" class, Second = "small" class.
+    
+    When the classifier returns ANY of these classes, we treat them as a "family"
+    and decide the specific class purely based on size measurement.
+    """
+    
+    disambiguation_family_name: str = 'Brown_Orange_Family'
+    """
+    Name of the class family for logging and future classifier training.
+    
+    This is used for:
+    1. Debug logging to show which family a detection belongs to
+    2. Future-proofing: if the classifier is retrained to return this family name
+       directly (e.g., "Brown_Orange_Family"), the disambiguation logic will 
+       automatically recognize it and apply size-based decision.
+    
+    Default: 'Brown_Orange_Family'
     """
     
     disambiguation_y_feature: str = 'cy'
@@ -1511,6 +1527,21 @@ class TrackingConfig:
     Common values: 720 (720p), 1080 (1080p), 480 (480p)
     
     Default: 720
+    """
+    
+    disambiguation_penalty_on_change_only: bool = _parse_bool_env("DISAMBIGUATION_PENALTY_ON_CHANGE_ONLY", False)
+    """
+    Only apply confidence penalty when size-based decision differs from classifier.
+    
+    When False (default): Always apply penalty for family members (conservative)
+    When True: Only apply penalty when classifier's prediction differs from size decision
+    
+    Rationale:
+    - False = conservative: All family detections are treated as "size-decided", 
+      so confidence reflects this override regardless of classifier accuracy.
+    - True = optimistic: Trust classifier's confidence when it agrees with size.
+    
+    Default: False (conservative approach)
     """
     
     # ============================================================================

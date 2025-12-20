@@ -1,32 +1,48 @@
 """
-Size-Based Disambiguation Module for Visually Similar Classes.
+Size-Based Disambiguation Module for Visually Similar Class Families.
 
-This module implements post-detection disambiguation between visually similar
+This module implements family-based disambiguation for visually similar
 bread bag classes (e.g., Brown_Orange_Overlay vs Brown_Orange_Small) using
 perspective-adjusted bounding box area analysis.
 
-The key insight is that these classes differ primarily in physical size, and
-the camera's fixed viewpoint creates a predictable relationship between:
+## Family-Based Approach
+
+When the classifier returns ANY member of a visually similar class family
+(e.g., Brown_Orange_Overlay or Brown_Orange_Small), we treat the detection
+as belonging to a "family" (Brown_Orange_Family) and decide the SPECIFIC
+class purely based on size measurement.
+
+This approach is future-proof:
+- If the classifier is later retrained to return "Brown_Orange_Family" directly,
+  the same size-based logic will work seamlessly.
+- Size measurement is the primary discriminant, not the classifier's guess.
+
+## Key Insight
+
+These classes differ primarily in physical size, and the camera's fixed 
+viewpoint creates a predictable relationship between:
 - Y position in frame (higher = farther = appears smaller)
 - Apparent bbox area (needs perspective adjustment)
 
 By computing perspective-adjusted area, we can reliably separate "small" vs
-"regular" bags even when the classifier is uncertain.
+"regular" bags regardless of what the classifier initially predicted.
 
-Usage:
+## Usage
+
     from src.classifier.disambiguation import disambiguate_by_size
     
     result = disambiguate_by_size(
-        original_label="Brown_Orange_Overlay",
+        original_label="Brown_Orange_Overlay",  # or "Brown_Orange_Small" or "Brown_Orange_Family"
         confidence=0.65,
         bbox=(x1, y1, x2, y2),
         image_height=720,
         config=tracking_config
     )
     
-    if result['disambiguated']:
-        final_label = result['label']
-        reason = result['reason']
+    # For family members, result.label is ALWAYS decided by size
+    # result.disambiguated = True for all family members
+    final_label = result.label
+    reason = result.reason  # e.g., "family_size_small (12500 < 15000)"
 
 All parameters are centralized in tracking_config.py for easy tuning.
 """
@@ -169,9 +185,12 @@ def disambiguate_by_size(
     """
     Disambiguate between visually similar classes using perspective-adjusted area.
     
-    This function checks if the original_label is one of the disambiguation
-    target classes, and if so, uses size-based logic to potentially override
-    the classifier's prediction.
+    This function implements a "family-based" disambiguation approach:
+    - When the classifier returns ANY member of a visually similar class family
+      (e.g., Brown_Orange_Overlay or Brown_Orange_Small), we treat them as 
+      "Brown_Orange_Family" and decide the specific class PURELY based on size.
+    - This approach is future-proof: if the classifier is later trained to return
+      "Brown_Orange_Family" directly, the same size-based logic will work.
     
     Args:
         original_label: Label predicted by the classifier
@@ -184,11 +203,14 @@ def disambiguate_by_size(
         DisambiguationResult with final label and diagnostic info
         
     Decision Logic:
-        1. If label not in target classes -> return original unchanged
-        2. Compute perspective-adjusted area
-        3. If adjusted_area < small_threshold -> force to small class
-        4. If adjusted_area > regular_threshold -> force to regular class
-        5. Else (gray zone) -> apply gray_zone_behavior
+        1. If label not in target family classes -> return original unchanged
+        2. If label IS in target family -> treat as "family" detection
+        3. Compute perspective-adjusted area
+        4. Decide final class PURELY based on size:
+           - adjusted_area < small_threshold -> Small class
+           - adjusted_area > regular_threshold -> Regular class  
+           - gray zone -> apply gray_zone_behavior
+        5. Always mark as disambiguated=True for family classes (size-decided)
     """
     # Check if disambiguation is enabled
     if not getattr(config, 'disambiguation_enabled', True):
@@ -203,23 +225,33 @@ def disambiguate_by_size(
             scale_factor=1.0
         )
     
-    # Get disambiguation target classes
+    # Get disambiguation target classes (family members)
     target_classes = getattr(config, 'disambiguation_classes', 
                              ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
     regular_class, small_class = target_classes
     
-    # Check if original label is a target class
-    if original_label not in target_classes:
+    # Get family name for logging/future use (defaults to combined name)
+    family_name = getattr(config, 'disambiguation_family_name', 'Brown_Orange_Family')
+    
+    # Check if original label is a member of the target family
+    # This also supports future case where classifier returns "Brown_Orange_Family" directly
+    is_family_member = (original_label in target_classes or original_label == family_name)
+    
+    if not is_family_member:
         return DisambiguationResult(
             label=original_label,
             confidence=confidence,
             disambiguated=False,
-            reason="not_target_class",
+            reason="not_target_family",
             raw_area=0.0,
             adjusted_area=0.0,
             y_norm=0.0,
             scale_factor=1.0
         )
+    
+    # === FAMILY MEMBER DETECTED ===
+    # From this point, we IGNORE the classifier's specific class prediction
+    # and decide purely based on size measurement
     
     # Get configuration parameters
     y_feature = getattr(config, 'disambiguation_y_feature', 'cy')
@@ -243,57 +275,61 @@ def disambiguate_by_size(
         scale_p=scale_p
     )
     
-    # Apply decision rules
-    final_label = original_label
-    disambiguated = False
-    reason = "unchanged"
+    # === SIZE-BASED DECISION (ignores classifier's specific class) ===
+    # For family members, we ALWAYS use size to decide, so disambiguated=True
+    disambiguated = True
     
     if adjusted_area < small_threshold:
-        # Force to small class
+        # Size indicates small class
         final_label = small_class
-        disambiguated = (original_label != small_class)
-        reason = f"area_below_small_threshold ({adjusted_area:.0f} < {small_threshold:.0f})"
+        reason = f"family_size_small ({adjusted_area:.0f} < {small_threshold:.0f})"
     
     elif adjusted_area > regular_threshold:
-        # Force to regular class
+        # Size indicates regular class
         final_label = regular_class
-        disambiguated = (original_label != regular_class)
-        reason = f"area_above_regular_threshold ({adjusted_area:.0f} > {regular_threshold:.0f})"
+        reason = f"family_size_regular ({adjusted_area:.0f} > {regular_threshold:.0f})"
     
     else:
         # Gray zone - apply configured behavior
         if gray_zone_behavior == 'uncertain':
             final_label = "Uncertain"
-            disambiguated = True
-            reason = f"gray_zone_uncertain ({small_threshold:.0f} <= {adjusted_area:.0f} <= {regular_threshold:.0f})"
+            reason = f"family_gray_zone_uncertain ({small_threshold:.0f} <= {adjusted_area:.0f} <= {regular_threshold:.0f})"
         
         elif gray_zone_behavior == 'prefer_small':
             final_label = small_class
-            disambiguated = (original_label != small_class)
-            reason = f"gray_zone_prefer_small ({adjusted_area:.0f})"
+            reason = f"family_gray_zone_prefer_small ({adjusted_area:.0f})"
         
         elif gray_zone_behavior == 'prefer_regular':
             final_label = regular_class
-            disambiguated = (original_label != regular_class)
-            reason = f"gray_zone_prefer_regular ({adjusted_area:.0f})"
+            reason = f"family_gray_zone_prefer_regular ({adjusted_area:.0f})"
         
-        else:  # 'keep_original' or unknown
-            reason = f"gray_zone_keep_original ({adjusted_area:.0f})"
+        else:  # 'keep_original' - but since we're treating as family, default to regular
+            # For family members in gray zone with 'keep_original', we need a decision
+            # Default to regular class as the "baseline" family member
+            final_label = regular_class
+            reason = f"family_gray_zone_default_regular ({adjusted_area:.0f})"
     
     # Debug logging for tuning
     if debug_logging:
         logger.info(
-            f"[Disambiguation] original={original_label}, final={final_label}, "
-            f"disambiguated={disambiguated}, bbox={bbox}, "
+            f"[Disambiguation] family={family_name}, classifier_said={original_label}, "
+            f"size_decision={final_label}, bbox={bbox}, "
             f"raw_area={raw_area:.0f}, adjusted_area={adjusted_area:.0f}, "
             f"y_norm={y_norm:.3f}, scale={scale_factor:.3f}, "
             f"thresholds=({small_threshold:.0f}, {regular_threshold:.0f}), "
             f"reason={reason}"
         )
     
-    # Get confidence penalty from config (default: 0.9 = 10% reduction)
+    # Confidence handling for family-based disambiguation
+    # Option 1: Always apply penalty (conservative - indicates size-based override)
+    # Option 2: Only apply when classifier's guess differs from size-based decision
     confidence_penalty = getattr(config, 'disambiguation_confidence_penalty', 0.9)
-    final_confidence = confidence if not disambiguated else confidence * confidence_penalty
+    apply_penalty_only_on_change = getattr(config, 'disambiguation_penalty_on_change_only', False)
+    
+    classifier_was_correct = (original_label == final_label)
+    should_apply_penalty = not apply_penalty_only_on_change or not classifier_was_correct
+    
+    final_confidence = confidence * confidence_penalty if should_apply_penalty else confidence
     
     return DisambiguationResult(
         label=final_label,
