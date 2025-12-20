@@ -466,6 +466,7 @@ class ROICandidate:
     confidence: float
     is_open: bool  # label the ROI as coming from open evidence
     is_closed: bool  # label the ROI as coming from closed evidence
+    bbox: Optional[Tuple[float, float, float, float]] = None  # (x1, y1, x2, y2) for disambiguation
 
 
 class BreadBagEvent:
@@ -1141,7 +1142,8 @@ class BreadBagEvent:
             centroid_stability=self.get_centroid_stability(),
             confidence=detection.confidence,
             is_open=roi_is_open,
-            is_closed=roi_is_closed
+            is_closed=roi_is_closed,
+            bbox=detection.box  # Pass bbox for disambiguation
         )
 
         # Insert and keep best-per-class by sharpness

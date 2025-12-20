@@ -57,10 +57,11 @@ class BagEvent:
         self.closed_id = closed_id
 
     # V4: Enhanced ROI storage with full metadata
-        # Each entry: (sharpness, roi, frame_index, bbox_area, confidence)
+        # Each entry: (sharpness, roi, frame_index, bbox_area, confidence, bbox)
         # roi is np.ndarray (BGR image)
-        self.open_rois: List[Tuple[float, np.ndarray, int, float, float]] = []
-        self.closed_rois: List[Tuple[float, np.ndarray, int, float, float]] = []
+        # bbox is Tuple[float, float, float, float] - (x1, y1, x2, y2) for disambiguation
+        self.open_rois: List[Tuple[float, np.ndarray, int, float, float, Tuple[float, float, float, float]]] = []
+        self.closed_rois: List[Tuple[float, np.ndarray, int, float, float, Tuple[float, float, float, float]]] = []
         
         # Motion tracking for adaptive suppression
         self.motion_history: List[float] = []  # Recent motion magnitudes
@@ -214,6 +215,9 @@ class BagEvent:
         
         # Calculate bbox area for stability tracking
         bbox_area = (x2 - x1) * (y2 - y1)
+        
+        # Store bbox tuple for disambiguation
+        bbox_tuple = (float(x1), float(y1), float(x2), float(y2))
 
         # Quality check (size and brightness)
         is_valid, sharpness, reject_reason = self._is_valid_roi_with_reason(roi)
@@ -238,8 +242,8 @@ class BagEvent:
         # ROI passed all quality checks - log then record metrics
         pipeline_metrics.record_roi_quality(True, sharpness, None)
         
-        # V4: Store ROI with full metadata (sharpness, roi, frame_index, bbox_area, confidence)
-        roi_entry = (sharpness, roi, frame_index, bbox_area, confidence)
+        # V4: Store ROI with full metadata (sharpness, roi, frame_index, bbox_area, confidence, bbox)
+        roi_entry = (sharpness, roi, frame_index, bbox_area, confidence, bbox_tuple)
 
         if is_open:
             self.open_rois.append(roi_entry)
@@ -390,6 +394,7 @@ class BagEvent:
             - bbox_area: Bounding box area in pixels
             - confidence: Detection confidence
             - relative_time: Position in track lifecycle (0.0 = start, 1.0 = end)
+            - bbox: Bounding box (x1, y1, x2, y2) for disambiguation
         """
         # Combine both buffers
         all_rois = self.open_rois + self.closed_rois
@@ -402,7 +407,7 @@ class BagEvent:
         
         # Convert to list of dictionaries with full metadata
         candidates = []
-        for sharpness, roi, frame_index, bbox_area, confidence in all_rois:
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox in all_rois:
             # Ensure no division by zero with additional safety check
             relative_time = (frame_index - self.start_frame_index) / track_duration if track_duration > 0 else 0.5
             candidates.append({
@@ -412,6 +417,7 @@ class BagEvent:
                 'bbox_area': bbox_area,
                 'confidence': confidence,
                 'relative_time': relative_time,
+                'bbox': bbox,  # Include bbox for disambiguation
             })
         
         # Sort by sharpness (highest first), then by frame_index (later first) for ties
@@ -431,7 +437,7 @@ class BagEvent:
         track_duration = self.current_frame_index - self.start_frame_index
         
         # Calculate average sharpness of all ROIs
-        all_sharpness = [s for s, _, _, _, _ in self.open_rois + self.closed_rois]
+        all_sharpness = [s for s, _, _, _, _, _ in self.open_rois + self.closed_rois]
         avg_sharpness = sum(all_sharpness) / len(all_sharpness) if all_sharpness else 0.0
         
         return {

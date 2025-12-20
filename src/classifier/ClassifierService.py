@@ -39,7 +39,7 @@ from src.utils.PipelineMetrics import pipeline_metrics
 # V7: Import new reliability modules
 from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
 from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
-from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult
+from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
@@ -812,13 +812,20 @@ class ClassifierService:
                 bbox = cand.get('bbox')  # May be None if not available
                 disambiguated = False
                 disambiguation_reason = None
-                if self.disambiguation_enabled and bbox is not None:
-                    label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
-                        label=label,
-                        confidence=conf,
-                        bbox=bbox,
-                        image_height=image_height
-                    )
+                if self.disambiguation_enabled:
+                    if bbox is not None:
+                        label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
+                            label=label,
+                            confidence=conf,
+                            bbox=bbox,
+                            image_height=image_height
+                        )
+                    else:
+                        # Defensive logging when bbox is missing
+                        logger.warning(
+                            f"[ClassifierService] Track {track_id}: bbox missing for candidate {idx}, "
+                            f"disambiguation skipped"
+                        )
                 
                 # Calculate contribution for this candidate
                 sharpness = cand.get('sharpness', 0)
@@ -869,22 +876,120 @@ class ClassifierService:
             classify_time = (time.perf_counter() - batch_start) * 1000
             
             # Step 2: Accumulate evidence
-            evidence = self._accumulate_evidence(classifications)
-            
-            # Step 3: Finalize classification
-            final_label, final_conf, rejection_reason, metadata = self._finalize_classification(
-                evidence, event_stats
-            )
-            
-            # V7: Add disambiguation stats to metadata
-            disambiguated_count = sum(1 for c in classifications if c.get('disambiguated', False))
-            if disambiguated_count > 0:
-                metadata['disambiguation_applied'] = True
-                metadata['disambiguation_count'] = disambiguated_count
+            # V7: Choose between evidence accumulation path or legacy ratio-based path
+            if self.evidence_accumulation_enabled:
+                # NEW PATH: Trust-weighted log-evidence accumulation
+                logger.info(f"[ClassifierService] Track {track_id}: Using trust-weighted evidence accumulation")
+                
+                # Re-classify with probs for evidence accumulation
+                classifications_with_probs = []
+                for idx, cand in enumerate(candidates):
+                    roi = cand['roi']
+                    label, conf, probs = self._classify_single_with_probs(roi, idx)
+                    
+                    # Apply disambiguation if enabled
+                    bbox = cand.get('bbox')
+                    disambiguated = False
+                    disambiguation_reason = None
+                    if self.disambiguation_enabled:
+                        if bbox is not None:
+                            label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
+                                label=label,
+                                confidence=conf,
+                                bbox=bbox,
+                                image_height=image_height
+                            )
+                        else:
+                            logger.warning(
+                                f"[ClassifierService] Track {track_id}: bbox missing for candidate {idx}, "
+                                f"disambiguation skipped in evidence path"
+                            )
+                    
+                    # Compute trust
+                    sharpness = cand.get('sharpness', 0)
+                    is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                    roi_size = median_size or (100, 100)
+                    if roi is not None and hasattr(roi, 'shape'):
+                        h, w = roi.shape[:2]
+                        roi_size = (w, h)
+                    trust = self._compute_roi_trust(
+                        sharpness=sharpness,
+                        is_open=is_open,
+                        roi_size=roi_size,
+                        median_size=median_size
+                    )
+                    
+                    # Determine state string
+                    state = 'open' if is_open else 'closed'
+                    
+                    classifications_with_probs.append({
+                        'probs': probs,
+                        'trust': trust,
+                        'state': state,
+                        'label': label,
+                        'confidence': conf,
+                        'roi': roi,
+                        'sharpness': sharpness,
+                        'frame_index': cand.get('frame_index', 0),
+                        'relative_time': cand.get('relative_time', 0.5),
+                        'is_open': is_open,
+                        'disambiguated': disambiguated,
+                        'disambiguation_reason': disambiguation_reason,
+                    })
+                
+                # Use accumulate_track_evidence convenience function
+                accumulator_result = accumulate_track_evidence(classifications_with_probs, tracking_config)
+                
+                # Extract final result
+                final_label = accumulator_result.label
+                final_conf = accumulator_result.confidence
+                rejection_reason = None if accumulator_result.is_certain else accumulator_result.gate_failure_reason
+                
+                # Build metadata from accumulator result
+                metadata = {
+                    "evidence_per_label": {k: round(v, 4) for k, v in accumulator_result.evidence_per_class.items()},
+                    "total_candidates_classified": accumulator_result.rois_used,
+                    "winner_score": round(accumulator_result.winner_score, 4),
+                    "runner_up": {
+                        "label": accumulator_result.runner_up_label,
+                        "score": round(accumulator_result.runner_up_score, 4)
+                    } if accumulator_result.runner_up_label else None,
+                    "margin": round(accumulator_result.margin, 4),
+                    "gate_passed": accumulator_result.gate_passed,
+                    "gate_failure_reason": accumulator_result.gate_failure_reason,
+                    "trust_stats": accumulator_result.trust_stats,
+                    "rois_trusted": accumulator_result.rois_trusted,
+                    "class_switch_penalty_applied": accumulator_result.class_switch_penalty_applied,
+                    "evidence_accumulation_used": True
+                }
+                
+                # Add disambiguation stats
+                disambiguated_count = sum(1 for c in classifications_with_probs if c.get('disambiguated', False))
+                if disambiguated_count > 0:
+                    metadata['disambiguation_applied'] = True
+                    metadata['disambiguation_count'] = disambiguated_count
+                
+            else:
+                # LEGACY PATH: Ratio-based evidence accumulation
+                logger.info(f"[ClassifierService] Track {track_id}: Using legacy ratio-based evidence accumulation")
+                evidence = self._accumulate_evidence(classifications)
+                
+                # Step 3: Finalize classification
+                final_label, final_conf, rejection_reason, metadata = self._finalize_classification(
+                    evidence, event_stats
+                )
+                
+                # V7: Add disambiguation stats to metadata
+                disambiguated_count = sum(1 for c in classifications if c.get('disambiguated', False))
+                if disambiguated_count > 0:
+                    metadata['disambiguation_applied'] = True
+                    metadata['disambiguation_count'] = disambiguated_count
+                
+                metadata['evidence_accumulation_used'] = False
             
             # Step 3.5: Apply classification smoothing (V5)
-            # Only smooth non-Unknown classifications
-            if final_label != "Unknown":
+            # Only smooth non-Unknown and non-Uncertain classifications
+            if final_label not in ("Unknown", "Uncertain"):
                 smoothed_label, smoothed_conf, smooth_reason = self._apply_classification_smoothing(
                     final_label, final_conf
                 )
@@ -906,8 +1011,10 @@ class ClassifierService:
                     )
 
             # Step 3.6: Apply label reuse smoothing ALWAYS
+            # Note: For evidence accumulation path, we use metadata as evidence dict substitute
+            evidence_for_reuse = evidence if not self.evidence_accumulation_enabled else metadata.get('evidence_per_label', {})
             reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
-                track_id, final_label, final_conf, evidence
+                track_id, final_label, final_conf, evidence_for_reuse
             )
             if reuse_label != final_label:
                 metadata["label_reuse_applied"] = True
@@ -930,13 +1037,27 @@ class ClassifierService:
             self._check_and_log_volatility(track_id)
             
             # Step 4: Select best representative ROI
-            if final_label != "Unknown":
-                best_roi = self._select_best_representative(evidence, final_label)
+            if final_label not in ("Unknown", "Uncertain"):
+                if self.evidence_accumulation_enabled:
+                    # For evidence accumulation, select from classifications_with_probs
+                    best_classification = max(
+                        classifications_with_probs,
+                        key=lambda x: x['confidence'] if x['label'] == final_label else 0.0
+                    )
+                    best_roi = best_classification['roi']
+                else:
+                    # For legacy path, use evidence dict
+                    best_roi = self._select_best_representative(evidence, final_label)
             else:
-                # For Unknown, use the ROI with highest individual confidence
-                best_classification = max(classifications, key=lambda x: x['confidence'])
-                best_roi = best_classification['roi']
-                final_conf = best_classification['confidence']
+                # For Unknown/Uncertain, use the ROI with highest individual confidence
+                if self.evidence_accumulation_enabled:
+                    best_classification = max(classifications_with_probs, key=lambda x: x['confidence'])
+                    best_roi = best_classification['roi']
+                    final_conf = best_classification['confidence']
+                else:
+                    best_classification = max(classifications, key=lambda x: x['confidence'])
+                    best_roi = best_classification['roi']
+                    final_conf = best_classification['confidence']
             
             # Log decision with full explainability
             self._log_classification_decision(
