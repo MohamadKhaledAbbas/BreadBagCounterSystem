@@ -799,7 +799,7 @@ class ClassifierService:
                 median_size = (median_w, median_h)
             
             # Get image height from context for disambiguation
-            image_height = 720  # Default
+            image_height = tracking_config.default_image_height
             frame = context.get("frame") if context else None
             if frame is not None and hasattr(frame, 'shape'):
                 image_height = frame.shape[0]

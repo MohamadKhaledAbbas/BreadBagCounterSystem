@@ -1493,6 +1493,26 @@ class TrackingConfig:
     Default: False
     """
     
+    disambiguation_confidence_penalty: float = _parse_float_env("DISAMBIGUATION_CONFIDENCE_PENALTY", 0.9)
+    """
+    Confidence multiplier applied when disambiguation overrides the classifier.
+    
+    When disambiguation changes the label, the confidence is multiplied by this factor.
+    Range: 0.8 - 1.0 (1.0 = no penalty)
+    
+    Default: 0.9 (10% reduction)
+    """
+    
+    default_image_height: int = _parse_int_env("DEFAULT_IMAGE_HEIGHT", 720)
+    """
+    Default image height for disambiguation when not available from context.
+    
+    Should match the camera's video resolution height.
+    Common values: 720 (720p), 1080 (1080p), 480 (480p)
+    
+    Default: 720
+    """
+    
     # ============================================================================
     # Part 2: Trust-Weighted Temporal Evidence Accumulation
     # ============================================================================

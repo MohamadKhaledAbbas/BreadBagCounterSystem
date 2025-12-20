@@ -291,9 +291,13 @@ def disambiguate_by_size(
             f"reason={reason}"
         )
     
+    # Get confidence penalty from config (default: 0.9 = 10% reduction)
+    confidence_penalty = getattr(config, 'disambiguation_confidence_penalty', 0.9)
+    final_confidence = confidence if not disambiguated else confidence * confidence_penalty
+    
     return DisambiguationResult(
         label=final_label,
-        confidence=confidence if not disambiguated else confidence * 0.9,  # Slight penalty for override
+        confidence=final_confidence,
         disambiguated=disambiguated,
         reason=reason,
         raw_area=raw_area,

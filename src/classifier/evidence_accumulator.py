@@ -267,30 +267,39 @@ class EvidenceAccumulator:
                 class_switch_penalty_applied=False
             )
         
+        # Create a copy of evidence scores for finalization
+        # This prevents modifying the original state if finalize() is called multiple times
+        evidence_scores = {
+            name: state.log_evidence
+            for name, state in self._evidence.items()
+        }
+        
         # Apply class-switch penalty to non-leading classes (if enabled)
         penalty_applied = False
         if self._inertia_enabled and self._leading_class and self._inertia_strength > 0:
-            for class_name in self._evidence:
+            for class_name in evidence_scores:
                 if class_name != self._leading_class:
-                    # Apply penalty to challengers
-                    self._evidence[class_name].log_evidence -= self._inertia_strength
+                    # Apply penalty to challengers (on the copy)
+                    evidence_scores[class_name] -= self._inertia_strength
                     penalty_applied = True
         
         # Sort by evidence score
         sorted_classes = sorted(
-            self._evidence.items(),
-            key=lambda x: x[1].log_evidence,
+            evidence_scores.items(),
+            key=lambda x: x[1],
             reverse=True
         )
         
         winner_name = sorted_classes[0][0]
-        winner_state = sorted_classes[0][1]
+        winner_score = sorted_classes[0][1]  # Now just the score (float)
         
         runner_up_name = sorted_classes[1][0] if len(sorted_classes) > 1 else None
-        runner_up_state = sorted_classes[1][1] if len(sorted_classes) > 1 else None
-        runner_up_score = runner_up_state.log_evidence if runner_up_state else float('-inf')
+        runner_up_score = sorted_classes[1][1] if len(sorted_classes) > 1 else float('-inf')
         
-        margin = winner_state.log_evidence - runner_up_score
+        margin = winner_score - runner_up_score
+        
+        # Get the winner's best confidence from original evidence state
+        winner_confidence = self._evidence[winner_name].best_confidence
         
         # Compute trust statistics
         trust_stats = self._compute_trust_stats()
@@ -326,9 +335,9 @@ class EvidenceAccumulator:
         
         return FinalClassificationResult(
             label=final_label,
-            confidence=winner_state.best_confidence,
+            confidence=winner_confidence,
             is_certain=is_certain,
-            winner_score=winner_state.log_evidence,
+            winner_score=winner_score,
             runner_up_label=runner_up_name,
             runner_up_score=runner_up_score,
             margin=margin,
