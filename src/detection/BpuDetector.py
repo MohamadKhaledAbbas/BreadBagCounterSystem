@@ -67,16 +67,19 @@ class BpuDetector(BaseDetector):
             return [BpuResultWrapper([], [], [])]
 
         # 1. Preprocess (Resize + BGR2NV12)
-        input_tensor, x_scale, y_scale, x_shift, y_shift = run_with_timing("detection pre-process", self._preprocess, frame)
+        # input_tensor, x_scale, y_scale, x_shift, y_shift = run_with_timing("detection pre-process", self._preprocess, frame)
+        input_tensor, x_scale, y_scale, x_shift, y_shift = self._preprocess(frame)
 
         # 2. Forward
-        outputs = run_with_timing("[BpuDetector] Inference", self.quantize_model[0].forward, input_tensor)
+        # outputs = run_with_timing("[BpuDetector] Inference", self.quantize_model[0].forward, input_tensor)
+        outputs = self.quantize_model[0].forward(input_tensor)
 
         # 3. Convert to Numpy
         output_arrays = [out.buffer for out in outputs]
 
         # 4. Post-Process (Decode)
-        results = run_with_timing("detection post-process",self._postprocess, output_arrays, x_scale, y_scale, x_shift, y_shift, frame.shape)
+        # results = run_with_timing("detection post-process",self._postprocess, output_arrays, x_scale, y_scale, x_shift, y_shift, frame.shape)
+        results = self._postprocess(output_arrays, x_scale, y_scale, x_shift, y_shift, frame.shape)
 
         # 5. Format Results
         boxes, scores, class_ids = [], [], []

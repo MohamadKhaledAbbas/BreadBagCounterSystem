@@ -71,7 +71,7 @@ class BpuClassifier(BaseClassifier):
         try:
             # 1. Preprocess
             input_tensor = self._preprocess(image)
-            logger.debug(f"[BpuClassifier] Preprocessed tensor shape: {input_tensor.shape}")
+            # logger.debug(f"[BpuClassifier] Preprocessed tensor shape: {input_tensor.shape}")
 
             # 2.  Inference
             t1 = cv2.getTickCount()
@@ -79,16 +79,16 @@ class BpuClassifier(BaseClassifier):
             t2 = cv2.getTickCount()
 
             latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-            logger.debug(f"[BpuClassifier] Inference time: {latency:.2f}ms")
+            # logger.debug(f"[BpuClassifier] Inference time: {latency:.2f}ms")
 
             # 3. Post-Process
             probs = outputs[0].buffer.flatten()
 
-            logger.debug(f"[BpuClassifier] Raw probs shape: {probs.shape}, range: [{probs.min():.4f}, {probs.max():.4f}]")
+            # logger.debug(f"[BpuClassifier] Raw probs shape: {probs.shape}, range: [{probs.min():.4f}, {probs.max():.4f}]")
 
             # Apply softmax if needed (raw logits instead of probabilities)
             if probs.max() > 1.0 or probs.min() < 0.0:
-                logger.debug("[BpuClassifier] Applying softmax")
+                # logger.debug("[BpuClassifier] Applying softmax")
                 exp_scores = np.exp(probs - np.max(probs))
                 probs = exp_scores / np.sum(exp_scores)
 
@@ -98,7 +98,7 @@ class BpuClassifier(BaseClassifier):
 
             label = self._class_names.get(top_id, "Unknown")
 
-            logger.info(f"[BpuClassifier] Result: {label} (conf={confidence:.3f}, id={top_id})")
+            # logger.info(f"[BpuClassifier] Result: {label} (conf={confidence:.3f}, id={top_id})")
 
             return label, confidence
 
