@@ -1059,11 +1059,6 @@ class ClassifierService:
                     best_classification = max(classifications, key=lambda x: x['confidence'])
                     best_roi = best_classification['roi']
                     final_conf = best_classification['confidence']
-            else:
-                # For Unknown, use the ROI with highest individual confidence
-                best_classification = max(classifications, key=lambda x: x['confidence'])
-                best_roi = best_classification['roi']
-                final_conf = best_classification['confidence']
             
             # Log decision with full explainability
             self._log_classification_decision(
