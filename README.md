@@ -57,6 +57,8 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 - **[PLATFORM_COMPATIBILITY.md](docs/PLATFORM_COMPATIBILITY.md)**: Platform support information
 - **[docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md)**: Log analyzer tool documentation
 - **[docs/STRUCTURED_LOGGING_SCHEMA.md](docs/STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
+- **[docs/PROBABILITY_ADJUSTMENTS.md](docs/PROBABILITY_ADJUSTMENTS.md)**: Probability mass transfer and disambiguation integration
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Production-grade classification improvements summary
 
 ## Key Components
 
@@ -67,12 +69,14 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 - `src/counting/BagCounterApp.py`: Main application logic
 
 ### Classification
-- `src/classifier/ClassifierService.py`: Multi-candidate classification with voting
-- Evidence-based decision making with rejection thresholds
+- `src/classifier/ClassifierService.py`: Multi-candidate classification with evidence accumulation
+- `src/classifier/probability_adjustments.py`: Probability mass transfer for disambiguation
+- `src/classifier/evidence_accumulator.py`: Trust-weighted log-evidence accumulation
+- Evidence-based decision making with rejection thresholds and stability gates
 
 ### Logging & Analysis
 - `src/utils/AppLogging.py`: Structured JSON logging
-- `tools/log_analyzer.py`: Log analysis and HTML report generation
+- `tools/log_analyzer.py`: Log analysis with probability adjustment tracking and HTML report generation
 
 ## Log Analysis
 
