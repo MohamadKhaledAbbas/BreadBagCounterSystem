@@ -274,7 +274,9 @@ def disambiguate_by_size(
         scale_b=scale_b,
         scale_p=scale_p
     )
-    
+
+    logger.debug(f"compute_adjusted_area: raw_area = {raw_area}, adjusted_area = {adjusted_area}, y_norm = {y_norm}, scale_factor = {scale_factor}")
+
     # === SIZE-BASED DECISION (ignores classifier's specific class) ===
     # For family members, we ALWAYS use size to decide, so disambiguated=True
     disambiguated = True
@@ -306,7 +308,7 @@ def disambiguate_by_size(
         else:  # 'keep_original' - but since we're treating as family, default to regular
             # For family members in gray zone with 'keep_original', we need a decision
             # Default to regular class as the "baseline" family member
-            final_label = regular_class
+            final_label = original_label
             reason = f"family_gray_zone_default_regular ({adjusted_area:.0f})"
     
     # Debug logging for tuning

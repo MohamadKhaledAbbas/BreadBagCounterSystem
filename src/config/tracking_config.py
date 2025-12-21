@@ -247,6 +247,7 @@ class TrackingConfig:
     Default: 220 (V3: increased from 200)
     """
 
+    save_all_rois: bool = True
 
     # ============================================================================
     # Classification Parameters (V4: Evidence-Based Classification)
@@ -365,7 +366,7 @@ class TrackingConfig:
     Default: False (disabled for safety, opt-in only)
     """
     
-    low_conf_threshold: float = _parse_float_env("LOW_CONF_THRESHOLD", 0.65)
+    low_conf_threshold: float = _parse_float_env("LOW_CONF_THRESHOLD", 0.7)
     """
     Confidence threshold below which previous-label reuse is considered.
     
@@ -1444,7 +1445,7 @@ class TrackingConfig:
     Default: 0.5
     """
     
-    disambiguation_scale_b: float = _parse_float_env("DISAMBIGUATION_SCALE_B", 1.0)
+    disambiguation_scale_b: float = _parse_float_env("DISAMBIGUATION_SCALE_B", 1)
     """
     Scaling coefficient 'b' for perspective adjustment.
     
@@ -1464,7 +1465,7 @@ class TrackingConfig:
     Default: 1.5
     """
     
-    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 15000.0)
+    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 10000.0)
     """
     Adjusted area threshold below which a detection is classified as "small".
     
@@ -1476,7 +1477,7 @@ class TrackingConfig:
     Default: 15000.0 (pixels^2)
     """
     
-    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 25000.0)
+    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 20000.0)
     """
     Adjusted area threshold above which a detection is classified as "regular/overlay".
     
@@ -1500,7 +1501,7 @@ class TrackingConfig:
     Default: 'keep_original'
     """
     
-    disambiguation_debug_logging: bool = _parse_bool_env("DISAMBIGUATION_DEBUG", False)
+    disambiguation_debug_logging: bool = _parse_bool_env("DISAMBIGUATION_DEBUG", True)
     """
     Enable detailed debug logging for disambiguation tuning.
     
@@ -1551,7 +1552,7 @@ class TrackingConfig:
     # disambiguation to ensure the evidence accumulator reflects the
     # disambiguated label decision.
     
-    prob_adjustment_strategy: str = 'full_transfer'
+    prob_adjustment_strategy: str = 'proportional_transfer'
     """
     Strategy for transferring probability mass after disambiguation.
     
@@ -1563,7 +1564,7 @@ class TrackingConfig:
     Default: 'full_transfer' (most conservative, ensures accumulator respects disambiguation)
     """
     
-    prob_adjustment_transfer_ratio: float = _parse_float_env("PROB_ADJUSTMENT_TRANSFER_RATIO", 1.0)
+    prob_adjustment_transfer_ratio: float = _parse_float_env("PROB_ADJUSTMENT_TRANSFER_RATIO", 0.5)
     """
     Transfer ratio for 'proportional_transfer' strategy.
     
@@ -1582,7 +1583,7 @@ class TrackingConfig:
     Default: 1e-9
     """
     
-    prob_adjustment_debug_logging: bool = _parse_bool_env("PROB_ADJUSTMENT_DEBUG", False)
+    prob_adjustment_debug_logging: bool = _parse_bool_env("PROB_ADJUSTMENT_DEBUG", True)
     """
     Enable detailed debug logging for probability adjustments.
     

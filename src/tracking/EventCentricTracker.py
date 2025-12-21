@@ -1497,7 +1497,8 @@ class BreadBagEvent:
                 'bbox_area': roi_cand.size[0] * roi_cand.size[1],
                 'confidence': roi_cand.confidence,
                 'relative_time': relative_time,
-                'state': 'open' if roi_cand.is_open else 'closed'
+                'state': 'open' if roi_cand.is_open else 'closed',
+                'bbox': roi_cand.bbox,
             })
         return candidates
     

@@ -67,7 +67,6 @@ class ClassifierService:
     def __init__(self,
                  classifier: BaseClassifier,
                  data_root: str = "data",
-                 save_all_rois: bool = False,
                  min_confidence_threshold: float = 0.3):
         """
         Initialize the evidence-based classifier service.
@@ -80,7 +79,7 @@ class ClassifierService:
         """
         self.classifier = classifier
         self.data_root = data_root
-        self.save_all_rois = save_all_rois
+        self.save_all_rois = tracking_config.save_all_rois
         self.min_confidence_threshold = min_confidence_threshold
         
         # V4: Configuration from centralized config
@@ -858,7 +857,8 @@ class ClassifierService:
                     sharpness=sharpness,
                     relative_time=relative_time,
                     contribution=clamped_contribution,
-                    frame_index=cand.get('frame_index', 0)
+                    frame_index=cand.get('frame_index', 0),
+                    bbox=bbox,
                 )
                 
                 classifications.append({
@@ -888,7 +888,9 @@ class ClassifierService:
                 
                 for idx, cand in enumerate(candidates):
                     roi = cand['roi']
+                    logger.info(f"[ClassifierService] Track {track_id}: STEP classify cand {idx} (roi_present={roi is not None})")
                     label, conf, probs = self._classify_single_with_probs(roi, idx)
+                    logger.debug(f"[ClassifierService] Track {track_id}: cand {idx} raw label={label}, conf={conf:.3f}")
                     
                     # Store original label before disambiguation
                     original_label = label
@@ -904,6 +906,10 @@ class ClassifierService:
                                 confidence=conf,
                                 bbox=bbox,
                                 image_height=image_height
+                            )
+                            logger.info(
+                                f"[ClassifierService] Track {track_id}: cand {idx} disambig applied={disambiguated}, reason={disambiguation_reason}, "
+                                f"bbox={bbox}, new_label={label}, new_conf={conf:.3f}"
                             )
                         else:
                             logger.warning(
@@ -951,6 +957,11 @@ class ClassifierService:
                         roi_size=roi_size,
                         median_size=median_size
                     )
+
+                    logger.info(
+                        f"[ClassifierService] Track {track_id}: cand {idx} trust={trust:.3f}, sharpness={sharpness}, "
+                        f"roi_size={roi_size}, state={'open' if is_open else 'closed'}"
+                    )
                     
                     # Determine state string
                     state = 'open' if is_open else 'closed'
@@ -974,7 +985,18 @@ class ClassifierService:
                 
                 # Use accumulate_track_evidence convenience function
                 accumulator_result = accumulate_track_evidence(classifications_with_probs, tracking_config)
-                
+
+                logger.info(
+                    f"[ClassifierService] Track {track_id}: STEP finalized track -> label={accumulator_result.label}, "
+                    f"conf={accumulator_result.confidence:.4f}, margin={accumulator_result.margin:.4f}, "
+                    f"gate_passed={accumulator_result.gate_passed}, gate_reason={accumulator_result.gate_failure_reason}"
+                )
+                logger.debug(
+                    f"[ClassifierService] Track {track_id}: evidence_per_class={accumulator_result.evidence_per_class}, "
+                    f"trust_stats={accumulator_result.trust_stats}, rois_trusted={accumulator_result.rois_trusted}, "
+                    f"class_switch_penalty_applied={accumulator_result.class_switch_penalty_applied}"
+                )
+
                 # Extract final result
                 final_label = accumulator_result.label
                 final_conf = accumulator_result.confidence
@@ -1243,9 +1265,9 @@ class ClassifierService:
         # Determine save path
         if label == "Unknown":
             # For Unknown, use a single directory instead of per-phash directories
-            target_dir = os.path.join(self.data_root, "unknown", "unknown_samples")
+            target_dir = os.path.join(self.data_root, "unknown", "unknown_samples", "saved_rois")
         else:
-            target_dir = os.path.join(self.data_root, "classes", label)
+            target_dir = os.path.join(self.data_root, "classes", label, "saved_rois")
         
         os.makedirs(target_dir, exist_ok=True)
         

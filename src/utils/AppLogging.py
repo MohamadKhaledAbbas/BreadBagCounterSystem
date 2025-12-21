@@ -20,7 +20,7 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from functools import wraps
 
 
@@ -437,12 +437,13 @@ class StructuredLogger:
     
     def classification_candidate(self, track_id: int, candidate_idx: int, 
                                 label: str, confidence: float, sharpness: float,
-                                relative_time: float, contribution: float, **kwargs):
+                                relative_time: float, contribution: float,
+                                 bbox: Tuple[float, float, float, float], **kwargs):
         """Log individual candidate classification in evidence accumulation."""
         msg = (
             f"[CANDIDATE] track={track_id}, idx={candidate_idx}, label={label}, "
             f"conf={confidence:.3f}, sharpness={sharpness:.1f}, time={relative_time:.2f}, "
-            f"contrib={contribution:.3f}"
+            f"contrib={contribution:.3f}, bbox={bbox}"
         )
         self._log_structured(
             logging.DEBUG,
