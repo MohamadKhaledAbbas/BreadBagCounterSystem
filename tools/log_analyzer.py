@@ -464,6 +464,23 @@ class LogAnalyzer:
         self.high_volatility_tracks = []  # tracks with high volatility
         self.volatility_scores = []  # all volatility scores
         
+        # V8: Probability adjustment tracking
+        self.prob_adjustment_count = 0
+        self.prob_adjustment_applied = 0
+        self.prob_adjustment_samples = []  # sample adjustments for analysis
+        
+        # V8: Evidence accumulation tracking
+        self.evidence_accumulation_used_count = 0
+        self.gate_passed_count = 0
+        self.gate_failed_count = 0
+        self.gate_failure_reasons = Counter()
+        self.trust_stats_samples = []  # sample trust stats for analysis
+        self.inertia_applied_count = 0
+        
+        # V8: Disambiguation tracking
+        self.disambiguation_applied_count = 0
+        self.disambiguation_samples = []  # sample disambiguation details
+        
         # Forced closes and lifecycle details
         self.forced_close_count = 0
         self.forced_close_reasons = Counter()
@@ -703,6 +720,66 @@ class LogAnalyzer:
             processing_time = data.get("processing_time_ms")
             track_id = data.get("track_id")
             frame_id = data.get("frame_id")
+            
+            # V8: Extract metadata (structured field in classification logs)
+            metadata = data.get("metadata", {})
+            
+            # V8: Track evidence accumulation usage
+            evidence_used = metadata.get("evidence_accumulation_used", False)
+            if evidence_used:
+                self.evidence_accumulation_used_count += 1
+                
+                # Track gate passing
+                gate_passed = metadata.get("gate_passed")
+                if gate_passed is True:
+                    self.gate_passed_count += 1
+                elif gate_passed is False:
+                    self.gate_failed_count += 1
+                    gate_reason = metadata.get("gate_failure_reason")
+                    if gate_reason:
+                        self.gate_failure_reasons[gate_reason] += 1
+                
+                # Track trust stats
+                trust_stats = metadata.get("trust_stats")
+                if trust_stats and len(self.trust_stats_samples) < 100:
+                    self.trust_stats_samples.append({
+                        "track_id": track_id,
+                        "label": label,
+                        "trust_stats": trust_stats,
+                        "rois_trusted": metadata.get("rois_trusted", 0)
+                    })
+                
+                # Track inertia/class-switch penalty
+                if metadata.get("class_switch_penalty_applied"):
+                    self.inertia_applied_count += 1
+            
+            # V8: Track probability adjustments
+            if metadata.get("probability_adjustment_applied"):
+                self.prob_adjustment_applied += 1
+                self.prob_adjustment_count += metadata.get("probability_adjustment_count", 0)
+                
+                # Store sample adjustments for analysis
+                samples = metadata.get("probability_adjustment_samples", [])
+                for sample in samples:
+                    if len(self.prob_adjustment_samples) < 50:
+                        self.prob_adjustment_samples.append({
+                            "track_id": track_id,
+                            "label": label,
+                            **sample
+                        })
+            
+            # V8: Track disambiguation
+            if metadata.get("disambiguation_applied"):
+                self.disambiguation_applied_count += 1
+                self.disambiguation_count_val = metadata.get("disambiguation_count", 0)
+                
+                # Store sample disambiguation details
+                if len(self.disambiguation_samples) < 50:
+                    self.disambiguation_samples.append({
+                        "track_id": track_id,
+                        "label": label,
+                        "count": self.disambiguation_count_val
+                    })
 
             if label == "Unknown":
                 self.unknown_count += 1
@@ -920,6 +997,31 @@ class LogAnalyzer:
                     "avg_volatility": statistics.mean(self.volatility_scores) if self.volatility_scores else 0,
                     "max_volatility": max(self.volatility_scores) if self.volatility_scores else 0,
                     "volatility_details": self.high_volatility_tracks[:20],  # Top 20 for report
+                },
+                # V8: Evidence accumulation metrics
+                "evidence_accumulation": {
+                    "used_count": self.evidence_accumulation_used_count,
+                    "usage_rate": self.evidence_accumulation_used_count / self.classification_count if self.classification_count > 0 else 0,
+                    "gate_passed_count": self.gate_passed_count,
+                    "gate_failed_count": self.gate_failed_count,
+                    "gate_pass_rate": self.gate_passed_count / self.evidence_accumulation_used_count if self.evidence_accumulation_used_count > 0 else 0,
+                    "gate_failure_reasons": dict(self.gate_failure_reasons),
+                    "inertia_applied_count": self.inertia_applied_count,
+                    "inertia_rate": self.inertia_applied_count / self.evidence_accumulation_used_count if self.evidence_accumulation_used_count > 0 else 0,
+                    "trust_stats_samples": self.trust_stats_samples[:10],  # Top 10 samples
+                },
+                # V8: Disambiguation metrics
+                "disambiguation": {
+                    "applied_count": self.disambiguation_applied_count,
+                    "application_rate": self.disambiguation_applied_count / self.classification_count if self.classification_count > 0 else 0,
+                    "samples": self.disambiguation_samples[:10],  # Top 10 samples
+                },
+                # V8: Probability adjustment metrics
+                "probability_adjustment": {
+                    "applied_tracks": self.prob_adjustment_applied,
+                    "total_adjustments": self.prob_adjustment_count,
+                    "application_rate": self.prob_adjustment_applied / self.classification_count if self.classification_count > 0 else 0,
+                    "samples": self.prob_adjustment_samples[:10],  # Top 10 samples
                 },
             },
             "streak_analysis": {
