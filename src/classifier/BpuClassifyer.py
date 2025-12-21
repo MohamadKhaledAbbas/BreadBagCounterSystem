@@ -108,6 +108,90 @@ class BpuClassifier(BaseClassifier):
             logger.error(traceback.format_exc())
             return "Unknown", 0.0
 
+    def predict_probs(self, image) -> Tuple[str, float, Dict[str, float]]:
+        """
+        Predict class label, confidence, and full probability vector.
+        
+        Returns normalized probability distribution over all known classes.
+        This is required for trust-weighted log-evidence accumulation.
+        
+        Args:
+            image: Input image (numpy array)
+            
+        Returns:
+            Tuple of (label, confidence, probs_dict) where:
+            - label: predicted class name
+            - confidence: probability of predicted class
+            - probs_dict: {class_name: probability} for all classes
+                         (normalized, non-negative, sums to ~1.0)
+        """
+        # Validate model
+        if self.model is None:
+            logger.error("[BpuClassifier] Model not loaded!")
+            return "Unknown", 0.0, {"Unknown": 1.0}
+        
+        # Validate input
+        if image is None:
+            logger.error("[BpuClassifier] Image is None!")
+            return "Unknown", 0.0, {"Unknown": 1.0}
+        
+        if not isinstance(image, np.ndarray):
+            logger.error(f"[BpuClassifier] Image is not ndarray: {type(image)}")
+            return "Unknown", 0.0, {"Unknown": 1.0}
+        
+        if image.size == 0:
+            logger.error("[BpuClassifier] Image is empty!")
+            return "Unknown", 0.0, {"Unknown": 1.0}
+        
+        if len(image.shape) != 3:
+            logger.error(f"[BpuClassifier] Invalid image shape: {image.shape}")
+            return "Unknown", 0.0, {"Unknown": 1.0}
+        
+        try:
+            # 1. Preprocess
+            input_tensor = self._preprocess(image)
+            
+            # 2. Inference
+            outputs = self.model[0].forward(input_tensor)
+            
+            # 3. Post-Process - Get probability vector
+            probs = outputs[0].buffer.flatten()
+            
+            # Apply softmax if needed (raw logits instead of probabilities)
+            if probs.max() > 1.0 or probs.min() < 0.0:
+                exp_scores = np.exp(probs - np.max(probs))
+                probs = exp_scores / np.sum(exp_scores)
+            
+            # Ensure probabilities are normalized (handle numerical errors)
+            probs_sum = np.sum(probs)
+            if probs_sum > 0:
+                probs = probs / probs_sum
+            
+            # Find top prediction
+            top_id = int(np.argmax(probs))
+            confidence = float(probs[top_id])
+            label = self._class_names.get(top_id, "Unknown")
+            
+            # Build probability dictionary for all known classes
+            probs_dict = {}
+            for class_id, class_name in self._class_names.items():
+                if class_id < len(probs):
+                    probs_dict[class_name] = float(probs[class_id])
+            
+            # Ensure all probabilities are present and valid
+            # Handle case where not all class_ids are in probs (defensive)
+            if not probs_dict:
+                # Fallback: single class with confidence
+                probs_dict = {label: confidence}
+            
+            return label, confidence, probs_dict
+            
+        except Exception as e:
+            logger.error(f"[BpuClassifier] predict_probs error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return "Unknown", 0.0, {"Unknown": 1.0}
+
     def _preprocess(self, img):
         resized = cv2.resize(img, (self.input_w, self.input_h))
         return self._bgr2nv12(resized)

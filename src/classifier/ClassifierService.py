@@ -40,6 +40,7 @@ from src.utils.PipelineMetrics import pipeline_metrics
 from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
 from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
 from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
+from src.classifier.probability_adjustments import apply_probability_adjustment, validate_probability_vector
 
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
@@ -883,9 +884,14 @@ class ClassifierService:
                 
                 # Re-classify with probs for evidence accumulation
                 classifications_with_probs = []
+                prob_adjustment_count = 0
+                
                 for idx, cand in enumerate(candidates):
                     roi = cand['roi']
                     label, conf, probs = self._classify_single_with_probs(roi, idx)
+                    
+                    # Store original label before disambiguation
+                    original_label = label
                     
                     # Apply disambiguation if enabled
                     bbox = cand.get('bbox')
@@ -903,6 +909,33 @@ class ClassifierService:
                             logger.warning(
                                 f"[ClassifierService] Track {track_id}: bbox missing for candidate {idx}, "
                                 f"disambiguation skipped in evidence path"
+                            )
+                    
+                    # NEW: Apply probability adjustment if disambiguation changed the label
+                    prob_adjustment_metadata = None
+                    if disambiguated and original_label != label:
+                        # Get family classes from config
+                        family_classes = list(tracking_config.disambiguation_classes) if hasattr(tracking_config, 'disambiguation_classes') else None
+                        
+                        # Apply probability mass transfer
+                        adjusted_probs, prob_adjustment_metadata = apply_probability_adjustment(
+                            original_probs=probs,
+                            from_label=original_label,
+                            to_label=label,
+                            family_classes=family_classes,
+                            config=tracking_config
+                        )
+                        
+                        # Replace probs with adjusted probs
+                        probs = adjusted_probs
+                        prob_adjustment_count += 1
+                        
+                        # Log the adjustment (only if debug enabled)
+                        if getattr(tracking_config, 'prob_adjustment_debug_logging', False):
+                            logger.info(
+                                f"[ClassifierService] Track {track_id} ROI {idx}: "
+                                f"Applied prob adjustment {original_label}->{label}, "
+                                f"transferred={prob_adjustment_metadata.get('mass_transferred', 0):.3f}"
                             )
                     
                     # Compute trust
@@ -923,7 +956,7 @@ class ClassifierService:
                     state = 'open' if is_open else 'closed'
                     
                     classifications_with_probs.append({
-                        'probs': probs,
+                        'probs': probs,  # Now potentially adjusted probs
                         'trust': trust,
                         'state': state,
                         'label': label,
@@ -935,6 +968,8 @@ class ClassifierService:
                         'is_open': is_open,
                         'disambiguated': disambiguated,
                         'disambiguation_reason': disambiguation_reason,
+                        'original_label': original_label,  # Track original for metadata
+                        'prob_adjustment': prob_adjustment_metadata,  # Include adjustment metadata
                     })
                 
                 # Use accumulate_track_evidence convenience function
@@ -968,6 +1003,32 @@ class ClassifierService:
                 if disambiguated_count > 0:
                     metadata['disambiguation_applied'] = True
                     metadata['disambiguation_count'] = disambiguated_count
+                
+                # Add probability adjustment stats
+                if prob_adjustment_count > 0:
+                    metadata['probability_adjustment_applied'] = True
+                    metadata['probability_adjustment_count'] = prob_adjustment_count
+                    
+                    # Collect detailed adjustment info for the first few adjustments
+                    adjustment_details = []
+                    for c in classifications_with_probs:
+                        adj = c.get('prob_adjustment')
+                        if adj and adj.get('applied'):
+                            adjustment_details.append({
+                                'from_label': adj['from_label'],
+                                'to_label': adj['to_label'],
+                                'mass_transferred': round(adj['mass_transferred'], 4),
+                                'before_from': round(adj['before_from'], 4),
+                                'before_to': round(adj['before_to'], 4),
+                                'after_from': round(adj['after_from'], 4),
+                                'after_to': round(adj['after_to'], 4),
+                                'reason': adj['reason']
+                            })
+                            if len(adjustment_details) >= 3:  # Limit to first 3 for logging size
+                                break
+                    
+                    if adjustment_details:
+                        metadata['probability_adjustment_samples'] = adjustment_details
                 
             else:
                 # LEGACY PATH: Ratio-based evidence accumulation

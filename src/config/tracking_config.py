@@ -1545,6 +1545,54 @@ class TrackingConfig:
     """
     
     # ============================================================================
+    # Part 1.5: Probability Mass Transfer (Variant B)
+    # ============================================================================
+    # These parameters control how probability vectors are adjusted after
+    # disambiguation to ensure the evidence accumulator reflects the
+    # disambiguated label decision.
+    
+    prob_adjustment_strategy: str = 'full_transfer'
+    """
+    Strategy for transferring probability mass after disambiguation.
+    
+    Options:
+    - 'full_transfer': Transfer ALL family mass to target class (default)
+    - 'proportional_transfer': Transfer only from source, proportionally
+    - 'swap': Swap probabilities between source and target
+    
+    Default: 'full_transfer' (most conservative, ensures accumulator respects disambiguation)
+    """
+    
+    prob_adjustment_transfer_ratio: float = _parse_float_env("PROB_ADJUSTMENT_TRANSFER_RATIO", 1.0)
+    """
+    Transfer ratio for 'proportional_transfer' strategy.
+    
+    Amount to transfer = from_label_prob * transfer_ratio
+    
+    Range: 0.0 - 1.0
+    Default: 1.0 (full transfer)
+    """
+    
+    prob_adjustment_epsilon: float = 1e-9
+    """
+    Epsilon value for numerical stability in probability adjustments.
+    
+    Used to avoid exact zeros which can cause issues with log-evidence.
+    
+    Default: 1e-9
+    """
+    
+    prob_adjustment_debug_logging: bool = _parse_bool_env("PROB_ADJUSTMENT_DEBUG", False)
+    """
+    Enable detailed debug logging for probability adjustments.
+    
+    When True: Logs each adjustment with before/after values
+    When False: Silent (only summary in metadata)
+    
+    Default: False (production)
+    """
+    
+    # ============================================================================
     # Part 2: Trust-Weighted Temporal Evidence Accumulation
     # ============================================================================
     # These parameters control the noise-resistant track-level classification
