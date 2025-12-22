@@ -32,13 +32,8 @@ class MockConfig:
     disambiguation_enabled: bool = True
     disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
     disambiguation_family_name: str = 'Brown_Orange_Family'
-    disambiguation_y_feature: str = 'cy'
-    disambiguation_scaling_model: str = 'linear'
-    disambiguation_scale_a: float = 0.5
-    disambiguation_scale_b: float = 1.0
-    disambiguation_scale_p: float = 1.5
-    disambiguation_small_threshold: float = 15000.0
-    disambiguation_regular_threshold: float = 25000.0
+    disambiguation_small_threshold: float = 10000.0
+    disambiguation_regular_threshold: float = 20000.0
     disambiguation_gray_zone_behavior: str = 'keep_original'
     disambiguation_debug_logging: bool = False
     disambiguation_confidence_penalty: float = 0.9
@@ -92,23 +87,46 @@ def test_disambiguation_with_bbox():
     
     config = MockConfig()
     
-    # Test with a large box near bottom (should be regular class)
+    # Test with a large box (should be regular class) in CLOSED state
     result = disambiguate_by_size(
         original_label='Brown_Orange_Overlay',
         confidence=0.75,
-        bbox=(100, 500, 250, 650),  # Large box near bottom
-        image_height=720,
+        bbox=(100, 500, 250, 650),  # Large box: 150x150 = 22500
+        is_open=False,  # CLOSED state
         config=config
     )
     
     assert result.disambiguated, "Should have attempted disambiguation!"
     assert result.raw_area > 0, "Raw area should be calculated!"
-    assert result.adjusted_area > 0, "Adjusted area should be calculated!"
     
     print(f"✓ Disambiguation applied: {result.disambiguated}")
     print(f"  Label: {result.label}")
     print(f"  Reason: {result.reason}")
-    print(f"  Raw area: {result.raw_area:.0f}, Adjusted area: {result.adjusted_area:.0f}")
+    print(f"  Raw area: {result.raw_area:.0f}")
+    return True
+
+
+def test_disambiguation_skips_open():
+    """Test 2b: Verify disambiguation skips open state ROIs."""
+    print("\n=== Test 2b: Disambiguation Skips Open State ===")
+    
+    config = MockConfig()
+    
+    # Test with a large box in OPEN state (should skip)
+    result = disambiguate_by_size(
+        original_label='Brown_Orange_Overlay',
+        confidence=0.75,
+        bbox=(100, 500, 250, 650),  # Large box
+        is_open=True,  # OPEN state - should skip
+        config=config
+    )
+    
+    assert not result.disambiguated, "Should have skipped disambiguation for open state!"
+    assert result.reason == 'skipped_open_state', f"Wrong reason: {result.reason}"
+    assert result.label == 'Brown_Orange_Overlay', "Label should be unchanged!"
+    
+    print(f"✓ Disambiguation correctly skipped for open state")
+    print(f"  Reason: {result.reason}")
     return True
 
 
@@ -211,6 +229,7 @@ def main():
     tests = [
         test_bbox_in_candidate,
         test_disambiguation_with_bbox,
+        test_disambiguation_skips_open,
         test_evidence_accumulation,
         test_metadata_structure,
     ]

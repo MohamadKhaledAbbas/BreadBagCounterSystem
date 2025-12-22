@@ -1380,13 +1380,13 @@ class TrackingConfig:
     # Part 1: Size-Based Disambiguation (Brown_Orange_Overlay vs Brown_Orange_Small)
     # ============================================================================
     # These parameters control the post-detection disambiguation between visually
-    # similar classes using perspective-adjusted bounding box area.
+    # similar classes using RAW bounding box area on CLOSED state ROIs only.
     
     disambiguation_enabled: bool = _parse_bool_env("DISAMBIGUATION_ENABLED", True)
     """
     Enable/disable size-based disambiguation between Brown_Orange_Overlay and Brown_Orange_Small.
     
-    When True: Uses perspective-adjusted bbox area to disambiguate similar classes
+    When True: Uses raw bbox area on CLOSED ROIs to disambiguate similar classes
     When False: Relies solely on YOLO classifier predictions
     
     Default: True
@@ -1398,7 +1398,7 @@ class TrackingConfig:
     First element = "regular/larger" class, Second = "small" class.
     
     When the classifier returns ANY of these classes, we treat them as a "family"
-    and decide the specific class purely based on size measurement.
+    and decide the specific class purely based on size measurement on CLOSED ROIs.
     """
     
     disambiguation_family_name: str = 'Brown_Orange_Family'
@@ -1414,84 +1414,39 @@ class TrackingConfig:
     Default: 'Brown_Orange_Family'
     """
     
-    disambiguation_y_feature: str = 'cy'
-    """
-    Which Y coordinate feature to use for perspective calculation.
-    Options:
-    - 'cy': Use bbox center y-coordinate (y1 + y2) / 2
-    - 'y2': Use bbox bottom y-coordinate
-    
-    Default: 'cy' (center y)
-    """
-    
-    disambiguation_scaling_model: str = 'linear'
-    """
-    Perspective scaling model to adjust apparent area.
-    Options:
-    - 'linear': scale = a + b * y_norm
-    - 'power': scale = (a + b * y_norm) ** p  
-    - 'inverse': scale = 1 / (a + b * (1 - y_norm))
-    
-    Default: 'linear'
-    """
-    
-    disambiguation_scale_a: float = _parse_float_env("DISAMBIGUATION_SCALE_A", 0.5)
-    """
-    Scaling coefficient 'a' for perspective adjustment.
-    
-    For linear model: scale = a + b * y_norm
-    Range: 0.3 - 1.0
-    
-    Default: 0.5
-    """
-    
-    disambiguation_scale_b: float = _parse_float_env("DISAMBIGUATION_SCALE_B", 1)
-    """
-    Scaling coefficient 'b' for perspective adjustment.
-    
-    For linear model: scale = a + b * y_norm
-    Range: 0.5 - 2.0
-    
-    Default: 1.0
-    """
-    
-    disambiguation_scale_p: float = _parse_float_env("DISAMBIGUATION_SCALE_P", 1.5)
-    """
-    Power exponent 'p' for power-law scaling model.
-    
-    Only used when disambiguation_scaling_model='power'
-    Range: 1.0 - 3.0
-    
-    Default: 1.5
-    """
-    
     disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 10000.0)
     """
-    Adjusted area threshold below which a detection is classified as "small".
+    Raw area threshold (pixels²) below which a detection is classified as "small".
     
-    If adjusted_area < small_threshold => force class to Brown_Orange_Small
+    If raw_area < small_threshold => force class to Brown_Orange_Small
     
-    Range: 10000 - 25000 (depends on camera setup)
-    Tuning: Plot adjusted_area vs true label to find optimal threshold.
+    Range: 8000 - 15000 (depends on camera setup and bag sizes)
+    Tuning: Plot raw_area vs true label to find optimal threshold.
     
-    Default: 15000.0 (pixels^2)
+    Note: This is RAW AREA in pixels², not adjusted for perspective.
+    Only applies to CLOSED state ROIs.
+    
+    Default: 10000.0 (pixels²)
     """
     
     disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 20000.0)
     """
-    Adjusted area threshold above which a detection is classified as "regular/overlay".
+    Raw area threshold (pixels²) above which a detection is classified as "regular/overlay".
     
-    If adjusted_area > regular_threshold => force class to Brown_Orange_Overlay
+    If raw_area > regular_threshold => force class to Brown_Orange_Overlay
     
-    Range: 20000 - 40000 (depends on camera setup)
-    Tuning: Plot adjusted_area vs true label to find optimal threshold.
+    Range: 15000 - 30000 (depends on camera setup and bag sizes)
+    Tuning: Plot raw_area vs true label to find optimal threshold.
     
-    Default: 25000.0 (pixels^2)
+    Note: This is RAW AREA in pixels², not adjusted for perspective.
+    Only applies to CLOSED state ROIs.
+    
+    Default: 20000.0 (pixels²)
     """
     
     disambiguation_gray_zone_behavior: str = 'keep_original'
     """
-    Behavior when adjusted_area falls in the gray zone (between small and regular thresholds).
+    Behavior when raw_area falls in the gray zone (between small and regular thresholds).
     Options:
     - 'keep_original': Keep YOLO's original prediction
     - 'uncertain': Return "Uncertain" classification
@@ -1505,7 +1460,7 @@ class TrackingConfig:
     """
     Enable detailed debug logging for disambiguation tuning.
     
-    When True: Logs raw area, adjusted area, y_norm, scale factor, and decision
+    When True: Logs raw area, decision, and reasoning for each disambiguation
     
     Default: False
     """
@@ -1518,16 +1473,6 @@ class TrackingConfig:
     Range: 0.8 - 1.0 (1.0 = no penalty)
     
     Default: 0.9 (10% reduction)
-    """
-    
-    default_image_height: int = _parse_int_env("DEFAULT_IMAGE_HEIGHT", 720)
-    """
-    Default image height for disambiguation when not available from context.
-    
-    Should match the camera's video resolution height.
-    Common values: 720 (720p), 1080 (1080p), 480 (480p)
-    
-    Default: 720
     """
     
     disambiguation_penalty_on_change_only: bool = _parse_bool_env("DISAMBIGUATION_PENALTY_ON_CHANGE_ONLY", False)

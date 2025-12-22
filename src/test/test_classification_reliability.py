@@ -16,8 +16,6 @@ from typing import Dict, Any, Optional
 
 from src.classifier.disambiguation import (
     disambiguate_by_size,
-    compute_adjusted_area,
-    compute_perspective_scale,
     disambiguate_batch,
     DisambiguationResult
 )
@@ -47,16 +45,13 @@ class MockConfig:
     # Disambiguation parameters
     disambiguation_enabled: bool = True
     disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
-    disambiguation_y_feature: str = 'cy'
-    disambiguation_scaling_model: str = 'linear'
-    disambiguation_scale_a: float = 0.5
-    disambiguation_scale_b: float = 1.0
-    disambiguation_scale_p: float = 1.5
-    disambiguation_small_threshold: float = 15000.0
-    disambiguation_regular_threshold: float = 25000.0
+    disambiguation_small_threshold: float = 10000.0
+    disambiguation_regular_threshold: float = 20000.0
     disambiguation_gray_zone_behavior: str = 'keep_original'
     disambiguation_debug_logging: bool = False
     disambiguation_family_name: str = 'Brown_Orange_Family'
+    disambiguation_confidence_penalty: float = 0.9
+    disambiguation_penalty_on_change_only: bool = False
     
     # Trust parameters
     trust_open_max: float = 1.0
@@ -88,94 +83,8 @@ def default_config():
 # Disambiguation Module Tests
 # =============================================================================
 
-class TestPerspectiveScale:
-    """Tests for perspective scale computation."""
-    
-    def test_linear_scale_at_top(self):
-        """At top of frame (y_norm=0), scale should be 'a'."""
-        scale = compute_perspective_scale(y_norm=0.0, model='linear', a=0.5, b=1.0)
-        assert scale == 0.5
-    
-    def test_linear_scale_at_bottom(self):
-        """At bottom of frame (y_norm=1), scale should be 'a + b'."""
-        scale = compute_perspective_scale(y_norm=1.0, model='linear', a=0.5, b=1.0)
-        assert scale == 1.5
-    
-    def test_linear_scale_monotonic(self):
-        """Scale should increase monotonically with y_norm."""
-        y_values = [0.0, 0.25, 0.5, 0.75, 1.0]
-        scales = [compute_perspective_scale(y, model='linear', a=0.5, b=1.0) 
-                  for y in y_values]
-        
-        for i in range(1, len(scales)):
-            assert scales[i] > scales[i-1], f"Scale not monotonic at {y_values[i]}"
-    
-    def test_power_scale_stronger_than_linear(self):
-        """Power model should produce more aggressive scaling."""
-        y_norm = 0.3  # Use value that produces different results
-        linear_scale = compute_perspective_scale(y_norm, model='linear', a=0.5, b=1.0)
-        power_scale = compute_perspective_scale(y_norm, model='power', a=0.5, b=1.0, p=1.5)
-        
-        # Power model with p>1 should produce different values for most y_norm values
-        # At y_norm=0.3: linear = 0.5 + 0.3 = 0.8
-        # Power = (0.5 + 0.3)^1.5 ≈ 0.716
-        assert abs(power_scale - linear_scale) > 0.01
-    
-    def test_scale_never_zero(self):
-        """Scale should never be zero or negative."""
-        for y in [0.0, 0.5, 1.0]:
-            for model in ['linear', 'power', 'inverse']:
-                scale = compute_perspective_scale(y, model=model, a=0.1, b=0.1, p=1.5)
-                assert scale > 0, f"Scale <= 0 for y={y}, model={model}"
-
-
-class TestAdjustedArea:
-    """Tests for perspective-adjusted area computation."""
-    
-    def test_adjusted_area_basic(self):
-        """Basic adjusted area computation."""
-        bbox = (100, 100, 200, 200)  # 100x100 box
-        raw, adjusted, y_norm, scale = compute_adjusted_area(
-            bbox=bbox,
-            image_height=720,
-            y_feature='cy'
-        )
-        
-        assert raw == 10000  # 100 * 100
-        assert y_norm == pytest.approx(150 / 720, rel=0.01)  # center y / height
-        assert adjusted > 0
-    
-    def test_adjusted_area_with_bottom_y(self):
-        """Using bottom y-coordinate for perspective."""
-        bbox = (100, 100, 200, 200)  # Bottom at y=200
-        _, _, y_norm_cy, _ = compute_adjusted_area(
-            bbox=bbox, image_height=720, y_feature='cy'
-        )
-        _, _, y_norm_y2, _ = compute_adjusted_area(
-            bbox=bbox, image_height=720, y_feature='y2'
-        )
-        
-        assert y_norm_y2 > y_norm_cy  # y2 > center y
-    
-    def test_objects_higher_in_frame_adjusted_larger(self):
-        """Objects higher in frame (farther away) should have larger adjusted area."""
-        # Two boxes with same raw area but different y positions
-        bbox_high = (100, 50, 200, 150)   # Near top (far from camera)
-        bbox_low = (100, 500, 200, 600)   # Near bottom (close to camera)
-        
-        _, adjusted_high, _, _ = compute_adjusted_area(
-            bbox=bbox_high, image_height=720
-        )
-        _, adjusted_low, _, _ = compute_adjusted_area(
-            bbox=bbox_low, image_height=720
-        )
-        
-        # Higher object's adjusted area should be larger (compensating for distance)
-        assert adjusted_high > adjusted_low
-
-
-class TestDisambiguation:
-    """Tests for the main disambiguation function."""
+class TestRawAreaDisambiguation:
+    """Tests for raw area-based disambiguation."""
     
     def test_non_target_class_unchanged(self, default_config):
         """Classes not in target family should be unchanged."""
@@ -183,7 +92,7 @@ class TestDisambiguation:
             original_label="Blue_Yellow",
             confidence=0.8,
             bbox=(100, 100, 200, 200),
-            image_height=720,
+            is_open=False,
             config=default_config
         )
         
@@ -199,7 +108,7 @@ class TestDisambiguation:
             original_label="Brown_Orange_Overlay",
             confidence=0.8,
             bbox=(100, 100, 200, 200),
-            image_height=720,
+            is_open=False,
             config=default_config
         )
         
@@ -207,114 +116,132 @@ class TestDisambiguation:
         assert result.disambiguated is False
         assert result.reason == "disambiguation_disabled"
     
+    def test_open_state_skipped(self, default_config):
+        """Open state ROIs should be skipped for disambiguation."""
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Overlay",
+            confidence=0.8,
+            bbox=(100, 100, 200, 200),
+            is_open=True,  # OPEN state
+            config=default_config
+        )
+        
+        assert result.label == "Brown_Orange_Overlay"  # Unchanged
+        assert result.disambiguated is False
+        assert result.reason == "skipped_open_state"
+    
     def test_small_area_forces_small_class(self, default_config):
-        """Family member with small adjusted area should be classified as small."""
-        # Small box near top of frame
-        small_bbox = (300, 50, 360, 110)  # 60x60 = 3600 px²
+        """Family member with small raw area should be classified as small."""
+        # Small box: 60x60 = 3600 px²
+        small_bbox = (300, 50, 360, 110)
         
         result = disambiguate_by_size(
             original_label="Brown_Orange_Overlay",  # Classifier said regular
             confidence=0.7,
             bbox=small_bbox,
-            image_height=720,
+            is_open=False,  # CLOSED state only
             config=default_config
         )
         
-        # Adjusted area should be < small_threshold (15000)
+        # Raw area should be < small_threshold (10000)
         # Result should be Small class based on SIZE, not classifier
-        assert result.adjusted_area < default_config.disambiguation_small_threshold
+        assert result.raw_area < default_config.disambiguation_small_threshold
         assert result.label == "Brown_Orange_Small"
         assert result.disambiguated is True
         assert "family_size_small" in result.reason
     
     def test_large_area_forces_regular_class(self, default_config):
-        """Family member with large adjusted area should be classified as regular."""
-        # Large box near bottom of frame
-        large_bbox = (100, 500, 300, 700)  # 200x200 = 40000 px²
+        """Family member with large raw area should be classified as regular."""
+        # Large box: 200x200 = 40000 px²
+        large_bbox = (100, 500, 300, 700)
         
         result = disambiguate_by_size(
             original_label="Brown_Orange_Small",  # Classifier said small
             confidence=0.7,
             bbox=large_bbox,
-            image_height=720,
+            is_open=False,  # CLOSED state only
             config=default_config
         )
         
-        # Adjusted area should be > regular_threshold (25000)
+        # Raw area should be > regular_threshold (20000)
         # Result should be Regular class based on SIZE, not classifier
-        assert result.adjusted_area > default_config.disambiguation_regular_threshold
+        assert result.raw_area > default_config.disambiguation_regular_threshold
         assert result.label == "Brown_Orange_Overlay"
         assert result.disambiguated is True
         assert "family_size_regular" in result.reason
     
-    def test_gray_zone_default_regular(self, default_config):
-        """Gray zone with 'keep_original' defaults to regular for family members."""
-        # Medium box that falls in gray zone
-        medium_bbox = (200, 300, 350, 430)  # 150x130 = 19500 px²
+    def test_gray_zone_keep_original(self, default_config):
+        """Test gray zone behavior with 'keep_original'."""
+        # Medium box: 120x120 = 14400 px² (between 10000 and 20000)
+        gray_bbox = (100, 200, 220, 320)
         
         result = disambiguate_by_size(
-            original_label="Brown_Orange_Overlay",
-            confidence=0.75,
-            bbox=medium_bbox,
-            image_height=720,
+            original_label="Brown_Orange_Overlay",  # Classifier said regular
+            confidence=0.7,
+            bbox=gray_bbox,
+            is_open=False,
             config=default_config
         )
         
-        # For family members in gray zone with 'keep_original', defaults to regular
-        if default_config.disambiguation_small_threshold <= result.adjusted_area <= default_config.disambiguation_regular_threshold:
-            assert result.label == "Brown_Orange_Overlay"  # Regular class
-            assert "family_gray_zone_default_regular" in result.reason
-            assert result.disambiguated is True  # Always disambiguated for family
+        # In gray zone with 'keep_original', should keep original
+        assert result.label == "Brown_Orange_Overlay"
+        assert result.disambiguated is True  # Still size-decided
+        assert "gray_zone" in result.reason
     
     def test_gray_zone_uncertain(self, default_config):
-        """Gray zone with 'uncertain' behavior."""
+        """Test gray zone with 'uncertain' behavior."""
         default_config.disambiguation_gray_zone_behavior = 'uncertain'
         
-        # Medium box that falls in gray zone
-        medium_bbox = (200, 300, 350, 430)  # Should fall in gray zone
+        # Medium box: 120x120 = 14400 px² (between 10000 and 20000)
+        gray_bbox = (100, 200, 220, 320)
         
         result = disambiguate_by_size(
             original_label="Brown_Orange_Overlay",
             confidence=0.75,
-            bbox=medium_bbox,
-            image_height=720,
+            bbox=gray_bbox,
+            is_open=False,
             config=default_config
         )
         
-        # Verify result based on actual area calculation
-        if default_config.disambiguation_small_threshold <= result.adjusted_area <= default_config.disambiguation_regular_threshold:
-            assert result.label == "Uncertain"
-            assert "family_gray_zone_uncertain" in result.reason
+        # Should return Uncertain in gray zone
+        assert result.label == "Uncertain"
+        assert "family_gray_zone_uncertain" in result.reason
     
-    def test_family_name_recognized(self, default_config):
-        """Future classifier returning family name should be recognized."""
-        # Test that Brown_Orange_Family is recognized as a family member
-        large_bbox = (100, 500, 300, 700)  # Large box -> regular
-        
+    def test_confidence_penalty_applied(self, default_config):
+        """Test confidence penalty when disambiguation changes label."""
         result = disambiguate_by_size(
-            original_label="Brown_Orange_Family",  # Future classifier output
-            confidence=0.8,
-            bbox=large_bbox,
-            image_height=720,
+            original_label="Brown_Orange_Overlay",
+            confidence=1.0,
+            bbox=(100, 50, 150, 100),  # Small: 50x50 = 2500
+            is_open=False,
             config=default_config
         )
         
-        # Family name should be recognized and processed
-        assert result.disambiguated is True
-        assert result.label in ["Brown_Orange_Overlay", "Brown_Orange_Small"]
-        assert "family_" in result.reason
+        # Penalty should be applied (0.9 by default)
+        assert result.confidence < 1.0
+        assert result.confidence == pytest.approx(0.9, rel=0.01)
     
-    def test_all_family_members_always_disambiguated(self, default_config):
-        """All family members should have disambiguated=True regardless of size match."""
-        # Even if classifier guesses correctly, disambiguated should be True
-        # because we're treating all family members the same way
-        large_bbox = (100, 500, 300, 700)
-        
+    def test_family_name_recognition(self, default_config):
+        """Test that family name is recognized as a member."""
         result = disambiguate_by_size(
-            original_label="Brown_Orange_Overlay",  # Classifier guessed regular
+            original_label="Brown_Orange_Family",  # Future-proof family name
             confidence=0.7,
-            bbox=large_bbox,
-            image_height=720,
+            bbox=(100, 500, 300, 700),  # Large: 200x200 = 40000
+            is_open=False,
+            config=default_config
+        )
+        
+        # Should be disambiguated just like family members
+        assert result.disambiguated is True
+        assert result.label == "Brown_Orange_Overlay"
+    
+    def test_classifier_agrees_with_size(self, default_config):
+        """Test when classifier prediction agrees with size-based decision."""
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Overlay",
+            confidence=0.8,
+            bbox=(100, 500, 300, 700),  # Large: 200x200 = 40000
+            is_open=False,
             config=default_config
         )
         
@@ -325,17 +252,21 @@ class TestDisambiguation:
     def test_batch_disambiguation(self, default_config):
         """Test batch disambiguation."""
         classifications = [
-            {'label': 'Brown_Orange_Overlay', 'confidence': 0.8, 'bbox': (100, 50, 160, 110)},
-            {'label': 'Blue_Yellow', 'confidence': 0.9, 'bbox': (200, 200, 300, 300)},
-            {'label': 'Brown_Orange_Small', 'confidence': 0.7, 'bbox': (100, 500, 300, 700)},
+            {'label': 'Brown_Orange_Overlay', 'confidence': 0.8, 'bbox': (100, 50, 160, 110), 'is_open': False},
+            {'label': 'Blue_Yellow', 'confidence': 0.9, 'bbox': (200, 200, 300, 300), 'is_open': False},
+            {'label': 'Brown_Orange_Small', 'confidence': 0.7, 'bbox': (100, 500, 300, 700), 'is_open': False},
+            {'label': 'Brown_Orange_Overlay', 'confidence': 0.8, 'bbox': (100, 50, 160, 110), 'is_open': True},  # Open - should skip
         ]
         
-        results = disambiguate_batch(classifications, image_height=720, config=default_config)
+        results = disambiguate_batch(classifications, config=default_config)
         
-        assert len(results) == 3
+        assert len(results) == 4
         # Second item (Blue_Yellow) should be unchanged
         assert results[1]['disambiguation']['applied'] is False
         assert results[1]['disambiguation']['reason'] == 'not_target_family'
+        # Fourth item (Open state) should be skipped
+        assert results[3]['disambiguation']['applied'] is False
+        assert results[3]['disambiguation']['reason'] == 'skipped_open_state'
 
 
 # =============================================================================

@@ -201,19 +201,20 @@ class ClassifierService:
         label: str, 
         confidence: float, 
         bbox: Optional[Tuple[float, float, float, float]],
-        image_height: int = 720
+        is_open: bool = True
     ) -> Tuple[str, float, bool, str]:
         """
         Apply size-based disambiguation for visually similar classes.
         
-        V7: Uses perspective-adjusted bounding box area to disambiguate
+        V7: Uses raw bounding box area to disambiguate
         between Brown_Orange_Overlay and Brown_Orange_Small.
+        Only processes CLOSED state ROIs (is_open=False).
         
         Args:
             label: Original classifier label
             confidence: Original confidence
             bbox: Bounding box (x1, y1, x2, y2) if available
-            image_height: Height of the source image
+            is_open: Whether the ROI is in open state (True) or closed state (False)
             
         Returns:
             Tuple of (final_label, final_confidence, was_disambiguated, reason)
@@ -225,7 +226,7 @@ class ClassifierService:
             original_label=label,
             confidence=confidence,
             bbox=bbox,
-            image_height=image_height,
+            is_open=is_open,
             config=tracking_config
         )
         
@@ -798,18 +799,13 @@ class ClassifierService:
                 median_h = sorted([s[1] for s in roi_sizes])[len(roi_sizes) // 2]
                 median_size = (median_w, median_h)
             
-            # Get image height from context for disambiguation
-            image_height = tracking_config.default_image_height
-            frame = context.get("frame") if context else None
-            if frame is not None and hasattr(frame, 'shape'):
-                image_height = frame.shape[0]
-            
             for idx, cand in enumerate(candidates):
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
                 
                 # V7: Apply size-based disambiguation if enabled
                 bbox = cand.get('bbox')  # May be None if not available
+                is_open = cand.get('is_open', True) or cand.get('state') == 'open'
                 disambiguated = False
                 disambiguation_reason = None
                 if self.disambiguation_enabled:
@@ -818,7 +814,7 @@ class ClassifierService:
                             label=label,
                             confidence=conf,
                             bbox=bbox,
-                            image_height=image_height
+                            is_open=is_open
                         )
                     else:
                         # Defensive logging when bbox is missing
@@ -897,6 +893,7 @@ class ClassifierService:
                     
                     # Apply disambiguation if enabled
                     bbox = cand.get('bbox')
+                    is_open = cand.get('is_open', True) or cand.get('state') == 'open'
                     disambiguated = False
                     disambiguation_reason = None
                     if self.disambiguation_enabled:
@@ -905,11 +902,11 @@ class ClassifierService:
                                 label=label,
                                 confidence=conf,
                                 bbox=bbox,
-                                image_height=image_height
+                                is_open=is_open
                             )
                             logger.info(
                                 f"[ClassifierService] Track {track_id}: cand {idx} disambig applied={disambiguated}, reason={disambiguation_reason}, "
-                                f"bbox={bbox}, new_label={label}, new_conf={conf:.3f}"
+                                f"bbox={bbox}, is_open={is_open}, new_label={label}, new_conf={conf:.3f}"
                             )
                         else:
                             logger.warning(

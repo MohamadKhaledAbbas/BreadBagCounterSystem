@@ -140,7 +140,7 @@ See `CHANGES_SUMMARY.md` for full details.
 
 1. **disambiguation_enabled** (default: True)
    - Controls size-based disambiguation
-   - When True: Uses perspective-adjusted bbox area
+   - When True: Uses raw bbox area on CLOSED state ROIs
 
 2. **evidence_accumulation_enabled** (default: True)
    - Controls evidence accumulation method
