@@ -73,7 +73,7 @@ class AppConfig:
 
     APP_VERSION: str = "2025-12-21-v1.5.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Wheatberry_Green_08_09.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\20251129050005_20251129050202.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models

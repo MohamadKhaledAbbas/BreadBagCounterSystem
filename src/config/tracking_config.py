@@ -185,7 +185,7 @@ class TrackingConfig:
     # ROI Collection Parameters (BagEvent)
     # ============================================================================
     
-    max_open_samples: int = 15  # V3: Reduced from 6 for memory efficiency
+    max_open_samples: int = 10  # V3: Reduced from 6 for memory efficiency
     """
     Maximum number of ROI samples to collect during the 'open' phase.
     
@@ -195,7 +195,7 @@ class TrackingConfig:
     Default: 5 (V3: reduced from 6)
     """
     
-    max_closed_samples: int = 5  # V3: Reduced from 4 for memory efficiency
+    max_closed_samples: int = 10  # V3: Reduced from 4 for memory efficiency
     """
     Maximum number of ROI samples to collect during the 'closed' phase.
     
@@ -1414,7 +1414,7 @@ class TrackingConfig:
     Default: 'Brown_Orange_Family'
     """
     
-    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 10000.0)
+    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 7000.0)
     """
     Raw area threshold (pixels²) below which a detection is classified as "small".
     
@@ -1429,7 +1429,7 @@ class TrackingConfig:
     Default: 10000.0 (pixels²)
     """
     
-    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 20000.0)
+    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 10000.0)
     """
     Raw area threshold (pixels²) above which a detection is classified as "regular/overlay".
     

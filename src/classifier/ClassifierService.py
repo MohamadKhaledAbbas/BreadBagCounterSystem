@@ -805,7 +805,7 @@ class ClassifierService:
                 
                 # V7: Apply size-based disambiguation if enabled
                 bbox = cand.get('bbox')  # May be None if not available
-                is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                is_open = cand.get('state') == 'open'
                 disambiguated = False
                 disambiguation_reason = None
                 if self.disambiguation_enabled:
@@ -832,7 +832,7 @@ class ClassifierService:
                 clamped_contribution = min(raw_contribution, self.max_single_weight)
                 
                 # V7: Compute trust score for this ROI
-                is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                is_open = cand.get('state') == 'open'
                 roi_size = median_size or (100, 100)
                 if roi is not None and hasattr(roi, 'shape'):
                     h, w = roi.shape[:2]
@@ -893,7 +893,7 @@ class ClassifierService:
                     
                     # Apply disambiguation if enabled
                     bbox = cand.get('bbox')
-                    is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                    is_open = cand.get('state') == 'open'
                     disambiguated = False
                     disambiguation_reason = None
                     if self.disambiguation_enabled:

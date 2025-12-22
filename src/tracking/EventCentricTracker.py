@@ -468,6 +468,10 @@ class ROICandidate:
     is_closed: bool  # label the ROI as coming from closed evidence
     bbox: Optional[Tuple[float, float, float, float]] = None  # (x1, y1, x2, y2) for disambiguation
 
+    def __str__(self):
+        return (f"Candidate: sharpness = {self.sharpness}, size = {self.size}, confidence = {self.confidence},"
+                f" is_open = {self.is_open}, is_closed = {self.is_closed}, bbox = {self.bbox}")
+
 
 class BreadBagEvent:
     """
@@ -1146,6 +1150,8 @@ class BreadBagEvent:
             bbox=detection.box  # Pass bbox for disambiguation
         )
 
+        logger.debug(f"[ROI_CANDIDATE] added candidate = {candidate}")
+
         # Insert and keep best-per-class by sharpness
         self.roi_candidates.append(candidate)
         self.roi_candidates.sort(key=lambda x: x.sharpness, reverse=True)
@@ -1157,20 +1163,26 @@ class BreadBagEvent:
         # Enforce class caps by dropping the lowest-sharpness ROI of that class if over cap
         if roi_is_open and self.open_roi_count > max_open_cap:
             # drop worst open ROI
+            logger.debug(
+                f"[ROI_CANDIDATE] open_roi_count({self.closed_roi_count}) > max_open_cap({max_open_cap})")
             worst_idx = max(
                 (i for i, c in enumerate(self.roi_candidates) if c.is_open),
                 key=lambda i: self.roi_candidates[i].sharpness * -1  # smallest sharpness
             )
             self.roi_candidates.pop(worst_idx)
+            logger.debug(f"[ROI_CANDIDATE] removed worst candidate = {candidate}")
             self.open_roi_count -= 1
 
         if roi_is_closed and self.closed_roi_count > max_closed_cap:
             # drop worst closed ROI
+            logger.debug(
+                f"[ROI_CANDIDATE] closed_roi_count({self.closed_roi_count}) > max_closed_cap({max_closed_cap})")
             worst_idx = max(
                 (i for i, c in enumerate(self.roi_candidates) if c.is_closed),
                 key=lambda i: self.roi_candidates[i].sharpness * -1
             )
             self.roi_candidates.pop(worst_idx)
+            logger.debug(f"[ROI_CANDIDATE] removed worst candidate = {candidate}")
             self.closed_roi_count -= 1
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
