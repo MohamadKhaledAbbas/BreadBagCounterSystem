@@ -788,8 +788,8 @@ class BagCounterApp:
                     
                     if is_at_capacity:
                         # At capacity: new skip replaces oldest decision
-                        # Need to know what the oldest decision was to calculate accurately
-                        # Since we don't have it, we use conservative estimate: assume oldest was 0
+                        # Conservative assumption: oldest was 0 (no skip)
+                        # This may slightly overestimate skip rate, but that's safer for skip cap
                         future_skip_rate = (skip_sum + 1) / deque_len
                     else:
                         # Not at capacity: new skip increases length
@@ -826,7 +826,9 @@ class BagCounterApp:
                 # Log when skip cap prevents skipping
                 if adaptive_skip_conditions_met and skip_rate_cap_exceeded:
                     self._skip_cap_blocks += 1
-                    if self._skip_cap_blocks % self.SKIP_CAP_LOG_FREQUENCY == 1:  # Use constant for logging frequency
+                    # Log on first occurrence and then every Nth (1, 6, 11, 16, ...)
+                    # This prevents flooding while still showing the pattern
+                    if self._skip_cap_blocks % self.SKIP_CAP_LOG_FREQUENCY == 1:
                         logger.warning(
                             f"[SkipCapBlock] Skip rate cap preventing frame skip: "
                             f"current_rate={current_skip_rate:.1%}, cap={self.SKIP_RATE_CAP:.1%}, "
@@ -1151,7 +1153,7 @@ class BagCounterApp:
                             input_drops = self.input_queue_drops
                             class_drops = self.classification_queue_drops
                         
-                        # Calculate current skip rate
+                        # Calculate current skip rate (O(n) but acceptable since this runs every 5s)
                         current_skip_rate = 0.0
                         if len(self._skip_decisions) > 0:
                             current_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
