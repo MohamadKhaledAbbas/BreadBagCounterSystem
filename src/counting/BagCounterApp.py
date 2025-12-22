@@ -64,7 +64,7 @@ class BagCounterApp:
     """
     
     # Queue configuration constants - V3: Optimized for 25fps at 720p
-    INPUT_QUEUE_SIZE = 100  # Reduced buffer for lower latency (was 100)
+    INPUT_QUEUE_SIZE = 500  # Increased buffer to allow more buffering (was 100)
     CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
     QUEUE_WARNING_THRESHOLD = 70  # Lower threshold for earlier warnings (was 80)
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
@@ -72,8 +72,15 @@ class BagCounterApp:
     # V3: Performance tuning constants
     TARGET_FPS = 25.0  # Target frames per second
     TARGET_FRAME_TIME_MS = 1000.0 / TARGET_FPS  # ~40ms per frame
-    MAX_DETECTION_TIME_MS = 35.0  # Max acceptable detection time before skipping
-    ADAPTIVE_SKIP_THRESHOLD = 0.8  # Queue utilization to trigger adaptive skipping
+    MAX_DETECTION_TIME_MS = 31.0  # Max acceptable detection time before skipping (was 35.0)
+    ADAPTIVE_SKIP_THRESHOLD = 0.7  # Queue utilization to trigger adaptive skipping (was 0.8)
+    
+    # Skip rate cap configuration
+    SKIP_RATE_CAP = 0.02  # Maximum allowed skip rate (2%)
+    SKIP_RATE_WINDOW = 500  # Number of frames to track for skip rate calculation
+    
+    # System monitoring configuration
+    SYSTEM_STATUS_LOG_INTERVAL = 900.0  # Log system status every 15 minutes (900 seconds)
 
     def __init__(
         self,
@@ -170,6 +177,20 @@ class BagCounterApp:
         self._frames_skipped = 0
         self._adaptive_skip_enabled = True
         
+        # Skip rate cap tracking
+        self._skip_decisions: deque = deque(maxlen=self.SKIP_RATE_WINDOW)  # Track skip decisions
+        self._skip_cap_blocks = 0  # Count how many times skip cap prevented skipping
+        
+        # System monitoring
+        self._last_system_status_log = time.perf_counter()
+        self._psutil_available = False
+        try:
+            import psutil
+            self._psutil_available = True
+            logger.info("[BagCounterApp] psutil available - system monitoring enabled")
+        except ImportError:
+            logger.info("[BagCounterApp] psutil not installed - system monitoring will be limited")
+        
         # Degraded mode tracking
         self._degraded_mode_active = False
         self._recent_queue_delays: deque = deque(maxlen=20)  # Track queue delay
@@ -231,6 +252,9 @@ class BagCounterApp:
         logger.info(
             f"[BagCounterApp] V3 Performance Config: target_fps={self.TARGET_FPS}, "
             f"target_frame_time={self.TARGET_FRAME_TIME_MS:.1f}ms, "
+            f"max_detection_time={self.MAX_DETECTION_TIME_MS:.1f}ms, "
+            f"adaptive_skip_threshold={self.ADAPTIVE_SKIP_THRESHOLD:.1%}, "
+            f"skip_rate_cap={self.SKIP_RATE_CAP:.1%}, "
             f"input_queue={self.INPUT_QUEUE_SIZE}, classification_queue={self.CLASSIFICATION_QUEUE_SIZE}"
         )
         logger.info("[BagCounterApp] Initialization complete")
@@ -247,6 +271,45 @@ class BagCounterApp:
         # Now toggle flag based on config key
         self.is_recording = (new_value == "1" or new_value is True or new_value == 1)
         logger.info(f"[BagCounterApp] is_recording set to {self.is_recording}")
+    
+    def _log_system_status(self):
+        """
+        Log system resource usage (CPU, RAM) if psutil is available.
+        Called periodically (every 15 minutes) to monitor system health.
+        """
+        if not self._psutil_available:
+            return
+        
+        try:
+            import psutil
+            
+            # Get CPU usage (average over short interval)
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            
+            # Get memory usage
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+            memory_used_mb = memory.used / (1024 * 1024)
+            memory_total_mb = memory.total / (1024 * 1024)
+            
+            # Log system status
+            logger.info(
+                f"[SystemStatus] CPU: {cpu_percent:.1f}%, "
+                f"RAM: {memory_percent:.1f}% ({memory_used_mb:.1f}MB / {memory_total_mb:.1f}MB)"
+            )
+            
+            # Also log via structured logging
+            structured_logger.log_json({
+                "event": "system_status",
+                "timestamp": datetime.now().isoformat(),
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory_percent,
+                "memory_used_mb": memory_used_mb,
+                "memory_total_mb": memory_total_mb
+            })
+            
+        except Exception as e:
+            logger.warning(f"[SystemStatus] Failed to log system status: {e}")
     
     def _check_degraded_mode(self, queue_utilization: float) -> bool:
         """
@@ -695,25 +758,71 @@ class BagCounterApp:
                     sum(self._recent_detection_times) / len(self._recent_detection_times)
                     if len(self._recent_detection_times) > 5 else 0.0
                 )
-                should_skip = (
+                
+                # Calculate current skip rate
+                current_skip_rate = 0.0
+                if len(self._skip_decisions) >= 10:  # Need minimum samples
+                    current_skip_rate = sum(self._skip_decisions) / len(self._skip_decisions)
+                
+                # Determine if adaptive skip conditions are met
+                adaptive_skip_conditions_met = (
                     self._adaptive_skip_enabled and 
                     queue_utilization > self.ADAPTIVE_SKIP_THRESHOLD and
                     avg_detection_time > self.MAX_DETECTION_TIME_MS
                 )
                 
+                # Check if skip rate cap would be exceeded
+                skip_rate_cap_exceeded = False
+                if adaptive_skip_conditions_met and len(self._skip_decisions) >= 10:
+                    # Predict what the skip rate would be if we skip this frame
+                    future_skip_rate = (sum(self._skip_decisions) + 1) / (len(self._skip_decisions) + 1)
+                    skip_rate_cap_exceeded = future_skip_rate > self.SKIP_RATE_CAP
+                
+                # Final skip decision
+                should_skip = adaptive_skip_conditions_met and not skip_rate_cap_exceeded
+                
+                # Track skip decision for rate calculation
+                self._skip_decisions.append(1 if should_skip else 0)
+                
                 if should_skip:
                     self._frames_skipped += 1
                     if self._frames_skipped % 10 == 0:
-                        # Structured logging for backpressure
+                        # Improved structured logging for adaptive skip
                         structured_logger.queue_backpressure(
                             queue_name='input_queue',
                             utilization=queue_utilization,
                             drops=self.input_queue_drops,
-                            action='skip_frame',
+                            action='adaptive_skip',
                             avg_detection_time_ms=avg_detection_time,
                             frames_skipped=self._frames_skipped
                         )
+                        logger.warning(
+                            f"[AdaptiveSkip] Frame skipped due to backpressure: "
+                            f"queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms "
+                            f"(threshold={self.MAX_DETECTION_TIME_MS:.1f}ms), "
+                            f"skip_rate={current_skip_rate:.1%}, total_skipped={self._frames_skipped}"
+                        )
                     continue
+                
+                # Log when skip cap prevents skipping
+                if adaptive_skip_conditions_met and skip_rate_cap_exceeded:
+                    self._skip_cap_blocks += 1
+                    if self._skip_cap_blocks % 5 == 1:  # Log every 5th block to avoid flooding
+                        logger.warning(
+                            f"[SkipCapBlock] Skip rate cap preventing frame skip: "
+                            f"current_rate={current_skip_rate:.1%}, cap={self.SKIP_RATE_CAP:.1%}, "
+                            f"queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms, "
+                            f"blocks={self._skip_cap_blocks}"
+                        )
+                        structured_logger.log_json({
+                            "event": "skip_cap_block",
+                            "timestamp": datetime.now().isoformat(),
+                            "current_skip_rate": current_skip_rate,
+                            "skip_rate_cap": self.SKIP_RATE_CAP,
+                            "queue_utilization": queue_utilization,
+                            "avg_detection_time_ms": avg_detection_time,
+                            "total_blocks": self._skip_cap_blocks
+                        })
 
                 # 1. Run Detector
                 detect_start = time.perf_counter()
@@ -882,6 +991,12 @@ class BagCounterApp:
 
                 # Log pipeline metrics periodically
                 pipeline_metrics.maybe_log_summary()
+                
+                # Log system status periodically (every 15 minutes)
+                current_time = time.perf_counter()
+                if current_time - self._last_system_status_log >= self.SYSTEM_STATUS_LOG_INTERVAL:
+                    self._log_system_status()
+                    self._last_system_status_log = current_time
 
             except Exception as e:
                 import traceback
@@ -1016,22 +1131,39 @@ class BagCounterApp:
                         with self.stats_lock:
                             input_drops = self.input_queue_drops
                             class_drops = self.classification_queue_drops
+                        
+                        # Calculate current skip rate
+                        current_skip_rate = 0.0
+                        if len(self._skip_decisions) > 0:
+                            current_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
+                        
                         logger.info(
                             f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
                             f"({input_utilization:.1f}% full, drops={input_drops}) | "
                             f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
                             f"({class_utilization:.1f}% full, drops={class_drops}) | "
-                            f"Skipped: {self._frames_skipped}"
+                            f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
+                            f"SkipCapBlocks: {self._skip_cap_blocks}"
                         )
                         if input_utilization > self.QUEUE_WARNING_THRESHOLD:
+                            # Enhanced warning with root cause information
+                            avg_detect_time = (
+                                sum(self._recent_detection_times) / len(self._recent_detection_times)
+                                if len(self._recent_detection_times) > 0 else 0.0
+                            )
                             logger.warning(
-                                f"[QueueStats] Input queue utilization high: {input_utilization:.1f}% - "
-                                "frames may be dropped if processing doesn't keep up"
+                                f"[InputQueuePressure] High queue utilization: {input_utilization:.1f}% "
+                                f"(threshold={self.QUEUE_WARNING_THRESHOLD}%) - "
+                                f"Root cause: avg_detection_time={avg_detect_time:.1f}ms "
+                                f"(target={self.TARGET_FRAME_TIME_MS:.1f}ms). "
+                                f"Risk: frames may be dropped if processing doesn't improve."
                             )
                         if class_utilization > self.QUEUE_WARNING_THRESHOLD:
                             logger.warning(
-                                f"[QueueStats] Classification queue utilization high: {class_utilization:.1f}% - "
-                                "classification is falling behind"
+                                f"[ClassificationQueuePressure] High queue utilization: {class_utilization:.1f}% "
+                                f"(threshold={self.QUEUE_WARNING_THRESHOLD}%) - "
+                                f"classification thread is falling behind. "
+                                f"Risk: classification tasks may be dropped."
                             )
                         last_queue_stats_time = current_time
             except KeyboardInterrupt:
@@ -1092,9 +1224,16 @@ class BagCounterApp:
         with self.stats_lock:
             input_drops = self.input_queue_drops if self.input_queue is not None else 0
             class_drops = self.classification_queue_drops
+        
+        # Calculate final skip rate
+        final_skip_rate = 0.0
+        if len(self._skip_decisions) > 0:
+            final_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
+        
         logger.info(
             f"[BagCounterApp] Final Stats: "
             f"input_drops={input_drops}, classification_drops={class_drops}, "
-            f"frames_skipped={self._frames_skipped}"
+            f"frames_skipped={self._frames_skipped}, skip_rate={final_skip_rate:.2f}%, "
+            f"skip_cap_blocks={self._skip_cap_blocks}"
         )
         logger.info("[BagCounterApp] Shutdown complete")
