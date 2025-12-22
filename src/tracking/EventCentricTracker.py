@@ -1096,7 +1096,7 @@ class BreadBagEvent:
             closed_hits=self.closed_evidence_count
         )
 
-    def _compute_roi_quality(self, gray: np.ndarray, sharpness: float) -> Tuple[float, float, float, float, float]:
+    def _compute_roi_quality(self, roi: np.ndarray, gray: np.ndarray, sharpness: float) -> Tuple[float, float, float, float, float]:
         """
         Lightweight ROI quality score:
          - sharpness (variance of Laplacian)               -> focus / blur
@@ -1120,18 +1120,24 @@ class BreadBagEvent:
         contrast = float(gray.std())
         glare_ratio = float(np.mean(gray > 245))  # near-white pixels
 
+        # image is BGR, so convert to HSV for better color perception
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        color_metric = float(np.std(hsv[..., 1]))  # Standard deviation of Saturation channel as a simple color diversity proxy
+
         # Normalize to [0,1] with soft reference values tuned for typical 720p crops
         sharp_norm = min(sharpness / (self.config.min_roi_sharpness * 1.5), 1.0)
         edge_norm = min(edge_density / 25.0, 1.0)
         entropy_norm = min(entropy / 5.0, 1.0)  # entropy of 5 is already rich
         contrast_norm = min(contrast / 60.0, 1.0)
+        color_norm = min(color_metric / 20.0, 1.0)  # Adjust denominator to match your empirical range
         glare_penalty = min(glare_ratio * 2.0, 0.3)  # cap penalty
 
         quality = (
-            0.45 * sharp_norm +
-            0.20 * edge_norm +
-            0.20 * entropy_norm +
-            0.15 * contrast_norm -
+            0.40 * sharp_norm +
+            0.18 * edge_norm +
+            0.17 * entropy_norm +
+            0.12 * contrast_norm +
+            0.13 * color_norm -  # <- new colorfulness component
             glare_penalty
         )
 
@@ -1178,7 +1184,7 @@ class BreadBagEvent:
             return
 
         # Lightweight composite quality
-        quality, edge_density, entropy, contrast, glare_ratio = self._compute_roi_quality(gray, sharpness)
+        quality, edge_density, entropy, contrast, glare_ratio = self._compute_roi_quality(roi, gray, sharpness)
         pipeline_metrics.record_roi_quality(True, sharpness, None)
 
         candidate = ROICandidate(

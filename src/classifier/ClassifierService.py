@@ -943,7 +943,7 @@ class ClassifierService:
                     
                     # Compute trust
                     sharpness = cand.get('sharpness', 0)
-                    is_open = cand.get('is_open', True) or cand.get('state') == 'open'
+                    is_open = cand.get('state') == 'open'
                     roi_size = median_size or (100, 100)
                     if roi is not None and hasattr(roi, 'shape'):
                         h, w = roi.shape[:2]

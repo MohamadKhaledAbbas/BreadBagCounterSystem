@@ -1429,7 +1429,7 @@ class TrackingConfig:
     Default: 10000.0 (pixels²)
     """
     
-    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 10000.0)
+    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 8500.0)
     """
     Raw area threshold (pixels²) above which a detection is classified as "regular/overlay".
     
