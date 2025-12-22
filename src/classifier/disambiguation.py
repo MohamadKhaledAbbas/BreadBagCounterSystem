@@ -152,8 +152,8 @@ def disambiguate_by_size(
     # and decide purely based on size measurement
     
     # Get configuration parameters
-    small_threshold = getattr(config, 'disambiguation_small_threshold', 15000.0)
-    regular_threshold = getattr(config, 'disambiguation_regular_threshold', 25000.0)
+    small_threshold = getattr(config, 'disambiguation_small_threshold', 10000.0)
+    regular_threshold = getattr(config, 'disambiguation_regular_threshold', 20000.0)
     gray_zone_behavior = getattr(config, 'disambiguation_gray_zone_behavior', 'keep_original')
     debug_logging = getattr(config, 'disambiguation_debug_logging', False)
     

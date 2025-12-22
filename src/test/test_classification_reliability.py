@@ -45,16 +45,13 @@ class MockConfig:
     # Disambiguation parameters
     disambiguation_enabled: bool = True
     disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
-    disambiguation_y_feature: str = 'cy'
-    disambiguation_scaling_model: str = 'linear'
-    disambiguation_scale_a: float = 0.5
-    disambiguation_scale_b: float = 1.0
-    disambiguation_scale_p: float = 1.5
-    disambiguation_small_threshold: float = 15000.0
-    disambiguation_regular_threshold: float = 25000.0
+    disambiguation_small_threshold: float = 10000.0
+    disambiguation_regular_threshold: float = 20000.0
     disambiguation_gray_zone_behavior: str = 'keep_original'
     disambiguation_debug_logging: bool = False
     disambiguation_family_name: str = 'Brown_Orange_Family'
+    disambiguation_confidence_penalty: float = 0.9
+    disambiguation_penalty_on_change_only: bool = False
     
     # Trust parameters
     trust_open_max: float = 1.0
