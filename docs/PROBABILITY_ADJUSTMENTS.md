@@ -8,7 +8,7 @@ This document describes the probability adjustment mechanism (Variant B: probabi
 
 When using evidence accumulation for classification, the system:
 1. Runs classifier to get probability vectors for each ROI
-2. Applies size-based disambiguation that may flip the label (e.g., Overlay → Small)
+2. Applies size-based disambiguation on CLOSED state ROIs that may flip the label (e.g., Overlay → Small)
 3. Accumulates evidence using log-probabilities
 
 **Issue**: If disambiguation flips the label but the probability vector remains unchanged, the evidence accumulator may still favor the original class, causing the final decision to contradict the disambiguation.
