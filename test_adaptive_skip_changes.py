@@ -120,46 +120,55 @@ def test_skip_rate_cap_logic():
     
     skip_decisions = deque(maxlen=SKIP_RATE_WINDOW)
     
-    # Simulate scenario 1: Skip rate below cap
-    # Fill with 1% skip rate (5 skips out of 500)
-    for i in range(500):
-        skip_decisions.append(1 if i < 5 else 0)
+    # Simulate scenario 1: Skip rate below cap (deque not yet at capacity)
+    # Fill with 1% skip rate (5 skips out of 100 - under capacity)
+    skip_decisions.clear()
+    for i in range(100):
+        skip_decisions.append(1 if i < 1 else 0)
     
     current_skip_rate = sum(skip_decisions) / len(skip_decisions)
-    print(f"\nScenario 1: {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
+    print(f"\nScenario 1 (not at capacity): {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
     
-    # Check if we should allow another skip
-    future_skip_rate = (sum(skip_decisions) + 1) / (len(skip_decisions) + 1)
+    # Check if we should allow another skip (not at capacity, so length increases)
+    skip_sum = sum(skip_decisions)
+    deque_len = len(skip_decisions)
+    future_skip_rate = (skip_sum + 1) / (deque_len + 1)  # Length will increase
     should_allow_skip = future_skip_rate <= SKIP_RATE_CAP
     print(f"  Future skip rate if we skip: {future_skip_rate:.2%}")
     print(f"  Should allow skip: {should_allow_skip} ✓" if should_allow_skip else f"  Should block skip: {not should_allow_skip} ✓")
     
-    # Simulate scenario 2: Skip rate at cap (exactly 2%)
+    # Simulate scenario 2: Skip rate at cap (at capacity)
     skip_decisions.clear()
     for i in range(500):
         skip_decisions.append(1 if i < 10 else 0)  # 10 out of 500 = 2%
     
     current_skip_rate = sum(skip_decisions) / len(skip_decisions)
-    print(f"\nScenario 2: {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
+    print(f"\nScenario 2 (at capacity): {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
     
-    future_skip_rate = (sum(skip_decisions) + 1) / (len(skip_decisions) + 1)
+    # At capacity: adding new skip replaces oldest (assume oldest was 0 for conservative estimate)
+    skip_sum = sum(skip_decisions)
+    deque_len = len(skip_decisions)
+    future_skip_rate = (skip_sum + 1) / deque_len  # Length stays constant at capacity
     should_block_skip = future_skip_rate > SKIP_RATE_CAP
-    print(f"  Future skip rate if we skip: {future_skip_rate:.2%}")
+    print(f"  Future skip rate if we skip (at capacity): {future_skip_rate:.2%}")
     print(f"  Should block skip: {should_block_skip} ✓" if should_block_skip else f"  Should allow skip: {not should_block_skip}")
     
     assert should_block_skip, "Skip should be blocked when at cap"
     
-    # Simulate scenario 3: Skip rate slightly below cap (1.8%)
+    # Simulate scenario 3: Skip rate slightly below cap (at capacity)
     skip_decisions.clear()
     for i in range(500):
         skip_decisions.append(1 if i < 9 else 0)  # 9 out of 500 = 1.8%
     
     current_skip_rate = sum(skip_decisions) / len(skip_decisions)
-    print(f"\nScenario 3: {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
+    print(f"\nScenario 3 (at capacity): {len(skip_decisions)} decisions, skip rate = {current_skip_rate:.2%}")
     
-    future_skip_rate = (sum(skip_decisions) + 1) / (len(skip_decisions) + 1)
+    # At capacity: adding new skip replaces oldest (assume oldest was 0)
+    skip_sum = sum(skip_decisions)
+    deque_len = len(skip_decisions)
+    future_skip_rate = (skip_sum + 1) / deque_len  # Length stays constant
     should_allow_skip = future_skip_rate <= SKIP_RATE_CAP
-    print(f"  Future skip rate if we skip: {future_skip_rate:.2%}")
+    print(f"  Future skip rate if we skip (at capacity): {future_skip_rate:.2%}")
     print(f"  Should allow skip: {should_allow_skip} ✓" if should_allow_skip else f"  Should block skip: {not should_allow_skip}")
     
     assert should_allow_skip, "Skip should be allowed when below cap"

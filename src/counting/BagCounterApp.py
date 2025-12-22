@@ -782,7 +782,19 @@ class BagCounterApp:
                 skip_rate_cap_exceeded = False
                 if adaptive_skip_conditions_met and len(self._skip_decisions) >= self.MIN_SKIP_SAMPLES:
                     # Predict what the skip rate would be if we skip this frame (use cached sum)
-                    future_skip_rate = (skip_sum + 1) / (len(self._skip_decisions) + 1)
+                    # When deque is at maxlen, adding an element removes the oldest, so length stays constant
+                    deque_len = len(self._skip_decisions)
+                    is_at_capacity = deque_len >= self.SKIP_RATE_WINDOW
+                    
+                    if is_at_capacity:
+                        # At capacity: new skip replaces oldest decision
+                        # Need to know what the oldest decision was to calculate accurately
+                        # Since we don't have it, we use conservative estimate: assume oldest was 0
+                        future_skip_rate = (skip_sum + 1) / deque_len
+                    else:
+                        # Not at capacity: new skip increases length
+                        future_skip_rate = (skip_sum + 1) / (deque_len + 1)
+                    
                     skip_rate_cap_exceeded = future_skip_rate > self.SKIP_RATE_CAP
                 
                 # Final skip decision
