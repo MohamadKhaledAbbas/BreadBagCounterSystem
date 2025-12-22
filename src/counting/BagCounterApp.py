@@ -78,6 +78,8 @@ class BagCounterApp:
     # Skip rate cap configuration
     SKIP_RATE_CAP = 0.02  # Maximum allowed skip rate (2%)
     SKIP_RATE_WINDOW = 500  # Number of frames to track for skip rate calculation
+    MIN_SKIP_SAMPLES = 10  # Minimum samples needed before applying skip rate logic
+    SKIP_CAP_LOG_FREQUENCY = 5  # Log every Nth skip cap block to avoid flooding
     
     # System monitoring configuration
     SYSTEM_STATUS_LOG_INTERVAL = 900.0  # Log system status every 15 minutes (900 seconds)
@@ -184,9 +186,11 @@ class BagCounterApp:
         # System monitoring
         self._last_system_status_log = time.perf_counter()
         self._psutil_available = False
+        self._psutil_module = None
         try:
             import psutil
             self._psutil_available = True
+            self._psutil_module = psutil
             logger.info("[BagCounterApp] psutil available - system monitoring enabled")
         except ImportError:
             logger.info("[BagCounterApp] psutil not installed - system monitoring will be limited")
@@ -277,11 +281,12 @@ class BagCounterApp:
         Log system resource usage (CPU, RAM) if psutil is available.
         Called periodically (every 15 minutes) to monitor system health.
         """
-        if not self._psutil_available:
+        if not self._psutil_available or self._psutil_module is None:
             return
         
         try:
-            import psutil
+            # Use cached psutil module
+            psutil = self._psutil_module
             
             # Get CPU usage (average over short interval)
             cpu_percent = psutil.cpu_percent(interval=0.1)
@@ -759,10 +764,12 @@ class BagCounterApp:
                     if len(self._recent_detection_times) > 5 else 0.0
                 )
                 
-                # Calculate current skip rate
+                # Calculate current skip rate - cache sum to avoid redundant O(n) operations
                 current_skip_rate = 0.0
-                if len(self._skip_decisions) >= 10:  # Need minimum samples
-                    current_skip_rate = sum(self._skip_decisions) / len(self._skip_decisions)
+                skip_sum = 0
+                if len(self._skip_decisions) >= self.MIN_SKIP_SAMPLES:
+                    skip_sum = sum(self._skip_decisions)
+                    current_skip_rate = skip_sum / len(self._skip_decisions)
                 
                 # Determine if adaptive skip conditions are met
                 adaptive_skip_conditions_met = (
@@ -773,9 +780,9 @@ class BagCounterApp:
                 
                 # Check if skip rate cap would be exceeded
                 skip_rate_cap_exceeded = False
-                if adaptive_skip_conditions_met and len(self._skip_decisions) >= 10:
-                    # Predict what the skip rate would be if we skip this frame
-                    future_skip_rate = (sum(self._skip_decisions) + 1) / (len(self._skip_decisions) + 1)
+                if adaptive_skip_conditions_met and len(self._skip_decisions) >= self.MIN_SKIP_SAMPLES:
+                    # Predict what the skip rate would be if we skip this frame (use cached sum)
+                    future_skip_rate = (skip_sum + 1) / (len(self._skip_decisions) + 1)
                     skip_rate_cap_exceeded = future_skip_rate > self.SKIP_RATE_CAP
                 
                 # Final skip decision
@@ -807,7 +814,7 @@ class BagCounterApp:
                 # Log when skip cap prevents skipping
                 if adaptive_skip_conditions_met and skip_rate_cap_exceeded:
                     self._skip_cap_blocks += 1
-                    if self._skip_cap_blocks % 5 == 1:  # Log every 5th block to avoid flooding
+                    if self._skip_cap_blocks % self.SKIP_CAP_LOG_FREQUENCY == 1:  # Use constant for logging frequency
                         logger.warning(
                             f"[SkipCapBlock] Skip rate cap preventing frame skip: "
                             f"current_rate={current_skip_rate:.1%}, cap={self.SKIP_RATE_CAP:.1%}, "

@@ -61,6 +61,20 @@ def test_constants_from_source():
     assert value == 900.0, f"SYSTEM_STATUS_LOG_INTERVAL should be 900.0, got {value}"
     print(f"✓ SYSTEM_STATUS_LOG_INTERVAL = {value}s (15 minutes)")
     
+    # Check MIN_SKIP_SAMPLES
+    match = re.search(r'MIN_SKIP_SAMPLES\s*=\s*(\d+)', source_code)
+    assert match, "MIN_SKIP_SAMPLES not found"
+    value = int(match.group(1))
+    assert value == 10, f"MIN_SKIP_SAMPLES should be 10, got {value}"
+    print(f"✓ MIN_SKIP_SAMPLES = {value}")
+    
+    # Check SKIP_CAP_LOG_FREQUENCY
+    match = re.search(r'SKIP_CAP_LOG_FREQUENCY\s*=\s*(\d+)', source_code)
+    assert match, "SKIP_CAP_LOG_FREQUENCY not found"
+    value = int(match.group(1))
+    assert value == 5, f"SKIP_CAP_LOG_FREQUENCY should be 5, got {value}"
+    print(f"✓ SKIP_CAP_LOG_FREQUENCY = {value}")
+    
     # Check for skip rate tracking initialization
     assert '_skip_decisions' in source_code, "Skip rate tracking (_skip_decisions) not found"
     print("✓ Skip rate tracking deque initialization found")
@@ -72,8 +86,9 @@ def test_constants_from_source():
     # Check for system status logging
     assert '_log_system_status' in source_code, "System status logging method not found"
     print("✓ System status logging method found")
-    
-    # Check for psutil availability check
+    # Check for psutil caching
+    assert '_psutil_module' in source_code, "psutil module caching (_psutil_module) not found"
+    print("✓ psutil module caching found")
     assert 'psutil' in source_code, "psutil import/usage not found"
     assert 'ImportError' in source_code, "psutil graceful fallback not found"
     print("✓ psutil availability check and graceful fallback found")
