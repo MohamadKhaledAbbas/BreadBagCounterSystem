@@ -13,61 +13,9 @@ import glob
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field, asdict
 import statistics
-
-
-@dataclass
-class EventLifecycle:
-    """Complete lifecycle tracking for a single event."""
-    event_id: Any
-    created_at: Optional[datetime] = None
-    committed_at: Optional[datetime] = None
-    expired_at: Optional[datetime] = None
-    
-    # Creation details
-    created_confidence: float = 0.0
-    created_frame: int = 0
-    created_box: List[float] = field(default_factory=list)
-    
-    # State tracking
-    transitions: List[Dict] = field(default_factory=list)
-    current_state: str = "UNKNOWN"
-    open_hits: int = 0
-    closed_hits: int = 0
-    
-    # ROI tracking
-    rois: List[Dict] = field(default_factory=list)
-    roi_count: int = 0
-    avg_sharpness: float = 0.0
-    
-    # Classification tracking
-    classifications: List[Dict] = field(default_factory=list)
-    final_label: str = "Unknown"
-    final_confidence: float = 0.0
-    label_history: List[str] = field(default_factory=list)
-    
-    # Closure details
-    forced_close: bool = False
-    forced_close_reason: str = ""
-    expiration_reason: str = ""
-    
-    # Association tracking
-    associations: List[Dict] = field(default_factory=list)
-    track_ids: Set[int] = field(default_factory=set)
-    
-    def to_dict(self) -> Dict:
-        """Convert to JSON-serializable dict."""
-        d = asdict(self)
-        # Convert datetime objects to ISO format
-        for key in ['created_at', 'committed_at', 'expired_at']:
-            if d[key]:
-                d[key] = d[key].isoformat() if isinstance(d[key], datetime) else d[key]
-        # Convert set to list
-        d['track_ids'] = list(d['track_ids'])
-        return d
 
 
 def parse_args():
@@ -459,11 +407,6 @@ class LogAnalyzer:
         self.event_lifetimes_ms = []
         self.event_states_at_close = Counter()
         
-        # Enhanced: Full event lifecycle tracking
-        self.event_lifecycles = {}  # event_id -> EventLifecycle
-        self.event_details_list = []  # List of completed events (limited to 500)
-        self.max_event_details = 500  # Performance limit
-        
         # Frame-based threshold tracking
         self.ghost_timeout_frames_observed = []
         self.temporal_cooldown_frames_observed = []
@@ -570,7 +513,6 @@ class LogAnalyzer:
             "skip_creation": 0,
             "roi_added": 0,
             "roi_rejected": 0,
-            "classification_by_label": Counter(),  # Enhanced: Track classifications by label
         })
 
     def analyze_entry(self, entry: Dict[str, Any]):
@@ -668,19 +610,6 @@ class LogAnalyzer:
             self.event_created_count += 1
             if minute_key:
                 self.time_buckets[minute_key]["event_created"] += 1
-            
-            # Enhanced: Track full event lifecycle
-            event_id = data.get("event_id")
-            if event_id is not None:
-                lifecycle = EventLifecycle(
-                    event_id=event_id,
-                    created_at=ts,
-                    created_confidence=data.get("confidence", 0.0),
-                    created_frame=data.get("frame_id", data.get("frame_index", 0)),
-                    created_box=data.get("box", []),
-                    current_state="detecting_open"
-                )
-                self.event_lifecycles[event_id] = lifecycle
 
         if "EVENT_COMMITTED" in message:
             self.event_committed_count += 1
@@ -694,17 +623,6 @@ class LogAnalyzer:
                 self.roi_per_event.append(roi_count)
             if minute_key:
                 self.time_buckets[minute_key]["event_committed"] += 1
-            
-            # Enhanced: Update event lifecycle
-            event_id = data.get("event_id")
-            if event_id and event_id in self.event_lifecycles:
-                lifecycle = self.event_lifecycles[event_id]
-                lifecycle.committed_at = ts
-                lifecycle.roi_count = roi_count or 0
-                lifecycle.current_state = "COMMITTED"
-                # Add to completed events list (limited)
-                if len(self.event_details_list) < self.max_event_details:
-                    self.event_details_list.append(lifecycle.to_dict())
 
         if "EVENT_EXPIRED" in message:
             self.event_expired_count += 1
@@ -723,33 +641,12 @@ class LogAnalyzer:
             })
             if minute_key:
                 self.time_buckets[minute_key]["event_expired"] += 1
-            
-            # Enhanced: Update event lifecycle
-            event_id = data.get("event_id")
-            if event_id and event_id in self.event_lifecycles:
-                lifecycle = self.event_lifecycles[event_id]
-                lifecycle.expired_at = ts
-                lifecycle.current_state = "EXPIRED"
-                lifecycle.expiration_reason = data.get("expiration_reason", "timeout")
-                lifecycle.open_hits = data.get("open_hits", 0)
-                lifecycle.closed_hits = data.get("closed_hits", 0)
-                # Add to completed events list (limited)
-                if len(self.event_details_list) < self.max_event_details:
-                    self.event_details_list.append(lifecycle.to_dict())
         
         # Forced close tracking
         if "EVENT_FORCED_CLOSE" in message or "FORCED_CLOSE" in message:
             self.forced_close_count += 1
             reason = data.get("forced_close_reason", data.get("reason", "unknown"))
             self.forced_close_reasons[reason] += 1
-            
-            # Enhanced: Update event lifecycle
-            event_id = data.get("event_id")
-            if event_id and event_id in self.event_lifecycles:
-                lifecycle = self.event_lifecycles[event_id]
-                lifecycle.forced_close = True
-                lifecycle.forced_close_reason = reason
-                lifecycle.current_state = "FORCED_CLOSE"
         
         # Idle commit tracking (from "idle threshold" or similar messages)
         if "idle" in message.lower() and "commit" in message.lower():
@@ -790,19 +687,6 @@ class LogAnalyzer:
                 self.roi_sharpness_values.append(sharpness)
             if minute_key:
                 self.time_buckets[minute_key]["roi_added"] += 1
-            
-            # Enhanced: Update event lifecycle
-            event_id = data.get("event_id")
-            if event_id and event_id in self.event_lifecycles:
-                lifecycle = self.event_lifecycles[event_id]
-                lifecycle.rois.append({
-                    "at": ts.isoformat() if ts else None,
-                    "sharpness": sharpness,
-                    "frame": data.get("frame_index", 0)
-                })
-                lifecycle.roi_count = len(lifecycle.rois)
-                if lifecycle.rois:
-                    lifecycle.avg_sharpness = statistics.mean([r["sharpness"] for r in lifecycle.rois if r.get("sharpness")])
         
         if "ROI_REJECTED" in message:
             self.roi_rejected_count += 1
@@ -957,8 +841,6 @@ class LogAnalyzer:
                     # Minute-level label distribution
                     if minute_key:
                         self.minute_label_distribution[minute_key][label] += 1
-                        # Enhanced: Track classifications by label in time bucket
-                        self.time_buckets[minute_key]["classification_by_label"][label] += 1
             
             if candidates is not None:
                 self.candidates_count.append(candidates)
@@ -968,25 +850,6 @@ class LogAnalyzer:
             
             if processing_time:
                 self.classification_times_ms.append(processing_time)
-            
-            # Enhanced: Update event lifecycle with classification
-            # Link classification to events via track_id
-            if track_id:
-                # Find events associated with this track_id
-                for event_id, lifecycle in self.event_lifecycles.items():
-                    if track_id in lifecycle.track_ids or not lifecycle.track_ids:
-                        lifecycle.track_ids.add(track_id)
-                        lifecycle.classifications.append({
-                            "at": ts.isoformat() if ts else None,
-                            "label": label,
-                            "confidence": confidence,
-                            "track_id": track_id
-                        })
-                        if label and label != "Unknown":
-                            lifecycle.final_label = label
-                            lifecycle.final_confidence = confidence or 0.0
-                            lifecycle.label_history.append(label)
-                        break  # Only update first matching event
 
         # Classification candidate details
         if "CANDIDATE" in message:
@@ -1079,9 +942,6 @@ class LogAnalyzer:
                 "avg_lifetime_seconds": statistics.mean(self.event_lifetimes_ms) / 1000.0 if self.event_lifetimes_ms else 0,
                 "lifetime_frames_stats": self._compute_percentile_stats(self.event_lifetimes_frames, "lifetime_frames"),
                 "lifetime_ms_stats": self._compute_percentile_stats(self.event_lifetimes_ms, "lifetime_ms"),
-                # Enhanced: Full event details for explorer
-                "event_details": self.event_details_list,
-                "event_details_count": len(self.event_details_list),
             },
             "counting": {
                 "total_bags_counted": self.count_update_count,
@@ -1394,8 +1254,7 @@ class LogAnalyzer:
                 "suppressed": bucket["suppressed"],
                 "skip_creation": bucket["skip_creation"],
                 "roi_added": bucket["roi_added"],
-                "roi_rejected": bucket["roi_rejected"],
-                "classification_by_label": dict(bucket["classification_by_label"])  # Enhanced
+                "roi_rejected": bucket["roi_rejected"]
             })
         return series
 
