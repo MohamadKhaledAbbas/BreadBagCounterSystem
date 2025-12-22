@@ -459,6 +459,7 @@ class ROICandidate:
     """
     roi: np.ndarray
     sharpness: float
+    quality: float  # composite quality score (lightweight to compute)
     size: Tuple[int, int]  # width, height
     timestamp_ms: float
     frame_index: int
@@ -469,8 +470,9 @@ class ROICandidate:
     bbox: Optional[Tuple[float, float, float, float]] = None  # (x1, y1, x2, y2) for disambiguation
 
     def __str__(self):
-        return (f"Candidate: sharpness = {self.sharpness}, size = {self.size}, confidence = {self.confidence},"
-                f" is_open = {self.is_open}, is_closed = {self.is_closed}, bbox = {self.bbox}")
+        return (f"Candidate: sharpness = {self.sharpness}, quality = {self.quality:.3f}, "
+                f"size = {self.size}, confidence = {self.confidence}, is_open = {self.is_open},"
+                f" is_closed = {self.is_closed}, bbox = {self.bbox}")
 
 
 class BreadBagEvent:
@@ -1094,6 +1096,46 @@ class BreadBagEvent:
             closed_hits=self.closed_evidence_count
         )
 
+    def _compute_roi_quality(self, gray: np.ndarray, sharpness: float) -> Tuple[float, float, float, float, float]:
+        """
+        Lightweight ROI quality score:
+         - sharpness (variance of Laplacian)               -> focus / blur
+        - edge density (mean abs Sobel)                   -> text/texture presence
+        - entropy (histogram entropy, 32 bins)            -> richness/texture
+        - contrast (stddev)                               -> usable dynamic range
+        - glare penalty (% of near-white pixels)          -> reduce specular highlights
+        All ops are O(pixels) on the already-cropped ROI.
+        """
+
+        # Edge density (Sobel)
+        sobel_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        edge_density = float(np.mean(np.abs(sobel_x)) + np.mean(np.abs(sobel_y)))
+
+        # Entropy (coarse 32-bin histogram to stay light)
+        hist, _ = np.histogram(gray, bins=32, range=(0, 256), density=True)
+        p = hist + 1e-12
+        entropy = float(-1 * np.sum(p * np.log2(p)))
+
+        contrast = float(gray.std())
+        glare_ratio = float(np.mean(gray > 245))  # near-white pixels
+
+        # Normalize to [0,1] with soft reference values tuned for typical 720p crops
+        sharp_norm = min(sharpness / (self.config.min_roi_sharpness * 1.5), 1.0)
+        edge_norm = min(edge_density / 25.0, 1.0)
+        entropy_norm = min(entropy / 5.0, 1.0)  # entropy of 5 is already rich
+        contrast_norm = min(contrast / 60.0, 1.0)
+        glare_penalty = min(glare_ratio * 2.0, 0.3)  # cap penalty
+
+        quality = (
+            0.45 * sharp_norm +
+            0.20 * edge_norm +
+            0.20 * entropy_norm +
+            0.15 * contrast_norm -
+            glare_penalty
+        )
+
+        return quality, edge_density, entropy, contrast, glare_ratio
 
     def _try_collect_roi(self, detection: DetectionEvidence, frame_img: np.ndarray):
         # Determine class-specific caps (fallback to legacy max_roi_samples)
@@ -1127,19 +1169,22 @@ class BreadBagEvent:
             pipeline_metrics.record_roi_quality(False, 0.0, "brightness")
             return
 
-        # Sharpness check
+        # Sharpness check (variance of Laplacian)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
         if sharpness < self.config.min_roi_sharpness:
             pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
             return
 
-        # Passed quality checks
+        # Lightweight composite quality
+        quality, edge_density, entropy, contrast, glare_ratio = self._compute_roi_quality(gray, sharpness)
         pipeline_metrics.record_roi_quality(True, sharpness, None)
 
         candidate = ROICandidate(
             roi=roi,
             sharpness=sharpness,
+            quality=quality,
             size=(roi_width, roi_height),
             timestamp_ms=detection.timestamp_ms,
             frame_index=detection.frame_index,
@@ -1152,37 +1197,33 @@ class BreadBagEvent:
 
         logger.debug(f"[ROI_CANDIDATE] added candidate = {candidate}")
 
-        # Insert and keep best-per-class by sharpness
+        # Insert and keep best-per-class by composite quality
         self.roi_candidates.append(candidate)
-        self.roi_candidates.sort(key=lambda x: x.sharpness, reverse=True)
+        self.roi_candidates.sort(key=lambda x: x.quality, reverse=True)
 
         # Recompute counts
         self.open_roi_count = sum(1 for c in self.roi_candidates if c.is_open)
         self.closed_roi_count = sum(1 for c in self.roi_candidates if c.is_closed)
 
-        # Enforce class caps by dropping the lowest-sharpness ROI of that class if over cap
+        # Enforce class caps by dropping the lowest-quality ROI of that class if over cap
         if roi_is_open and self.open_roi_count > max_open_cap:
             # drop worst open ROI
-            logger.debug(
-                f"[ROI_CANDIDATE] open_roi_count({self.closed_roi_count}) > max_open_cap({max_open_cap})")
-            worst_idx = max(
+            logger.debug(f"[ROI_CANDIDATE] open_roi_count({self.open_roi_count}) > max_open_cap({max_open_cap})")
+            worst_idx = min(
                 (i for i, c in enumerate(self.roi_candidates) if c.is_open),
-                key=lambda i: self.roi_candidates[i].sharpness * -1  # smallest sharpness
-            )
-            self.roi_candidates.pop(worst_idx)
-            logger.debug(f"[ROI_CANDIDATE] removed worst candidate = {candidate}")
+                key = lambda i: self.roi_candidates[i].quality)
+            removed = self.roi_candidates.pop(worst_idx)
+            logger.debug(f"[ROI_CANDIDATE] removed worst open candidate = {removed}")
             self.open_roi_count -= 1
 
         if roi_is_closed and self.closed_roi_count > max_closed_cap:
             # drop worst closed ROI
-            logger.debug(
-                f"[ROI_CANDIDATE] closed_roi_count({self.closed_roi_count}) > max_closed_cap({max_closed_cap})")
-            worst_idx = max(
+            logger.debug(f"[ROI_CANDIDATE] closed_roi_count({self.closed_roi_count}) > max_closed_cap({max_closed_cap})")
+            worst_idx = min(
                 (i for i, c in enumerate(self.roi_candidates) if c.is_closed),
-                key=lambda i: self.roi_candidates[i].sharpness * -1
-            )
-            self.roi_candidates.pop(worst_idx)
-            logger.debug(f"[ROI_CANDIDATE] removed worst candidate = {candidate}")
+                key = lambda i: self.roi_candidates[i].quality)
+            removed = self.roi_candidates.pop(worst_idx)
+            logger.debug(f"[ROI_CANDIDATE] removed worst closed candidate = {removed}")
             self.closed_roi_count -= 1
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
