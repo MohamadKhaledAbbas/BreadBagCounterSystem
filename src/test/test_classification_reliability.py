@@ -42,11 +42,11 @@ from src.classifier.evidence_accumulator import (
 @dataclass
 class MockConfig:
     """Mock configuration for testing."""
-    # Disambiguation parameters
+    # Disambiguation parameters (updated to match production values)
     disambiguation_enabled: bool = True
     disambiguation_classes: tuple = ('Brown_Orange_Overlay', 'Brown_Orange_Small')
-    disambiguation_small_threshold: float = 10000.0
-    disambiguation_regular_threshold: float = 20000.0
+    disambiguation_small_threshold: float = 9000.0  # UPDATED from 10000.0
+    disambiguation_regular_threshold: float = 11000.0  # UPDATED from 20000.0
     disambiguation_gray_zone_behavior: str = 'keep_original'
     disambiguation_debug_logging: bool = False
     disambiguation_family_name: str = 'Brown_Orange_Family'
@@ -172,8 +172,8 @@ class TestRawAreaDisambiguation:
     
     def test_gray_zone_keep_original(self, default_config):
         """Test gray zone behavior with 'keep_original'."""
-        # Medium box: 120x120 = 14400 px² (between 10000 and 20000)
-        gray_bbox = (100, 200, 220, 320)
+        # Medium box in gray zone: 95x100 = 9500 px² (between 9000 and 11000)
+        gray_bbox = (100, 200, 195, 300)
         
         result = disambiguate_by_size(
             original_label="Brown_Orange_Overlay",  # Classifier said regular
@@ -184,6 +184,7 @@ class TestRawAreaDisambiguation:
         )
         
         # In gray zone with 'keep_original', should keep original
+        assert 9000 < result.raw_area < 11000  # Verify in gray zone
         assert result.label == "Brown_Orange_Overlay"
         assert result.disambiguated is True  # Still size-decided
         assert "gray_zone" in result.reason
@@ -192,8 +193,8 @@ class TestRawAreaDisambiguation:
         """Test gray zone with 'uncertain' behavior."""
         default_config.disambiguation_gray_zone_behavior = 'uncertain'
         
-        # Medium box: 120x120 = 14400 px² (between 10000 and 20000)
-        gray_bbox = (100, 200, 220, 320)
+        # Medium box in gray zone: 95x105 = 9975 px² (between 9000 and 11000)
+        gray_bbox = (100, 200, 195, 305)
         
         result = disambiguate_by_size(
             original_label="Brown_Orange_Overlay",
@@ -204,6 +205,7 @@ class TestRawAreaDisambiguation:
         )
         
         # Should return Uncertain in gray zone
+        assert 9000 < result.raw_area < 11000  # Verify in gray zone
         assert result.label == "Uncertain"
         assert "family_gray_zone_uncertain" in result.reason
     
@@ -267,6 +269,78 @@ class TestRawAreaDisambiguation:
         # Fourth item (Open state) should be skipped
         assert results[3]['disambiguation']['applied'] is False
         assert results[3]['disambiguation']['reason'] == 'skipped_open_state'
+    
+    def test_production_boundary_just_below_small_threshold(self, default_config):
+        """Test area just below small threshold (8900 px²) forces Small class."""
+        # Box: 89x100 = 8900 px² (just below 9000)
+        bbox = (100, 50, 189, 150)
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Overlay",  # Classifier said regular
+            confidence=0.75,
+            bbox=bbox,
+            is_open=False,
+            config=default_config
+        )
+        
+        assert result.raw_area < default_config.disambiguation_small_threshold
+        assert result.label == "Brown_Orange_Small"
+        assert result.disambiguated is True
+        assert "family_size_small" in result.reason
+    
+    def test_production_boundary_just_above_regular_threshold(self, default_config):
+        """Test area just above regular threshold (11100 px²) forces Overlay class."""
+        # Box: 111x100 = 11100 px² (just above 11000)
+        bbox = (100, 50, 211, 150)
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Small",  # Classifier said small
+            confidence=0.75,
+            bbox=bbox,
+            is_open=False,
+            config=default_config
+        )
+        
+        assert result.raw_area > default_config.disambiguation_regular_threshold
+        assert result.label == "Brown_Orange_Overlay"
+        assert result.disambiguated is True
+        assert "family_size_regular" in result.reason
+    
+    def test_production_gray_zone_lower_boundary(self, default_config):
+        """Test lower boundary of gray zone (9100 px²)."""
+        # Box: 91x100 = 9100 px² (just above small threshold)
+        bbox = (100, 50, 191, 150)
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Small",  # Classifier said small
+            confidence=0.7,
+            bbox=bbox,
+            is_open=False,
+            config=default_config
+        )
+        
+        assert 9000 < result.raw_area < 11000  # In gray zone
+        assert result.label == "Brown_Orange_Small"  # Keeps original
+        assert result.disambiguated is True
+        assert "gray_zone" in result.reason
+    
+    def test_production_gray_zone_upper_boundary(self, default_config):
+        """Test upper boundary of gray zone (10900 px²)."""
+        # Box: 109x100 = 10900 px² (just below regular threshold)
+        bbox = (100, 50, 209, 150)
+        
+        result = disambiguate_by_size(
+            original_label="Brown_Orange_Overlay",  # Classifier said regular
+            confidence=0.7,
+            bbox=bbox,
+            is_open=False,
+            config=default_config
+        )
+        
+        assert 9000 < result.raw_area < 11000  # In gray zone
+        assert result.label == "Brown_Orange_Overlay"  # Keeps original
+        assert result.disambiguated is True
+        assert "gray_zone" in result.reason
 
 
 # =============================================================================
