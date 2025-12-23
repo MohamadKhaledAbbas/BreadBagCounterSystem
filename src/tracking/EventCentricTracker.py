@@ -252,7 +252,14 @@ class EventConfig:
     max_brightness: int = 220
     max_open_roi_samples: int = 15        # Max ROIs to collect while open
     max_closed_roi_samples: int = 5       # Max ROIs to collect while closed
-    
+
+    # ==========================================================================
+    # Disambiguate Parameters
+    # ==========================================================================
+    disambiguation_small_threshold: float = 8200
+    disambiguation_regular_threshold: float = 10_000
+    penalty_for_roi_in_gray_zone: float = 0.2
+
     # ==========================================================================
     # Classification Voting Parameters
     # ==========================================================================
@@ -1096,7 +1103,7 @@ class BreadBagEvent:
             closed_hits=self.closed_evidence_count
         )
 
-    def _compute_roi_quality(self, roi: np.ndarray, gray: np.ndarray, sharpness: float) -> Tuple[float, float, float, float, float]:
+    def _compute_roi_quality(self, roi: np.ndarray, gray: np.ndarray, sharpness: float, raw_area: float) -> Tuple[float, float, float, float, float]:
         """
         Lightweight ROI quality score:
          - sharpness (variance of Laplacian)               -> focus / blur
@@ -1132,13 +1139,24 @@ class BreadBagEvent:
         color_norm = min(color_metric / 20.0, 1.0)  # Adjust denominator to match your empirical range
         glare_penalty = min(glare_ratio * 2.0, 0.3)  # cap penalty
 
+        # === Area penalty for gray zone ===
+        small_thresh = self.config.disambiguation_small_threshold
+        regular_thresh = self.config.disambiguation_regular_threshold
+        fixed_penalty = self.config.penalty_for_roi_in_gray_zone  # Select/tune based on logs/experiments
+
+        if small_thresh <= raw_area <= regular_thresh:
+            area_penalty = fixed_penalty
+        else:
+            area_penalty = 0.0
+
         quality = (
             0.40 * sharp_norm +
             0.18 * edge_norm +
             0.17 * entropy_norm +
             0.12 * contrast_norm +
             0.13 * color_norm -  # <- new colorfulness component
-            glare_penalty
+            glare_penalty -
+            area_penalty
         )
 
         return quality, edge_density, entropy, contrast, glare_ratio
@@ -1184,7 +1202,7 @@ class BreadBagEvent:
             return
 
         # Lightweight composite quality
-        quality, edge_density, entropy, contrast, glare_ratio = self._compute_roi_quality(roi, gray, sharpness)
+        quality, edge_density, entropy, contrast, glare_ratio = self._compute_roi_quality(roi, gray, sharpness, (roi_width * roi_height))
         pipeline_metrics.record_roi_quality(True, sharpness, None)
 
         candidate = ROICandidate(

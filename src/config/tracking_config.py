@@ -1458,7 +1458,12 @@ class TrackingConfig:
     
     Default: 11000.0 (pixels²) - UPDATED from 8500.0 based on production logs
     """
-    
+
+    penalty_for_roi_in_gray_zone: float = 0.3
+    """
+    Penalty for ROI quality when it is in the gray zone of raw area  
+    """
+
     disambiguation_gray_zone_behavior: str = 'keep_original'
     """
     Behavior when raw_area falls in the gray zone (between small and regular thresholds).
@@ -1965,6 +1970,11 @@ def get_event_config():
         max_brightness=tracking_config.max_mean_brightness,
         max_open_roi_samples=tracking_config.max_open_samples,
         max_closed_roi_samples=tracking_config.max_closed_samples,
+
+        # Disambiguate
+        disambiguation_small_threshold=tracking_config.disambiguation_small_threshold,
+        disambiguation_regular_threshold=tracking_config.disambiguation_regular_threshold,
+        penalty_for_roi_in_gray_zone=tracking_config.penalty_for_roi_in_gray_zone,
         
         # Classification voting
         min_voting_agreement_pct=tracking_config.voting_agreement_threshold_pct,
