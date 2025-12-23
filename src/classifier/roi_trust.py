@@ -5,16 +5,91 @@ This module computes trust scores for ROI candidates based on quality metrics
 that are independent of the predicted class. The trust score determines how
 much weight an ROI's classification contributes to the final track-level decision.
 
-Trust Score Composition:
-- Sharpness: Primary component - sharper images are more reliable
-- State (Open/Closed): Open ROIs can reach max trust; Closed are capped
-- Motion blur: Penalty for blurry ROIs (inferred from sharpness)
-- Size stability: Penalty for outlier sizes vs track median
+## Trust Score Composition
 
-The goal is to ensure that quantity of ROIs is irrelevant - only quality matters.
+Trust scoring uses multiple quality dimensions to ensure only high-quality ROIs
+influence the final classification:
+
+### Primary Components:
+- **Sharpness**: Primary component - sharper images are more reliable
+  - Measured by Laplacian variance (higher = sharper)
+  - Normalized to [0, 1] using configurable min/max thresholds
+  - Weight: Acts as base trust before penalties
+  
+- **State (Open/Closed)**: Open ROIs can reach max trust; Closed are capped
+  - Open max: 1.0 (full view of bag features)
+  - Closed max: 0.7 (may have deformation/obscured features)
+  - Ensures closed ROIs don't overpower open ROIs in evidence
+
+### Penalties Applied:
+- **Motion Blur**: Penalty for blurry ROIs (inferred from low sharpness)
+  - Applied when sharpness < 30% of normalized range
+  - Max penalty: 30% trust reduction
+  
+- **Size Stability**: Penalty for outlier sizes vs track median
+  - Tolerance: 30% deviation allowed without penalty
+  - Max penalty: 30% trust reduction for large outliers
+  - Detects detection artifacts or bag flip anomalies
+
+### Trust Threshold:
+- **Minimum for Support**: 0.4 (configurable)
+  - ROIs below this don't count toward stability gate
+  - Ensures only sufficiently reliable ROIs influence decision
+
+## Quality Filters (Pre-Trust Scoring)
+
+Before trust scoring, ROIs pass through multiple quality filters in EventCentricTracker:
+
+1. **Sharpness Filter** (min_roi_sharpness: 500.0):
+   - Rejects blurry/out-of-focus ROIs
+   - Variance of Laplacian < threshold → rejected
+
+2. **Edge Density** (computed in quality score):
+   - Mean absolute Sobel gradient
+   - Detects presence of text/texture
+   - Normalized by dividing by 25.0
+
+3. **Entropy** (computed in quality score):
+   - Histogram entropy (32 bins)
+   - Measures information content/richness
+   - Normalized by dividing by 5.0
+
+4. **Contrast** (computed in quality score):
+   - Standard deviation of grayscale values
+   - Ensures usable dynamic range
+   - Normalized by dividing by 60.0
+
+5. **Colorfulness** (computed in quality score):
+   - Standard deviation of HSV Saturation channel
+   - Detects color diversity
+   - Normalized by dividing by 20.0
+
+6. **Glare Detection** (computed in quality score):
+   - Percentage of near-white pixels (>245)
+   - Penalizes specular highlights
+   - Max penalty: 0.3 reduction in quality
+
+7. **Size Filter** (min_roi_size: 70px):
+   - Rejects ROIs too small for reliable features
+   
+8. **Brightness Filter** ([60, 240] range):
+   - Rejects underexposed or overexposed ROIs
+
+See docs/ROI_FILTERING_AND_THRESHOLDS.md for complete documentation.
+
+## Design Philosophy
+
+The goal is to ensure that **quantity of ROIs is irrelevant - only quality matters**.
 Low-quality ROIs cannot outweigh high-quality ones in evidence accumulation.
 
-Usage:
+This is achieved through:
+1. Hard rejection filters (sharpness, size, brightness) - eliminate unusable ROIs
+2. Trust scoring - weight remaining ROIs by reliability
+3. Top-K selection - use only the best K ROIs regardless of total collected
+4. Stability gate - require minimum number of high-trust ROIs
+
+## Usage
+
     from src.classifier.roi_trust import compute_roi_trust, ROITrustResult
     
     result = compute_roi_trust(
@@ -26,6 +101,7 @@ Usage:
     )
     
     trust_score = result.trust  # Use for evidence weighting
+    is_reliable = result.is_trusted  # True if trust >= min_for_support
 
 All parameters are centralized in tracking_config.py for easy tuning.
 """
@@ -113,6 +189,16 @@ def compute_roi_trust(
     The trust score is class-independent - it measures how reliable
     the ROI is as evidence, regardless of what class it predicts.
     
+    Trust is computed as:
+        base_trust = min(sharpness_normalized, state_cap)
+        trust = base_trust * (1 - size_penalty) * (1 - blur_penalty)
+        
+    This ensures:
+    1. Sharper ROIs get higher trust (primary discriminant)
+    2. Closed ROIs are capped to prevent overpowering open ROIs
+    3. Size outliers are penalized (likely detection artifacts)
+    4. Very blurry ROIs are further penalized beyond low sharpness
+    
     Args:
         sharpness: Laplacian variance (higher = sharper)
         is_open: True if ROI is from an Open detection
@@ -123,12 +209,13 @@ def compute_roi_trust(
     Returns:
         ROITrustResult with trust score and component breakdown
         
-    Trust Calculation:
-        1. Normalize sharpness to [0, 1]
-        2. Apply state cap (Open vs Closed)
-        3. Apply size stability penalty
-        4. Apply blur penalty (implicit in low sharpness)
+    Trust Calculation Steps:
+        1. Normalize sharpness to [0, 1] using configurable min/max
+        2. Apply state cap (Open=1.0, Closed=0.7)
+        3. Compute and apply size stability penalty if ROI is outlier
+        4. Apply blur penalty if sharpness is very low (<30% normalized)
         5. Clamp final trust to [0, 1]
+        6. Check if trust meets minimum for support threshold
     """
     # Get configuration parameters
     open_max = getattr(config, 'trust_open_max', 1.0)
@@ -139,44 +226,60 @@ def compute_roi_trust(
     size_tolerance = getattr(config, 'trust_size_stability_tolerance', 0.3)
     trust_min_for_support = getattr(config, 'trust_min_for_support', 0.4)
     
-    # 1. Normalize sharpness
+    # === STEP 1: Normalize sharpness to [0, 1] ===
+    # Maps raw Laplacian variance to normalized score
+    # Example: sharpness=450 with min=100, max=800 → 0.5
     sharpness_norm = normalize_sharpness(
         sharpness=sharpness,
         sharpness_min=sharpness_min,
         sharpness_max=sharpness_max
     )
     
-    # 2. Determine state cap
+    # === STEP 2: Determine state cap ===
+    # Open ROIs: Can reach full trust (1.0) - clear view of features
+    # Closed ROIs: Capped at 0.7 - may have deformation/obscured features
+    # This prevents closed ROIs from overpowering open ROIs in evidence
     state_cap = open_max if is_open else closed_max
     
-    # 3. Compute size deviation penalty
+    # === STEP 3: Compute size deviation penalty ===
+    # Penalize ROIs with unusual size compared to track median
+    # Rationale: Size outliers often indicate detection artifacts or bag flips
     size_deviation = compute_size_deviation(roi_size, median_size)
     size_penalty = 0.0
     if size_deviation > size_tolerance:
-        # Penalize ROIs with unusual size
+        # Penalize ROIs with size deviation > 30%
+        # Example: 50% deviation → 10% penalty (0.5 - 0.3) * 0.5 = 0.1
         excess = size_deviation - size_tolerance
         size_penalty = min(excess * 0.5, 0.3)  # Max 30% penalty
     
-    # 4. Compute blur penalty (applied when sharpness is very low)
+    # === STEP 4: Compute blur penalty ===
+    # Additional penalty for very blurry ROIs (compounds low sharpness)
+    # Applied when normalized sharpness < 30% (very blurry)
     applied_blur_penalty = 0.0
     if sharpness_norm < 0.3:  # Below 30% normalized sharpness
+        # Scale penalty from 0 (at 30%) to full penalty (at 0%)
+        # Example: sharpness_norm=0.15 → penalty = 0.3 * (1 - 0.15/0.3) = 0.15
         applied_blur_penalty = blur_penalty * (1.0 - sharpness_norm / 0.3)
     
-    # 5. Calculate final trust
-    # Start with sharpness as base
+    # === STEP 5: Calculate final trust ===
+    # Start with sharpness as base (primary quality indicator)
     base_trust = sharpness_norm
     
-    # Apply state cap
+    # Apply state cap (open vs closed)
     trust = min(base_trust, state_cap)
     
-    # Apply penalties (multiplicative reduction)
+    # Apply penalties (multiplicative reduction to preserve scale)
+    # Example: trust=0.7, size_penalty=0.1, blur_penalty=0.15
+    #          → trust = 0.7 * 0.9 * 0.85 = 0.5355
     trust = trust * (1.0 - size_penalty)
     trust = trust * (1.0 - applied_blur_penalty)
     
-    # Clamp to [0, 1]
+    # Clamp to [0, 1] for safety (should not exceed 1.0)
     trust = max(0.0, min(1.0, trust))
     
-    # Determine if this ROI is "trusted" (meets support threshold)
+    # === STEP 6: Determine if this ROI is "trusted" ===
+    # Trusted ROIs meet the minimum threshold for supporting evidence
+    # Used in stability gate to ensure sufficient high-quality evidence
     is_trusted = trust >= trust_min_for_support
     
     # Build reason string
