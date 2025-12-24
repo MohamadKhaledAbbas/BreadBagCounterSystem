@@ -170,7 +170,8 @@ class BagCounterApp:
 
         # Async classification queue as normal
         self.classification_queue = queue.Queue(maxsize=self.CLASSIFICATION_QUEUE_SIZE)
-        self._classification_thread = None
+        # Phase 2: Classification workers list (multiple threads)
+        self._classification_threads = []
         self._classification_running = False
 
         # Queue monitoring statistics
@@ -1244,16 +1245,20 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Shutting down...")
         self.is_running = False
         THREAD_SHUTDOWN_TIMEOUT = 3.0
+        
+        # Phase 2: Shutdown all classification worker threads
         self._classification_running = False
-        if self._classification_thread and self._classification_thread.is_alive():
-            self._classification_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
-            if self._classification_thread.is_alive():
-                logger.warning(
-                    f"[BagCounterApp] Classification thread did not stop within "
-                    f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
-                )
-            else:
-                logger.debug("[BagCounterApp] Classification thread joined")
+        for i, thread in enumerate(self._classification_threads):
+            if thread and thread.is_alive():
+                thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] Classification thread {i} did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug(f"[BagCounterApp] Classification thread {i} joined")
+        
         self.frame_source.cleanup()
         logger.debug("[BagCounterApp] Frame source cleaned up")
         self.config_watcher.stop()
