@@ -30,6 +30,10 @@ class Visualizer:
         self._frame_counter = 0
         self._legend_redraw_interval = 30  # Redraw legend every N frames
         self._last_state_hash = None  # Track state changes for legend updates
+        
+        # Phase 1 Optimization: Cache legend as static image
+        self._legend_cache = None
+        self._legend_cache_size = None  # (width, height) of frame when legend was created
 
     def set_exit_margin(self, margin: int):
         """Set the exit boundary margin for visualization."""
@@ -256,32 +260,53 @@ class Visualizer:
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
     def draw_state_legend(self, frame: np.ndarray):
-        """Draw a legend showing what each state color means."""
+        """
+        Draw a legend showing what each state color means.
+        Phase 1 Optimization: Returns pre-rendered legend image for blitting.
+        """
         h, w = frame.shape[:2]
-        legend_x = w - 220
-        legend_y = 30
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        thickness = 1
-        line_height = 25
         
-        # Background for legend
-        cv2.rectangle(frame, (legend_x - 10, legend_y - 20), 
-                     (w - 10, legend_y + len(STATE_COLORS) * line_height), 
-                     (40, 40, 40), -1)
-        
-        cv2.putText(frame, "Event States:", (legend_x, legend_y), 
-                    font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-        
-        for i, (state, color) in enumerate(STATE_COLORS.items()):
-            if state in ['detecting_open', 'detecting_closed', 'counted']:  # Skip legacy names
-                continue
-            y = legend_y + (i + 1) * line_height
-            # Draw color box
-            cv2.rectangle(frame, (legend_x, y - 12), (legend_x + 15, y + 3), color, -1)
-            # Draw state name
-            cv2.putText(frame, state, (legend_x + 20, y), 
+        # Check if we need to regenerate the legend (frame size changed)
+        if self._legend_cache is None or self._legend_cache_size != (w, h):
+            # Create legend as a separate image
+            legend_w, legend_h = 220, 150
+            self._legend_cache = np.zeros((legend_h, legend_w, 3), dtype=np.uint8)
+            
+            legend_x = 0
+            legend_y = 30
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            line_height = 25
+            
+            # Background for legend
+            cv2.rectangle(self._legend_cache, (legend_x, legend_y - 20), 
+                         (legend_w, legend_y + len(STATE_COLORS) * line_height), 
+                         (40, 40, 40), -1)
+            
+            cv2.putText(self._legend_cache, "Event States:", (legend_x, legend_y), 
                         font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            
+            for i, (state, color) in enumerate(STATE_COLORS.items()):
+                if state in ['detecting_open', 'detecting_closed', 'counted']:  # Skip legacy names
+                    continue
+                y = legend_y + (i + 1) * line_height
+                # Draw color box
+                cv2.rectangle(self._legend_cache, (legend_x, y - 12), (legend_x + 15, y + 3), color, -1)
+                # Draw state name
+                cv2.putText(self._legend_cache, state, (legend_x + 20, y), 
+                            font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            
+            self._legend_cache_size = (w, h)
+        
+        # Blit cached legend onto frame (fast operation)
+        legend_h, legend_w = self._legend_cache.shape[:2]
+        x_pos = w - legend_w - 10
+        y_pos = 30
+        
+        # Ensure we don't go out of bounds
+        if x_pos >= 0 and y_pos + legend_h <= h:
+            frame[y_pos:y_pos+legend_h, x_pos:x_pos+legend_w] = self._legend_cache
 
     def render_all(self, frame: np.ndarray,
                    detections: List[Union[TrackedObject, Dict]],
