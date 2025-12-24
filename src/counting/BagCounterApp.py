@@ -64,7 +64,7 @@ class BagCounterApp:
     """
     
     # Queue configuration constants - V3: Optimized for 20fps at 720p (reduced memory pressure)
-    INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1318MB to 158MB
+    INPUT_QUEUE_SIZE = 100  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1318MB to 158MB
     CLASSIFICATION_QUEUE_SIZE = 30  # Phase 2: Increased from 20 to reduce queue pressure
     CLASSIFICATION_WORKERS = 2  # Phase 2: Multiple workers for parallel classification
     QUEUE_WARNING_THRESHOLD = 50.0  # 50% - Lowered from 70% for earlier warnings (percentage 0-100)
