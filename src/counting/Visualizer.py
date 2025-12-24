@@ -325,9 +325,9 @@ class Visualizer:
         # - Or when active event states change (detected via efficient hash)
         if show_legend:
             # Efficient state change detection: count and hash of state values
-            current_state_hash = (len(active_events), hash(tuple(str(e.state) for e in active_events))) if active_events else (0, 0)
+            current_state_hash = (len(active_events), hash(tuple(e.state for e in active_events))) if active_events else (0, 0)
             state_changed = current_state_hash != self._last_state_hash
             
-            if self._frame_counter % self._legend_redraw_interval == 1 or state_changed:
+            if self._frame_counter % self._legend_redraw_interval == 0 or state_changed:
                 self.draw_state_legend(frame)
                 self._last_state_hash = current_state_hash

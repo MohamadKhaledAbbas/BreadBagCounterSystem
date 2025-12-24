@@ -75,6 +75,7 @@ class BagCounterApp:
     TARGET_FRAME_TIME_MS = 1000.0 / TARGET_FPS  # Computed dynamically (50ms for 20fps)
     MAX_DETECTION_TIME_MS = 40.0  # Increased from 31.0ms for more headroom
     ADAPTIVE_SKIP_THRESHOLD = 0.5  # Lowered from 0.7 for earlier intervention
+    PROACTIVE_BACKPRESSURE_THRESHOLD = 0.5  # Queue utilization to trigger proactive backpressure
     
     # Skip rate cap configuration - more permissive under load
     SKIP_RATE_CAP = 0.07  # Increased from 0.02 (7% vs 2%)
@@ -778,7 +779,7 @@ class BagCounterApp:
                 critical_queue_exceeded = queue_utilization >= (self.CRITICAL_QUEUE_THRESHOLD / 100.0)
                 
                 # V3 Performance: Proactive backpressure at 50% queue utilization
-                proactive_backpressure = queue_utilization >= 0.5 and avg_detection_time > self.MAX_DETECTION_TIME_MS
+                proactive_backpressure = queue_utilization >= self.PROACTIVE_BACKPRESSURE_THRESHOLD and avg_detection_time > self.MAX_DETECTION_TIME_MS
                 
                 # Determine if adaptive skip conditions are met
                 adaptive_skip_conditions_met = (
