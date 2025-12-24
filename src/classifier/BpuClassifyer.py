@@ -193,7 +193,8 @@ class BpuClassifier(BaseClassifier):
             return "Unknown", 0.0, {"Unknown": 1.0}
 
     def _preprocess(self, img):
-        resized = cv2.resize(img, (self.input_w, self.input_h))
+        # Phase 2 Optimization: Use INTER_NEAREST for faster resize (acceptable for classification)
+        resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_NEAREST)
         return self._bgr2nv12(resized)
 
     def _bgr2nv12(self, bgr_img):

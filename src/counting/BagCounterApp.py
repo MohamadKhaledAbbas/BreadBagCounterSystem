@@ -65,7 +65,8 @@ class BagCounterApp:
     
     # Queue configuration constants - V3: Optimized for 20fps at 720p (reduced memory pressure)
     INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1318MB to 158MB
-    CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
+    CLASSIFICATION_QUEUE_SIZE = 30  # Phase 2: Increased from 20 to reduce queue pressure
+    CLASSIFICATION_WORKERS = 2  # Phase 2: Multiple workers for parallel classification
     QUEUE_WARNING_THRESHOLD = 50.0  # 50% - Lowered from 70% for earlier warnings (percentage 0-100)
     CRITICAL_QUEUE_THRESHOLD = 90.0  # 90% - emergency dropping threshold (percentage 0-100)
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
@@ -325,6 +326,56 @@ class BagCounterApp:
             
         except Exception as e:
             logger.warning(f"[SystemStatus] Failed to log system status: {e}")
+    
+    def _log_queue_stats(self):
+        """
+        Phase 2 Optimization: Extracted queue stats logging to reduce hot path overhead.
+        Called every STATS_LOG_INTERVAL seconds from the frame capture thread.
+        """
+        input_size = self.input_queue.qsize()
+        input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
+        class_size = self.classification_queue.qsize()
+        class_utilization = (class_size / self.CLASSIFICATION_QUEUE_SIZE) * 100
+        
+        with self.stats_lock:
+            input_drops = self.input_queue_drops
+            class_drops = self.classification_queue_drops
+        
+        # Calculate current skip rate (O(n) but acceptable since this runs every 5s)
+        current_skip_rate = 0.0
+        if len(self._skip_decisions) > 0:
+            current_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
+        
+        logger.info(
+            f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
+            f"({input_utilization:.1f}% full, drops={input_drops}) | "
+            f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
+            f"({class_utilization:.1f}% full, drops={class_drops}) | "
+            f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
+            f"SkipCapBlocks: {self._skip_cap_blocks}"
+        )
+        
+        if input_utilization > self.QUEUE_WARNING_THRESHOLD:
+            # Enhanced warning with root cause information
+            avg_detect_time = (
+                sum(self._recent_detection_times) / len(self._recent_detection_times)
+                if len(self._recent_detection_times) > 0 else 0.0
+            )
+            logger.warning(
+                f"[InputQueuePressure] High queue utilization: {input_utilization:.1f}% "
+                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.0f}%) - "
+                f"Root cause: avg_detection_time={avg_detect_time:.1f}ms "
+                f"(target={self.TARGET_FRAME_TIME_MS:.1f}ms). "
+                f"Risk: frames may be dropped if processing doesn't improve."
+            )
+        
+        if class_utilization > self.QUEUE_WARNING_THRESHOLD:
+            logger.warning(
+                f"[ClassificationQueuePressure] High queue utilization: {class_utilization:.1f}% "
+                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.0f}%) - "
+                f"classification thread is falling behind. "
+                f"Risk: classification tasks may be dropped."
+            )
     
     def _check_degraded_mode(self, queue_utilization: float) -> bool:
         """
@@ -1074,15 +1125,18 @@ class BagCounterApp:
         logger.info("[BagCounterApp] Starting main loop (V3 with async classification)")
         self.is_running = True
         
-        # V3: Start classification thread
+        # Phase 2: Start multiple classification worker threads
         self._classification_running = True
-        self._classification_thread = threading.Thread(
-            target=self._classification_thread_loop, 
-            daemon=True,
-            name="ClassificationThread"
-        )
-        self._classification_thread.start()
-        logger.info("[BagCounterApp] Classification thread started")
+        self._classification_threads = []
+        for i in range(self.CLASSIFICATION_WORKERS):
+            thread = threading.Thread(
+                target=self._classification_thread_loop, 
+                daemon=True,
+                name=f"ClassificationThread-{i}"
+            )
+            thread.start()
+            self._classification_threads.append(thread)
+        logger.info(f"[BagCounterApp] Started {self.CLASSIFICATION_WORKERS} classification worker threads")
 
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
@@ -1174,47 +1228,8 @@ class BagCounterApp:
                                 )
                     current_time = time.perf_counter()
                     if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
-                        input_size = self.input_queue.qsize()
-                        input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
-                        class_size = self.classification_queue.qsize()
-                        class_utilization = (class_size / self.CLASSIFICATION_QUEUE_SIZE) * 100
-                        with self.stats_lock:
-                            input_drops = self.input_queue_drops
-                            class_drops = self.classification_queue_drops
-                        
-                        # Calculate current skip rate (O(n) but acceptable since this runs every 5s)
-                        current_skip_rate = 0.0
-                        if len(self._skip_decisions) > 0:
-                            current_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
-                        
-                        logger.info(
-                            f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
-                            f"({input_utilization:.1f}% full, drops={input_drops}) | "
-                            f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
-                            f"({class_utilization:.1f}% full, drops={class_drops}) | "
-                            f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
-                            f"SkipCapBlocks: {self._skip_cap_blocks}"
-                        )
-                        if input_utilization > self.QUEUE_WARNING_THRESHOLD:
-                            # Enhanced warning with root cause information
-                            avg_detect_time = (
-                                sum(self._recent_detection_times) / len(self._recent_detection_times)
-                                if len(self._recent_detection_times) > 0 else 0.0
-                            )
-                            logger.warning(
-                                f"[InputQueuePressure] High queue utilization: {input_utilization:.1f}% "
-                                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.0f}%) - "
-                                f"Root cause: avg_detection_time={avg_detect_time:.1f}ms "
-                                f"(target={self.TARGET_FRAME_TIME_MS:.1f}ms). "
-                                f"Risk: frames may be dropped if processing doesn't improve."
-                            )
-                        if class_utilization > self.QUEUE_WARNING_THRESHOLD:
-                            logger.warning(
-                                f"[ClassificationQueuePressure] High queue utilization: {class_utilization:.1f}% "
-                                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.0f}%) - "
-                                f"classification thread is falling behind. "
-                                f"Risk: classification tasks may be dropped."
-                            )
+                        # Phase 2 Optimization: Collect stats efficiently
+                        self._log_queue_stats()
                         last_queue_stats_time = current_time
             except KeyboardInterrupt:
                 logger.info("[BagCounterApp] Interrupted by user")
