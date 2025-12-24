@@ -21,6 +21,15 @@ class Visualizer:
     def __init__(self, class_names: Dict[int, str]):
         self.names = class_names
         self.exit_margin = 50  # Default exit boundary margin
+        
+        # V3 Performance: Cache for exit boundary overlay
+        self._exit_boundary_cache = None
+        self._exit_boundary_cache_shape = None
+        
+        # V3 Performance: Frame counter for conditional rendering
+        self._frame_counter = 0
+        self._legend_redraw_interval = 30  # Redraw legend every N frames
+        self._last_state_hash = None  # Track state changes for legend updates
 
     def set_exit_margin(self, margin: int):
         """Set the exit boundary margin for visualization."""
@@ -191,6 +200,9 @@ class Visualizer:
         Draw the exit boundary zone around the frame edges.
         Bags must reach this zone to be counted.
         
+        V3 Performance: Uses caching to avoid recreating overlay every frame.
+        Only redraws when frame size changes.
+        
         Args:
             frame: Frame to draw on
             margin: Exit boundary margin in pixels (uses self.exit_margin if None)
@@ -200,23 +212,29 @@ class Visualizer:
         if margin is None:
             margin = self.exit_margin
         
-        # Draw semi-transparent exit zone around edges
-        overlay = frame.copy()
-        exit_color = (0, 100, 0)  # Dark green for exit zone
+        current_shape = (h, w, margin)
         
-        # Top edge
-        cv2.rectangle(overlay, (0, 0), (w, margin), exit_color, -1)
-        # Bottom edge
-        cv2.rectangle(overlay, (0, h - margin), (w, h), exit_color, -1)
-        # Left edge
-        cv2.rectangle(overlay, (0, 0), (margin, h), exit_color, -1)
-        # Right edge
-        cv2.rectangle(overlay, (w - margin, 0), (w, h), exit_color, -1)
+        # V3 Performance: Check if we need to regenerate the cache
+        if self._exit_boundary_cache is None or self._exit_boundary_cache_shape != current_shape:
+            # Create new cached overlay
+            self._exit_boundary_cache = np.zeros((h, w, 3), dtype=np.uint8)
+            exit_color = (0, 100, 0)  # Dark green for exit zone
+            
+            # Top edge
+            cv2.rectangle(self._exit_boundary_cache, (0, 0), (w, margin), exit_color, -1)
+            # Bottom edge
+            cv2.rectangle(self._exit_boundary_cache, (0, h - margin), (w, h), exit_color, -1)
+            # Left edge
+            cv2.rectangle(self._exit_boundary_cache, (0, 0), (margin, h), exit_color, -1)
+            # Right edge
+            cv2.rectangle(self._exit_boundary_cache, (w - margin, 0), (w, h), exit_color, -1)
+            
+            self._exit_boundary_cache_shape = current_shape
         
-        # Blend with original frame
-        cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        # Blend cached overlay with frame (in-place to avoid extra copy)
+        cv2.addWeighted(self._exit_boundary_cache, 0.2, frame, 0.8, 0, frame)
         
-        # Draw boundary lines
+        # Draw boundary lines (these are cheap)
         line_color = (0, 200, 0)  # Brighter green for lines
         thickness = 2
         # Inner rectangle showing work zone
@@ -275,6 +293,8 @@ class Visualizer:
         """
         Full pass: draws detections, events, stats, fps, and visual guides in one call.
         
+        V3 Performance: Legend is only redrawn every 30 frames or when state changes.
+        
         Args:
             frame: Frame to draw on
             detections: List of detections to draw
@@ -284,6 +304,9 @@ class Visualizer:
             show_exit_boundary: Whether to show the exit boundary zone
             show_legend: Whether to show the state color legend
         """
+        # Increment frame counter
+        self._frame_counter += 1
+        
         # Draw exit boundary first (background layer)
         if show_exit_boundary:
             self.draw_exit_boundary(frame)
@@ -297,6 +320,13 @@ class Visualizer:
         if fps is not None:
             self.draw_fps(frame, fps)
         
-        # Draw legend last (on top)
+        # V3 Performance: Draw legend conditionally
+        # - Every 30th frame (to reduce overhead)
+        # - Or when active event states change (detected via simple hash)
         if show_legend:
-            self.draw_state_legend(frame)
+            current_state_hash = tuple(sorted([str(e.state) for e in active_events])) if active_events else ()
+            state_changed = current_state_hash != self._last_state_hash
+            
+            if self._frame_counter % self._legend_redraw_interval == 1 or state_changed:
+                self.draw_state_legend(frame)
+                self._last_state_hash = current_state_hash

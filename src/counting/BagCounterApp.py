@@ -63,20 +63,21 @@ class BagCounterApp:
     - Adaptive frame skip when pipeline is overloaded
     """
     
-    # Queue configuration constants - V3: Optimized for 25fps at 720p
-    INPUT_QUEUE_SIZE = 500  # Increased buffer to allow more buffering (was 100)
+    # Queue configuration constants - V3: Optimized for 20fps at 720p (reduced memory pressure)
+    INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1.35GB to 162MB
     CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
-    QUEUE_WARNING_THRESHOLD = 70  # Lower threshold for earlier warnings (was 80)
+    QUEUE_WARNING_THRESHOLD = 50  # Lowered from 70 for earlier warnings
+    CRITICAL_QUEUE_THRESHOLD = 90  # New: emergency dropping threshold (90% full)
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     
-    # V3: Performance tuning constants
-    TARGET_FPS = 25.0  # Target frames per second
-    TARGET_FRAME_TIME_MS = 1000.0 / TARGET_FPS  # ~40ms per frame
-    MAX_DETECTION_TIME_MS = 31.0  # Max acceptable detection time before skipping (was 35.0)
-    ADAPTIVE_SKIP_THRESHOLD = 0.7  # Queue utilization to trigger adaptive skipping (was 0.8)
+    # V3: Performance tuning constants - relaxed for 20fps target
+    TARGET_FPS = 20.0  # Reduced from 25.0 for more headroom
+    TARGET_FRAME_TIME_MS = 50.0  # 50ms per frame (20fps) - was 1000.0 / TARGET_FPS
+    MAX_DETECTION_TIME_MS = 40.0  # Increased from 31.0ms for more headroom
+    ADAPTIVE_SKIP_THRESHOLD = 0.5  # Lowered from 0.7 for earlier intervention
     
-    # Skip rate cap configuration
-    SKIP_RATE_CAP = 0.02  # Maximum allowed skip rate (2%)
+    # Skip rate cap configuration - more permissive under load
+    SKIP_RATE_CAP = 0.07  # Increased from 0.02 (7% vs 2%)
     SKIP_RATE_WINDOW = 500  # Number of frames to track for skip rate calculation
     MIN_SKIP_SAMPLES = 10  # Minimum samples needed before applying skip rate logic
     SKIP_CAP_LOG_FREQUENCY = 5  # Log every Nth skip cap block to avoid flooding
@@ -259,7 +260,8 @@ class BagCounterApp:
             f"max_detection_time={self.MAX_DETECTION_TIME_MS:.1f}ms, "
             f"adaptive_skip_threshold={self.ADAPTIVE_SKIP_THRESHOLD:.1%}, "
             f"skip_rate_cap={self.SKIP_RATE_CAP:.1%}, "
-            f"input_queue={self.INPUT_QUEUE_SIZE}, classification_queue={self.CLASSIFICATION_QUEUE_SIZE}"
+            f"input_queue={self.INPUT_QUEUE_SIZE}, classification_queue={self.CLASSIFICATION_QUEUE_SIZE}, "
+            f"critical_queue_threshold={self.CRITICAL_QUEUE_THRESHOLD}%"
         )
         logger.info("[BagCounterApp] Initialization complete")
 
@@ -697,7 +699,8 @@ class BagCounterApp:
                         }
                     self._enqueue_classification(event_id, candidates, context)
             if self.is_publishing:
-                annotated_frame = frame.copy()
+                # V3 Performance: Resize BEFORE visualization
+                annotated_frame = cv2.resize(frame, (1280, 720))
                 self.visualizer.render_all(
                     annotated_frame,
                     [],
@@ -705,7 +708,7 @@ class BagCounterApp:
                     counts=self.ui_counts,
                     fps=0,
                 )
-                annotated_frame = cv2.resize(annotated_frame, (1280, 720))
+                # V3 Performance: No need to resize again
                 self.ipc_publisher.publish(annotated_frame)
             pipeline_metrics.maybe_log_summary()
         except Exception as e:
@@ -771,11 +774,19 @@ class BagCounterApp:
                     skip_sum = sum(self._skip_decisions)
                     current_skip_rate = skip_sum / len(self._skip_decisions)
                 
+                # V3 Performance: Critical queue threshold for emergency dropping
+                critical_queue_exceeded = queue_utilization >= (self.CRITICAL_QUEUE_THRESHOLD / 100.0)
+                
+                # V3 Performance: Proactive backpressure at 50% queue utilization
+                proactive_backpressure = queue_utilization >= 0.5 and avg_detection_time > self.MAX_DETECTION_TIME_MS
+                
                 # Determine if adaptive skip conditions are met
                 adaptive_skip_conditions_met = (
-                    self._adaptive_skip_enabled and 
-                    queue_utilization > self.ADAPTIVE_SKIP_THRESHOLD and
-                    avg_detection_time > self.MAX_DETECTION_TIME_MS
+                    self._adaptive_skip_enabled and (
+                        critical_queue_exceeded or  # Emergency: always skip
+                        proactive_backpressure or   # Proactive: skip at 50% if slow
+                        (queue_utilization > self.ADAPTIVE_SKIP_THRESHOLD and avg_detection_time > self.MAX_DETECTION_TIME_MS)
+                    )
                 )
                 
                 # Check if skip rate cap would be exceeded
@@ -807,6 +818,7 @@ class BagCounterApp:
                     self._frames_skipped += 1
                     if self._frames_skipped % 10 == 0:
                         # Improved structured logging for adaptive skip
+                        skip_reason = "critical_queue" if critical_queue_exceeded else ("proactive_bp" if proactive_backpressure else "adaptive")
                         structured_logger.queue_backpressure(
                             queue_name='input_queue',
                             utilization=queue_utilization,
@@ -816,7 +828,7 @@ class BagCounterApp:
                             frames_skipped=self._frames_skipped
                         )
                         logger.warning(
-                            f"[AdaptiveSkip] Frame skipped due to backpressure: "
+                            f"[AdaptiveSkip] Frame skipped ({skip_reason}): "
                             f"queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms "
                             f"(threshold={self.MAX_DETECTION_TIME_MS:.1f}ms), "
                             f"skip_rate={current_skip_rate:.1%}, total_skipped={self._frames_skipped}"
@@ -947,8 +959,10 @@ class BagCounterApp:
                 if should_visualize:
                     publish_start = time.perf_counter()
 
-                    # V3: Visualize directly on frame (avoid copy when not recording)
-                    annotated_frame = frame.copy()
+                    # V3 Performance: Resize BEFORE visualization (process at 720p throughout)
+                    # This reduces the amount of pixels to process during visualization
+                    annotated_frame = cv2.resize(frame, (1280, 720))
+                    
                     frame_mid = time.perf_counter()
                     mid_time = (frame_mid - frame_start) * 1000
                     fps_display = 1000 / mid_time if mid_time > 0 else 0
@@ -961,7 +975,7 @@ class BagCounterApp:
                         fps=fps_display,
                     )
 
-                    annotated_frame = cv2.resize(annotated_frame, (1280, 720))
+                    # V3 Performance: No need to resize again - already at 1280x720
                     self.ipc_publisher.publish(annotated_frame)
 
                     publish_end = time.perf_counter()
