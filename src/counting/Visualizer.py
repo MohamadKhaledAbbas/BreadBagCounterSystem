@@ -327,13 +327,20 @@ class Visualizer:
             # Efficient state change detection: count and hash of state values
             # Guard against missing 'state' attribute
             try:
-                current_state_hash = (len(active_events), hash(tuple(e.state for e in active_events if hasattr(e, 'state')))) if active_events else (0, 0)
+                states = tuple(e.state for e in active_events if hasattr(e, 'state'))
+                current_state_hash = (len(active_events), hash(states))
             except (TypeError, AttributeError):
                 # Fallback if hashing fails
                 current_state_hash = (len(active_events), 0)
             
             state_changed = current_state_hash != self._last_state_hash
             
-            if self._frame_counter % self._legend_redraw_interval == 0 or state_changed:
+            # Redraw on every Nth frame or when state changes (skip frame 0)
+            should_redraw = (
+                (self._frame_counter > 0 and self._frame_counter % self._legend_redraw_interval == 0) or 
+                state_changed
+            )
+            
+            if should_redraw:
                 self.draw_state_legend(frame)
                 self._last_state_hash = current_state_hash
