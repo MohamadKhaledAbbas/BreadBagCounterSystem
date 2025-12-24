@@ -1262,9 +1262,9 @@ class ClassifierService:
         # Determine save path
         if label == "Unknown":
             # For Unknown, use a single directory instead of per-phash directories
-            target_dir = os.path.join(self.data_root, "unknown", "unknown_samples", "saved_rois")
+            target_dir = os.path.join(self.data_root, "saved_rois", "unknown")
         else:
-            target_dir = os.path.join(self.data_root, "classes", label, "saved_rois")
+            target_dir = os.path.join(self.data_root, "saved_rois", "classes", label)
         
         os.makedirs(target_dir, exist_ok=True)
         

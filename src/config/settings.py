@@ -71,7 +71,7 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2025-12-23-v1.6.0"
+    APP_VERSION: str = "2025-12-24-v1.7.0"
 
     video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Small_2025_11_29_06_07_02.mp4")
 

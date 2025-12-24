@@ -234,7 +234,12 @@ class Visualizer:
             cv2.rectangle(self._exit_boundary_cache, (w - margin, 0), (w, h), exit_color, -1)
             
             self._exit_boundary_cache_shape = current_shape
-        
+
+        if self._exit_boundary_cache.shape != frame.shape:
+            self._exit_boundary_cache = cv2.resize(
+                self._exit_boundary_cache,
+                (frame.shape[1], frame.shape[0])  # (width, height)
+            )
         # Blend cached overlay with frame (in-place to avoid extra copy)
         cv2.addWeighted(self._exit_boundary_cache, 0.2, frame, 0.8, 0, frame)
         
@@ -314,7 +319,7 @@ class Visualizer:
                    counts: Dict[str, int] = None,
                    fps: float = None,
                    show_exit_boundary: bool = True,
-                   show_legend: bool = True):
+                   show_legend: bool = False):
         """
         Full pass: draws detections, events, stats, fps, and visual guides in one call.
         
@@ -349,6 +354,7 @@ class Visualizer:
         # - Every 30th frame (to reduce overhead)
         # - Or when active event states change (detected via efficient hash)
         if show_legend:
+            self.draw_state_legend(frame)
             # Efficient state change detection: count and hash of state values
             # Guard against missing 'state' attribute
             try:
@@ -357,15 +363,15 @@ class Visualizer:
             except (TypeError, AttributeError):
                 # Fallback if hashing fails
                 current_state_hash = (len(active_events), 0)
-            
+
             state_changed = current_state_hash != self._last_state_hash
-            
+
             # Redraw on every Nth frame or when state changes (skip frame 0)
             should_redraw = (
-                (self._frame_counter > 0 and self._frame_counter % self._legend_redraw_interval == 0) or 
+                (self._frame_counter > 0 and self._frame_counter % self._legend_redraw_interval == 0) or
                 state_changed
             )
-            
+
             if should_redraw:
                 self.draw_state_legend(frame)
                 self._last_state_hash = current_state_hash
