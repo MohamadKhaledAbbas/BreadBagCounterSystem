@@ -64,7 +64,7 @@ class BagCounterApp:
     """
     
     # Queue configuration constants - V3: Optimized for 20fps at 720p (reduced memory pressure)
-    INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1.35GB to 162MB
+    INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1318MB to 158MB
     CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
     QUEUE_WARNING_THRESHOLD = 50  # Lowered from 70 for earlier warnings
     CRITICAL_QUEUE_THRESHOLD = 90  # New: emergency dropping threshold (90% full)
@@ -72,7 +72,7 @@ class BagCounterApp:
     
     # V3: Performance tuning constants - relaxed for 20fps target
     TARGET_FPS = 20.0  # Reduced from 25.0 for more headroom
-    TARGET_FRAME_TIME_MS = 50.0  # 50ms per frame (20fps) - was 1000.0 / TARGET_FPS
+    TARGET_FRAME_TIME_MS = 1000.0 / TARGET_FPS  # Computed dynamically (50ms for 20fps)
     MAX_DETECTION_TIME_MS = 40.0  # Increased from 31.0ms for more headroom
     ADAPTIVE_SKIP_THRESHOLD = 0.5  # Lowered from 0.7 for earlier intervention
     

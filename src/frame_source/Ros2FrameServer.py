@@ -49,6 +49,9 @@ class FrameServer(Node, FrameSource):
         # Store target_fps for logging only
         self.target_fps = target_fps
         
+        # V3 Performance: Proactive drop threshold (80% of queue size)
+        self.proactive_drop_threshold = int(30 * 0.8)  # 24 frames
+        
         # Stats for debugging
         self.frames_received = 0
         self.frames_processed = 0
@@ -72,7 +75,7 @@ class FrameServer(Node, FrameSource):
         
         # V3 Performance: Log stats periodically (time-based for consistent intervals)
         if now - self.last_stats_log_time >= self.stats_log_interval:
-            queue_utilization = (self.frame_queue.qsize() / 30.0) * 100  # 30 is maxsize
+            queue_utilization = (self.frame_queue.qsize() / self.frame_queue.maxsize) * 100
             drop_rate = (self.frames_dropped / self.frames_received * 100) if self.frames_received > 0 else 0.0
             logger.info(
                 f"[Ros2FrameServer] Stats: received={self.frames_received}, "
@@ -96,12 +99,12 @@ class FrameServer(Node, FrameSource):
         # V3 Performance: Leaky queue with drop tracking
         # Proactively drop when queue is heavily utilized (> 80% full)
         queue_size = self.frame_queue.qsize()
-        if queue_size >= 24:  # 80% of 30 frames
+        if queue_size >= self.proactive_drop_threshold:
             # Drop oldest frame to make room
             try:
                 self.frame_queue.get_nowait()
                 self.frames_dropped += 1
-                logger.debug(f"[Ros2FrameServer] Proactive drop at queue_size={queue_size}/30 (80% threshold)")
+                logger.debug(f"[Ros2FrameServer] Proactive drop at queue_size={queue_size}/{self.frame_queue.maxsize} (80% threshold)")
             except queue.Empty:
                 pass
         elif self.frame_queue.full():

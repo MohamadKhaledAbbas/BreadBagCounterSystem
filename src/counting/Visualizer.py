@@ -322,9 +322,10 @@ class Visualizer:
         
         # V3 Performance: Draw legend conditionally
         # - Every 30th frame (to reduce overhead)
-        # - Or when active event states change (detected via simple hash)
+        # - Or when active event states change (detected via efficient hash)
         if show_legend:
-            current_state_hash = tuple(sorted([str(e.state) for e in active_events])) if active_events else ()
+            # Efficient state change detection: count and hash of state values
+            current_state_hash = (len(active_events), hash(tuple(str(e.state) for e in active_events))) if active_events else (0, 0)
             state_changed = current_state_hash != self._last_state_hash
             
             if self._frame_counter % self._legend_redraw_interval == 1 or state_changed:
