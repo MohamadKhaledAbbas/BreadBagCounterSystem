@@ -66,8 +66,8 @@ class BagCounterApp:
     # Queue configuration constants - V3: Optimized for 20fps at 720p (reduced memory pressure)
     INPUT_QUEUE_SIZE = 60  # Reduced from 500 (2.4s buffer vs 20s) - reduces memory from 1318MB to 158MB
     CLASSIFICATION_QUEUE_SIZE = 20  # Dedicated queue for async classification
-    QUEUE_WARNING_THRESHOLD = 50  # Lowered from 70 for earlier warnings
-    CRITICAL_QUEUE_THRESHOLD = 90  # New: emergency dropping threshold (90% full)
+    QUEUE_WARNING_THRESHOLD = 0.50  # 50% - Lowered from 0.70 for earlier warnings
+    CRITICAL_QUEUE_THRESHOLD = 0.90  # 90% - emergency dropping threshold
     STATS_LOG_INTERVAL = 5.0  # Log statistics every N seconds
     
     # V3: Performance tuning constants - relaxed for 20fps target
@@ -262,7 +262,7 @@ class BagCounterApp:
             f"adaptive_skip_threshold={self.ADAPTIVE_SKIP_THRESHOLD:.1%}, "
             f"skip_rate_cap={self.SKIP_RATE_CAP:.1%}, "
             f"input_queue={self.INPUT_QUEUE_SIZE}, classification_queue={self.CLASSIFICATION_QUEUE_SIZE}, "
-            f"critical_queue_threshold={self.CRITICAL_QUEUE_THRESHOLD}%"
+            f"critical_queue_threshold={self.CRITICAL_QUEUE_THRESHOLD:.1%}"
         )
         logger.info("[BagCounterApp] Initialization complete")
 
@@ -776,7 +776,7 @@ class BagCounterApp:
                     current_skip_rate = skip_sum / len(self._skip_decisions)
                 
                 # V3 Performance: Critical queue threshold for emergency dropping
-                critical_queue_exceeded = queue_utilization >= (self.CRITICAL_QUEUE_THRESHOLD / 100.0)
+                critical_queue_exceeded = queue_utilization >= self.CRITICAL_QUEUE_THRESHOLD
                 
                 # V3 Performance: Proactive backpressure at 50% queue utilization
                 proactive_backpressure = queue_utilization >= self.PROACTIVE_BACKPRESSURE_THRESHOLD and avg_detection_time > self.MAX_DETECTION_TIME_MS
@@ -1181,7 +1181,7 @@ class BagCounterApp:
                             f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
                             f"SkipCapBlocks: {self._skip_cap_blocks}"
                         )
-                        if input_utilization > self.QUEUE_WARNING_THRESHOLD:
+                        if input_utilization > self.QUEUE_WARNING_THRESHOLD * 100:
                             # Enhanced warning with root cause information
                             avg_detect_time = (
                                 sum(self._recent_detection_times) / len(self._recent_detection_times)
@@ -1189,15 +1189,15 @@ class BagCounterApp:
                             )
                             logger.warning(
                                 f"[InputQueuePressure] High queue utilization: {input_utilization:.1f}% "
-                                f"(threshold={self.QUEUE_WARNING_THRESHOLD}%) - "
+                                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.1%}) - "
                                 f"Root cause: avg_detection_time={avg_detect_time:.1f}ms "
                                 f"(target={self.TARGET_FRAME_TIME_MS:.1f}ms). "
                                 f"Risk: frames may be dropped if processing doesn't improve."
                             )
-                        if class_utilization > self.QUEUE_WARNING_THRESHOLD:
+                        if class_utilization > self.QUEUE_WARNING_THRESHOLD * 100:
                             logger.warning(
                                 f"[ClassificationQueuePressure] High queue utilization: {class_utilization:.1f}% "
-                                f"(threshold={self.QUEUE_WARNING_THRESHOLD}%) - "
+                                f"(threshold={self.QUEUE_WARNING_THRESHOLD:.1%}) - "
                                 f"classification thread is falling behind. "
                                 f"Risk: classification tasks may be dropped."
                             )

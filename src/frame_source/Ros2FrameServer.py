@@ -50,7 +50,7 @@ class FrameServer(Node, FrameSource):
         self.target_fps = target_fps
         
         # V3 Performance: Proactive drop threshold (80% of queue size)
-        self.proactive_drop_threshold = int(30 * 0.8)  # 24 frames
+        self.proactive_drop_threshold = int(self.frame_queue.maxsize * 0.8)  # 24 frames for size=30
         
         # Stats for debugging
         self.frames_received = 0
