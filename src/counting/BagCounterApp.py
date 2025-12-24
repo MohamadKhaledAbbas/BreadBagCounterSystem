@@ -210,6 +210,12 @@ class BagCounterApp:
         self._recent_queue_delays: deque = deque(maxlen=20)  # Track queue delay
         self._last_degraded_mode_check = time.perf_counter()
         self._degraded_mode_check_interval = 2.0  # Check every 2 seconds
+        
+        # Smart frame skipping state
+        self._smart_skip_frame_counter = 0  # Counter for pattern-based skipping
+        self._frames_processed_in_degraded = 0  # Frames processed while in degraded mode
+        self._frames_skipped_by_pattern = 0  # Frames skipped by smart pattern
+        self._event_frame_counts: Dict[int, int] = {}  # Track frames per event: {event_id: frame_count}
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -347,6 +353,13 @@ class BagCounterApp:
         if len(self._skip_decisions) > 0:
             current_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
         
+        # Calculate smart skip statistics
+        smart_skip_info = ""
+        if tracking_config.degraded_mode_smart_skip_enabled and self._frames_processed_in_degraded > 0:
+            total_degraded_frames = self._frames_processed_in_degraded + self._frames_skipped_by_pattern
+            pattern_skip_rate = (self._frames_skipped_by_pattern / total_degraded_frames) * 100
+            smart_skip_info = f" | SmartSkip: {self._frames_skipped_by_pattern} frames (rate={pattern_skip_rate:.1f}% in degraded)"
+        
         logger.info(
             f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
             f"({input_utilization:.1f}% full, drops={input_drops}) | "
@@ -354,6 +367,7 @@ class BagCounterApp:
             f"({class_utilization:.1f}% full, drops={class_drops}) | "
             f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
             f"SkipCapBlocks: {self._skip_cap_blocks}"
+            f"{smart_skip_info}"
         )
         
         if input_utilization > self.QUEUE_WARNING_THRESHOLD:
@@ -438,9 +452,121 @@ class BagCounterApp:
                 f"[BagCounterApp] EXITING DEGRADED MODE: "
                 f"queue_util={queue_utilization:.1%}, system recovered"
             )
+            # Reset smart skip counters when exiting degraded mode
+            if tracking_config.degraded_mode_smart_skip_enabled:
+                self._smart_skip_frame_counter = 0
         
         self._degraded_mode_active = should_activate
         return self._degraded_mode_active
+    
+    def _should_smart_skip_frame(self, queue_utilization: float, active_events: list) -> Tuple[bool, str]:
+        """
+        Determine if current frame should be skipped using smart pattern-based logic.
+        
+        Smart skipping ensures:
+        - Events get minimum required frames for tracking
+        - Critical states are never skipped
+        - Skip pattern adapts to queue pressure
+        
+        Args:
+            queue_utilization: Current queue utilization (0.0 - 1.0)
+            active_events: List of currently active events
+            
+        Returns:
+            Tuple of (should_skip: bool, reason: str)
+        """
+        if not tracking_config.degraded_mode_smart_skip_enabled:
+            return (False, "smart_skip_disabled")
+        
+        if not self._degraded_mode_active:
+            return (False, "not_in_degraded_mode")
+        
+        # Check if we should skip when no active events
+        if len(active_events) == 0:
+            if tracking_config.degraded_mode_skip_with_active_events_only:
+                return (False, "no_active_events")
+        
+        # Check for critical states that should never be skipped
+        if tracking_config.degraded_mode_preserve_critical_states:
+            for event in active_events:
+                # Check for CLOSING state (critical for state transition)
+                if hasattr(event, 'state') and event.state == 'CLOSING':
+                    return (False, "event_in_closing_state")
+                
+                # Check for early OPEN state (critical for initial tracking)
+                if hasattr(event, 'state') and event.state == 'OPEN':
+                    event_id = getattr(event, 'event_id', None) or getattr(event, 'id', None)
+                    if event_id is not None:
+                        frames_for_this_event = self._event_frame_counts.get(event_id, 0)
+                        if frames_for_this_event < tracking_config.degraded_mode_critical_state_frame_threshold:
+                            return (False, f"event_{event_id}_early_open")
+        
+        # Check minimum frames per event requirement
+        for event in active_events:
+            event_id = getattr(event, 'event_id', None) or getattr(event, 'id', None)
+            if event_id is not None:
+                frames_for_this_event = self._event_frame_counts.get(event_id, 0)
+                if frames_for_this_event < tracking_config.degraded_mode_min_frames_per_event:
+                    # Don't skip - event needs more frames
+                    return (False, f"event_{event_id}_needs_frames")
+        
+        # Determine skip pattern based on configuration
+        skip_pattern = tracking_config.degraded_mode_skip_pattern
+        
+        # Increment frame counter
+        self._smart_skip_frame_counter += 1
+        
+        should_skip = False
+        reason = ""
+        
+        if skip_pattern == 'every_2nd':
+            # Skip every 2nd frame (50% reduction)
+            should_skip = (self._smart_skip_frame_counter % 2 == 0)
+            reason = "pattern_every_2nd"
+            
+        elif skip_pattern == 'every_3rd':
+            # Skip every 3rd frame (33% reduction)
+            should_skip = (self._smart_skip_frame_counter % 3 == 0)
+            reason = "pattern_every_3rd"
+            
+        elif skip_pattern == 'adaptive':
+            # Adaptive skip based on queue pressure
+            if queue_utilization < 0.5:
+                # Below 50%: no pattern skipping (rely on existing adaptive skip)
+                should_skip = False
+                reason = "adaptive_low_queue"
+                
+            elif queue_utilization < 0.7:
+                # 50-70%: skip every 3rd frame (mild load)
+                should_skip = (self._smart_skip_frame_counter % 3 == 0)
+                reason = "adaptive_every_3rd"
+                
+            elif queue_utilization < 0.85:
+                # 70-85%: skip every 2nd frame (moderate load)
+                should_skip = (self._smart_skip_frame_counter % 2 == 0)
+                reason = "adaptive_every_2nd"
+                
+            elif queue_utilization < 0.95:
+                # 85-95%: skip 2 out of 3 frames (heavy load)
+                should_skip = (self._smart_skip_frame_counter % 3 != 0)
+                reason = "adaptive_2_of_3"
+                
+            else:
+                # 95%+: skip 3 out of 4 frames (critical load)
+                should_skip = (self._smart_skip_frame_counter % 4 != 0)
+                reason = "adaptive_3_of_4"
+        
+        # Enforce max skip rate when events are active
+        if should_skip and len(active_events) > 0:
+            # Calculate what the skip rate would be
+            if self._frames_processed_in_degraded > 0:
+                current_pattern_skip_rate = self._frames_skipped_by_pattern / (
+                    self._frames_processed_in_degraded + self._frames_skipped_by_pattern
+                )
+                if current_pattern_skip_rate >= tracking_config.degraded_mode_max_skip_rate_with_events:
+                    return (False, "max_skip_rate_exceeded")
+        
+        return (should_skip, reason)
 
     # --- Snapshot helpers ---
     def _annotate_frame(self, frame, detections, label, conf, event_box=None):
@@ -868,27 +994,45 @@ class BagCounterApp:
                     
                     skip_rate_cap_exceeded = future_skip_rate > self.SKIP_RATE_CAP
                 
-                # Final skip decision
-                should_skip = adaptive_skip_conditions_met and not skip_rate_cap_exceeded
+                # Legacy adaptive skip decision
+                legacy_should_skip = adaptive_skip_conditions_met and not skip_rate_cap_exceeded
+                
+                # Smart pattern-based skip decision (in degraded mode)
+                smart_should_skip, smart_skip_reason = self._should_smart_skip_frame(
+                    queue_utilization, 
+                    self.monitor.active_events
+                )
+                
+                # Final skip decision: use smart skip if enabled and in degraded mode, otherwise legacy
+                if in_degraded_mode and tracking_config.degraded_mode_smart_skip_enabled:
+                    should_skip = smart_should_skip
+                    skip_reason = smart_skip_reason
+                else:
+                    should_skip = legacy_should_skip
+                    skip_reason = "critical_queue" if critical_queue_exceeded else ("proactive_bp" if proactive_backpressure else "adaptive")
                 
                 # Track skip decision for rate calculation
                 self._skip_decisions.append(1 if should_skip else 0)
                 
                 if should_skip:
                     self._frames_skipped += 1
+                    
+                    # Track smart skip statistics
+                    if smart_should_skip and in_degraded_mode:
+                        self._frames_skipped_by_pattern += 1
+                    
                     if self._frames_skipped % 10 == 0:
                         # Improved structured logging for adaptive skip
-                        skip_reason = "critical_queue" if critical_queue_exceeded else ("proactive_bp" if proactive_backpressure else "adaptive")
                         structured_logger.queue_backpressure(
                             queue_name='input_queue',
                             utilization=queue_utilization,
                             drops=self.input_queue_drops,
-                            action='adaptive_skip',
+                            action='smart_skip' if smart_should_skip else 'adaptive_skip',
                             avg_detection_time_ms=avg_detection_time,
                             frames_skipped=self._frames_skipped
                         )
                         logger.warning(
-                            f"[AdaptiveSkip] Frame skipped ({skip_reason}): "
+                            f"[{'SmartSkip' if smart_should_skip else 'AdaptiveSkip'}] Frame skipped ({skip_reason}): "
                             f"queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms "
                             f"(threshold={self.MAX_DETECTION_TIME_MS:.1f}ms), "
                             f"skip_rate={current_skip_rate:.1%}, total_skipped={self._frames_skipped}"
@@ -963,6 +1107,26 @@ class BagCounterApp:
                                                    {"frame_count": frame_count, "frame": frame})
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
+                
+                # Track frames processed in degraded mode for statistics
+                if in_degraded_mode:
+                    self._frames_processed_in_degraded += 1
+                
+                # Update event frame counts for smart skip logic
+                if tracking_config.degraded_mode_smart_skip_enabled:
+                    # Update counts for active events
+                    current_event_ids = set()
+                    for event in self.monitor.active_events:
+                        event_id = getattr(event, 'event_id', None) or getattr(event, 'id', None)
+                        if event_id is not None:
+                            current_event_ids.add(event_id)
+                            self._event_frame_counts[event_id] = self._event_frame_counts.get(event_id, 0) + 1
+                    
+                    # Clean up counts for events that are no longer active
+                    # Keep only current events to prevent memory growth
+                    events_to_remove = [eid for eid in self._event_frame_counts.keys() if eid not in current_event_ids]
+                    for eid in events_to_remove:
+                        del self._event_frame_counts[eid]
 
                 # 3. V3: Queue ready events for async classification (non-blocking)
                 enqueue_time = 0.0
@@ -1300,10 +1464,22 @@ class BagCounterApp:
         if len(self._skip_decisions) > 0:
             final_skip_rate = (sum(self._skip_decisions) / len(self._skip_decisions)) * 100
         
+        # Calculate smart skip statistics
+        smart_skip_stats = ""
+        if tracking_config.degraded_mode_smart_skip_enabled and self._frames_processed_in_degraded > 0:
+            total_degraded_frames = self._frames_processed_in_degraded + self._frames_skipped_by_pattern
+            pattern_skip_rate = (self._frames_skipped_by_pattern / total_degraded_frames) * 100
+            smart_skip_stats = (
+                f", smart_skip_frames={self._frames_skipped_by_pattern}, "
+                f"smart_skip_rate={pattern_skip_rate:.2f}%, "
+                f"frames_in_degraded={total_degraded_frames}"
+            )
+        
         logger.info(
             f"[BagCounterApp] Final Stats: "
             f"input_drops={input_drops}, classification_drops={class_drops}, "
             f"frames_skipped={self._frames_skipped}, skip_rate={final_skip_rate:.2f}%, "
             f"skip_cap_blocks={self._skip_cap_blocks}"
+            f"{smart_skip_stats}"
         )
         logger.info("[BagCounterApp] Shutdown complete")

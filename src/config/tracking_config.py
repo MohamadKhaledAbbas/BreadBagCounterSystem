@@ -532,6 +532,116 @@ class TrackingConfig:
     """
     
     # ============================================================================
+    # Smart Frame Skipping in Degraded Mode
+    # ============================================================================
+    
+    degraded_mode_smart_skip_enabled: bool = True
+    """
+    Enable smart pattern-based frame skipping in degraded mode.
+    
+    When True: Uses intelligent skip patterns (every 2nd/3rd frame) to reduce load
+              while ensuring events receive sufficient frames for tracking
+    When False: Uses legacy binary skip logic (all or nothing)
+    
+    Smart skipping ensures:
+    - Events get minimum required frames for detection/tracking
+    - Critical states (CLOSING, early OPEN) are never skipped
+    - Skip pattern adapts to queue pressure and active event count
+    
+    Default: True
+    """
+    
+    degraded_mode_skip_pattern: str = 'adaptive'
+    """
+    Frame skip pattern to use in degraded mode.
+    
+    Options:
+    - 'every_2nd': Skip every 2nd frame (50% reduction, processes 50% of frames)
+    - 'every_3rd': Skip every 3rd frame (33% reduction, processes 67% of frames)
+    - 'adaptive': Dynamically adjust based on queue pressure:
+        * 50-70% queue: skip every 3rd frame (mild load)
+        * 70-85% queue: skip every 2nd frame (moderate load)
+        * 85-95% queue: skip 2 out of 3 frames (heavy load)
+        * 95%+ queue: skip 3 out of 4 frames (critical load)
+    
+    Recommendation: Use 'adaptive' for production (best balance)
+    
+    Default: 'adaptive'
+    """
+    
+    degraded_mode_min_frames_per_event: int = 15
+    """
+    Minimum frames an event must receive for reliable tracking.
+    
+    Smart skipping ensures each event gets at least this many frames before
+    it can be committed or expired. This prevents skipping from breaking tracking.
+    
+    Range: 10 - 25 frames
+    - Lower values (10-12): More aggressive skipping, may affect tracking quality
+    - Higher values (20-25): Conservative, better tracking but less skip benefit
+    
+    Calculation basis:
+    - ghost_timeout_frames = 40 frames
+    - commit_idle_frames = 18 frames
+    - With 50% skip rate: 40 frames → 20 processed
+    - Minimum 15 frames ensures adequate state transitions
+    
+    Default: 15 (ensures reliable tracking with 50% skip rate)
+    """
+    
+    degraded_mode_skip_with_active_events_only: bool = False
+    """
+    Only apply smart skipping when active events exist.
+    
+    When True: No skipping when no events are active (preserve responsiveness)
+    When False: Always apply skip pattern in degraded mode (maximize throughput)
+    
+    Recommendation: False for production (consistent throughput)
+    
+    Default: False
+    """
+    
+    degraded_mode_preserve_critical_states: bool = True
+    """
+    Never skip frames when events are in critical states.
+    
+    When True: Processes all frames when any event is in CLOSING or early OPEN state
+    When False: Applies skip pattern regardless of event states
+    
+    Critical states:
+    - CLOSING: Bag is being tied, need continuous frames for state transition
+    - Early OPEN: First few frames of a new event, critical for association
+    
+    Default: True (ensures reliable state transitions)
+    """
+    
+    degraded_mode_critical_state_frame_threshold: int = 5
+    """
+    Number of frames to consider an OPEN event as "early" (critical).
+    
+    Events in OPEN state for fewer than this many frames are considered critical
+    and will prevent frame skipping.
+    
+    Range: 3 - 10 frames
+    
+    Default: 5 (ensures new events get good initial tracking)
+    """
+    
+    degraded_mode_max_skip_rate_with_events: float = 0.5
+    """
+    Maximum skip rate when active events exist.
+    
+    Limits how aggressively we skip when tracking is active.
+    Range: 0.3 - 0.6 (30% - 60%)
+    
+    Examples:
+    - 0.5: Skip at most 50% of frames (every 2nd frame)
+    - 0.33: Skip at most 33% of frames (every 3rd frame)
+    
+    Default: 0.5 (balanced throughput and tracking quality)
+    """
+    
+    # ============================================================================
     # V5: Event-Centric Tracking Parameters
     # ============================================================================
     # These parameters control the new event-centric tracking system that replaces
