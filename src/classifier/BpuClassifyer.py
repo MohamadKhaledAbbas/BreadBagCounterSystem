@@ -24,6 +24,10 @@ class BpuClassifier(BaseClassifier):
         self._class_names = class_names
         self.input_h, self.input_w = input_size
         self.model = None
+        
+        # Phase 3 Optimization: Pre-allocate NV12 buffer (saves memory allocation per call)
+        self.area = self.input_h * self.input_w
+        self.nv12_buffer = np.zeros((self.area * 3 // 2,), dtype=np.uint8)
 
         logger.info(f"[BpuClassifier] Class names: {class_names}")
 
@@ -69,36 +73,60 @@ class BpuClassifier(BaseClassifier):
         logger.debug(f"[BpuClassifier] Input image shape: {image.shape}, dtype: {image.dtype}")
 
         try:
+            # Phase 3: Add detailed timing logs for CPU operations
             # 1. Preprocess
+            t_preprocess_start = cv2.getTickCount()
             input_tensor = self._preprocess(image)
-            # logger.debug(f"[BpuClassifier] Preprocessed tensor shape: {input_tensor.shape}")
+            t_preprocess_end = cv2.getTickCount()
+            preprocess_time_ms = (t_preprocess_end - t_preprocess_start) * 1000 / cv2.getTickFrequency()
 
-            # 2.  Inference
-            t1 = cv2.getTickCount()
+            # 2. Inference (BPU)
+            t_inference_start = cv2.getTickCount()
             outputs = self.model[0].forward(input_tensor)
-            t2 = cv2.getTickCount()
-
-            latency = (t2 - t1) * 1000 / cv2.getTickFrequency()
-            # logger.debug(f"[BpuClassifier] Inference time: {latency:.2f}ms")
+            t_inference_end = cv2.getTickCount()
+            inference_time_ms = (t_inference_end - t_inference_start) * 1000 / cv2.getTickFrequency()
 
             # 3. Post-Process
+            t_postprocess_start = cv2.getTickCount()
             probs = outputs[0].buffer.flatten()
-
-            # logger.debug(f"[BpuClassifier] Raw probs shape: {probs.shape}, range: [{probs.min():.4f}, {probs.max():.4f}]")
 
             # Apply softmax if needed (raw logits instead of probabilities)
             if probs.max() > 1.0 or probs.min() < 0.0:
-                # logger.debug("[BpuClassifier] Applying softmax")
                 exp_scores = np.exp(probs - np.max(probs))
                 probs = exp_scores / np.sum(exp_scores)
 
             # Find max
             top_id = int(np.argmax(probs))
             confidence = float(probs[top_id])
-
             label = self._class_names.get(top_id, "Unknown")
-
-            # logger.info(f"[BpuClassifier] Result: {label} (conf={confidence:.3f}, id={top_id})")
+            t_postprocess_end = cv2.getTickCount()
+            postprocess_time_ms = (t_postprocess_end - t_postprocess_start) * 1000 / cv2.getTickFrequency()
+            
+            # Log timing every 50 classifications
+            if not hasattr(self, '_classify_counter'):
+                self._classify_counter = 0
+                self._classify_timing_sum = {'preprocess': 0, 'inference': 0, 'postprocess': 0}
+            
+            self._classify_counter += 1
+            self._classify_timing_sum['preprocess'] += preprocess_time_ms
+            self._classify_timing_sum['inference'] += inference_time_ms
+            self._classify_timing_sum['postprocess'] += postprocess_time_ms
+            
+            if self._classify_counter % 50 == 0:
+                avg_preprocess = self._classify_timing_sum['preprocess'] / 50
+                avg_inference = self._classify_timing_sum['inference'] / 50
+                avg_postprocess = self._classify_timing_sum['postprocess'] / 50
+                total_avg = avg_preprocess + avg_inference + avg_postprocess
+                
+                logger.info(
+                    f"[BpuClassifier] Avg timing (50 classifications): "
+                    f"preprocess={avg_preprocess:.2f}ms ({avg_preprocess/total_avg*100:.1f}%), "
+                    f"inference={avg_inference:.2f}ms ({avg_inference/total_avg*100:.1f}%), "
+                    f"postprocess={avg_postprocess:.2f}ms ({avg_postprocess/total_avg*100:.1f}%), "
+                    f"total={total_avg:.2f}ms"
+                )
+                # Reset counters
+                self._classify_timing_sum = {'preprocess': 0, 'inference': 0, 'postprocess': 0}
 
             return label, confidence
 
@@ -193,19 +221,25 @@ class BpuClassifier(BaseClassifier):
             return "Unknown", 0.0, {"Unknown": 1.0}
 
     def _preprocess(self, img):
-        resized = cv2.resize(img, (self.input_w, self.input_h))
+        # Phase 2 Optimization: Use INTER_NEAREST for faster resize (acceptable for classification)
+        resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_NEAREST)
         return self._bgr2nv12(resized)
 
     def _bgr2nv12(self, bgr_img):
+        """
+        Phase 3 Optimization: Optimized NV12 conversion using pre-allocated buffer.
+        """
         height, width = bgr_img.shape[:2]
-        area = height * width
 
-        yuv420p = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2YUV_I420).reshape((area * 3 // 2,))
-        y = yuv420p[:area]
-        uv_packed = yuv420p[area:].reshape((2, area // 4)).transpose((1, 0)).reshape((area // 2,))
+        yuv420p = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2YUV_I420).reshape((self.area * 3 // 2,))
+        
+        # Copy Y plane directly to pre-allocated buffer
+        self.nv12_buffer[:self.area] = yuv420p[:self.area]
+        
+        # Interleave UV directly into buffer
+        u_start = self.area
+        v_start = self.area + (self.area // 4)
+        self.nv12_buffer[self.area::2] = yuv420p[u_start: v_start]
+        self.nv12_buffer[self.area + 1::2] = yuv420p[v_start:]
 
-        nv12 = np.zeros_like(yuv420p)
-        nv12[:area] = y
-        nv12[area:] = uv_packed
-
-        return nv12
+        return self.nv12_buffer
