@@ -7,6 +7,7 @@ A production-grade computer vision system for counting bread bags on a conveyor 
 - **Real-time Bag Detection**: YOLO-based detection of open and closed bread bags
 - **Multi-class Classification**: Classifies bags by type (Whole Wheat, White, Bran, etc.)
 - **Event-based Tracking**: Robust event lifecycle management with state transitions
+- **Smart Frame Skipping**: Intelligent frame skipping in degraded mode that ensures events survive
 - **Production Logging**: Structured JSON logging for analysis and debugging
 - **Log Analysis Tool**: Windows-friendly log analyzer with HTML report generation
 
@@ -50,6 +51,8 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 
 ## Documentation
 
+- **[SMART_SKIP_QUICKSTART.md](SMART_SKIP_QUICKSTART.md)**: Quick start guide for smart frame skipping
+- **[SMART_FRAME_SKIPPING.md](SMART_FRAME_SKIPPING.md)**: Complete smart frame skipping documentation
 - **[AUDIT_REPORT.md](docs/AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
 - **[LOGGING_REFACTOR_SUMMARY.md](docs/LOGGING_REFACTOR_SUMMARY.md)**: Logging architecture overview
 - **[LOGGING_SAMPLES.md](docs/LOGGING_SAMPLES.md)**: Log format reference and debugging guide
