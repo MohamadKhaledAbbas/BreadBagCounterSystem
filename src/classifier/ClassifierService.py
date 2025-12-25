@@ -1062,6 +1062,9 @@ class ClassifierService:
             
             classify_time = (time.perf_counter() - batch_start) * 1000
             
+            # Initialize track-level disambiguation flag
+            track_disambiguation_applied = False
+            
             # Step 2: Accumulate evidence
             # V7: Choose between evidence accumulation path or legacy ratio-based path
             if self.evidence_accumulation_enabled:
@@ -1175,8 +1178,11 @@ class ClassifierService:
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = 'final label is uncertain'
                 elif track_disambiguation_applied and metadata.get('track_disambiguation', {}).get('confidence_tier') == 'low':
-                    # Track-level disambiguation set tier to low - keep it
-                    pass  # Already set above in disambiguation section
+                    # Track-level disambiguation already set tier to low in the disambiguation section
+                    # No need to override it here
+                    if 'track_confidence_tier' not in metadata:
+                        metadata['track_confidence_tier'] = 'low'
+                        metadata['track_confidence_tier_reason'] = f"track_disambiguation: {metadata.get('track_disambiguation', {}).get('disambiguation_reason', 'unknown')}"
                 else:
                     metadata['track_confidence_tier'] = 'high'
                     metadata['track_confidence_tier_reason'] = 'all checks passed'
@@ -1204,8 +1210,11 @@ class ClassifierService:
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = 'final label is uncertain'
                 elif track_disambiguation_applied and metadata.get('track_disambiguation', {}).get('confidence_tier') == 'low':
-                    # Track-level disambiguation set tier to low - keep it
-                    pass  # Already set above in disambiguation section
+                    # Track-level disambiguation already set tier to low in the disambiguation section
+                    # Ensure it's set if not already
+                    if 'track_confidence_tier' not in metadata:
+                        metadata['track_confidence_tier'] = 'low'
+                        metadata['track_confidence_tier_reason'] = f"track_disambiguation: {metadata.get('track_disambiguation', {}).get('disambiguation_reason', 'unknown')}"
                 else:
                     metadata['track_confidence_tier'] = 'high'
                     metadata['track_confidence_tier_reason'] = 'all checks passed'
@@ -1213,7 +1222,6 @@ class ClassifierService:
                 metadata['evidence_accumulation_used'] = False
             
             # NEW REFACTORED LOGIC: Check if final_label is a family label and needs disambiguation
-            track_disambiguation_applied = False
             if self.disambiguation_enabled and final_label not in ("Unknown", "Uncertain"):
                 if self._is_family_label(final_label):
                     logger.info(

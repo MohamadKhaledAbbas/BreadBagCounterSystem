@@ -44,6 +44,9 @@ from dataclasses import dataclass
 from typing import Dict, Any, Optional, List
 import unittest
 
+# Import the real disambiguation function for use in tests
+from src.classifier.disambiguation_v2 import disambiguate_v2
+
 
 # =============================================================================
 # Mock Configuration
@@ -109,9 +112,6 @@ class MockClassifierService:
         track_id: int
     ):
         """Simplified mock for track-level disambiguation."""
-        # Import the real function for testing
-        from src.classifier.disambiguation_v2 import disambiguate_v2
-        
         # Filter to closed ROIs only
         closed_candidates = [c for c in candidates if c.get('state') == 'closed']
         
