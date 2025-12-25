@@ -142,7 +142,7 @@ def validate_bbox(
     min_aspect_ratio = getattr(config, 'disambiguation_v2_min_aspect_ratio', 0.3)
     max_aspect_ratio = getattr(config, 'disambiguation_v2_max_aspect_ratio', 3.0)
     
-    aspect_ratio = width / height if height > 0 else float('inf')
+    aspect_ratio = width / height
     metadata['aspect_ratio'] = aspect_ratio
     
     if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
@@ -461,7 +461,8 @@ def disambiguate_v2(
         if context:
             track_id = context.get('track_id', 'N/A')
             frame_index = context.get('frame_index', 'N/A')
-            context_str = f"Track {track_id} Frame {frame_index}: "
+            roi_index = context.get('roi_index', 'N/A')
+            context_str = f"Track {track_id} Frame {frame_index} ROI {roi_index}: "
         
         logger.info(
             f"[Disambiguation V2] {context_str}"

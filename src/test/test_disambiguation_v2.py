@@ -592,7 +592,8 @@ if __name__ == '__main__':
             try:
                 test_instance = test_class()
                 test_method = getattr(test_instance, test_method_name)
-                test_method(config)
+                # Call test method with config as the fixture parameter
+                test_method(default_config_v2=config)
                 print(f"✓ {test_class.__name__}.{test_method_name}")
                 test_results['passed'] += 1
             except AssertionError as e:
