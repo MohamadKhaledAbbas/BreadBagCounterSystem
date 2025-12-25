@@ -220,7 +220,7 @@ class ClassifierService:
         bbox: Optional[Tuple[float, float, float, float]],
         is_open: bool = True,
         context: Optional[Dict[str, Any]] = None
-    ) -> Tuple[str, float, bool, str, Dict[str, Any]]:
+    ) -> Tuple[str, float, bool, str, str, Dict[str, Any]]:
         """
         Apply size-based disambiguation for visually similar classes.
         
@@ -228,6 +228,7 @@ class ClassifierService:
         between Brown_Orange_Overlay and Brown_Orange_Small.
         V7.1: Supports both V1 (legacy) and V2 (enhanced) disambiguation modules.
         Only processes CLOSED state ROIs (is_open=False).
+        V7.2: Returns confidence_tier for low-confidence flagging.
         
         Args:
             label: Original classifier label
@@ -237,10 +238,10 @@ class ClassifierService:
             context: Optional context dict with track_id, frame_index, etc.
             
         Returns:
-            Tuple of (final_label, final_confidence, was_disambiguated, reason, metadata)
+            Tuple of (final_label, final_confidence, was_disambiguated, reason, confidence_tier, metadata)
         """
         if not self.disambiguation_enabled or bbox is None:
-            return label, confidence, False, "disambiguation_skipped", {}
+            return label, confidence, False, "disambiguation_skipped", 'high', {}
         
         # Update statistics
         self._disambiguation_v2_stats['total_attempts'] += 1
@@ -286,7 +287,7 @@ class ClassifierService:
             # Track by reason
             self._disambiguation_v2_stats['by_reason'][result.reason] += 1
             
-            return result.label, result.confidence, result.disambiguated, result.reason, result.metadata
+            return result.label, result.confidence, result.disambiguated, result.reason, result.confidence_tier, result.metadata
         else:
             # Use legacy V1 module
             result = disambiguate_by_size(
@@ -297,7 +298,8 @@ class ClassifierService:
                 config=tracking_config
             )
             
-            return result.label, result.confidence, result.disambiguated, result.reason, {}
+            # V1 doesn't have confidence_tier, default to 'high'
+            return result.label, result.confidence, result.disambiguated, result.reason, 'high', {}
     
     def _compute_roi_trust(
         self,
@@ -875,6 +877,7 @@ class ClassifierService:
                 is_open = cand.get('state') == 'open'
                 disambiguated = False
                 disambiguation_reason = None
+                disambiguation_confidence_tier = 'high'
                 disambiguation_metadata = {}
                 if self.disambiguation_enabled:
                     if bbox is not None:
@@ -884,7 +887,7 @@ class ClassifierService:
                             'frame_index': cand.get('frame_index', 0),
                             'roi_index': idx
                         }
-                        label, conf, disambiguated, disambiguation_reason, disambiguation_metadata = self._apply_disambiguation(
+                        label, conf, disambiguated, disambiguation_reason, disambiguation_confidence_tier, disambiguation_metadata = self._apply_disambiguation(
                             label=label,
                             confidence=conf,
                             bbox=bbox,
@@ -943,6 +946,7 @@ class ClassifierService:
                     'is_open': is_open,
                     'disambiguated': disambiguated,
                     'disambiguation_reason': disambiguation_reason,
+                    'disambiguation_confidence_tier': disambiguation_confidence_tier,  # V7.2: Track confidence tier
                 })
             
             classify_time = (time.perf_counter() - batch_start) * 1000
@@ -971,6 +975,7 @@ class ClassifierService:
                     is_open = cand.get('state') == 'open'
                     disambiguated = False
                     disambiguation_reason = None
+                    disambiguation_confidence_tier = 'high'
                     disambiguation_metadata = {}
                     if self.disambiguation_enabled:
                         if bbox is not None:
@@ -980,7 +985,7 @@ class ClassifierService:
                                 'frame_index': cand.get('frame_index', 0),
                                 'roi_index': idx
                             }
-                            label, conf, disambiguated, disambiguation_reason, disambiguation_metadata = self._apply_disambiguation(
+                            label, conf, disambiguated, disambiguation_reason, disambiguation_confidence_tier, disambiguation_metadata = self._apply_disambiguation(
                                 label=label,
                                 confidence=conf,
                                 bbox=bbox,
@@ -989,7 +994,7 @@ class ClassifierService:
                             )
                             logger.info(
                                 f"[ClassifierService] Track {track_id}: cand {idx} disambig applied={disambiguated}, reason={disambiguation_reason}, "
-                                f"bbox={bbox}, is_open={is_open}, new_label={label}, new_conf={conf:.3f}"
+                                f"bbox={bbox}, is_open={is_open}, new_label={label}, new_conf={conf:.3f}, confidence_tier={disambiguation_confidence_tier}"
                             )
                         else:
                             logger.warning(
@@ -1059,6 +1064,7 @@ class ClassifierService:
                         'is_open': is_open,
                         'disambiguated': disambiguated,
                         'disambiguation_reason': disambiguation_reason,
+                        'disambiguation_confidence_tier': disambiguation_confidence_tier,  # V7.2: Track confidence tier
                         'original_label': original_label,  # Track original for metadata
                         'prob_adjustment': prob_adjustment_metadata,  # Include adjustment metadata
                     })
@@ -1106,6 +1112,25 @@ class ClassifierService:
                     metadata['disambiguation_applied'] = True
                     metadata['disambiguation_count'] = disambiguated_count
                 
+                # V7.2: Determine overall confidence_tier for track
+                # Track is 'low' confidence if:
+                # - Any ROI was marked as low confidence by disambiguation
+                # - The final result didn't pass the stability gate
+                # - Final label is Unknown or Uncertain
+                low_confidence_rois = sum(1 for c in classifications_with_probs if c.get('disambiguation_confidence_tier') == 'low')
+                if low_confidence_rois > 0:
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = f'{low_confidence_rois} ROIs flagged as low confidence'
+                elif not accumulator_result.gate_passed:
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = f'stability gate failed: {accumulator_result.gate_failure_reason}'
+                elif final_label in ('Unknown', 'Uncertain'):
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = 'final label is uncertain'
+                else:
+                    metadata['track_confidence_tier'] = 'high'
+                    metadata['track_confidence_tier_reason'] = 'all ROIs and gates passed'
+                
                 # Add probability adjustment stats
                 if prob_adjustment_count > 0:
                     metadata['probability_adjustment_applied'] = True
@@ -1147,6 +1172,21 @@ class ClassifierService:
                 if disambiguated_count > 0:
                     metadata['disambiguation_applied'] = True
                     metadata['disambiguation_count'] = disambiguated_count
+                
+                # V7.2: Determine overall confidence_tier for track (legacy path)
+                low_confidence_rois = sum(1 for c in classifications if c.get('disambiguation_confidence_tier') == 'low')
+                if low_confidence_rois > 0:
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = f'{low_confidence_rois} ROIs flagged as low confidence'
+                elif rejection_reason:
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = f'classification rejected: {rejection_reason}'
+                elif final_label in ('Unknown', 'Uncertain'):
+                    metadata['track_confidence_tier'] = 'low'
+                    metadata['track_confidence_tier_reason'] = 'final label is uncertain'
+                else:
+                    metadata['track_confidence_tier'] = 'high'
+                    metadata['track_confidence_tier_reason'] = 'all checks passed'
                 
                 metadata['evidence_accumulation_used'] = False
             
