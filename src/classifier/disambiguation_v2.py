@@ -71,6 +71,7 @@ class DisambiguationV2Result:
     confidence: float
     disambiguated: bool  # True if label was changed from original
     reason: str  # Human-readable explanation
+    confidence_tier: str = 'high'  # 'high' or 'low' - flagged as 'low' for gray zone/ambiguous results
     
     # Enhanced metadata for monitoring and debugging
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -82,6 +83,7 @@ class DisambiguationV2Result:
             'confidence': self.confidence,
             'disambiguated': self.disambiguated,
             'reason': self.reason,
+            'confidence_tier': self.confidence_tier,
             'metadata': self.metadata
         }
 
@@ -244,16 +246,20 @@ def resolve_gray_zone(
     confidence: float,
     size_bin_metadata: Dict[str, Any],
     config: Any,
-    target_classes: Tuple[str, str]
+    target_classes: Tuple[str, str],
+    family_name: str = 'Brown_Orange_Family'
 ) -> Tuple[str, str]:
     """
     Resolve classification in gray zone using configured strategy.
     
+    CRITICAL: Always returns a specific class, never a generic family label.
+    Gray zone results are always flagged as 'low' confidence in the caller.
+    
     Strategies:
-    - 'keep_original': Trust classifier's prediction (default)
+    - 'keep_original': Trust classifier's prediction, but use best match if it's a family label
     - 'prefer_small': Bias toward small class
     - 'prefer_regular': Bias toward regular class
-    - 'use_confidence': Use confidence to break ties (high conf keeps original, low conf → uncertain)
+    - 'use_confidence': Use confidence to break ties; pick best match for low confidence
     
     Args:
         original_label: Original classifier prediction
@@ -261,16 +267,30 @@ def resolve_gray_zone(
         size_bin_metadata: Metadata from size bin computation
         config: Configuration object
         target_classes: Tuple of (regular_class, small_class)
+        family_name: Generic family name to avoid in output
         
     Returns:
-        Tuple of (resolved_label, reason)
+        Tuple of (resolved_label, reason) - resolved_label is always a specific class
     """
     gray_zone_behavior = getattr(config, 'disambiguation_gray_zone_behavior', 'keep_original')
     regular_class, small_class = target_classes
     raw_area = size_bin_metadata.get('raw_area', 0)
     
+    # Helper: pick best match based on area (closer to midpoint = better)
+    def pick_best_match_by_area():
+        small_threshold = size_bin_metadata.get('thresholds', {}).get('small', 9000.0)
+        regular_threshold = size_bin_metadata.get('thresholds', {}).get('regular', 11000.0)
+        midpoint = (small_threshold + regular_threshold) / 2
+        # Closer to small threshold → small, closer to regular threshold → regular
+        if raw_area < midpoint:
+            return small_class
+        else:
+            return regular_class
+    
     if gray_zone_behavior == 'uncertain':
-        return "Uncertain", f"gray_zone_uncertain (area={raw_area:.0f})"
+        # CHANGED: Instead of returning "Uncertain", pick best match by area
+        best_match = pick_best_match_by_area()
+        return best_match, f"gray_zone_uncertain_resolved (area={raw_area:.0f}, picked={best_match})"
     
     elif gray_zone_behavior == 'prefer_small':
         return small_class, f"gray_zone_prefer_small (area={raw_area:.0f})"
@@ -282,12 +302,26 @@ def resolve_gray_zone(
         # Use confidence threshold to decide
         confidence_threshold = getattr(config, 'disambiguation_v2_gray_zone_confidence_threshold', 0.6)
         if confidence >= confidence_threshold:
-            return original_label, f"gray_zone_high_confidence (area={raw_area:.0f}, conf={confidence:.3f})"
+            # High confidence: trust classifier if it's a specific class, else pick best match
+            if original_label in target_classes:
+                return original_label, f"gray_zone_high_confidence (area={raw_area:.0f}, conf={confidence:.3f})"
+            else:
+                # Family label or other - pick best match
+                best_match = pick_best_match_by_area()
+                return best_match, f"gray_zone_high_confidence_resolved (area={raw_area:.0f}, conf={confidence:.3f}, picked={best_match})"
         else:
-            return "Uncertain", f"gray_zone_low_confidence (area={raw_area:.0f}, conf={confidence:.3f})"
+            # Low confidence: pick best match by area
+            best_match = pick_best_match_by_area()
+            return best_match, f"gray_zone_low_confidence_resolved (area={raw_area:.0f}, conf={confidence:.3f}, picked={best_match})"
     
     else:  # 'keep_original' or unknown strategy
-        return original_label, f"gray_zone_keep_original (area={raw_area:.0f})"
+        # If original is a specific target class, use it; else pick best match
+        if original_label in target_classes:
+            return original_label, f"gray_zone_keep_original (area={raw_area:.0f})"
+        else:
+            # Family label or other - pick best match
+            best_match = pick_best_match_by_area()
+            return best_match, f"gray_zone_keep_original_resolved (area={raw_area:.0f}, picked={best_match})"
 
 
 def disambiguate_v2(
@@ -453,6 +487,36 @@ def disambiguate_v2(
     metadata['final_label'] = final_label
     metadata['final_confidence'] = final_confidence
     
+    # Step 4.5: Determine confidence tier
+    # Mark as 'low' confidence for:
+    # - Gray zone results (ambiguous size)
+    # - Validation penalties applied
+    # - Label changed from original (disambiguation had to intervene)
+    # - Generic family label was originally detected (had to be resolved)
+    confidence_tier = 'high'  # Default
+    
+    # Gray zone always means low confidence
+    if size_bin == 'gray_zone':
+        confidence_tier = 'low'
+        metadata['confidence_tier_reason'] = 'gray_zone_ambiguous'
+    # Validation penalty means suspicious/low quality bbox
+    elif validation_result.penalty_applied > 0:
+        confidence_tier = 'low'
+        metadata['confidence_tier_reason'] = 'validation_penalty'
+    # Label changed means disambiguation had to override classifier
+    elif label_changed:
+        confidence_tier = 'low'
+        metadata['confidence_tier_reason'] = 'label_changed'
+    # Original was a family label (needed resolution)
+    elif original_label == family_name:
+        confidence_tier = 'low'
+        metadata['confidence_tier_reason'] = 'family_label_resolved'
+    else:
+        # High confidence: clear size bin + classifier agrees
+        metadata['confidence_tier_reason'] = 'clear_classification'
+    
+    metadata['confidence_tier'] = confidence_tier
+    
     # Step 5: Debug logging if enabled
     debug_logging = getattr(config, 'disambiguation_v2_debug_logging', False)
     
@@ -480,6 +544,7 @@ def disambiguate_v2(
         confidence=final_confidence,
         disambiguated=True,
         reason=reason,
+        confidence_tier=confidence_tier,
         metadata=metadata
     )
 

@@ -689,9 +689,16 @@ class BagCounterApp:
         conf = data.get("confidence", 1.0)
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
+        metadata = data.get("metadata", {})
 
-        # Determine confidence tier based on tracking_config threshold
-        confidence_tier = 'high' if conf >= tracking_config.high_confidence_threshold else 'low'
+        # V7.2: Determine confidence tier
+        # Priority:
+        # 1. Use track_confidence_tier from metadata if available (from disambiguation/evidence accumulator)
+        # 2. Fall back to threshold-based determination
+        confidence_tier = metadata.get('track_confidence_tier')
+        if not confidence_tier:
+            # Legacy fallback: use confidence threshold
+            confidence_tier = 'high' if conf >= tracking_config.high_confidence_threshold else 'low'
         
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf, confidence_tier)
