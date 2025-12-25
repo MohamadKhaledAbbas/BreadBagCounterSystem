@@ -213,6 +213,33 @@ class ClassifierService:
             )
             return "Unknown", 0.0, {"Unknown": 0.0}
     
+    def _is_family_label(self, label: str) -> bool:
+        """
+        Check if a label is a family/generic label that needs disambiguation.
+        
+        A label is considered a family label if it:
+        1. Matches the explicit family name (e.g., 'Brown_Orange_Family'), OR
+        2. Is one of the target classes that belong to a family (e.g., 'Brown_Orange_Overlay', 'Brown_Orange_Small')
+        
+        Args:
+            label: Classification label to check
+            
+        Returns:
+            True if label is a family label, False otherwise
+        """
+        # Check explicit family name
+        family_name = getattr(tracking_config, 'disambiguation_family_name', 'Brown_Orange_Family')
+        if label == family_name:
+            return True
+        
+        # Check if label is in the target classes (family members)
+        target_classes = getattr(tracking_config, 'disambiguation_classes', 
+                                 ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
+        if label in target_classes:
+            return True
+        
+        return False
+    
     def _apply_disambiguation(
         self, 
         label: str, 
@@ -300,6 +327,116 @@ class ClassifierService:
             
             # V1 doesn't have confidence_tier, default to 'high'
             return result.label, result.confidence, result.disambiguated, result.reason, 'high', {}
+    
+    def _disambiguate_track_family_label(
+        self,
+        final_label: str,
+        final_confidence: float,
+        candidates: List[Dict[str, Any]],
+        track_id: int
+    ) -> Tuple[str, float, str, Dict[str, Any]]:
+        """
+        Disambiguate a family label at track level using closed ROIs.
+        
+        This function is called AFTER track aggregation/voting determines a winner label
+        that is a family/generic type. It selects the best closed ROI and runs
+        disambiguate_v2 once to resolve to a specific subclass.
+        
+        Args:
+            final_label: The winning label from aggregation (should be a family label)
+            final_confidence: The confidence for the winning label
+            candidates: List of candidate ROI dicts with 'state', 'bbox', 'confidence', 'trust', etc.
+            track_id: Track ID for logging
+            
+        Returns:
+            Tuple of (resolved_label, resolved_confidence, confidence_tier, metadata)
+        """
+        # Filter to closed ROIs only
+        closed_candidates = [c for c in candidates if c.get('state') == 'closed']
+        
+        if not closed_candidates:
+            # No closed ROIs available - fallback to default subclass
+            # We use the first target class (typically the 'regular' variant like Overlay)
+            target_classes = getattr(tracking_config, 'disambiguation_classes', 
+                                     ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
+            fallback_label = target_classes[0]  # Default to first (regular) class
+            
+            logger.warning(
+                f"[ClassifierService] Track {track_id}: No closed ROIs available for family label '{final_label}', "
+                f"falling back to default subclass '{fallback_label}' with low confidence tier"
+            )
+            
+            return fallback_label, final_confidence, 'low', {
+                'disambiguation_applied': True,
+                'disambiguation_reason': 'no_closed_rois_fallback',
+                'original_family_label': final_label,
+                'fallback_used': True
+            }
+        
+        # Select best closed ROI by trust/confidence
+        # Prioritize: 1) trust score, 2) confidence, 3) sharpness
+        best_closed_roi = max(
+            closed_candidates,
+            key=lambda c: (c.get('trust', 0), c.get('confidence', 0), c.get('sharpness', 0))
+        )
+        
+        # Run disambiguation on best closed ROI
+        bbox = best_closed_roi.get('bbox')
+        if bbox is None:
+            # No bbox available - fallback
+            target_classes = getattr(tracking_config, 'disambiguation_classes', 
+                                     ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
+            fallback_label = target_classes[0]
+            
+            logger.warning(
+                f"[ClassifierService] Track {track_id}: Best closed ROI has no bbox for family label '{final_label}', "
+                f"falling back to default subclass '{fallback_label}' with low confidence tier"
+            )
+            
+            return fallback_label, final_confidence, 'low', {
+                'disambiguation_applied': True,
+                'disambiguation_reason': 'no_bbox_fallback',
+                'original_family_label': final_label,
+                'fallback_used': True
+            }
+        
+        # Create context for disambiguation
+        disamb_context = {
+            'track_id': track_id,
+            'frame_index': best_closed_roi.get('frame_index', 0),
+            'roi_index': -1,  # Track-level disambiguation
+            'track_level': True
+        }
+        
+        # Run disambiguation
+        resolved_label, resolved_conf, disambiguated, reason, confidence_tier, metadata = self._apply_disambiguation(
+            label=final_label,
+            confidence=final_confidence,
+            bbox=bbox,
+            is_open=False,  # Using closed ROI
+            context=disamb_context
+        )
+        
+        logger.info(
+            f"[ClassifierService] Track {track_id}: Disambiguated family label '{final_label}' -> '{resolved_label}' "
+            f"(conf={resolved_conf:.3f}, tier={confidence_tier}, reason={reason})"
+        )
+        
+        # Build metadata
+        track_disambiguation_metadata = {
+            'disambiguation_applied': True,
+            'disambiguation_reason': reason,
+            'original_family_label': final_label,
+            'resolved_label': resolved_label,
+            'resolved_confidence': resolved_conf,
+            'confidence_tier': confidence_tier,
+            'best_closed_roi_trust': best_closed_roi.get('trust', 0),
+            'best_closed_roi_confidence': best_closed_roi.get('confidence', 0),
+            'total_closed_rois': len(closed_candidates),
+            'disambiguation_metadata': metadata
+        }
+        
+        return resolved_label, resolved_conf, confidence_tier, track_disambiguation_metadata
     
     def _compute_roi_trust(
         self,
@@ -872,34 +1009,10 @@ class ClassifierService:
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
                 
-                # V7: Apply size-based disambiguation if enabled
+                # REFACTORED: NO per-ROI disambiguation - preserve raw classifier labels
+                # Disambiguation will be applied at track level after aggregation
                 bbox = cand.get('bbox')  # May be None if not available
                 is_open = cand.get('state') == 'open'
-                disambiguated = False
-                disambiguation_reason = None
-                disambiguation_confidence_tier = 'high'
-                disambiguation_metadata = {}
-                if self.disambiguation_enabled:
-                    if bbox is not None:
-                        # Create context for disambiguation
-                        disamb_context = {
-                            'track_id': track_id,
-                            'frame_index': cand.get('frame_index', 0),
-                            'roi_index': idx
-                        }
-                        label, conf, disambiguated, disambiguation_reason, disambiguation_confidence_tier, disambiguation_metadata = self._apply_disambiguation(
-                            label=label,
-                            confidence=conf,
-                            bbox=bbox,
-                            is_open=is_open,
-                            context=disamb_context
-                        )
-                    else:
-                        # Defensive logging when bbox is missing
-                        logger.warning(
-                            f"[ClassifierService] Track {track_id}: bbox missing for candidate {idx}, "
-                            f"disambiguation skipped"
-                        )
                 
                 # Calculate contribution for this candidate
                 sharpness = cand.get('sharpness', 0)
@@ -944,9 +1057,7 @@ class ClassifierService:
                     'relative_time': relative_time,
                     'trust': trust,  # V7: Include trust score
                     'is_open': is_open,
-                    'disambiguated': disambiguated,
-                    'disambiguation_reason': disambiguation_reason,
-                    'disambiguation_confidence_tier': disambiguation_confidence_tier,  # V7.2: Track confidence tier
+                    'bbox': bbox,  # Store bbox for potential track-level disambiguation
                 })
             
             classify_time = (time.perf_counter() - batch_start) * 1000
@@ -967,67 +1078,13 @@ class ClassifierService:
                     label, conf, probs = self._classify_single_with_probs(roi, idx)
                     logger.debug(f"[ClassifierService] Track {track_id}: cand {idx} raw label={label}, conf={conf:.3f}")
                     
-                    # Store original label before disambiguation
+                    # Store original label (no per-ROI disambiguation)
                     original_label = label
                     
-                    # Apply disambiguation if enabled
+                    # REFACTORED: NO per-ROI disambiguation in evidence accumulation path
+                    # Store raw labels and apply disambiguation at track level after voting
                     bbox = cand.get('bbox')
                     is_open = cand.get('state') == 'open'
-                    disambiguated = False
-                    disambiguation_reason = None
-                    disambiguation_confidence_tier = 'high'
-                    disambiguation_metadata = {}
-                    if self.disambiguation_enabled:
-                        if bbox is not None:
-                            # Create context for disambiguation
-                            disamb_context = {
-                                'track_id': track_id,
-                                'frame_index': cand.get('frame_index', 0),
-                                'roi_index': idx
-                            }
-                            label, conf, disambiguated, disambiguation_reason, disambiguation_confidence_tier, disambiguation_metadata = self._apply_disambiguation(
-                                label=label,
-                                confidence=conf,
-                                bbox=bbox,
-                                is_open=is_open,
-                                context=disamb_context
-                            )
-                            logger.info(
-                                f"[ClassifierService] Track {track_id}: cand {idx} disambig applied={disambiguated}, reason={disambiguation_reason}, "
-                                f"bbox={bbox}, is_open={is_open}, new_label={label}, new_conf={conf:.3f}, confidence_tier={disambiguation_confidence_tier}"
-                            )
-                        else:
-                            logger.warning(
-                                f"[ClassifierService] Track {track_id}: bbox missing for candidate {idx}, "
-                                f"disambiguation skipped in evidence path"
-                            )
-                    
-                    # NEW: Apply probability adjustment if disambiguation changed the label
-                    prob_adjustment_metadata = None
-                    if disambiguated and original_label != label:
-                        # Get family classes from config
-                        family_classes = list(tracking_config.disambiguation_classes) if hasattr(tracking_config, 'disambiguation_classes') else None
-                        
-                        # Apply probability mass transfer
-                        adjusted_probs, prob_adjustment_metadata = apply_probability_adjustment(
-                            original_probs=probs,
-                            from_label=original_label,
-                            to_label=label,
-                            family_classes=family_classes,
-                            config=tracking_config
-                        )
-                        
-                        # Replace probs with adjusted probs
-                        probs = adjusted_probs
-                        prob_adjustment_count += 1
-                        
-                        # Log the adjustment (only if debug enabled)
-                        if getattr(tracking_config, 'prob_adjustment_debug_logging', False):
-                            logger.info(
-                                f"[ClassifierService] Track {track_id} ROI {idx}: "
-                                f"Applied prob adjustment {original_label}->{label}, "
-                                f"transferred={prob_adjustment_metadata.get('mass_transferred', 0):.3f}"
-                            )
                     
                     # Compute trust
                     sharpness = cand.get('sharpness', 0)
@@ -1052,7 +1109,7 @@ class ClassifierService:
                     state = 'open' if is_open else 'closed'
                     
                     classifications_with_probs.append({
-                        'probs': probs,  # Now potentially adjusted probs
+                        'probs': probs,
                         'trust': trust,
                         'state': state,
                         'label': label,
@@ -1062,11 +1119,8 @@ class ClassifierService:
                         'frame_index': cand.get('frame_index', 0),
                         'relative_time': cand.get('relative_time', 0.5),
                         'is_open': is_open,
-                        'disambiguated': disambiguated,
-                        'disambiguation_reason': disambiguation_reason,
-                        'disambiguation_confidence_tier': disambiguation_confidence_tier,  # V7.2: Track confidence tier
+                        'bbox': bbox,  # Store bbox for track-level disambiguation
                         'original_label': original_label,  # Track original for metadata
-                        'prob_adjustment': prob_adjustment_metadata,  # Include adjustment metadata
                     })
                 
                 # Use accumulate_track_evidence convenience function
@@ -1106,56 +1160,29 @@ class ClassifierService:
                     "evidence_accumulation_used": True
                 }
                 
-                # Add disambiguation stats
-                disambiguated_count = sum(1 for c in classifications_with_probs if c.get('disambiguated', False))
-                if disambiguated_count > 0:
-                    metadata['disambiguation_applied'] = True
-                    metadata['disambiguation_count'] = disambiguated_count
+                # Removed old per-ROI disambiguation stats - now using track-level disambiguation
+                # Track-level disambiguation metadata is added in the track_disambiguation section above
                 
                 # V7.2: Determine overall confidence_tier for track
                 # Track is 'low' confidence if:
-                # - Any ROI was marked as low confidence by disambiguation
                 # - The final result didn't pass the stability gate
                 # - Final label is Unknown or Uncertain
-                low_confidence_rois = sum(1 for c in classifications_with_probs if c.get('disambiguation_confidence_tier') == 'low')
-                if low_confidence_rois > 0:
-                    metadata['track_confidence_tier'] = 'low'
-                    metadata['track_confidence_tier_reason'] = f'{low_confidence_rois} ROIs flagged as low confidence'
-                elif not accumulator_result.gate_passed:
+                # - Track-level disambiguation flagged it as low
+                if not accumulator_result.gate_passed:
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = f'stability gate failed: {accumulator_result.gate_failure_reason}'
                 elif final_label in ('Unknown', 'Uncertain'):
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = 'final label is uncertain'
+                elif track_disambiguation_applied and metadata.get('track_disambiguation', {}).get('confidence_tier') == 'low':
+                    # Track-level disambiguation set tier to low - keep it
+                    pass  # Already set above in disambiguation section
                 else:
                     metadata['track_confidence_tier'] = 'high'
-                    metadata['track_confidence_tier_reason'] = 'all ROIs and gates passed'
+                    metadata['track_confidence_tier_reason'] = 'all checks passed'
                 
-                # Add probability adjustment stats
-                if prob_adjustment_count > 0:
-                    metadata['probability_adjustment_applied'] = True
-                    metadata['probability_adjustment_count'] = prob_adjustment_count
-                    
-                    # Collect detailed adjustment info for the first few adjustments
-                    adjustment_details = []
-                    for c in classifications_with_probs:
-                        adj = c.get('prob_adjustment')
-                        if adj and adj.get('applied'):
-                            adjustment_details.append({
-                                'from_label': adj['from_label'],
-                                'to_label': adj['to_label'],
-                                'mass_transferred': round(adj['mass_transferred'], 4),
-                                'before_from': round(adj['before_from'], 4),
-                                'before_to': round(adj['before_to'], 4),
-                                'after_from': round(adj['after_from'], 4),
-                                'after_to': round(adj['after_to'], 4),
-                                'reason': adj['reason']
-                            })
-                            if len(adjustment_details) >= 3:  # Limit to first 3 for logging size
-                                break
-                    
-                    if adjustment_details:
-                        metadata['probability_adjustment_samples'] = adjustment_details
+                # Remove old probability adjustment stats since we're not doing per-ROI disambiguation
+                # Probability adjustments are no longer needed with track-level disambiguation
                 
             else:
                 # LEGACY PATH: Ratio-based evidence accumulation
@@ -1167,28 +1194,63 @@ class ClassifierService:
                     evidence, event_stats
                 )
                 
-                # V7: Add disambiguation stats to metadata
-                disambiguated_count = sum(1 for c in classifications if c.get('disambiguated', False))
-                if disambiguated_count > 0:
-                    metadata['disambiguation_applied'] = True
-                    metadata['disambiguation_count'] = disambiguated_count
+                # Removed old per-ROI disambiguation stats - now using track-level disambiguation
                 
                 # V7.2: Determine overall confidence_tier for track (legacy path)
-                low_confidence_rois = sum(1 for c in classifications if c.get('disambiguation_confidence_tier') == 'low')
-                if low_confidence_rois > 0:
-                    metadata['track_confidence_tier'] = 'low'
-                    metadata['track_confidence_tier_reason'] = f'{low_confidence_rois} ROIs flagged as low confidence'
-                elif rejection_reason:
+                if rejection_reason:
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = f'classification rejected: {rejection_reason}'
                 elif final_label in ('Unknown', 'Uncertain'):
                     metadata['track_confidence_tier'] = 'low'
                     metadata['track_confidence_tier_reason'] = 'final label is uncertain'
+                elif track_disambiguation_applied and metadata.get('track_disambiguation', {}).get('confidence_tier') == 'low':
+                    # Track-level disambiguation set tier to low - keep it
+                    pass  # Already set above in disambiguation section
                 else:
                     metadata['track_confidence_tier'] = 'high'
                     metadata['track_confidence_tier_reason'] = 'all checks passed'
                 
                 metadata['evidence_accumulation_used'] = False
+            
+            # NEW REFACTORED LOGIC: Check if final_label is a family label and needs disambiguation
+            track_disambiguation_applied = False
+            if self.disambiguation_enabled and final_label not in ("Unknown", "Uncertain"):
+                if self._is_family_label(final_label):
+                    logger.info(
+                        f"[ClassifierService] Track {track_id}: Winner label '{final_label}' is a family label, "
+                        f"applying track-level disambiguation"
+                    )
+                    
+                    # Disambiguate at track level using closed ROIs
+                    # Use classifications_with_probs if available (evidence path), else classifications (legacy path)
+                    candidates_for_disambiguation = classifications_with_probs if self.evidence_accumulation_enabled else classifications
+                    
+                    resolved_label, resolved_conf, resolved_tier, track_disamb_metadata = self._disambiguate_track_family_label(
+                        final_label=final_label,
+                        final_confidence=final_conf,
+                        candidates=candidates_for_disambiguation,
+                        track_id=track_id
+                    )
+                    
+                    # Update final label and confidence
+                    original_family_label = final_label
+                    final_label = resolved_label
+                    final_conf = resolved_conf
+                    track_disambiguation_applied = True
+                    
+                    # Update metadata
+                    metadata['track_disambiguation'] = track_disamb_metadata
+                    metadata['original_family_label'] = original_family_label
+                    
+                    # Update confidence tier if disambiguation produced low tier
+                    if resolved_tier == 'low':
+                        metadata['track_confidence_tier'] = 'low'
+                        metadata['track_confidence_tier_reason'] = f"track_disambiguation: {track_disamb_metadata.get('disambiguation_reason', 'unknown')}"
+                    
+                    logger.info(
+                        f"[ClassifierService] Track {track_id}: Track-level disambiguation complete: "
+                        f"{original_family_label} -> {final_label} (conf={final_conf:.3f}, tier={resolved_tier})"
+                    )
             
             # Step 3.5: Apply classification smoothing (V5)
             # Only smooth non-Unknown and non-Uncertain classifications
