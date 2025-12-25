@@ -11,9 +11,47 @@ Tests cover:
 7. Context tracking
 
 Run with: python -m pytest src/test/test_disambiguation_v2.py -v
+(Or run directly if pytest not installed: python src/test/test_disambiguation_v2.py)
 """
 
-import pytest
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+# Handle pytest import gracefully
+try:
+    import pytest
+    PYTEST_AVAILABLE = True
+except ImportError:
+    print("Warning: pytest not installed. Running in standalone mode.")
+    PYTEST_AVAILABLE = False
+    # Mock pytest decorators
+    class pytest:
+        @staticmethod
+        def fixture(func):
+            return func
+        
+        class mark:
+            @staticmethod
+            def parametrize(argnames, argvalues):
+                def decorator(func):
+                    return func
+                return decorator
+        
+        @staticmethod
+        def approx(value, rel=None):
+            """Mock pytest.approx for standalone mode."""
+            class Approx:
+                def __init__(self, expected, rel):
+                    self.expected = expected
+                    self.rel = rel if rel is not None else 1e-6
+                
+                def __eq__(self, actual):
+                    return abs(actual - self.expected) <= abs(self.expected * self.rel)
+            return Approx(value, rel)
+
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 
@@ -536,4 +574,79 @@ class TestBatchDisambiguationV2:
 # =============================================================================
 
 if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+    if PYTEST_AVAILABLE:
+        pytest.main([__file__, '-v'])
+    else:
+        # Standalone mode - run tests manually
+        print("\n" + "="*80)
+        print("Running Disambiguation V2 Tests (Standalone Mode)")
+        print("="*80 + "\n")
+        
+        # Create config
+        config = MockConfigV2()
+        
+        # Track results
+        test_results = {'passed': 0, 'failed': 0}
+        
+        def run_test(test_class, test_method_name):
+            try:
+                test_instance = test_class()
+                test_method = getattr(test_instance, test_method_name)
+                test_method(config)
+                print(f"✓ {test_class.__name__}.{test_method_name}")
+                test_results['passed'] += 1
+            except AssertionError as e:
+                print(f"✗ {test_class.__name__}.{test_method_name}: {e}")
+                test_results['failed'] += 1
+            except Exception as e:
+                print(f"✗ {test_class.__name__}.{test_method_name}: {type(e).__name__}: {e}")
+                test_results['failed'] += 1
+        
+        # Run all tests
+        print("\n--- Bbox Validation Tests ---")
+        run_test(TestBboxValidation, 'test_valid_bbox')
+        run_test(TestBboxValidation, 'test_degenerate_bbox_negative_width')
+        run_test(TestBboxValidation, 'test_degenerate_bbox_zero_height')
+        run_test(TestBboxValidation, 'test_suspicious_aspect_ratio_too_narrow')
+        run_test(TestBboxValidation, 'test_suspicious_aspect_ratio_too_wide')
+        run_test(TestBboxValidation, 'test_unrealistically_small_area')
+        run_test(TestBboxValidation, 'test_unrealistically_large_area')
+        
+        print("\n--- Size Bin Tests ---")
+        run_test(TestSizeBinComputation, 'test_very_small_bin')
+        run_test(TestSizeBinComputation, 'test_small_bin')
+        run_test(TestSizeBinComputation, 'test_gray_zone_bin')
+        run_test(TestSizeBinComputation, 'test_regular_bin')
+        run_test(TestSizeBinComputation, 'test_large_bin')
+        
+        print("\n--- Gray Zone Resolution Tests ---")
+        run_test(TestGrayZoneResolution, 'test_keep_original_strategy')
+        run_test(TestGrayZoneResolution, 'test_uncertain_strategy')
+        run_test(TestGrayZoneResolution, 'test_prefer_small_strategy')
+        run_test(TestGrayZoneResolution, 'test_prefer_regular_strategy')
+        run_test(TestGrayZoneResolution, 'test_use_confidence_high_conf')
+        run_test(TestGrayZoneResolution, 'test_use_confidence_low_conf')
+        
+        print("\n--- Main Disambiguation V2 Tests ---")
+        run_test(TestDisambiguationV2, 'test_disabled_v2_returns_original')
+        run_test(TestDisambiguationV2, 'test_skip_open_state')
+        run_test(TestDisambiguationV2, 'test_skip_non_target_family')
+        run_test(TestDisambiguationV2, 'test_validation_failure_skips_disambiguation')
+        run_test(TestDisambiguationV2, 'test_very_small_area_to_small_class')
+        run_test(TestDisambiguationV2, 'test_large_area_to_overlay_class')
+        run_test(TestDisambiguationV2, 'test_gray_zone_keeps_original_by_default')
+        run_test(TestDisambiguationV2, 'test_confidence_penalty_on_label_change')
+        run_test(TestDisambiguationV2, 'test_no_penalty_when_label_unchanged')
+        run_test(TestDisambiguationV2, 'test_validation_penalty_applied')
+        run_test(TestDisambiguationV2, 'test_context_included_in_metadata')
+        run_test(TestDisambiguationV2, 'test_family_name_recognition')
+        
+        print("\n--- Batch Disambiguation Tests ---")
+        run_test(TestBatchDisambiguationV2, 'test_batch_with_mixed_results')
+        
+        # Summary
+        print("\n" + "="*80)
+        print(f"Test Results: {test_results['passed']} passed, {test_results['failed']} failed")
+        print("="*80)
+        
+        sys.exit(0 if test_results['failed'] == 0 else 1)
