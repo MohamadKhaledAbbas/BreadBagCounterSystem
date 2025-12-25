@@ -38,6 +38,7 @@ from src.utils.PipelineMetrics import pipeline_metrics
 
 # V7: Import new reliability modules
 from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
+from src.classifier.disambiguation_v2 import disambiguate_v2, DisambiguationV2Result
 from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
 from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 from src.classifier.probability_adjustments import apply_probability_adjustment, validate_probability_vector
@@ -121,13 +122,29 @@ class ClassifierService:
         
         # V7: Classification reliability improvements
         self.disambiguation_enabled = tracking_config.disambiguation_enabled
+        self.disambiguation_v2_enabled = tracking_config.disambiguation_v2_enabled
         self.evidence_accumulation_enabled = tracking_config.evidence_accumulation_enabled
         self.evidence_top_k = tracking_config.evidence_top_k_rois
+        
+        # V7.1: Disambiguation V2 statistics
+        self._disambiguation_v2_stats = {
+            'total_attempts': 0,
+            'applied': 0,
+            'skipped_open_state': 0,
+            'skipped_not_family': 0,
+            'validation_failed': 0,
+            'label_changed': 0,
+            'by_size_bin': defaultdict(int),
+            'by_reason': defaultdict(int),
+            'confidence_penalty_applied': 0,
+        }
         
         # Log V7 configuration
         v7_status = []
         if self.disambiguation_enabled:
             v7_status.append("disambiguation=ON")
+        if self.disambiguation_v2_enabled:
+            v7_status.append("disambiguation_v2=ON")
         if self.evidence_accumulation_enabled:
             v7_status.append("evidence_accumulation=ON")
         v7_str = ", ".join(v7_status) if v7_status else "disabled"
@@ -201,13 +218,15 @@ class ClassifierService:
         label: str, 
         confidence: float, 
         bbox: Optional[Tuple[float, float, float, float]],
-        is_open: bool = True
-    ) -> Tuple[str, float, bool, str]:
+        is_open: bool = True,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, float, bool, str, Dict[str, Any]]:
         """
         Apply size-based disambiguation for visually similar classes.
         
         V7: Uses raw bounding box area to disambiguate
         between Brown_Orange_Overlay and Brown_Orange_Small.
+        V7.1: Supports both V1 (legacy) and V2 (enhanced) disambiguation modules.
         Only processes CLOSED state ROIs (is_open=False).
         
         Args:
@@ -215,22 +234,70 @@ class ClassifierService:
             confidence: Original confidence
             bbox: Bounding box (x1, y1, x2, y2) if available
             is_open: Whether the ROI is in open state (True) or closed state (False)
+            context: Optional context dict with track_id, frame_index, etc.
             
         Returns:
-            Tuple of (final_label, final_confidence, was_disambiguated, reason)
+            Tuple of (final_label, final_confidence, was_disambiguated, reason, metadata)
         """
         if not self.disambiguation_enabled or bbox is None:
-            return label, confidence, False, "disambiguation_skipped"
+            return label, confidence, False, "disambiguation_skipped", {}
         
-        result = disambiguate_by_size(
-            original_label=label,
-            confidence=confidence,
-            bbox=bbox,
-            is_open=is_open,
-            config=tracking_config
-        )
+        # Update statistics
+        self._disambiguation_v2_stats['total_attempts'] += 1
         
-        return result.label, result.confidence, result.disambiguated, result.reason
+        # Choose V2 or V1 based on configuration
+        if self.disambiguation_v2_enabled:
+            # Use enhanced V2 module
+            result = disambiguate_v2(
+                original_label=label,
+                confidence=confidence,
+                bbox=bbox,
+                is_open=is_open,
+                config=tracking_config,
+                context=context
+            )
+            
+            # Update V2 statistics
+            if result.disambiguated:
+                self._disambiguation_v2_stats['applied'] += 1
+                
+                # Track by size bin if available
+                size_bin = result.metadata.get('size_bin')
+                if size_bin:
+                    self._disambiguation_v2_stats['by_size_bin'][size_bin] += 1
+                
+                # Track if label changed
+                if result.metadata.get('label_changed'):
+                    self._disambiguation_v2_stats['label_changed'] += 1
+                
+                # Track confidence penalty
+                if result.metadata.get('confidence_penalty_applied'):
+                    self._disambiguation_v2_stats['confidence_penalty_applied'] += 1
+            else:
+                # Track skip reasons
+                skip_reason = result.reason
+                if 'open_state' in skip_reason:
+                    self._disambiguation_v2_stats['skipped_open_state'] += 1
+                elif 'not_target_family' in skip_reason:
+                    self._disambiguation_v2_stats['skipped_not_family'] += 1
+                elif 'validation_failed' in skip_reason:
+                    self._disambiguation_v2_stats['validation_failed'] += 1
+            
+            # Track by reason
+            self._disambiguation_v2_stats['by_reason'][result.reason] += 1
+            
+            return result.label, result.confidence, result.disambiguated, result.reason, result.metadata
+        else:
+            # Use legacy V1 module
+            result = disambiguate_by_size(
+                original_label=label,
+                confidence=confidence,
+                bbox=bbox,
+                is_open=is_open,
+                config=tracking_config
+            )
+            
+            return result.label, result.confidence, result.disambiguated, result.reason, {}
     
     def _compute_roi_trust(
         self,
@@ -808,13 +875,21 @@ class ClassifierService:
                 is_open = cand.get('state') == 'open'
                 disambiguated = False
                 disambiguation_reason = None
+                disambiguation_metadata = {}
                 if self.disambiguation_enabled:
                     if bbox is not None:
-                        label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
+                        # Create context for disambiguation
+                        disamb_context = {
+                            'track_id': track_id,
+                            'frame_index': cand.get('frame_index', 0),
+                            'roi_index': idx
+                        }
+                        label, conf, disambiguated, disambiguation_reason, disambiguation_metadata = self._apply_disambiguation(
                             label=label,
                             confidence=conf,
                             bbox=bbox,
-                            is_open=is_open
+                            is_open=is_open,
+                            context=disamb_context
                         )
                     else:
                         # Defensive logging when bbox is missing
@@ -896,13 +971,21 @@ class ClassifierService:
                     is_open = cand.get('state') == 'open'
                     disambiguated = False
                     disambiguation_reason = None
+                    disambiguation_metadata = {}
                     if self.disambiguation_enabled:
                         if bbox is not None:
-                            label, conf, disambiguated, disambiguation_reason = self._apply_disambiguation(
+                            # Create context for disambiguation
+                            disamb_context = {
+                                'track_id': track_id,
+                                'frame_index': cand.get('frame_index', 0),
+                                'roi_index': idx
+                            }
+                            label, conf, disambiguated, disambiguation_reason, disambiguation_metadata = self._apply_disambiguation(
                                 label=label,
                                 confidence=conf,
                                 bbox=bbox,
-                                is_open=is_open
+                                is_open=is_open,
+                                context=disamb_context
                             )
                             logger.info(
                                 f"[ClassifierService] Track {track_id}: cand {idx} disambig applied={disambiguated}, reason={disambiguation_reason}, "
@@ -1356,5 +1439,18 @@ class ClassifierService:
                 "tracks_analyzed": len(self._track_label_history),
                 "avg_volatility": avg_volatility,
                 "high_volatility_tracks": high_volatility_count,
+            },
+            # V7.1: Disambiguation V2 statistics
+            "disambiguation_v2": {
+                "enabled": self.disambiguation_v2_enabled,
+                "total_attempts": self._disambiguation_v2_stats['total_attempts'],
+                "applied": self._disambiguation_v2_stats['applied'],
+                "skipped_open_state": self._disambiguation_v2_stats['skipped_open_state'],
+                "skipped_not_family": self._disambiguation_v2_stats['skipped_not_family'],
+                "validation_failed": self._disambiguation_v2_stats['validation_failed'],
+                "label_changed": self._disambiguation_v2_stats['label_changed'],
+                "confidence_penalty_applied": self._disambiguation_v2_stats['confidence_penalty_applied'],
+                "by_size_bin": dict(self._disambiguation_v2_stats['by_size_bin']),
+                "by_reason": dict(self._disambiguation_v2_stats['by_reason']),
             },
         }
