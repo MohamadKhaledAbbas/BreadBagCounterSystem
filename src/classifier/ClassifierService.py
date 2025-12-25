@@ -1008,7 +1008,10 @@ class ClassifierService:
             for idx, cand in enumerate(candidates):
                 roi = cand['roi']
                 label, conf = self._classify_single(roi, idx)
-                
+
+                # For testing only, can uncomment for testing.
+                # self._save_roi_for_test(roi, label)
+
                 # REFACTORED: NO per-ROI disambiguation - preserve raw classifier labels
                 # Disambiguation will be applied at track level after aggregation
                 bbox = cand.get('bbox')  # May be None if not available
@@ -1439,6 +1442,24 @@ class ClassifierService:
                 cb(track_id, result_data)
             except Exception as e:
                 logger.error(f"[ClassifierService] Callback error: {e}")
+
+    def _save_roi_for_test(self, roi: Any, label: str):
+        if not hasattr(self, "roi_counter_for_test"):
+            self.roi_counter_for_test = 0
+
+        self.roi_counter_for_test += 1
+        if label == "Unknown":
+            # For Unknown, use a single directory instead of per-phash directories
+            target_dir = os.path.join(self.data_root, "saved_rois", "unknown")
+        else:
+            target_dir = os.path.join(self.data_root, "saved_rois", "classes", label)
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        timestamp = int(time.time())
+        filename = f"{timestamp}_{self.roi_counter_for_test}.jpg"
+        save_path = os.path.join(target_dir, filename)
+        cv2.imwrite(save_path, roi)
 
     def _save_and_callback(self, track_id: int, best_roi: Any, label: str, 
                            confidence: float, candidates_count: int,

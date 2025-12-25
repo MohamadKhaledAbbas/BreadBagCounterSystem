@@ -1616,7 +1616,7 @@ class TrackingConfig:
     Default: False
     """
     
-    disambiguation_confidence_penalty: float = _parse_float_env("DISAMBIGUATION_CONFIDENCE_PENALTY", 0.9)
+    disambiguation_confidence_penalty: float = _parse_float_env("DISAMBIGUATION_CONFIDENCE_PENALTY", 0.8)
     """
     Confidence multiplier applied when disambiguation overrides the classifier.
     

@@ -425,13 +425,9 @@ def disambiguate_v2(
             reason=f"validation_failed: {validation_result.reason}",
             metadata=metadata
         )
-    
+
     # Apply validation penalty if any
     current_confidence = confidence
-    if validation_result.penalty_applied > 0:
-        current_confidence = confidence * (1.0 - validation_result.penalty_applied)
-        metadata['validation_penalty'] = validation_result.penalty_applied
-        metadata['confidence_after_validation'] = current_confidence
     
     # Step 2: Compute size bin
     x1, y1, x2, y2 = bbox
@@ -472,21 +468,7 @@ def disambiguate_v2(
     metadata['label_changed'] = label_changed
     
     confidence_penalty = getattr(config, 'disambiguation_confidence_penalty', 0.9)
-    penalty_on_change_only = getattr(config, 'disambiguation_penalty_on_change_only', False)
-    
-    should_apply_penalty = not penalty_on_change_only or label_changed
-    
-    if should_apply_penalty:
-        final_confidence = current_confidence * confidence_penalty
-        metadata['confidence_penalty_applied'] = True
-        metadata['confidence_penalty_value'] = confidence_penalty
-    else:
-        final_confidence = current_confidence
-        metadata['confidence_penalty_applied'] = False
-    
-    metadata['final_label'] = final_label
-    metadata['final_confidence'] = final_confidence
-    
+
     # Step 4.5: Determine confidence tier
     # Mark as 'low' confidence for:
     # - Gray zone results (ambiguous size)
@@ -494,29 +476,34 @@ def disambiguate_v2(
     # - Label changed from original (disambiguation had to intervene)
     # - Generic family label was originally detected (had to be resolved)
     confidence_tier = 'high'  # Default
-    
-    # Gray zone always means low confidence
-    if size_bin == 'gray_zone':
+
+    # Step 4: Decide if penalty should be applied
+    final_confidence = confidence
+    confidence_tier = 'high'  # default
+    metadata['confidence_penalty_applied'] = False
+    metadata['confidence_tier_reason'] = 'clear_classification'
+
+    # ROI validation: penalty if needed
+    if validation_result.penalty_applied > 0:
+        final_confidence *= (1.0 - validation_result.penalty_applied)
         confidence_tier = 'low'
-        metadata['confidence_tier_reason'] = 'gray_zone_ambiguous'
-    # Validation penalty means suspicious/low quality bbox
-    elif validation_result.penalty_applied > 0:
-        confidence_tier = 'low'
+        metadata['confidence_penalty_applied'] = True
         metadata['confidence_tier_reason'] = 'validation_penalty'
-    # Label changed means disambiguation had to override classifier
-    elif label_changed:
+        metadata['validation_penalty'] = validation_result.penalty_applied
+        metadata['confidence_after_validation'] = final_confidence
+
+    # Gray zone: confidence penalty applies ON TOP of any previous penalty
+    if size_bin == 'gray_zone':
+        final_confidence *= confidence_penalty
         confidence_tier = 'low'
-        metadata['confidence_tier_reason'] = 'label_changed'
-    # Original was a family label (needed resolution)
-    elif original_label == family_name:
-        confidence_tier = 'low'
-        metadata['confidence_tier_reason'] = 'family_label_resolved'
-    else:
-        # High confidence: clear size bin + classifier agrees
-        metadata['confidence_tier_reason'] = 'clear_classification'
+        metadata['confidence_penalty_applied'] = True
+        metadata['confidence_tier_reason'] = 'gray_zone_ambiguous'
+
     
     metadata['confidence_tier'] = confidence_tier
-    
+    metadata['final_label'] = final_label
+    metadata['final_confidence'] = final_confidence
+
     # Step 5: Debug logging if enabled
     debug_logging = getattr(config, 'disambiguation_v2_debug_logging', False)
     

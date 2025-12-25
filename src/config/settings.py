@@ -71,9 +71,9 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2025-12-24-v1.7.0"
+    APP_VERSION: str = "2025-12-25-v1.8.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Small_2025_11_29_06_07_02.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Orange_Overlay_20251128010005_20251128011157.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
@@ -84,8 +84,8 @@ class AppConfig:
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
-        "data/model/classify_yolo_small_v6_bayese_224x224_nv12.bin" if IS_RDK
-        else "data/model/classify_yolo_small_v6.pt"
+        "data/model/classify_yolo_small_v7_bayese_224x224_nv12.bin" if IS_RDK
+        else "data/model/classify_yolo_small_v7.pt"
     )
 
     db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
@@ -95,7 +95,7 @@ class AppConfig:
     
     # V2: Model version identifiers
     detection_model_version: str = os.getenv("DETECTION_MODEL_VERSION", "v8.0")
-    classification_model_version: str = os.getenv("CLASS_MODEL_VERSION", "v5.0")
+    classification_model_version: str = os.getenv("CLASS_MODEL_VERSION", "v7.0")
     
     # V3: Testing mode for OpenCV frame source
     # When enabled, frames are read synchronously on-demand (no background thread)
@@ -118,11 +118,10 @@ class AppConfig:
             self.classifier_classes = {
                 0: 'Blue_Yellow', 
                 1: 'Bran', 
-                2: 'Brown_Orange_Overlay', 
-                3: 'Brown_Orange_Small', 
-                4: 'Green_Yellow', 
-                5: 'Red_Yellow', 
-                6: 'Wheatberry'
+                2: 'Brown_Orange_Family',
+                3: 'Green_Yellow',
+                4: 'Red_Yellow',
+                5: 'Wheatberry'
             }
         if self.detector_classes is None:
             self.detector_classes = {
