@@ -1642,6 +1642,130 @@ class TrackingConfig:
     """
     
     # ============================================================================
+    # Part 1.1: Enhanced Disambiguation V2 (Production-Grade)
+    # ============================================================================
+    # These parameters control the enhanced V2 disambiguation module with
+    # multi-threshold logic, validation, and detailed diagnostics.
+    
+    disambiguation_v2_enabled: bool = _parse_bool_env("DISAMBIGUATION_V2_ENABLED", True)
+    """
+    Enable enhanced V2 disambiguation module with production-grade features.
+    
+    When True: Uses V2 module with validation, multi-thresholds, and detailed logging
+    When False: Falls back to V1 module (legacy behavior)
+    
+    V2 Features:
+    - Multi-threshold size bins (very_small, small, gray_zone, regular, large)
+    - Aspect ratio and area validation
+    - Enhanced gray zone strategies (including 'use_confidence')
+    - Detailed diagnostic metadata
+    - Context-aware logging (track_id, frame_index)
+    
+    Default: True (V2 enabled)
+    """
+    
+    # Validation Parameters
+    disambiguation_v2_min_aspect_ratio: float = _parse_float_env("DISAMBIGUATION_V2_MIN_ASPECT_RATIO", 0.3)
+    """
+    Minimum acceptable aspect ratio (width/height) for bounding box validation.
+    
+    Detects unrealistically elongated or squished bboxes that may indicate
+    detection artifacts or occlusion issues.
+    
+    Range: 0.2 - 0.5
+    Default: 0.3 (width >= 30% of height)
+    """
+    
+    disambiguation_v2_max_aspect_ratio: float = _parse_float_env("DISAMBIGUATION_V2_MAX_ASPECT_RATIO", 3.0)
+    """
+    Maximum acceptable aspect ratio (width/height) for bounding box validation.
+    
+    Range: 2.5 - 4.0
+    Default: 3.0 (width <= 3x height)
+    """
+    
+    disambiguation_v2_aspect_ratio_penalty: float = _parse_float_env("DISAMBIGUATION_V2_ASPECT_RATIO_PENALTY", 0.3)
+    """
+    Confidence penalty for bboxes with suspicious aspect ratios.
+    
+    Applied when aspect ratio is outside acceptable range but not degenerate.
+    Range: 0.2 - 0.5
+    Default: 0.3 (30% confidence reduction)
+    """
+    
+    disambiguation_v2_min_realistic_area: float = _parse_float_env("DISAMBIGUATION_V2_MIN_REALISTIC_AREA", 1000.0)
+    """
+    Minimum realistic area (pixels²) for a bread bag bbox.
+    
+    Areas below this are penalized as unrealistically small (possible artifacts).
+    Range: 500 - 2000
+    Default: 1000.0 pixels²
+    """
+    
+    disambiguation_v2_max_realistic_area: float = _parse_float_env("DISAMBIGUATION_V2_MAX_REALISTIC_AREA", 100000.0)
+    """
+    Maximum realistic area (pixels²) for a bread bag bbox.
+    
+    Areas above this are penalized as unrealistically large (possible merge artifacts).
+    Range: 50000 - 200000
+    Default: 100000.0 pixels²
+    """
+    
+    disambiguation_v2_unrealistic_area_penalty: float = _parse_float_env("DISAMBIGUATION_V2_UNREALISTIC_AREA_PENALTY", 0.5)
+    """
+    Confidence penalty for unrealistic area sizes.
+    
+    Range: 0.3 - 0.7
+    Default: 0.5 (50% confidence reduction)
+    """
+    
+    # Multi-Threshold Size Bins
+    disambiguation_v2_very_small_threshold: float = _parse_float_env("DISAMBIGUATION_V2_VERY_SMALL_THRESHOLD", 5000.0)
+    """
+    Threshold for 'very_small' bin (well below normal small bag sizes).
+    
+    Areas below this are confidently classified as Brown_Orange_Small.
+    Range: 3000 - 7000
+    Default: 5000.0 pixels²
+    """
+    
+    disambiguation_v2_large_threshold: float = _parse_float_env("DISAMBIGUATION_V2_LARGE_THRESHOLD", 25000.0)
+    """
+    Threshold for 'large' bin (well above normal regular bag sizes).
+    
+    Areas above this are confidently classified as Brown_Orange_Overlay.
+    Range: 20000 - 50000
+    Default: 25000.0 pixels²
+    """
+    
+    # Gray Zone Confidence Strategy
+    disambiguation_v2_gray_zone_confidence_threshold: float = _parse_float_env("DISAMBIGUATION_V2_GRAY_ZONE_CONF_THRESHOLD", 0.6)
+    """
+    Confidence threshold for 'use_confidence' gray zone strategy.
+    
+    When gray_zone_behavior='use_confidence':
+    - confidence >= threshold: Keep classifier prediction
+    - confidence < threshold: Return "Uncertain"
+    
+    Range: 0.5 - 0.8
+    Default: 0.6
+    """
+    
+    disambiguation_v2_debug_logging: bool = _parse_bool_env("DISAMBIGUATION_V2_DEBUG", True)
+    """
+    Enable detailed debug logging for V2 disambiguation.
+    
+    Logs include:
+    - Before/after labels and confidence
+    - Area, aspect ratio, size bin
+    - Validation results and penalties
+    - Resolution reason with full context
+    - Track and frame context
+    
+    Default: True (enable for initial deployment, disable after validation)
+    """
+    
+    # ============================================================================
     # Part 1.5: Probability Mass Transfer (Variant B)
     # ============================================================================
     # These parameters control how probability vectors are adjusted after
