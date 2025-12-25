@@ -253,7 +253,7 @@ def resolve_gray_zone(
     Resolve classification in gray zone using configured strategy.
     
     CRITICAL: Always returns a specific class, never a generic family label.
-    Gray zone results are always flagged as 'low' confidence in the caller.
+    Note: Confidence tier flagging is handled by the caller (disambiguate_v2).
     
     Strategies:
     - 'keep_original': Trust classifier's prediction, but use best match if it's a family label
@@ -276,12 +276,12 @@ def resolve_gray_zone(
     regular_class, small_class = target_classes
     raw_area = size_bin_metadata.get('raw_area', 0)
     
-    # Helper: pick best match based on area (closer to midpoint = better)
+    # Helper: pick best match based on area relative to midpoint
     def pick_best_match_by_area():
         small_threshold = size_bin_metadata.get('thresholds', {}).get('small', 9000.0)
         regular_threshold = size_bin_metadata.get('thresholds', {}).get('regular', 11000.0)
         midpoint = (small_threshold + regular_threshold) / 2
-        # Closer to small threshold → small, closer to regular threshold → regular
+        # Below midpoint → small class, above midpoint → regular class
         if raw_area < midpoint:
             return small_class
         else:

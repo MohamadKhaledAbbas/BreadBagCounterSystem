@@ -64,7 +64,6 @@ def test_gray_zone_marked_as_low_confidence():
     config = MockConfig()
     
     # Gray zone area (between 9000 and 11000)
-    bbox = (100, 100, 200, 150)  # 100x50 = 5000, but we'll use 10000 area
     bbox_gray = (100, 100, 200, 200)  # 100x100 = 10000 (gray zone)
     
     result = disambiguate_v2(
