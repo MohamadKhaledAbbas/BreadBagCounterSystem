@@ -61,6 +61,8 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 - **[docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md)**: Log analyzer tool documentation
 - **[docs/STRUCTURED_LOGGING_SCHEMA.md](docs/STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
 - **[docs/PROBABILITY_ADJUSTMENTS.md](docs/PROBABILITY_ADJUSTMENTS.md)**: Probability mass transfer and disambiguation integration
+- **[docs/DISAMBIGUATION_V2_GUIDE.md](docs/DISAMBIGUATION_V2_GUIDE.md)**: Production guide for enhanced disambiguation V2 module
+- **[docs/ROI_FILTERING_AND_THRESHOLDS.md](docs/ROI_FILTERING_AND_THRESHOLDS.md)**: ROI quality filtering and threshold selection
 - **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Production-grade classification improvements summary
 
 ## Key Components
@@ -73,8 +75,10 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 
 ### Classification
 - `src/classifier/ClassifierService.py`: Multi-candidate classification with evidence accumulation
+- `src/classifier/disambiguation_v2.py`: Production-grade size-based disambiguation (V2)
 - `src/classifier/probability_adjustments.py`: Probability mass transfer for disambiguation
 - `src/classifier/evidence_accumulator.py`: Trust-weighted log-evidence accumulation
+- `src/classifier/roi_trust.py`: ROI quality scoring for evidence weighting
 - Evidence-based decision making with rejection thresholds and stability gates
 
 ### Logging & Analysis
