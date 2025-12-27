@@ -173,11 +173,40 @@ class BagCounterApp:
         # Phase 2: Classification workers list (multiple threads)
         self._classification_threads = []
         self._classification_running = False
+        
+        # V4 Phase 1: Detection results queue (decouple detection from monitor)
+        self.detection_queue_enabled = tracking_config.detection_queue_enabled
+        if self.detection_queue_enabled and not self.testing_mode:
+            self.detection_queue = queue.Queue(maxsize=tracking_config.detection_queue_size)
+            self._monitor_thread = None
+            self._monitor_running = False
+            logger.info(
+                f"[BagCounterApp] V4 Phase 1: Detection queue enabled "
+                f"(size={tracking_config.detection_queue_size}, "
+                f"warning_threshold={tracking_config.detection_queue_warning_threshold:.0%})"
+            )
+        else:
+            self.detection_queue = None
+            logger.info("[BagCounterApp] Detection queue disabled (legacy mode)")
+        
+        # V4 Phase 2: Batch inference configuration
+        self.batch_inference_enabled = tracking_config.detection_batch_enabled
+        if self.batch_inference_enabled:
+            self._frame_batch = []
+            self._batch_start_time = None
+            logger.info(
+                f"[BagCounterApp] V4 Phase 2: Batch inference enabled "
+                f"(batch_size={tracking_config.detection_batch_size}, "
+                f"timeout={tracking_config.detection_batch_timeout_ms}ms)"
+            )
+        else:
+            logger.info("[BagCounterApp] Batch inference disabled (legacy mode)")
 
         # Queue monitoring statistics
         self.stats_lock = threading.Lock()
         self.input_queue_drops = 0
         self.classification_queue_drops = 0  # V3: Track classification queue drops
+        self.detection_queue_drops = 0  # V4 Phase 1: Track detection queue drops
         self.last_queue_stats_log_time = time.perf_counter()
         
         # V3: Performance metrics for adaptive processing
@@ -347,6 +376,17 @@ class BagCounterApp:
         with self.stats_lock:
             input_drops = self.input_queue_drops
             class_drops = self.classification_queue_drops
+            detection_drops = self.detection_queue_drops if self.detection_queue_enabled else 0
+        
+        # V4 Phase 1: Detection queue stats
+        detection_stats = ""
+        if self.detection_queue_enabled and self.detection_queue is not None:
+            detection_size = self.detection_queue.qsize()
+            detection_utilization = (detection_size / tracking_config.detection_queue_size) * 100
+            detection_stats = (
+                f" | Detection: {detection_size}/{tracking_config.detection_queue_size} "
+                f"({detection_utilization:.1f}% full, drops={detection_drops})"
+            )
         
         # Calculate current skip rate (O(n) but acceptable since this runs every 5s)
         current_skip_rate = 0.0
@@ -362,7 +402,8 @@ class BagCounterApp:
         
         logger.info(
             f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
-            f"({input_utilization:.1f}% full, drops={input_drops}) | "
+            f"({input_utilization:.1f}% full, drops={input_drops})"
+            f"{detection_stats} | "
             f"Classification: {class_size}/{self.CLASSIFICATION_QUEUE_SIZE} "
             f"({class_utilization:.1f}% full, drops={class_drops}) | "
             f"Skipped: {self._frames_skipped} (rate={current_skip_rate:.1f}%, cap={self.SKIP_RATE_CAP*100:.1f}%) | "
@@ -391,6 +432,18 @@ class BagCounterApp:
                 f"classification thread is falling behind. "
                 f"Risk: classification tasks may be dropped."
             )
+        
+        # V4 Phase 1: Detection queue warning
+        if self.detection_queue_enabled and self.detection_queue is not None:
+            detection_size = self.detection_queue.qsize()
+            detection_utilization = detection_size / tracking_config.detection_queue_size
+            if detection_utilization > tracking_config.detection_queue_warning_threshold:
+                logger.warning(
+                    f"[DetectionQueuePressure] High queue utilization: {detection_utilization:.1%} "
+                    f"(threshold={tracking_config.detection_queue_warning_threshold:.0%}) - "
+                    f"monitor thread is falling behind detection. "
+                    f"Risk: detection results may be dropped."
+                )
     
     def _check_degraded_mode(self, queue_utilization: float) -> bool:
         """
@@ -786,6 +839,130 @@ class BagCounterApp:
                 )
         
         logger.info("[ClassificationThread] Stopped")
+    
+    # --- V4 Phase 1: Monitor Thread (consumes detection results) ---
+    
+    def _monitor_thread_loop(self):
+        """
+        V4 Phase 1: Dedicated thread for monitor processing.
+        
+        Consumes detection results from detection_queue and processes them
+        through the monitor (EventCentricStateMonitor). This decouples
+        detection from monitoring, allowing detection to run at full BPU speed.
+        
+        Expected benefit: ~30-40% performance improvement.
+        """
+        logger.info("[MonitorThread] Started (V4 Phase 1: Detection Queue decoupling)")
+        
+        while self._monitor_running:
+            try:
+                # Wait for detection result with timeout
+                detection_result = self.detection_queue.get(timeout=1.0)
+            except queue.Empty:
+                if not self._monitor_running:
+                    break
+                continue
+            except Exception as e:
+                structured_logger.pipeline_error(
+                    component="MonitorThread",
+                    operation="queue_get",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=None,
+                    context={"queue_size": self.detection_queue.qsize()}
+                )
+                continue
+            
+            try:
+                # Unpack detection result
+                current_frame_detections, frame_count, frame, detect_time = detection_result
+                
+                # Process through monitor
+                monitor_start = time.perf_counter()
+                ready_events = self.monitor.update(current_frame_detections,
+                                                   {"frame_count": frame_count, "frame": frame})
+                monitor_end = time.perf_counter()
+                monitor_time = (monitor_end - monitor_start) * 1000
+                
+                # Track degraded mode state for ROI saving
+                in_degraded_mode = self._degraded_mode_active
+                
+                # Queue ready events for classification
+                if ready_events:
+                    for event_id, candidates, event_box, event_stats in ready_events:
+                        # Determine if we should save snapshot
+                        should_save_snapshot = self.is_recording and not (
+                            in_degraded_mode and tracking_config.degraded_mode_disable_roi_saving
+                        )
+                        
+                        # Build context
+                        if should_save_snapshot:
+                            det_copy = []
+                            for d in current_frame_detections:
+                                det_copy.append({
+                                    "box": d["box"].copy(),
+                                    "class_id": d["class_id"],
+                                    "conf": float(d.get("conf", 0)),
+                                })
+                            try:
+                                event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
+                            except (TypeError, AttributeError):
+                                event_box_copy = event_box
+                            context = {
+                                "frame": frame.copy(),
+                                "detections": det_copy,
+                                "event_box": event_box_copy,
+                                "event_stats": event_stats,
+                                "frame_id": frame_count,
+                                "timestamp": time.time(),
+                            }
+                        else:
+                            context = {
+                                "frame": None,
+                                "detections": [],
+                                "event_box": event_box,
+                                "event_stats": event_stats,
+                                "frame_id": frame_count,
+                                "timestamp": time.time(),
+                            }
+                        
+                        # Enqueue for classification
+                        self._enqueue_classification(event_id, candidates, context)
+                
+                # Record metrics
+                pipeline_metrics.record_detection(
+                    current_frame_detections,
+                    detect_time,
+                    self.monitor.open_id,
+                    self.monitor.closed_id
+                )
+                
+                # Log timing periodically
+                if frame_count % 30 == 0:
+                    logger.info(
+                        f"[MonitorThread] Frame {frame_count}: "
+                        f"detect={detect_time:.1f}ms, monitor={monitor_time:.1f}ms, "
+                        f"queue_size={self.detection_queue.qsize()}/{tracking_config.detection_queue_size}"
+                    )
+                
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                
+                structured_logger.pipeline_error(
+                    component='MonitorThread',
+                    operation='monitor_processing',
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    affected_ids=[frame_count] if 'frame_count' in locals() else None,
+                    context={
+                        'detections_count': len(current_frame_detections) if 'current_frame_detections' in locals() else 0,
+                        'detection_queue_size': self.detection_queue.qsize()
+                    },
+                    traceback=error_trace
+                )
+        
+        logger.info("[MonitorThread] Stopped")
     
     def _enqueue_classification(self, event_id: int, candidates: List, context: Dict[str, Any]) -> bool:
         """
