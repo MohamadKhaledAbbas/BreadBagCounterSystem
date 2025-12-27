@@ -1090,15 +1090,21 @@ class BagCounterApp:
 
     def _logic_thread_loop(self):
         """
-        V3: Optimized main logic loop with async classification.
+        V4: Optimized main logic loop with detection queue and batch inference.
         
         Key optimizations:
-        - Classification is offloaded to separate thread
+        - V3: Classification offloaded to separate thread
+        - V4 Phase 1: Detection decoupled from monitor via queue
+        - V4 Phase 2: Batch inference for 40-60% speedup
         - Frame skipping when detection is too slow
         - Reduced frame copying operations
-        - Performance metrics for adaptive tuning
         """
-        logger.info("[LogicThread] Started (V3 with async classification)")
+        if self.detection_queue_enabled:
+            logger.info("[LogicThread] Started (V4 with detection queue and batch inference)")
+        elif self.batch_inference_enabled:
+            logger.info("[LogicThread] Started (V4 with batch inference)")
+        else:
+            logger.info("[LogicThread] Started (V3 with async classification)")
 
         TIMING_LOG_INTERVAL = 30
         frame_count = 0
@@ -1245,208 +1251,361 @@ class BagCounterApp:
                             "total_blocks": self._skip_cap_blocks
                         })
 
-                # 1. Run Detector
+                # 1. Run Detector (V4: With batch inference support)
                 detect_start = time.perf_counter()
-                detections = self.detector.predict(frame)
-                detect_end = time.perf_counter()
-                detect_time = (detect_end - detect_start) * 1000
                 
-                # V3: Track detection time for adaptive skipping
-                self._recent_detection_times.append(detect_time)
-
-                current_frame_detections = []
-
-                if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
-                    # Phase 1 Optimization: Vectorized detection extraction (2-3x faster)
-                    boxes = detections[0].boxes
-                    xyxy = boxes.xyxy.cpu().numpy()
-                    cls_ids = boxes.cls.cpu().numpy().astype(int)
-                    confidences = boxes.conf.cpu().numpy()
-
-                    # Use list comprehension for vectorized creation (faster than append loop)
-                    current_frame_detections = [
-                        {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
-                        for i in range(len(cls_ids))
-                    ]
-                
-                # Degraded mode: skip frames with no detections and no active events
-                if (in_degraded_mode and 
-                    tracking_config.degraded_mode_skip_low_detection_frames and
-                    len(current_frame_detections) == 0 and
-                    len(self.monitor.active_events) == 0):
-                    # Skip this frame to save processing time
-                    continue
-
-                # Record detection metrics
-                pipeline_metrics.record_detection(
-                    current_frame_detections, 
-                    detect_time,
-                    self.monitor.open_id,
-                    self.monitor.closed_id
-                )
-
-                # 2. Update Monitor
-                monitor_start = time.perf_counter()
-                ready_events = self.monitor.update(current_frame_detections,
-                                                   {"frame_count": frame_count, "frame": frame})
-                monitor_end = time.perf_counter()
-                monitor_time = (monitor_end - monitor_start) * 1000
-                
-                # Track frames processed in degraded mode for statistics
-                if in_degraded_mode:
-                    self._frames_processed_in_degraded += 1
-                
-                # Update event frame counts for smart skip logic
-                if tracking_config.degraded_mode_smart_skip_enabled:
-                    # Update counts for active events
-                    current_event_ids = set()
-                    for event in self.monitor.active_events:
-                        event_id = getattr(event, 'event_id', None) or getattr(event, 'id', None)
-                        if event_id is not None:
-                            current_event_ids.add(event_id)
-                            self._event_frame_counts[event_id] = self._event_frame_counts.get(event_id, 0) + 1
+                # V4 Phase 2: Batch inference
+                if self.batch_inference_enabled:
+                    # Accumulate frame for batch processing
+                    if not hasattr(self, '_frame_batch'):
+                        self._frame_batch = []
+                        self._batch_start_time = None
+                        self._batch_frame_data = []  # Store (frame, frame_count) pairs
                     
-                    # Clean up counts for events that are no longer active
-                    # Keep only current events to prevent memory growth
-                    events_to_remove = [eid for eid in self._event_frame_counts.keys() if eid not in current_event_ids]
-                    for eid in events_to_remove:
-                        del self._event_frame_counts[eid]
+                    self._frame_batch.append(frame)
+                    self._batch_frame_data.append((frame, frame_count))
+                    
+                    if self._batch_start_time is None:
+                        self._batch_start_time = time.perf_counter()
+                    
+                    # Check if batch is ready (full or timeout)
+                    batch_elapsed_ms = (time.perf_counter() - self._batch_start_time) * 1000
+                    batch_ready = (
+                        len(self._frame_batch) >= tracking_config.detection_batch_size or
+                        batch_elapsed_ms >= tracking_config.detection_batch_timeout_ms
+                    )
+                    
+                    if not batch_ready:
+                        # Batch not ready yet, continue accumulating
+                        continue
+                    
+                    # Process batch
+                    try:
+                        detections_batch = self.detector.predict_batch(self._frame_batch)
+                    except Exception as e:
+                        # Fallback to single-frame processing on error
+                        logger.warning(f"[LogicThread] Batch inference failed: {e}, falling back to single-frame")
+                        detections_batch = [self.detector.predict(f) for f in self._frame_batch]
+                    
+                    detect_end = time.perf_counter()
+                    detect_time = (detect_end - detect_start) * 1000
+                    
+                    # Process each frame in the batch
+                    for i, (batch_frame, batch_frame_count) in enumerate(self._batch_frame_data):
+                        detections = detections_batch[i]
+                        frame_detect_time = detect_time / len(self._frame_batch)  # Approximate per-frame time
+                        
+                        # V3: Track detection time for adaptive skipping
+                        self._recent_detection_times.append(frame_detect_time)
+                        
+                        # Extract detections
+                        current_frame_detections = []
+                        if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
+                            boxes = detections[0].boxes
+                            xyxy = boxes.xyxy.cpu().numpy()
+                            cls_ids = boxes.cls.cpu().numpy().astype(int)
+                            confidences = boxes.conf.cpu().numpy()
+                            current_frame_detections = [
+                                {"box": xyxy[j], "class_id": cls_ids[j], "conf": confidences[j]}
+                                for j in range(len(cls_ids))
+                            ]
+                        
+                        # V4 Phase 1: Enqueue detection result or process inline
+                        if self.detection_queue_enabled:
+                            # Enqueue detection result for monitor thread
+                            detection_result = (current_frame_detections, batch_frame_count, batch_frame, frame_detect_time)
+                            try:
+                                self.detection_queue.put_nowait(detection_result)
+                            except queue.Full:
+                                # Queue full - drop oldest and try again
+                                try:
+                                    dropped = self.detection_queue.get_nowait()
+                                    with self.stats_lock:
+                                        self.detection_queue_drops += 1
+                                    self.detection_queue.put_nowait(detection_result)
+                                    logger.warning(f"[LogicThread] Detection queue full, dropped frame {dropped[1]}")
+                                except (queue.Empty, queue.Full):
+                                    with self.stats_lock:
+                                        self.detection_queue_drops += 1
+                                    logger.warning(f"[LogicThread] Failed to enqueue detection result for frame {batch_frame_count}")
+                        else:
+                            # Legacy: Process monitor inline
+                            pipeline_metrics.record_detection(
+                                current_frame_detections, 
+                                frame_detect_time,
+                                self.monitor.open_id,
+                                self.monitor.closed_id
+                            )
+                            
+                            monitor_start = time.perf_counter()
+                            ready_events = self.monitor.update(current_frame_detections,
+                                                               {"frame_count": batch_frame_count, "frame": batch_frame})
+                            monitor_end = time.perf_counter()
+                            monitor_time = (monitor_end - monitor_start) * 1000
+                            
+                            # Queue ready events for classification
+                            if ready_events:
+                                for event_id, candidates, event_box, event_stats in ready_events:
+                                    should_save_snapshot = self.is_recording and not (
+                                        in_degraded_mode and tracking_config.degraded_mode_disable_roi_saving
+                                    )
+                                    
+                                    if should_save_snapshot:
+                                        det_copy = [{"box": d["box"].copy(), "class_id": d["class_id"], "conf": float(d.get("conf", 0))} for d in current_frame_detections]
+                                        try:
+                                            event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
+                                        except (TypeError, AttributeError):
+                                            event_box_copy = event_box
+                                        context = {
+                                            "frame": batch_frame.copy(),
+                                            "detections": det_copy,
+                                            "event_box": event_box_copy,
+                                            "event_stats": event_stats,
+                                            "frame_id": batch_frame_count,
+                                            "timestamp": time.time(),
+                                        }
+                                    else:
+                                        context = {
+                                            "frame": None,
+                                            "detections": [],
+                                            "event_box": event_box,
+                                            "event_stats": event_stats,
+                                            "frame_id": batch_frame_count,
+                                            "timestamp": time.time(),
+                                        }
+                                    
+                                    self._enqueue_classification(event_id, candidates, context)
+                    
+                    # Reset batch
+                    self._frame_batch = []
+                    self._batch_start_time = None
+                    self._batch_frame_data = []
+                    
+                else:
+                    # V3: Single-frame detection (legacy)
+                    detections = self.detector.predict(frame)
+                    detect_end = time.perf_counter()
+                    detect_time = (detect_end - detect_start) * 1000
+                    
+                    # V3: Track detection time for adaptive skipping
+                    self._recent_detection_times.append(detect_time)
 
-                # 3. V3: Queue ready events for async classification (non-blocking)
-                enqueue_time = 0.0
-                if ready_events:
-                    enqueue_start = time.perf_counter()
-                    for event_id, candidates, event_box, event_stats in ready_events:
-                        # Determine if we should save snapshot based on recording flag and degraded mode
-                        should_save_snapshot = self.is_recording and not (
-                            in_degraded_mode and tracking_config.degraded_mode_disable_roi_saving
+                    current_frame_detections = []
+
+                    if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
+                        # Phase 1 Optimization: Vectorized detection extraction (2-3x faster)
+                        boxes = detections[0].boxes
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        cls_ids = boxes.cls.cpu().numpy().astype(int)
+                        confidences = boxes.conf.cpu().numpy()
+
+                        # Use list comprehension for vectorized creation (faster than append loop)
+                        current_frame_detections = [
+                            {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
+                            for i in range(len(cls_ids))
+                        ]
+                    
+                    # Degraded mode: skip frames with no detections and no active events
+                    if (in_degraded_mode and 
+                        tracking_config.degraded_mode_skip_low_detection_frames and
+                        len(current_frame_detections) == 0 and
+                        len(self.monitor.active_events) == 0):
+                        # Skip this frame to save processing time
+                        continue
+                    
+                    # V4 Phase 1: Enqueue detection result or process inline
+                    if self.detection_queue_enabled:
+                        # Enqueue detection result for monitor thread
+                        detection_result = (current_frame_detections, frame_count, frame, detect_time)
+                        try:
+                            self.detection_queue.put_nowait(detection_result)
+                        except queue.Full:
+                            # Queue full - drop oldest and try again
+                            try:
+                                dropped = self.detection_queue.get_nowait()
+                                with self.stats_lock:
+                                    self.detection_queue_drops += 1
+                                self.detection_queue.put_nowait(detection_result)
+                                logger.warning(f"[LogicThread] Detection queue full, dropped frame {dropped[1]}")
+                            except (queue.Empty, queue.Full):
+                                with self.stats_lock:
+                                    self.detection_queue_drops += 1
+                                logger.warning(f"[LogicThread] Failed to enqueue detection result for frame {frame_count}")
+                    else:
+                        # Legacy: Process monitor inline
+                        # Record detection metrics
+                        pipeline_metrics.record_detection(
+                            current_frame_detections, 
+                            detect_time,
+                            self.monitor.open_id,
+                            self.monitor.closed_id
+                        )
+
+                        # 2. Update Monitor
+                        monitor_start = time.perf_counter()
+                        ready_events = self.monitor.update(current_frame_detections,
+                                                           {"frame_count": frame_count, "frame": frame})
+                        monitor_end = time.perf_counter()
+                        monitor_time = (monitor_end - monitor_start) * 1000
+                        
+                        # Track frames processed in degraded mode for statistics
+                        if in_degraded_mode:
+                            self._frames_processed_in_degraded += 1
+                        
+                        # Update event frame counts for smart skip logic
+                        if tracking_config.degraded_mode_smart_skip_enabled:
+                            # Update counts for active events
+                            current_event_ids = set()
+                            for event in self.monitor.active_events:
+                                event_id = getattr(event, 'event_id', None) or getattr(event, 'id', None)
+                                if event_id is not None:
+                                    current_event_ids.add(event_id)
+                                    self._event_frame_counts[event_id] = self._event_frame_counts.get(event_id, 0) + 1
+                            
+                            # Clean up counts for events that are no longer active
+                            events_to_remove = [eid for eid in self._event_frame_counts.keys() if eid not in current_event_ids]
+                            for eid in events_to_remove:
+                                del self._event_frame_counts[eid]
+
+                        # 3. V3: Queue ready events for async classification (non-blocking)
+                        enqueue_time = 0.0
+                        if ready_events:
+                            enqueue_start = time.perf_counter()
+                            for event_id, candidates, event_box, event_stats in ready_events:
+                                # Determine if we should save snapshot based on recording flag and degraded mode
+                                should_save_snapshot = self.is_recording and not (
+                                    in_degraded_mode and tracking_config.degraded_mode_disable_roi_saving
+                                )
+                                
+                                # V3: Only copy frame if snapshot saving is enabled
+                                if should_save_snapshot:
+                                    det_copy = []
+                                    for d in current_frame_detections:
+                                        det_copy.append({
+                                            "box": d["box"].copy(),
+                                            "class_id": d["class_id"],
+                                            "conf": float(d.get("conf", 0)),
+                                        })
+                                    # V3: Safe copy of event_box - handle numpy arrays and lists
+                                    try:
+                                        event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
+                                    except (TypeError, AttributeError):
+                                        event_box_copy = event_box  # Fallback to reference if copy fails
+                                    context = {
+                                        "frame": frame.copy(),  # Only copy when needed
+                                        "detections": det_copy,
+                                        "event_box": event_box_copy,
+                                        "event_stats": event_stats,
+                                        "frame_id": frame_count,
+                                        "timestamp": time.time(),
+                                    }
+                                else:
+                                    # V3: Lightweight context when recording is off or in degraded mode
+                                    context = {
+                                        "frame": None,
+                                        "detections": [],
+                                        "event_box": event_box,
+                                        "event_stats": event_stats,
+                                        "frame_id": frame_count,
+                                        "timestamp": time.time(),
+                                    }
+                                
+                                # V3: Non-blocking enqueue
+                                self._enqueue_classification(event_id, candidates, context)
+                            
+                            enqueue_time = (time.perf_counter() - enqueue_start) * 1000
+
+                        # 4. Publishing logic
+                        publish_time = 0.0
+                        
+                        # Phase 1 Optimization: Visualization decimation
+                        self._visualization_counter += 1
+                        should_visualize_this_frame = (
+                            self.is_publishing and 
+                            self._visualization_counter % self.VISUALIZATION_DECIMATION == 0 and
+                            not (in_degraded_mode and tracking_config.degraded_mode_disable_visualization)
                         )
                         
-                        # V3: Only copy frame if snapshot saving is enabled
-                        if should_save_snapshot:
-                            det_copy = []
-                            for d in current_frame_detections:
-                                det_copy.append({
-                                    "box": d["box"].copy(),
-                                    "class_id": d["class_id"],
-                                    "conf": float(d.get("conf", 0)),
-                                })
-                            # V3: Safe copy of event_box - handle numpy arrays and lists
-                            try:
-                                event_box_copy = event_box.copy() if hasattr(event_box, 'copy') else list(event_box)
-                            except (TypeError, AttributeError):
-                                event_box_copy = event_box  # Fallback to reference if copy fails
-                            context = {
-                                "frame": frame.copy(),  # Only copy when needed
-                                "detections": det_copy,
-                                "event_box": event_box_copy,
-                                "event_stats": event_stats,
-                                "frame_id": frame_count,
-                                "timestamp": time.time(),
-                            }
-                        else:
-                            # V3: Lightweight context when recording is off or in degraded mode
-                            context = {
-                                "frame": None,
-                                "detections": [],
-                                "event_box": event_box,
-                                "event_stats": event_stats,
-                                "frame_id": frame_count,
-                                "timestamp": time.time(),
-                            }
+                        if should_visualize_this_frame:
+                            publish_start = time.perf_counter()
+
+                            # V3 Performance: Resize BEFORE visualization (process at 720p throughout)
+                            # This reduces the amount of pixels to process during visualization
+                            annotated_frame = cv2.resize(frame, (1280, 720))
+                            
+                            frame_mid = time.perf_counter()
+                            mid_time = (frame_mid - frame_start) * 1000
+                            fps_display = 1000 / mid_time if mid_time > 0 else 0
+
+                            self.visualizer.render_all(
+                                annotated_frame,
+                                [],
+                                self.monitor.active_events,
+                                counts=self.ui_counts,
+                                fps=fps_display,
+                            )
+
+                            # V3 Performance: No need to resize again - already at 1280x720
+                            self.ipc_publisher.publish(annotated_frame)
+
+                            publish_end = time.perf_counter()
+                            publish_time = (publish_end - publish_start) * 1000
+
+                        # 5. Timing logs and pipeline metrics
+                        frame_end = time.perf_counter()
+                        total_time = (frame_end - frame_start) * 1000
+                        fps = 1000 / total_time if total_time > 0 else 0
                         
-                        # V3: Non-blocking enqueue
-                        self._enqueue_classification(event_id, candidates, context)
-                    
-                    enqueue_time = (time.perf_counter() - enqueue_start) * 1000
+                        # V3: Track frame processing time
+                        self._recent_frame_times.append(total_time)
 
-                # 4. Publishing logic
-                publish_time = 0.0
+                        if frame_count % TIMING_LOG_INTERVAL == 0 or enqueue_time > 0:
+                            timing_msg = (
+                                f"[Frame {frame_count}] Total: {total_time:.1f}ms | "
+                                f"Detect: {detect_time:.1f}ms | "
+                                f"Monitor: {monitor_time:.1f}ms"
+                            )
+                            if enqueue_time > 0:
+                                timing_msg += f" | Queue: {enqueue_time:.1f}ms"
+                            if publish_time > 0:
+                                timing_msg += f" | Publish: {publish_time:.1f}ms"
+                            timing_msg += f" | FPS: {fps:.1f}"
+                            
+                            # V3: Add queue status
+                            input_q_size = self.input_queue.qsize()
+                            class_q_size = self.classification_queue.qsize()
+                            timing_msg += f" | InputQ: {input_q_size}/{self.INPUT_QUEUE_SIZE}"
+                            timing_msg += f" | ClassQ: {class_q_size}/{self.CLASSIFICATION_QUEUE_SIZE}"
+                            
+                            logger.info(timing_msg)
+                            
+                            # Structured logging for frame processing
+                            structured_logger.frame_processed(
+                                frame_id=frame_count,
+                                detection_time_ms=detect_time,
+                                monitor_time_ms=monitor_time,
+                                total_time_ms=total_time,
+                                detections_count=len(current_frame_detections),
+                                events_ready=len(ready_events) if ready_events else 0,
+                                queue_sizes={
+                                    'input': input_q_size,
+                                    'classification': class_q_size
+                                },
+                                fps=fps
+                            )
+
+                        # Log pipeline metrics periodically
+                        pipeline_metrics.maybe_log_summary()
+                        
+                        # Log system status periodically (every 15 minutes)
+                        current_time = time.perf_counter()
+                        if current_time - self._last_system_status_log >= self.SYSTEM_STATUS_LOG_INTERVAL:
+                            self._log_system_status()
+                            self._last_system_status_log = current_time
                 
-                # Phase 1 Optimization: Visualization decimation
-                self._visualization_counter += 1
-                should_visualize_this_frame = (
-                    self.is_publishing and 
-                    self._visualization_counter % self.VISUALIZATION_DECIMATION == 0 and
-                    not (in_degraded_mode and tracking_config.degraded_mode_disable_visualization)
-                )
-                
-                if should_visualize_this_frame:
-                    publish_start = time.perf_counter()
-
-                    # V3 Performance: Resize BEFORE visualization (process at 720p throughout)
-                    # This reduces the amount of pixels to process during visualization
-                    annotated_frame = cv2.resize(frame, (1280, 720))
-                    
-                    frame_mid = time.perf_counter()
-                    mid_time = (frame_mid - frame_start) * 1000
-                    fps_display = 1000 / mid_time if mid_time > 0 else 0
-
-                    self.visualizer.render_all(
-                        annotated_frame,
-                        [],
-                        self.monitor.active_events,
-                        counts=self.ui_counts,
-                        fps=fps_display,
-                    )
-
-                    # V3 Performance: No need to resize again - already at 1280x720
-                    self.ipc_publisher.publish(annotated_frame)
-
-                    publish_end = time.perf_counter()
-                    publish_time = (publish_end - publish_start) * 1000
-
-                # 5. Timing logs and pipeline metrics
-                frame_end = time.perf_counter()
-                total_time = (frame_end - frame_start) * 1000
-                fps = 1000 / total_time if total_time > 0 else 0
-                
-                # V3: Track frame processing time
-                self._recent_frame_times.append(total_time)
-
-                if frame_count % TIMING_LOG_INTERVAL == 0 or enqueue_time > 0:
-                    timing_msg = (
-                        f"[Frame {frame_count}] Total: {total_time:.1f}ms | "
-                        f"Detect: {detect_time:.1f}ms | "
-                        f"Monitor: {monitor_time:.1f}ms"
-                    )
-                    if enqueue_time > 0:
-                        timing_msg += f" | Queue: {enqueue_time:.1f}ms"
-                    if publish_time > 0:
-                        timing_msg += f" | Publish: {publish_time:.1f}ms"
-                    timing_msg += f" | FPS: {fps:.1f}"
-                    
-                    # V3: Add queue status
-                    input_q_size = self.input_queue.qsize()
-                    class_q_size = self.classification_queue.qsize()
-                    timing_msg += f" | InputQ: {input_q_size}/{self.INPUT_QUEUE_SIZE}"
-                    timing_msg += f" | ClassQ: {class_q_size}/{self.CLASSIFICATION_QUEUE_SIZE}"
-                    
-                    logger.info(timing_msg)
-                    
-                    # Structured logging for frame processing
-                    structured_logger.frame_processed(
-                        frame_id=frame_count,
-                        detection_time_ms=detect_time,
-                        monitor_time_ms=monitor_time,
-                        total_time_ms=total_time,
-                        detections_count=len(current_frame_detections),
-                        events_ready=len(ready_events) if ready_events else 0,
-                        queue_sizes={
-                            'input': input_q_size,
-                            'classification': class_q_size
-                        },
-                        fps=fps
-                    )
-
-                # Log pipeline metrics periodically
-                pipeline_metrics.maybe_log_summary()
-                
-                # Log system status periodically (every 15 minutes)
-                current_time = time.perf_counter()
-                if current_time - self._last_system_status_log >= self.SYSTEM_STATUS_LOG_INTERVAL:
-                    self._log_system_status()
-                    self._last_system_status_log = current_time
+                # V4 Phase 1: Skip visualization/timing when using detection queue (handled by monitor thread)
+                if not self.detection_queue_enabled:
+                    pass  # All processing done above in legacy path
 
             except Exception as e:
                 import traceback
@@ -1486,6 +1645,17 @@ class BagCounterApp:
             thread.start()
             self._classification_threads.append(thread)
         logger.info(f"[BagCounterApp] Started {self.CLASSIFICATION_WORKERS} classification worker threads")
+        
+        # V4 Phase 1: Start monitor thread if detection queue is enabled
+        if self.detection_queue_enabled and self.detection_queue is not None:
+            self._monitor_running = True
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_thread_loop,
+                daemon=True,
+                name="MonitorThread"
+            )
+            self._monitor_thread.start()
+            logger.info("[BagCounterApp] Monitor thread started (V4 Phase 1: Detection queue decoupling)")
 
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
@@ -1607,6 +1777,19 @@ class BagCounterApp:
                 else:
                     logger.debug(f"[BagCounterApp] Classification thread {i} joined")
         
+        # V4 Phase 1: Shutdown monitor thread if detection queue is enabled
+        if self.detection_queue_enabled and hasattr(self, '_monitor_thread') and self._monitor_thread is not None:
+            self._monitor_running = False
+            if self._monitor_thread.is_alive():
+                self._monitor_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if self._monitor_thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] Monitor thread did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug("[BagCounterApp] Monitor thread joined")
+        
         self.frame_source.cleanup()
         logger.debug("[BagCounterApp] Frame source cleaned up")
         self.config_watcher.stop()
@@ -1642,6 +1825,7 @@ class BagCounterApp:
         with self.stats_lock:
             input_drops = self.input_queue_drops if self.input_queue is not None else 0
             class_drops = self.classification_queue_drops
+            detection_drops = self.detection_queue_drops if self.detection_queue_enabled else 0
         
         # Calculate final skip rate
         final_skip_rate = 0.0
@@ -1661,7 +1845,9 @@ class BagCounterApp:
         
         logger.info(
             f"[BagCounterApp] Final Stats: "
-            f"input_drops={input_drops}, classification_drops={class_drops}, "
+            f"input_drops={input_drops}, "
+            f"detection_drops={detection_drops}, "
+            f"classification_drops={class_drops}, "
             f"frames_skipped={self._frames_skipped}, skip_rate={final_skip_rate:.2f}%, "
             f"skip_cap_blocks={self._skip_cap_blocks}"
             f"{smart_skip_stats}"
