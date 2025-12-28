@@ -209,6 +209,20 @@ class SpoolRecorderNode(Node):
             self._frames_received += 1
         
         # Create frame record from ROS message
+        # Handle encoding field that might be numpy array, bytes, or string
+        encoding = msg.encoding
+        if hasattr(encoding, 'tobytes'):
+            # numpy array
+            encoding = encoding.tobytes().decode('utf-8', errors='replace').rstrip('\x00')
+        elif isinstance(encoding, bytes):
+            encoding = encoding.decode('utf-8', errors='replace').rstrip('\x00')
+        elif not isinstance(encoding, str):
+            # Fallback for other array-like types
+            try:
+                encoding = bytes(encoding).decode('utf-8', errors='replace').rstrip('\x00')
+            except (TypeError, ValueError):
+                encoding = "H264"  # Default encoding
+        
         record = FrameRecord(
             index=msg.index,
             width=msg.width,
@@ -217,7 +231,7 @@ class SpoolRecorderNode(Node):
             dts_nsec=msg.dts.nanosec,
             pts_sec=msg.pts.sec,
             pts_nsec=msg.pts.nanosec,
-            encoding=msg.encoding,
+            encoding=encoding,
             data=bytes(msg.data)
         )
         

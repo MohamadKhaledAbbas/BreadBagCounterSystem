@@ -303,6 +303,43 @@ def test_large_frame_data():
         print("✓ test_large_frame_data passed")
 
 
+def test_encoding_type_handling():
+    """Test handling of different encoding field types (str, bytes, list)."""
+    
+    # Test with string encoding
+    frame_str = FrameRecord(
+        index=1, width=1920, height=1080,
+        dts_sec=0, dts_nsec=0, pts_sec=0, pts_nsec=0,
+        encoding="H264",
+        data=b"test"
+    )
+    data_str = frame_str.to_bytes()
+    assert len(data_str) > 0, "String encoding should serialize"
+    
+    # Test with bytes encoding
+    frame_bytes = FrameRecord(
+        index=2, width=1920, height=1080,
+        dts_sec=0, dts_nsec=0, pts_sec=0, pts_nsec=0,
+        encoding=b"H264",
+        data=b"test"
+    )
+    data_bytes = frame_bytes.to_bytes()
+    assert len(data_bytes) > 0, "Bytes encoding should serialize"
+    
+    # Test with list encoding (simulating array-like type from ROS message)
+    list_encoding = [72, 50, 54, 52, 0, 0, 0, 0]  # "H264" + nulls as ASCII values
+    frame_list = FrameRecord(
+        index=3, width=1920, height=1080,
+        dts_sec=0, dts_nsec=0, pts_sec=0, pts_nsec=0,
+        encoding=list_encoding,
+        data=b"test"
+    )
+    data_list = frame_list.to_bytes()
+    assert len(data_list) > 0, "List encoding should serialize"
+    
+    print("✓ test_encoding_type_handling passed")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Segment I/O Roundtrip")
@@ -320,6 +357,7 @@ if __name__ == "__main__":
         test_empty_spool()
         test_frame_record_timestamps()
         test_large_frame_data()
+        test_encoding_type_handling()
         
         print()
         print("=" * 60)

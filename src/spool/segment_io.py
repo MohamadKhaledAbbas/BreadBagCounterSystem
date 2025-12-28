@@ -95,7 +95,17 @@ class FrameRecord:
     
     def to_bytes(self) -> bytes:
         """Serialize the frame record to bytes."""
-        encoding_bytes = self.encoding.encode('utf-8')[:12].ljust(12, b'\x00')
+        # Handle encoding field that might be str, bytes, or numpy array
+        if isinstance(self.encoding, str):
+            encoding_bytes = self.encoding.encode('utf-8')[:12].ljust(12, b'\x00')
+        elif isinstance(self.encoding, bytes):
+            encoding_bytes = self.encoding[:12].ljust(12, b'\x00')
+        else:
+            # Handle numpy array or other array-like types
+            try:
+                encoding_bytes = bytes(self.encoding)[:12].ljust(12, b'\x00')
+            except (TypeError, ValueError):
+                encoding_bytes = b'H264'.ljust(12, b'\x00')
         header = RECORD_STRUCT.pack(
             RECORD_MAGIC,
             self.index,
