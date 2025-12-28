@@ -307,7 +307,19 @@ class SpoolProcessorNode(Node):
             frame_msg.pts = Time()
             frame_msg.pts.sec = record.pts_sec
             frame_msg.pts.nanosec = record.pts_nsec
-            frame_msg.encoding = record.encoding
+            
+            # Convert encoding string to list of 12 unsigned integers (as expected by H26XFrame)
+            # The encoding field in H26XFrame is a sequence of 12 bytes (uint8 array)
+            if isinstance(record.encoding, str):
+                encoding_bytes = record.encoding.encode('utf-8')[:12]
+            elif isinstance(record.encoding, bytes):
+                encoding_bytes = record.encoding[:12]
+            else:
+                encoding_bytes = bytes(record.encoding)[:12]
+            # Pad to exactly 12 bytes
+            encoding_padded = list(encoding_bytes) + [0] * (12 - len(encoding_bytes))
+            frame_msg.encoding = encoding_padded
+            
             frame_msg.data = list(record.data)
             
             self._frame_pub.publish(frame_msg)
