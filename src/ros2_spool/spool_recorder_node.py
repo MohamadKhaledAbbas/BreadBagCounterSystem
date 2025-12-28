@@ -31,6 +31,8 @@ import threading
 from typing import Optional
 from dataclasses import dataclass
 
+from src.config.settings import AppConfig
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -77,7 +79,7 @@ class SpoolConfig:
     stats_interval: float = DEFAULT_STATS_INTERVAL
 
 
-def load_config_from_db(db_path: str = "data/db/bag_events.db") -> SpoolConfig:
+def load_config_from_db(db_path: str = AppConfig.db_path) -> SpoolConfig:
     """Load spool configuration from database config table."""
     try:
         db = DatabaseManager(db_path)

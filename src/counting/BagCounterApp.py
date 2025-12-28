@@ -278,49 +278,43 @@ class BagCounterApp:
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
 
-        logger.debug("[BagCounterApp] Initializing ROS 2 context...")
-        self.ros_executor = init_ros2_context()
-
         self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
 
         self.ipc_publisher = FramePublisher(publish_rate_hz=25.0)
 
-        # Accuracy Mode: ACK publisher for frame processing acknowledgment
-        # This enables the SpoolProcessorNode to know when a frame has been processed
-        # Check database config first, fall back to environment variable
-        accuracy_mode_config = db.get_config_value(constants.accuracy_mode_enabled)
-        if accuracy_mode_config is not None:
-            self._accuracy_mode = accuracy_mode_config == '1'
-        else:
-            self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
-        
+        # -------------------------
+        # Accuracy Mode: ACK publisher (for SpoolProcessor backpressure)
+        # -------------------------
+        self._accuracy_mode = (self.db.get_config_value(constants.accuracy_mode_enabled) == "1")
         self._ack_publisher = None
-        self._current_processing_frame_index = 0
-        
+        self._ack_publisher_node = None
+
         if IS_RDK and self._accuracy_mode:
+            import rclpy
             from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
             from std_msgs.msg import UInt32
-            
-            # Create ACK publisher node
-            import rclpy
-            self._ack_publisher_node = rclpy.create_node('processing_ack_publisher')
+
             reliable_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=1
+                depth=1,
             )
+
+            # Create a dedicated node for publishing ACKs
+            self._ack_publisher_node = rclpy.create_node("processing_ack_publisher")
             self._ack_publisher = self._ack_publisher_node.create_publisher(
                 UInt32,
-                '/processing_ack',
-                reliable_qos
+                "/processing_ack",
+                reliable_qos,
             )
             logger.info("[BagCounterApp] Accuracy Mode enabled - ACK publisher created on /processing_ack")
 
+
         if IS_RDK and self.ros_executor is not None:
             self.ros_executor.add_node(self.ipc_publisher)
-            # Add ACK publisher node to executor if in accuracy mode
-            if self._accuracy_mode and hasattr(self, '_ack_publisher_node'):
+
+            if self._accuracy_mode and self._ack_publisher_node is not None:
                 self.ros_executor.add_node(self._ack_publisher_node)
 
         if IS_RDK and self.ros_executor is not None and isinstance(self.frame_source, Node):
@@ -849,28 +843,18 @@ class BagCounterApp:
                     affected_ids=[track_id],
                     context={"label": label, "phash": phash}
                 )
-    
+
     def _publish_processing_ack(self, frame_index: int):
-        """
-        Publish processing ACK for accuracy mode.
-        
-        This signals to SpoolProcessorNode that the frame has been
-        fully processed and the next frame can be sent.
-        
-        Args:
-            frame_index: Index of the processed frame
-        """
-        if not self._accuracy_mode or self._ack_publisher is None:
+        """Publish processing ACK for Accuracy Mode."""
+        if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ack_publisher is None:
             return
-        
         try:
             from std_msgs.msg import UInt32
             msg = UInt32()
-            msg.data = frame_index
+            msg.data = int(frame_index)
             self._ack_publisher.publish(msg)
-            logger.debug(f"[BagCounterApp] Published ACK for frame {frame_index}")
         except Exception as e:
-            logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {frame_index}: {e}")
+            logger.warning(f"[BagCounterApp] Failed to publish ACK: {e}")
 
     # --- V3: Async Classification Thread ---
     
@@ -1219,6 +1203,11 @@ class BagCounterApp:
 
             try:
                 frame_count += 1
+                # Accuracy Mode: ACK the currently processed frame index
+                # This unblocks SpoolProcessor to publish the next frame.
+                if getattr(self, "_accuracy_mode", False) and hasattr(self.frame_source, "get_current_frame_index"):
+                    self._publish_processing_ack(self.frame_source.get_current_frame_index())
+
                 frame_start = time.perf_counter()
                 
                 # V3: Check if we should skip processing due to backpressure
@@ -1680,12 +1669,7 @@ class BagCounterApp:
                         if current_time - self._last_system_status_log >= self.SYSTEM_STATUS_LOG_INTERVAL:
                             self._log_system_status()
                             self._last_system_status_log = current_time
-                        
-                        # Accuracy Mode: Publish ACK after frame processing complete
-                        # Get frame index from frame source (if in accuracy mode)
-                        if self._accuracy_mode and hasattr(self.frame_source, 'get_current_frame_index'):
-                            processed_frame_index = self.frame_source.get_current_frame_index()
-                            self._publish_processing_ack(processed_frame_index)
+
                 
                 # V4 Phase 1: Skip visualization/timing when using detection queue (handled by monitor thread)
                 if not self.detection_queue_enabled:
@@ -1882,8 +1866,7 @@ class BagCounterApp:
             self.ros_executor.remove_node(self.ipc_publisher)
             if isinstance(self.frame_source, Node):
                 self.ros_executor.remove_node(self.frame_source)
-            # Remove ACK publisher node if in accuracy mode
-            if self._accuracy_mode and hasattr(self, '_ack_publisher_node'):
+            if getattr(self, "_accuracy_mode", False) and getattr(self, "_ack_publisher_node", None) is not None:
                 self.ros_executor.remove_node(self._ack_publisher_node)
                 self._ack_publisher_node.destroy_node()
         self.ipc_publisher.close_node()

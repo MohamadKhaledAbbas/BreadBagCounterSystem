@@ -32,6 +32,8 @@ from typing import Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
 
+from src.config.settings import AppConfig
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -88,7 +90,7 @@ class ProcessorConfig:
     stats_interval: float = DEFAULT_STATS_INTERVAL
 
 
-def load_config_from_db(db_path: str = "data/db/bag_events.db") -> ProcessorConfig:
+def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
     try:
         db = DatabaseManager(db_path)
@@ -174,12 +176,12 @@ class SpoolProcessorNode(Node):
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=1
             )
-            
+
             # Publisher for encoded frames (to decoder input)
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
-                best_effort_qos
+                reliable_qos
             )
             
             # Publisher for current frame index (side channel for ACK correlation)

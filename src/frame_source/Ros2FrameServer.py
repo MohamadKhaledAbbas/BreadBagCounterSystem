@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import UInt32
 
+from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
 from src.logging.Database import DatabaseManager
 from src import constants
@@ -74,7 +75,7 @@ class FrameServer(Node, FrameSource):
         
         # Check if accuracy mode is enabled via database config, fall back to environment
         try:
-            db = DatabaseManager()
+            db = DatabaseManager(db_path=AppConfig.db_path)
             accuracy_mode_config = db.get_config_value(constants.accuracy_mode_enabled)
             db.close()
             if accuracy_mode_config is not None:
@@ -108,13 +109,13 @@ class FrameServer(Node, FrameSource):
     def _frame_index_callback(self, msg):
         """Callback for frame index updates from SpoolProcessorNode."""
         with self._frame_index_lock:
-            self._current_frame_index = msg.data
+            self._current_frame_index = int(msg.data)
         logger.debug(f"[Ros2FrameServer] Received frame index: {msg.data}")
     
     def get_current_frame_index(self) -> int:
         """Get the current frame index for ACK correlation."""
         with self._frame_index_lock:
-            return self._current_frame_index
+            return int(self._current_frame_index)
 
     def listener_callback(self, msg):
         now = time.time()
