@@ -219,7 +219,7 @@ def test_disk_usage_function():
         
         usage = get_spool_disk_usage(tmpdir)
         
-        assert usage['exists'] == True
+        assert usage['exists']
         assert usage['segment_count'] == 2
         assert usage['tmp_count'] == 1
         assert usage['meta_count'] == 1
@@ -232,7 +232,7 @@ def test_disk_usage_nonexistent():
     """Test get_spool_disk_usage with nonexistent directory."""
     usage = get_spool_disk_usage("/nonexistent/path/12345")
     
-    assert usage['exists'] == False
+    assert not usage['exists']
     assert usage['total_bytes'] == 0
     assert usage['segment_count'] == 0
     

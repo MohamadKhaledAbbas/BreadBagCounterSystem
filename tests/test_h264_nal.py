@@ -215,23 +215,28 @@ def test_empty_data():
 def test_nal_unit_lengths():
     """Test that NAL unit lengths are calculated correctly."""
     data = bytes([
-        0x00, 0x00, 0x01, 0x67,  # SPS (offset 3)
-        0x11, 0x22, 0x33,        # 3 bytes of data
-        0x00, 0x00, 0x01, 0x68,  # PPS (offset 10)
-        0x44, 0x55,              # 2 bytes of data
+        0x00, 0x00, 0x01, 0x67,  # SPS start (offset 3 after start code)
+        0x11, 0x22, 0x33,        # 3 bytes of SPS data
+        0x00, 0x00, 0x01, 0x68,  # PPS start (offset 10 after start code)
+        0x44, 0x55,              # 2 bytes of PPS data
     ])
     
     nal_units = parse_nal_units(data)
     
     assert len(nal_units) == 2
     
-    # SPS: from offset 3, length should be 7-3 = 4 bytes (header + 3 data)
-    # Actually 10-3 = 7 (next NAL start) - 3 (start code) = 4
+    # SPS NAL unit:
+    # - Starts at offset 3 (after start code)
+    # - Ends at offset 7 (next start code is at byte 7, which means data goes 3-6)
+    # - Length = (7 - 3) = 4 bytes (1 byte NAL header 0x67 + 3 bytes data)
     sps = nal_units[0]
     assert sps.offset == 3, f"SPS offset should be 3: {sps.offset}"
     assert sps.length == 4, f"SPS length should be 4: {sps.length}"
     
-    # PPS: from offset 10 to end
+    # PPS NAL unit:
+    # - Starts at offset 10 (after second start code)
+    # - Ends at offset 13 (end of data)
+    # - Length = (13 - 10) = 3 bytes (1 byte NAL header 0x68 + 2 bytes data)
     pps = nal_units[1]
     assert pps.offset == 10, f"PPS offset should be 10: {pps.offset}"
     assert pps.length == 3, f"PPS length should be 3: {pps.length}"

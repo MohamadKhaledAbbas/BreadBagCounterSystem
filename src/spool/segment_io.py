@@ -35,7 +35,7 @@ import os
 import struct
 import time
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Iterator, List, Dict, Any
 from pathlib import Path
 import threading
