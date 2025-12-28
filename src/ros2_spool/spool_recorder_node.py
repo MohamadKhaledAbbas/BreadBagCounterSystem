@@ -16,11 +16,10 @@ Features:
 Usage:
     python -m src.ros2_spool.spool_recorder_node
 
-Environment Variables:
-    SPOOL_DIR: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    SEGMENT_DURATION: Target segment duration in seconds (default: 5.0)
-    RETENTION_SECONDS: Maximum segment age before deletion (default: 180)
-    RMW_IMPLEMENTATION: ROS2 middleware (typically rmw_cyclonedds_cpp)
+Configuration (via database config table):
+    spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
+    spool_segment_duration: Target segment duration in seconds (default: 5.0)
+    spool_retention_seconds: Maximum segment age before deletion (default: 180)
 """
 
 import os
@@ -40,6 +39,8 @@ from src.utils.platform import IS_RDK
 from src.spool.h264_nal import extract_sps_pps, is_idr_frame
 from src.spool.segment_io import SegmentWriter, FrameRecord
 from src.spool.retention import RetentionPolicy, cleanup_stale_tmp_files
+from src.logging.Database import DatabaseManager
+from src import constants
 
 # ROS2 imports (only on RDK platform)
 if IS_RDK:
@@ -56,15 +57,45 @@ else:
         def destroy_node(self): pass
 
 
+# Default configuration values
+DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
+DEFAULT_SEGMENT_DURATION = 5.0
+DEFAULT_MAX_SEGMENT_DURATION = 10.0
+DEFAULT_RETENTION_SECONDS = 180.0
+DEFAULT_QUEUE_SIZE = 100
+DEFAULT_STATS_INTERVAL = 10.0
+
+
 @dataclass
 class SpoolConfig:
     """Configuration for the spool recorder."""
-    spool_dir: str = "/home/sunrise/BreadCounting/data/spool"
-    segment_duration: float = 5.0
-    max_segment_duration: float = 10.0
-    retention_seconds: float = 180.0
-    queue_size: int = 100
-    stats_interval: float = 10.0
+    spool_dir: str = DEFAULT_SPOOL_DIR
+    segment_duration: float = DEFAULT_SEGMENT_DURATION
+    max_segment_duration: float = DEFAULT_MAX_SEGMENT_DURATION
+    retention_seconds: float = DEFAULT_RETENTION_SECONDS
+    queue_size: int = DEFAULT_QUEUE_SIZE
+    stats_interval: float = DEFAULT_STATS_INTERVAL
+
+
+def load_config_from_db(db_path: str = "data/db/bag_events.db") -> SpoolConfig:
+    """Load spool configuration from database config table."""
+    try:
+        db = DatabaseManager(db_path)
+        
+        spool_dir = db.get_config_value(constants.spool_dir)
+        segment_duration = db.get_config_value(constants.spool_segment_duration)
+        retention_seconds = db.get_config_value(constants.spool_retention_seconds)
+        
+        db.close()
+        
+        return SpoolConfig(
+            spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
+            segment_duration=float(segment_duration) if segment_duration else DEFAULT_SEGMENT_DURATION,
+            retention_seconds=float(retention_seconds) if retention_seconds else DEFAULT_RETENTION_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(f"[SpoolRecorder] Failed to load config from DB: {e}, using defaults")
+        return SpoolConfig()
 
 
 class SpoolRecorderNode(Node):
@@ -81,12 +112,8 @@ class SpoolRecorderNode(Node):
     def __init__(self, config: Optional[SpoolConfig] = None):
         super().__init__('spool_recorder')
         
-        # Load configuration
-        self.config = config or SpoolConfig(
-            spool_dir=os.getenv('SPOOL_DIR', '/home/sunrise/BreadCounting/data/spool'),
-            segment_duration=float(os.getenv('SEGMENT_DURATION', '5.0')),
-            retention_seconds=float(os.getenv('RETENTION_SECONDS', '180')),
-        )
+        # Load configuration from database if not provided
+        self.config = config or load_config_from_db()
         
         logger.info(f"[SpoolRecorder] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "

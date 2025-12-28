@@ -175,16 +175,31 @@ Optional `seg_XXXXXX.meta.json` files contain:
 
 ## Configuration
 
-### Environment Variables
+### Database Configuration (config table)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SPOOL_DIR` | `/home/sunrise/BreadCounting/data/spool` | Spool directory |
-| `SEGMENT_DURATION` | `5.0` | Target segment duration (seconds) |
-| `RETENTION_SECONDS` | `180` | Maximum segment age before deletion |
-| `ACK_TIMEOUT` | `30.0` | Timeout waiting for ACK (seconds) |
-| `RETRY_COUNT` | `2` | Retries before advancing |
-| `ACCURACY_MODE` | `false` | Enable accuracy mode in BagCounterApp |
+Configuration is stored in the SQLite database config table. Use `config.py` to set values:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `accuracy_mode_enabled` | `0` | Enable accuracy mode (`1` = enabled) |
+| `spool_dir` | `/home/sunrise/BreadCounting/data/spool` | Spool directory |
+| `spool_segment_duration` | `5.0` | Target segment duration (seconds) |
+| `spool_retention_seconds` | `180` | Maximum segment age before deletion |
+| `spool_ack_timeout` | `30.0` | Timeout waiting for ACK (seconds) |
+| `spool_retry_count` | `2` | Retries before advancing |
+
+Example configuration commands:
+
+```bash
+# Enable accuracy mode
+python config.py --key accuracy_mode_enabled --value 1
+
+# Set spool directory
+python config.py --key spool_dir --value /home/sunrise/BreadCounting/data/spool
+
+# Set retention to 5 minutes
+python config.py --key spool_retention_seconds --value 300
+```
 
 ### ROS2 Environment
 
@@ -197,7 +212,36 @@ export CYCLONEDDS_URI=file:///path/to/cyclonedds.xml
 
 ## Usage
 
-### Running the Recorder
+### Using Supervisor (Recommended for Production)
+
+Install the supervisor configuration:
+
+```bash
+sudo cp supervisor/breadcount-spool.conf /etc/supervisor/conf.d/
+sudo supervisorctl reread
+sudo supervisorctl update
+```
+
+Start/stop services:
+
+```bash
+# Start spool services
+sudo supervisorctl start breadcount-spool-recorder breadcount-spool-processor
+
+# Stop spool services
+sudo supervisorctl stop breadcount-spool-recorder breadcount-spool-processor
+
+# Check status
+sudo supervisorctl status breadcount-spool-recorder breadcount-spool-processor
+```
+
+Or use the run_app.sh script (automatically starts spool services when accuracy_mode_enabled=1):
+
+```bash
+./run_app.sh
+```
+
+### Running Manually (Development)
 
 ```bash
 # Start the recorder process (always-on)
@@ -213,10 +257,10 @@ python -m src.ros2_spool.spool_processor_node
 
 ### Enabling Accuracy Mode in BagCounterApp
 
-Set the environment variable before starting:
+Enable via database configuration:
 
 ```bash
-export ACCURACY_MODE=true
+python config.py --key accuracy_mode_enabled --value 1
 python main.py
 ```
 

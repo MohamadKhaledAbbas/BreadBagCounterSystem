@@ -288,7 +288,13 @@ class BagCounterApp:
 
         # Accuracy Mode: ACK publisher for frame processing acknowledgment
         # This enables the SpoolProcessorNode to know when a frame has been processed
-        self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        # Check database config first, fall back to environment variable
+        accuracy_mode_config = db.get_config_value(constants.accuracy_mode_enabled)
+        if accuracy_mode_config is not None:
+            self._accuracy_mode = accuracy_mode_config == '1'
+        else:
+            self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        
         self._ack_publisher = None
         self._current_processing_frame_index = 0
         

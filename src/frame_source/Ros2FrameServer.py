@@ -12,6 +12,8 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy,
 from std_msgs.msg import UInt32
 
 from src.frame_source.FrameSource import FrameSource
+from src.logging.Database import DatabaseManager
+from src import constants
 
 from src.utils.AppLogging import logger
 
@@ -70,8 +72,17 @@ class FrameServer(Node, FrameSource):
         self._current_frame_index = 0
         self._frame_index_lock = threading.Lock()
         
-        # Check if accuracy mode is enabled via environment
-        self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        # Check if accuracy mode is enabled via database config, fall back to environment
+        try:
+            db = DatabaseManager()
+            accuracy_mode_config = db.get_config_value(constants.accuracy_mode_enabled)
+            db.close()
+            if accuracy_mode_config is not None:
+                self._accuracy_mode = accuracy_mode_config == '1'
+            else:
+                self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        except Exception:
+            self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
         
         if self._accuracy_mode:
             reliable_qos = QoSProfile(

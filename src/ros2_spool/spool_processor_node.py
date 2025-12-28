@@ -17,11 +17,10 @@ Architecture:
 Usage:
     python -m src.ros2_spool.spool_processor_node
 
-Environment Variables:
-    SPOOL_DIR: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    ACK_TIMEOUT: Timeout waiting for ACK in seconds (default: 30.0)
-    RETRY_COUNT: Number of retries before advancing (default: 2)
-    RMW_IMPLEMENTATION: ROS2 middleware (typically rmw_cyclonedds_cpp)
+Configuration (via database config table):
+    spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
+    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 30.0)
+    spool_retry_count: Number of retries before advancing (default: 2)
 """
 
 import os
@@ -39,6 +38,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from src.utils.AppLogging import logger
 from src.utils.platform import IS_RDK
 from src.spool.segment_io import SegmentReader, FrameRecord
+from src.logging.Database import DatabaseManager
+from src import constants
 
 # ROS2 imports (only on RDK platform)
 if IS_RDK:
@@ -69,14 +70,43 @@ class ProcessorState(Enum):
     STOPPED = "stopped"
 
 
+# Default configuration values
+DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
+DEFAULT_ACK_TIMEOUT = 30.0
+DEFAULT_RETRY_COUNT = 2
+DEFAULT_POLL_INTERVAL = 1.0
+DEFAULT_STATS_INTERVAL = 10.0
+
+
 @dataclass
 class ProcessorConfig:
     """Configuration for the spool processor."""
-    spool_dir: str = "/home/sunrise/BreadCounting/data/spool"
-    ack_timeout: float = 30.0
-    retry_count: int = 2
-    poll_interval: float = 1.0
-    stats_interval: float = 10.0
+    spool_dir: str = DEFAULT_SPOOL_DIR
+    ack_timeout: float = DEFAULT_ACK_TIMEOUT
+    retry_count: int = DEFAULT_RETRY_COUNT
+    poll_interval: float = DEFAULT_POLL_INTERVAL
+    stats_interval: float = DEFAULT_STATS_INTERVAL
+
+
+def load_config_from_db(db_path: str = "data/db/bag_events.db") -> ProcessorConfig:
+    """Load spool processor configuration from database config table."""
+    try:
+        db = DatabaseManager(db_path)
+        
+        spool_dir = db.get_config_value(constants.spool_dir)
+        ack_timeout = db.get_config_value(constants.spool_ack_timeout)
+        retry_count = db.get_config_value(constants.spool_retry_count)
+        
+        db.close()
+        
+        return ProcessorConfig(
+            spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
+            ack_timeout=float(ack_timeout) if ack_timeout else DEFAULT_ACK_TIMEOUT,
+            retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
+        )
+    except Exception as e:
+        logger.warning(f"[SpoolProcessor] Failed to load config from DB: {e}, using defaults")
+        return ProcessorConfig()
 
 
 class SpoolProcessorNode(Node):
@@ -97,12 +127,8 @@ class SpoolProcessorNode(Node):
     def __init__(self, config: Optional[ProcessorConfig] = None):
         super().__init__('spool_processor')
         
-        # Load configuration
-        self.config = config or ProcessorConfig(
-            spool_dir=os.getenv('SPOOL_DIR', '/home/sunrise/BreadCounting/data/spool'),
-            ack_timeout=float(os.getenv('ACK_TIMEOUT', '30.0')),
-            retry_count=int(os.getenv('RETRY_COUNT', '2')),
-        )
+        # Load configuration from database if not provided
+        self.config = config or load_config_from_db()
         
         logger.info(f"[SpoolProcessor] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "

@@ -10,6 +10,14 @@ rtsp_host = "rtsp_host"
 rtsp_port = "rtsp_port"
 is_profiler_enabled = "is_profiler_enabled"
 
+# Accuracy Mode / Spool configuration keys
+accuracy_mode_enabled = "accuracy_mode_enabled"
+spool_dir = "spool_dir"
+spool_segment_duration = "spool_segment_duration"
+spool_retention_seconds = "spool_retention_seconds"
+spool_ack_timeout = "spool_ack_timeout"
+spool_retry_count = "spool_retry_count"
+
 CONFIG_KEYS = [
     show_ui_screen_key,
     is_development_key,
@@ -22,4 +30,11 @@ CONFIG_KEYS = [
     recording_seconds,
     recording_fps,
     is_profiler_enabled,
+    # Accuracy Mode / Spool config
+    accuracy_mode_enabled,
+    spool_dir,
+    spool_segment_duration,
+    spool_retention_seconds,
+    spool_ack_timeout,
+    spool_retry_count,
 ]
