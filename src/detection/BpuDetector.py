@@ -253,19 +253,7 @@ class BpuDetector(BaseDetector):
             speedup_factor = baseline_single_frame / avg_per_frame if avg_per_frame > 0 else 1.0
             
             from src.utils.AppLogging import structured_logger
-            structured_logger.log_json({
-                "event": "batch_inference_stats",
-                "batch_count": self._batch_counter,
-                "avg_batch_size": avg_batch_size,
-                "avg_preprocess_ms": avg_preprocess,
-                "avg_inference_ms": avg_inference,
-                "avg_postprocess_ms": avg_postprocess,
-                "avg_total_batch_ms": avg_total,
-                "avg_time_per_frame_ms": avg_per_frame,
-                "speedup_factor": speedup_factor,
-                "target_speedup": "1.4-1.6x"
-            })
-            
+
             logger.info(
                 f"[BpuDetector] Batch inference stats (50 batches): "
                 f"avg_batch_size={avg_batch_size:.1f}, "

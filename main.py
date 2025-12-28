@@ -63,6 +63,25 @@ if __name__ == "__main__":
     logger.info("[Startup] Detection Model: {}".format(config.detection_model))
     logger.info("[Startup] Classification Model: {}".format(config.classification_model))
     logger.info("[Startup] DB: {}".format(db_manager.db_path))
-    logger.info("[Startup] Starting main application loop...")
 
-    app.run()
+    profiler_enabled = db_manager.get_config_value(constants.is_profiler_enabled)
+    if profiler_enabled:
+        logger.info("[Startup] profiler is enabled... running profiler...")
+        import cProfile
+        import pstats
+        import io
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            logger.info("[Startup] Starting main application loop...")
+            app.run()
+        finally:
+            profiler.disable()
+            s = io.StringIO()
+            ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+            ps.print_stats(25)
+            print(s.getvalue())
+            profiler.dump_stats("data/logs/cprofile.prof")
+    else:
+        logger.info("[Startup] Starting main application loop...")
+        app.run()

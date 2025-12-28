@@ -13,3 +13,7 @@ class BaseDetector(ABC):
     @abstractmethod
     def class_names(self) -> Dict[int, str]:
         pass
+
+    @abstractmethod
+    def predict_batch(self, frames):
+        pass

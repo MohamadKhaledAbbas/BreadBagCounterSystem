@@ -70,7 +70,7 @@ Check performance metrics:
 |----------|-------------|
 | **[V4_CONFIGURATION_GUIDE.md](./V4_CONFIGURATION_GUIDE.md)** | Complete configuration reference, tuning guide, troubleshooting |
 | **[V4_PERFORMANCE_OPTIMIZATION_STATUS.md](./V4_PERFORMANCE_OPTIMIZATION_STATUS.md)** | Implementation status, remaining work, testing plan |
-| **[CHANGES_SUMMARY.md](../CHANGES_SUMMARY.md)** | Change log, commit history, deployment plan |
+| **[CHANGES_SUMMARY.md](CHANGES_SUMMARY.md)** | Change log, commit history, deployment plan |
 
 ---
 

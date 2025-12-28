@@ -25,3 +25,6 @@ class UltralyticsDetector(BaseDetector):
     def class_names(self) -> Dict[int, str]:
         # Use custom class names if provided, otherwise use model's names
         return self._class_names if self._class_names is not None else self.model.names
+
+    def predict_batch(self, frames):
+        raise NotImplementedError()

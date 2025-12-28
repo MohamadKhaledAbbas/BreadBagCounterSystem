@@ -230,13 +230,13 @@ disambiguation_v2_enabled = False
 
 ## References
 
-- **Implementation Guide**: [docs/LOW_CONFIDENCE_LABELING.md](docs/LOW_CONFIDENCE_LABELING.md)
-- **Test Suite**: [src/test/test_confidence_tier.py](src/test/test_confidence_tier.py)
-- **Core Logic**: [src/classifier/disambiguation_v2.py](src/classifier/disambiguation_v2.py)
-- **Service Integration**: [src/classifier/ClassifierService.py](src/classifier/ClassifierService.py)
-- **App Integration**: [src/counting/BagCounterApp.py](src/counting/BagCounterApp.py)
-- **Database Schema**: [src/logging/Database.py](src/logging/Database.py)
-- **UI Template**: [src/endpoint/templates/analytics.html](src/endpoint/templates/analytics.html)
+- **Implementation Guide**: [docs/LOW_CONFIDENCE_LABELING.md](LOW_CONFIDENCE_LABELING.md)
+- **Test Suite**: [src/test/test_confidence_tier.py](../src/test/test_confidence_tier.py)
+- **Core Logic**: [src/classifier/disambiguation_v2.py](../src/classifier/disambiguation_v2.py)
+- **Service Integration**: [src/classifier/ClassifierService.py](../src/classifier/ClassifierService.py)
+- **App Integration**: [src/counting/BagCounterApp.py](../src/counting/BagCounterApp.py)
+- **Database Schema**: [src/logging/Database.py](../src/logging/Database.py)
+- **UI Template**: [src/endpoint/templates/analytics.html](../src/endpoint/templates/analytics.html)
 
 ---
 

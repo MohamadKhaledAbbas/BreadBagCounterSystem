@@ -193,6 +193,7 @@ class BagCounterApp:
         self.batch_inference_enabled = tracking_config.detection_batch_enabled
         if self.batch_inference_enabled:
             self._frame_batch = []
+            self._batch_frame_data = []
             self._batch_start_time = None
             logger.info(
                 f"[BagCounterApp] V4 Phase 2: Batch inference enabled "
@@ -322,7 +323,40 @@ class BagCounterApp:
         # Now toggle flag based on config key
         self.is_recording = (new_value == "1" or new_value is True or new_value == 1)
         logger.info(f"[BagCounterApp] is_recording set to {self.is_recording}")
-    
+
+    def _convert_detections(self, detections):
+        """Normalize detector output to a list of dicts with box, class_id, conf."""
+        if detections is None:
+            return []
+
+        # Case 1: single object with .boxes (e.g., BpuResultWrapper)
+        if hasattr(detections, "boxes"):
+            det_obj = detections
+        else:
+            # Case 2: sequence, take first element if present
+            try:
+                if len(detections) == 0:
+                    return []
+                det_obj = detections[0]
+            except TypeError:
+                # Not len()-able, assume single detection object
+                det_obj = detections
+
+        if not hasattr(det_obj, "boxes") or det_obj.boxes is None:
+            return []
+
+        boxes = det_obj.boxes
+        if not hasattr(boxes, "xyxy") or boxes.xyxy is None:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls_ids = boxes.cls.cpu().numpy().astype(int)
+        confidences = boxes.conf.cpu().numpy()
+        return [
+            {"box": xyxy[i], "class_id": cls_ids[i], "conf": confidences[i]}
+            for i in range(len(cls_ids))
+        ]
+
     def _log_system_status(self):
         """
         Log system resource usage (CPU, RAM) if psutil is available.
@@ -351,7 +385,7 @@ class BagCounterApp:
             )
             
             # Also log via structured logging
-            structured_logger.log_json({
+            structured_logger.pipeline_summary({
                 "event": "system_status",
                 "timestamp": datetime.now().isoformat(),
                 "cpu_percent": cpu_percent,
@@ -1241,27 +1275,23 @@ class BagCounterApp:
                             f"queue={queue_utilization:.1%}, avg_detect={avg_detection_time:.1f}ms, "
                             f"blocks={self._skip_cap_blocks}"
                         )
-                        structured_logger.log_json({
-                            "event": "skip_cap_block",
-                            "timestamp": datetime.now().isoformat(),
-                            "current_skip_rate": current_skip_rate,
-                            "skip_rate_cap": self.SKIP_RATE_CAP,
-                            "queue_utilization": queue_utilization,
-                            "avg_detection_time_ms": avg_detection_time,
-                            "total_blocks": self._skip_cap_blocks
-                        })
+                        structured_logger.pipeline_metric(
+                            component="BagCounterApp",
+                            metric_name="skip_cap_block",
+                            metric_value=self._skip_cap_blocks,
+                            context={
+                                "current_skip_rate": current_skip_rate,
+                                "skip_rate_cap": self.SKIP_RATE_CAP,
+                                "queue_utilization": queue_utilization,
+                                "avg_detection_time_ms": avg_detection_time
+                            }
+                        )
 
                 # 1. Run Detector (V4: With batch inference support)
                 detect_start = time.perf_counter()
                 
                 # V4 Phase 2: Batch inference
                 if self.batch_inference_enabled:
-                    # Accumulate frame for batch processing
-                    if not hasattr(self, '_frame_batch'):
-                        self._frame_batch = []
-                        self._batch_start_time = None
-                        self._batch_frame_data = []  # Store (frame, frame_count) pairs
-                    
                     self._frame_batch.append(frame)
                     self._batch_frame_data.append((frame, frame_count))
                     
@@ -1291,24 +1321,16 @@ class BagCounterApp:
                     detect_time = (detect_end - detect_start) * 1000
                     
                     # Process each frame in the batch
+                    # Process each frame in the batch
                     for i, (batch_frame, batch_frame_count) in enumerate(self._batch_frame_data):
                         detections = detections_batch[i]
                         frame_detect_time = detect_time / len(self._frame_batch)  # Approximate per-frame time
-                        
+
                         # V3: Track detection time for adaptive skipping
                         self._recent_detection_times.append(frame_detect_time)
-                        
-                        # Extract detections
-                        current_frame_detections = []
-                        if len(detections) > 0 and hasattr(detections[0], "boxes") and len(detections[0].boxes) > 0:
-                            boxes = detections[0].boxes
-                            xyxy = boxes.xyxy.cpu().numpy()
-                            cls_ids = boxes.cls.cpu().numpy().astype(int)
-                            confidences = boxes.conf.cpu().numpy()
-                            current_frame_detections = [
-                                {"box": xyxy[j], "class_id": cls_ids[j], "conf": confidences[j]}
-                                for j in range(len(cls_ids))
-                            ]
+
+                        # Extract detections using _convert_detections helper (handles BpuResultWrapper)
+                        current_frame_detections = self._convert_detections(detections)
                         
                         # V4 Phase 1: Enqueue detection result or process inline
                         if self.detection_queue_enabled:
