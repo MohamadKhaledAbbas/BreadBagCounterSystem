@@ -17,6 +17,7 @@ spool_segment_duration = "spool_segment_duration"
 spool_retention_seconds = "spool_retention_seconds"
 spool_ack_timeout = "spool_ack_timeout"
 spool_retry_count = "spool_retry_count"
+spool_inflight_window = "spool_inflight_window"
 
 CONFIG_KEYS = [
     show_ui_screen_key,
@@ -37,4 +38,5 @@ CONFIG_KEYS = [
     spool_retention_seconds,
     spool_ack_timeout,
     spool_retry_count,
+    spool_inflight_window,
 ]

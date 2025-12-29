@@ -31,6 +31,7 @@ import threading
 from typing import Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
+from collections import deque
 
 from src.config.settings import AppConfig
 
@@ -86,6 +87,29 @@ class ProcessorState(Enum):
     STOPPED = "stopped"
 
 
+@dataclass
+class InflightFrame:
+    """
+    Tracking information for a frame in the inflight window.
+    
+    Attributes:
+        seq: Sequence number assigned when published
+        frame_index: Frame index from the spool
+        segment_num: Segment number
+        publish_time: Timestamp when frame was published
+        retry_count: Number of retries so far
+        acked: Whether this frame has been acknowledged
+        frame_record: The original FrameRecord (for retry)
+    """
+    seq: int
+    frame_index: int
+    segment_num: int
+    publish_time: float
+    retry_count: int
+    acked: bool
+    frame_record: 'FrameRecord'  # Forward reference
+
+
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
 DEFAULT_ACK_TIMEOUT = 10.0  # Reduced from 30.0 - should be much faster with FIFO correlation
@@ -94,6 +118,7 @@ DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
+DEFAULT_INFLIGHT_WINDOW = 1  # Default to 1 for backward compatibility (strict one-at-a-time)
 
 
 @dataclass
@@ -106,6 +131,7 @@ class ProcessorConfig:
     stats_interval: float = DEFAULT_STATS_INTERVAL
     startup_grace_period: float = DEFAULT_STARTUP_GRACE_PERIOD
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
+    inflight_window: int = DEFAULT_INFLIGHT_WINDOW
 
 
 def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
@@ -116,6 +142,7 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
         spool_dir = db.get_config_value(constants.spool_dir)
         ack_timeout = db.get_config_value(constants.spool_ack_timeout)
         retry_count = db.get_config_value(constants.spool_retry_count)
+        inflight_window = db.get_config_value(constants.spool_inflight_window)
         
         db.close()
         
@@ -123,6 +150,7 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
             spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
             ack_timeout=float(ack_timeout) if ack_timeout else DEFAULT_ACK_TIMEOUT,
             retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
+            inflight_window=int(inflight_window) if inflight_window else DEFAULT_INFLIGHT_WINDOW,
         )
     except Exception as e:
         logger.warning(f"[SpoolProcessor] Failed to load config from DB: {e}, using defaults")
@@ -131,23 +159,28 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
 
 class SpoolProcessorNode(Node):
     """
-    ROS2 Node that processes spooled H.264 frames with strict backpressure.
+    ROS2 Node that processes spooled H.264 frames with configurable backpressure.
     
-    The processor ensures exactly one frame is in flight at a time:
-    1. Read next frame from spool
-    2. Publish frame index to /spool/current_frame_index
-    3. Publish encoded frame to /spool_image_ch_0
-    4. Wait for ACK on /processing_ack with matching index
-    5. Only then proceed to next frame
+    The processor supports windowed ACK processing (configurable via inflight_window):
+    - inflight_window=1: Strict one-at-a-time processing (backward compatible)
+    - inflight_window>1: Multiple frames can be in-flight simultaneously
     
-    This design implements strict pull-based processing where BagCounterApp
-    controls the pace.
+    Processing flow:
+    1. Read frames from spool
+    2. Publish up to inflight_window frames
+    3. Track ACKs (can arrive out-of-order)
+    4. Retire frames from head of window when acknowledged
+    5. Handle timeouts and retries per frame
+    
+    This design implements pull-based processing with configurable parallelism
+    to balance throughput and backpressure.
     
     Production Reliability Features:
     - Startup synchronization: Waits for consumer before processing
     - Watchdog: Auto-recovery from stuck ACK states
     - SPS/PPS caching: Prepends to segment boundaries for decoder init
     - Graceful degradation: Advances after max retries to prevent deadlock
+    - Out-of-order ACK handling: Supports parallel processing in consumer
     """
     
     def __init__(self, config: Optional[ProcessorConfig] = None):
@@ -163,6 +196,7 @@ class SpoolProcessorNode(Node):
                    f"spool_dir={self.config.spool_dir}, "
                    f"ack_timeout={self.config.ack_timeout}s, "
                    f"retry_count={self.config.retry_count}, "
+                   f"inflight_window={self.config.inflight_window}, "
                    f"startup_grace={self.config.startup_grace_period}s, "
                    f"session_id={self._session_id}")
         
@@ -191,6 +225,10 @@ class SpoolProcessorNode(Node):
         self._consumer_session_id: Optional[str] = None  # Session ID from consumer's READY
         self._last_ack_time: float = 0.0  # Track last successful ACK for watchdog
         
+        # Inflight window tracking (for windowed ACK / backpressure)
+        self._inflight_frames: deque[InflightFrame] = deque()
+        self._inflight_lock = threading.Lock()  # Protects _inflight_frames
+        
         # Processing thread
         self._running = False
         self._processor_thread: Optional[threading.Thread] = None
@@ -202,6 +240,7 @@ class SpoolProcessorNode(Node):
         self._ack_timeouts = 0
         self._ack_rejected_stale = 0  # ACKs rejected due to wrong session
         self._ack_accepted = 0  # Total ACKs accepted
+        self._out_of_order_acks = 0  # ACKs received out of order
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
@@ -320,6 +359,7 @@ class SpoolProcessorNode(Node):
         
         # Log final stats
         with self._stats_lock:
+            inflight_count = self._get_inflight_count()
             logger.info(f"[SpoolProcessor] Final stats: "
                        f"session={self._session_id[:8]}, "
                        f"seq={self._seq_counter}, "
@@ -328,6 +368,8 @@ class SpoolProcessorNode(Node):
                        f"skipped={self._frames_skipped}, "
                        f"timeouts={self._ack_timeouts}, "
                        f"ack_rejected={self._ack_rejected_stale}, "
+                       f"out_of_order_acks={self._out_of_order_acks}, "
+                       f"inflight={inflight_count}, "
                        f"segments={self._segments_processed}, "
                        f"sps_pps_prepends={self._sps_pps_prepends}")
         
@@ -696,15 +738,62 @@ class SpoolProcessorNode(Node):
             logger.error(f"[SpoolProcessor] Error parsing READY message: {e}")
     
     def _ack_callback(self, msg):
-        """Callback for processing ACK messages."""
+        """
+        Callback for processing ACK messages.
+        
+        Handles windowed ACKs:
+        - Validates session ID
+        - Marks corresponding inflight frame as acked
+        - Triggers window retirement if needed
+        """
         try:
             ack = processing_ack_from_ros_string(msg.data)
+            
+            # Validate session ID first
+            if ack.session_id != self._session_id:
+                with self._stats_lock:
+                    self._ack_rejected_stale += 1
+                logger.warning(f"[SpoolProcessor] ⚠ ACK rejected: wrong session_id. "
+                             f"Expected {self._session_id[:8]}, got {ack.session_id[:8]}. "
+                             f"Stale ACK count: {self._ack_rejected_stale}")
+                return
+            
+            # Find and mark the corresponding inflight frame as acked
+            with self._inflight_lock:
+                found = False
+                for i, inflight in enumerate(self._inflight_frames):
+                    if inflight.seq == ack.seq and inflight.frame_index == ack.frame_index:
+                        if not inflight.acked:
+                            inflight.acked = True
+                            found = True
+                            with self._stats_lock:
+                                self._ack_accepted += 1
+                                # Track if this is out-of-order (not at head of queue)
+                                if i > 0:
+                                    self._out_of_order_acks += 1
+                            logger.debug(f"[SpoolProcessor] ✓ ACK marked: seq={ack.seq}, "
+                                       f"frame_index={ack.frame_index}, position={i}, "
+                                       f"out_of_order={i > 0}")
+                            break
+                        else:
+                            # Duplicate ACK
+                            logger.debug(f"[SpoolProcessor] Duplicate ACK: seq={ack.seq}, "
+                                       f"frame_index={ack.frame_index}")
+                            return
+                
+                if not found:
+                    logger.debug(f"[SpoolProcessor] ACK for unknown frame: seq={ack.seq}, "
+                               f"frame_index={ack.frame_index} (may have already been retired)")
+            
+            # Signal that we received an ACK (for legacy wait_for_ack compatibility)
             self._last_ack = ack
             self._ack_received.set()
-            logger.debug(f"[SpoolProcessor] ACK callback: seq={ack.seq}, frame_index={ack.frame_index}, "
-                        f"session_id={ack.session_id[:8]}")
+            self._last_ack_time = time.time()
+            
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error parsing ACK message: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
     
     def _request_callback(self, msg):
         """Callback for external pull requests (optional feature)."""
@@ -740,56 +829,197 @@ class SpoolProcessorNode(Node):
                       "proceeding without explicit READY signal. Consumer may not be synchronized.")
         return False
     
+    def _retire_acked_frames(self):
+        """
+        Retire (remove) frames from the head of the inflight window that have been acked.
+        
+        This maintains ordering: we only remove frames from the head while they are
+        contiguously acked. Out-of-order ACKs are marked but not retired until all
+        earlier frames are acked.
+        """
+        with self._inflight_lock:
+            while self._inflight_frames:
+                head = self._inflight_frames[0]
+                if head.acked:
+                    self._inflight_frames.popleft()
+                    # Count as processed when successfully retired
+                    with self._stats_lock:
+                        self._frames_processed += 1
+                    logger.debug(f"[SpoolProcessor] Retired frame: seq={head.seq}, "
+                               f"frame_index={head.frame_index}")
+                else:
+                    # Head frame not acked yet, stop retiring
+                    break
+    
+    def _check_and_retry_timeouts(self):
+        """
+        Check for timed-out frames in the inflight window and retry or skip them.
+        
+        For each frame that has exceeded ack_timeout:
+        - If retry_count not exceeded: increment retry counter and republish
+        - If retry_count exceeded: mark as acked (to allow retirement) and skip
+        
+        This ensures the pipeline doesn't get stuck on a single failed frame.
+        """
+        current_time = time.time()
+        
+        with self._inflight_lock:
+            for inflight in list(self._inflight_frames):
+                # Skip already acked frames
+                if inflight.acked:
+                    continue
+                
+                # Check if frame has timed out
+                age = current_time - inflight.publish_time
+                if age > self.config.ack_timeout:
+                    # Frame has timed out
+                    if inflight.retry_count < self.config.retry_count:
+                        # Retry: republish the frame
+                        inflight.retry_count += 1
+                        with self._stats_lock:
+                            self._frames_retried += 1
+                            self._ack_timeouts += 1
+                        
+                        logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {inflight.frame_index}, "
+                                     f"seq={inflight.seq}, retry {inflight.retry_count}/{self.config.retry_count}")
+                        
+                        # Republish the frame with a new sequence number
+                        success, new_seq, _, _ = self._publish_frame(inflight.frame_record)
+                        if success:
+                            inflight.seq = new_seq
+                            inflight.publish_time = current_time
+                            logger.debug(f"[SpoolProcessor] Retried frame {inflight.frame_index} with new seq={new_seq}")
+                        else:
+                            logger.error(f"[SpoolProcessor] Failed to retry frame {inflight.frame_index}")
+                    else:
+                        # Max retries exceeded, mark as acked to allow retirement
+                        inflight.acked = True
+                        with self._stats_lock:
+                            self._frames_skipped += 1
+                            self._ack_timeouts += 1
+                        logger.error(f"[SpoolProcessor] 🔴 Frame {inflight.frame_index} skipped after "
+                                   f"{inflight.retry_count} retries")
+    
+    def _can_publish_frame(self) -> bool:
+        """
+        Check if we can publish a new frame (window not full).
+        
+        Returns:
+            True if inflight window has space for another frame
+        """
+        with self._inflight_lock:
+            return len(self._inflight_frames) < self.config.inflight_window
+    
+    def _get_inflight_count(self) -> int:
+        """Get current number of inflight frames."""
+        with self._inflight_lock:
+            return len(self._inflight_frames)
+    
+    def _get_oldest_inflight_age(self) -> float:
+        """
+        Get age of the oldest inflight frame (for monitoring).
+        
+        Returns:
+            Age in seconds, or 0.0 if no frames inflight
+        """
+        with self._inflight_lock:
+            if not self._inflight_frames:
+                return 0.0
+            oldest = self._inflight_frames[0]
+            return time.time() - oldest.publish_time
+    
     def _processor_loop(self):
         """
-        Main processing loop with strict backpressure.
+        Main processing loop with windowed backpressure.
         
-        This loop ensures exactly one frame is in flight:
+        This loop manages the inflight window:
         1. Wait for consumer startup (startup sync)
-        2. Get next frame from spool
-        3. Publish frame
-        4. Wait for ACK (with retry)
+        2. While window not full:
+           - Get next frame from spool
+           - Publish frame and add to inflight window
+        3. Retire acked frames from head of window
+        4. Check for timeouts and retry/skip as needed
         5. Repeat
         
         Production reliability features:
         - Startup synchronization: Wait for consumer before first frame
+        - Windowed ACK: Configurable parallelism (1 = strict serial)
+        - Out-of-order ACK handling: Marks frames but retires in order
+        - Timeout/retry per frame: Doesn't block other frames
         - Watchdog: Detect and recover from stuck states
-        - Graceful degradation: Advance after max retries
+        - Graceful degradation: Skip frames after max retries
         """
         logger.info("[SpoolProcessor] Processing loop started")
         
         # Startup synchronization: Wait for consumer READY
         self._wait_for_consumer_ready()
         
+        # Track when we last tried to get a frame (to avoid tight loop on empty spool)
+        last_spool_check = 0.0
+        
         while self._running:
             try:
-                # Get next frame
-                frame = self._get_next_frame()
+                # Retire any acked frames from the head of the window
+                self._retire_acked_frames()
                 
-                if frame is None:
-                    # Spool is empty, wait and retry
-                    with self._state_lock:
-                        self._state = ProcessorState.SPOOL_EMPTY
-                    logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
-                    time.sleep(self.config.poll_interval)
-                    continue
+                # Check for timeouts and retry/skip
+                self._check_and_retry_timeouts()
                 
-                self._current_frame = frame
-                self._current_frame_index = frame.index
-                
-                # Process frame with retry logic
-                success = self._process_frame_with_retry(frame)
-                
-                if success:
-                    with self._stats_lock:
-                        self._frames_processed += 1
+                # Try to fill the window with new frames
+                current_time = time.time()
+                if self._can_publish_frame():
+                    # Avoid tight loop if spool is empty - check at most once per poll_interval
+                    if current_time - last_spool_check >= self.config.poll_interval:
+                        last_spool_check = current_time
+                        
+                        # Get next frame
+                        frame = self._get_next_frame()
+                        
+                        if frame is None:
+                            # Spool is empty
+                            with self._state_lock:
+                                self._state = ProcessorState.SPOOL_EMPTY
+                            logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
+                        else:
+                            # Publish the frame and add to inflight window
+                            self._current_frame = frame
+                            self._current_frame_index = frame.index
+                            
+                            with self._state_lock:
+                                self._state = ProcessorState.IDLE
+                            
+                            success, seq, sent_time_sec, sent_time_nsec = self._publish_frame(frame)
+                            
+                            if success:
+                                # Add to inflight window
+                                inflight = InflightFrame(
+                                    seq=seq,
+                                    frame_index=frame.index,
+                                    segment_num=self._current_segment,
+                                    publish_time=time.time(),
+                                    retry_count=0,
+                                    acked=False,
+                                    frame_record=frame
+                                )
+                                
+                                with self._inflight_lock:
+                                    self._inflight_frames.append(inflight)
+                                
+                                logger.debug(f"[SpoolProcessor] Added to inflight: seq={seq}, "
+                                           f"frame_index={frame.index}, window_size={self._get_inflight_count()}")
+                            else:
+                                logger.warning(f"[SpoolProcessor] 🔴 Failed to publish frame {frame.index}")
+                                # We'll retry on next iteration
                 else:
-                    with self._stats_lock:
-                        self._frames_skipped += 1
-                    logger.warning(f"[SpoolProcessor] Frame {frame.index} skipped after retries")
+                    # Window is full, just wait a bit before checking again
+                    with self._state_lock:
+                        self._state = ProcessorState.WAITING_FOR_ACK
                 
                 # Log stats periodically
                 self._maybe_log_stats()
+                
+                # Small sleep to avoid tight loop
+                time.sleep(0.01)
                 
             except Exception as e:
                 logger.error(f"[SpoolProcessor] Error in processing loop: {e}")
@@ -799,60 +1029,16 @@ class SpoolProcessorNode(Node):
         
         logger.info("[SpoolProcessor] Processing loop stopped")
     
-    def _process_frame_with_retry(self, frame: FrameRecord) -> bool:
-        """
-        Process a frame with retry logic.
-        
-        Args:
-            frame: Frame record to process
-            
-        Returns:
-            True if successfully processed (ACK received), False otherwise
-        """
-        retries = 0
-        seq = 0
-        sent_time_sec = 0
-        sent_time_nsec = 0
-        
-        while retries <= self.config.retry_count and self._running:
-            with self._state_lock:
-                self._state = ProcessorState.IDLE
-            
-            # Publish frame (gets new seq number each time)
-            success, seq, sent_time_sec, sent_time_nsec = self._publish_frame(frame)
-            if not success:
-                logger.warning(f"[SpoolProcessor] 🔴 Failed to publish frame {frame.index}")
-                retries += 1
-                continue
-            
-            with self._state_lock:
-                self._state = ProcessorState.WAITING_FOR_ACK
-            
-            # Wait for ACK with session and seq validation
-            if self._wait_for_ack(seq, frame.index, self.config.ack_timeout):
-                return True
-            
-            # Timeout - retry
-            with self._stats_lock:
-                self._ack_timeouts += 1
-            
-            if retries < self.config.retry_count:
-                with self._stats_lock:
-                    self._frames_retried += 1
-                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame.index}, seq={seq}, "
-                              f"retry {retries + 1}/{self.config.retry_count}")
-            
-            retries += 1
-        
-        logger.error(f"[SpoolProcessor] 🔴 Frame {frame.index} failed after {retries} attempts")
-        return False
-    
     def _maybe_log_stats(self):
         """Log statistics periodically."""
         current_time = time.time()
         
         # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
+            # Get inflight metrics
+            inflight_count = self._get_inflight_count()
+            oldest_age = self._get_oldest_inflight_age()
+            
             with self._stats_lock:
                 # Calculate time since last successful ACK (watchdog info)
                 ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
@@ -865,6 +1051,9 @@ class SpoolProcessorNode(Node):
                            f"skipped={self._frames_skipped}, "
                            f"timeouts={self._ack_timeouts}, "
                            f"ack_rejected={self._ack_rejected_stale}, "
+                           f"out_of_order_acks={self._out_of_order_acks}, "
+                           f"inflight={inflight_count}/{self.config.inflight_window}, "
+                           f"oldest_inflight_age={oldest_age:.1f}s, "
                            f"segments={self._segments_processed}, "
                            f"sps_pps_prepends={self._sps_pps_prepends}, "
                            f"state={self._state.value}")
@@ -905,9 +1094,14 @@ class SpoolProcessorNode(Node):
                 logger.info("=" * 80)
                 logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
                 logger.info(f"  Session: {self._session_id}")
+                logger.info(f"  Configuration:")
+                logger.info(f"    - Inflight Window: {self.config.inflight_window}")
+                logger.info(f"    - ACK Timeout: {self.config.ack_timeout}s")
+                logger.info(f"    - Retry Count: {self.config.retry_count}")
                 logger.info(f"  ACK Statistics:")
                 logger.info(f"    - Accepted: {ack_accepted} ({ack_accept_rate:.1f}%)")
                 logger.info(f"    - Rejected (stale): {ack_rejected} ({ack_reject_rate:.1f}%)")
+                logger.info(f"    - Out-of-order: {self._out_of_order_acks}")
                 logger.info(f"    - Total: {total_acks}")
                 logger.info(f"  Frame Processing:")
                 logger.info(f"    - Processed: {self._frames_processed}")
