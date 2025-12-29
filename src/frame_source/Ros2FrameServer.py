@@ -66,6 +66,7 @@ class FrameServer(Node, FrameSource):
         self.frames_processed = 0
         self.frames_dropped = 0  # Track dropped frames
         self.frames_index_fallback = 0  # Track fallback to current index (should be rare)
+        self.frames_index_lost = 0  # Track frame indices that couldn't be enqueued (severe stall)
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
@@ -150,8 +151,12 @@ class FrameServer(Node, FrameSource):
                 self._pending_frame_indices.put_nowait(frame_idx)
             except queue.Full:
                 # Extremely rare: queue filled again between operations
-                # This indicates severe decoder stall - log error
-                logger.error(f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx} after drop - decoder severely stalled")
+                # This indicates severe decoder stall - log error and track metric
+                self.frames_index_lost += 1
+                logger.error(
+                    f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx} after drop - "
+                    f"decoder severely stalled (lost_indices={self.frames_index_lost})"
+                )
     
     def get_current_frame_index(self) -> int:
         """Get the current frame index for ACK correlation."""
@@ -173,12 +178,16 @@ class FrameServer(Node, FrameSource):
             # Include pending index queue stats for accuracy mode
             if self._accuracy_mode:
                 pending_queue_size = self._pending_frame_indices.qsize()
-                logger.info(
+                stats_msg = (
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
                     f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
                     f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%, "
                     f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}"
                 )
+                # Add lost_indices to output if non-zero (severe stall indicator)
+                if self.frames_index_lost > 0:
+                    stats_msg += f", LOST_INDICES={self.frames_index_lost}"
+                logger.info(stats_msg)
             else:
                 logger.info(
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
