@@ -155,11 +155,22 @@ class FrameServer(Node, FrameSource):
         if now - self.last_stats_log_time >= self.stats_log_interval:
             queue_utilization = (self.frame_queue.qsize() / self.frame_queue.maxsize) * 100
             drop_rate = (self.frames_dropped / self.frames_received * 100) if self.frames_received > 0 else 0.0
-            logger.info(
-                f"[Ros2FrameServer] Stats: received={self.frames_received}, "
-                f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
-                f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%"
-            )
+            
+            # Include pending index queue stats for accuracy mode
+            if self._accuracy_mode:
+                pending_queue_size = self._pending_frame_indices.qsize()
+                logger.info(
+                    f"[Ros2FrameServer] Stats: received={self.frames_received}, "
+                    f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
+                    f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%, "
+                    f"pending_indices={pending_queue_size}"
+                )
+            else:
+                logger.info(
+                    f"[Ros2FrameServer] Stats: received={self.frames_received}, "
+                    f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
+                    f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%"
+                )
             self.last_stats_log_time = now
         
         img = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
