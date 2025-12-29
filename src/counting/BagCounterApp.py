@@ -844,27 +844,35 @@ class BagCounterApp:
                     context={"label": label, "phash": phash}
                 )
 
-    def _publish_processing_ack(self, frame_index: int):
+    def _publish_processing_ack(self, spool_frame_index: int):
         """
         Publish processing ACK for Accuracy Mode.
         
-        This ACK tells SpoolProcessorNode that the frame with the given index
+        SINGLE SOURCE OF TRUTH:
+        spool_frame_index is the canonical ID assigned when the frame entered the system.
+        It travels WITH the frame data through the entire pipeline, ensuring perfect
+        correlation for ACK without any separate state queries or timing dependencies.
+        
+        This ACK tells SpoolProcessorNode that the frame with the given spool_frame_index
         has been consumed from the queue and is being processed. This unblocks
         the processor to publish the next frame.
         
+        Args:
+            spool_frame_index: The canonical frame index that traveled with this frame
+        
         CRITICAL: This must be called IMMEDIATELY after a frame is consumed,
-        using the frame index that was stored with that specific frame.
+        using the spool_frame_index that was extracted from the frame tuple.
         """
         if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ack_publisher is None:
             return
         try:
             from std_msgs.msg import UInt32
             msg = UInt32()
-            msg.data = int(frame_index)
+            msg.data = int(spool_frame_index)
             self._ack_publisher.publish(msg)
-            logger.debug(f"[BagCounterApp] Published ACK for frame {frame_index}")
+            logger.info(f"[BagCounterApp] ✓ Published ACK for spool_frame_index {spool_frame_index}")
         except Exception as e:
-            logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {frame_index}: {e}")
+            logger.warning(f"[BagCounterApp] Failed to publish ACK for spool_frame_index {spool_frame_index}: {e}")
 
     # --- V3: Async Classification Thread ---
     
@@ -1773,16 +1781,23 @@ class BagCounterApp:
             frame_interval_count = 0
             last_queue_stats_time = time.perf_counter()
             try:
-                for frame, latencyMs in self.frame_source.frames():
+                for frame_data in self.frame_source.frames():
                     frame_count += 1
                     
-                    # Accuracy Mode: Publish ACK IMMEDIATELY when frame is consumed from frame source
-                    # This is the correct place to ACK because we have the exact frame index
-                    # that was stored with this frame when it was enqueued in Ros2FrameServer
-                    if getattr(self, "_accuracy_mode", False):
-                        if hasattr(self.frame_source, "get_last_yielded_frame_index"):
-                            ack_frame_index = self.frame_source.get_last_yielded_frame_index()
-                            self._publish_processing_ack(ack_frame_index)
+                    # SINGLE SOURCE OF TRUTH: Extract frame and spool_frame_index from tuple
+                    # In accuracy mode, spool_frame_index travels WITH the frame data
+                    # In normal mode, tuple is (frame, latency) - backward compatible
+                    if len(frame_data) == 3:
+                        frame, latencyMs, spool_frame_index = frame_data
+                    else:
+                        frame, latencyMs = frame_data
+                        spool_frame_index = None
+                    
+                    # Accuracy Mode: Publish ACK IMMEDIATELY when frame is consumed
+                    # CRITICAL: Use spool_frame_index that traveled WITH this specific frame
+                    # This ensures perfect correlation - no separate state queries needed
+                    if getattr(self, "_accuracy_mode", False) and spool_frame_index is not None:
+                        self._publish_processing_ack(spool_frame_index)
                     
                     current_time = time.perf_counter()
                     if last_frame_time is not None:

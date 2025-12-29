@@ -19,7 +19,7 @@ Usage:
 
 Configuration (via database config table):
     spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 30.0)
+    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0)
     spool_retry_count: Number of retries before advancing (default: 2)
 """
 
@@ -76,7 +76,7 @@ class ProcessorState(Enum):
 
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
-DEFAULT_ACK_TIMEOUT = 30.0
+DEFAULT_ACK_TIMEOUT = 10.0  # Reduced from 30.0 - should be much faster with FIFO correlation
 DEFAULT_RETRY_COUNT = 2
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
@@ -193,19 +193,20 @@ class SpoolProcessorNode(Node):
                 depth=10  # Increased from 1 for better reliability
             )
             
-            # Best effort for encoded frames (matches decoder expectations)
-            best_effort_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            # QoS for encoded frames - must match decoder's subscription QoS
+            # The hobot_codec_republish decoder uses RELIABLE by default
+            frame_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=5  # Increased for decoder input buffering
+                depth=10  # Buffering for reliability
             )
 
             # Publisher for encoded frames (to decoder input)
-            # Use BEST_EFFORT to match typical decoder QoS expectations
+            # Use RELIABLE to match decoder's default QoS expectations
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
-                best_effort_qos
+                frame_qos
             )
             
             # Publisher for current frame index (side channel for ACK correlation)
@@ -232,7 +233,7 @@ class SpoolProcessorNode(Node):
             )
             
             logger.info("[SpoolProcessor] ROS2 topics configured: "
-                       "/spool_image_ch_0 (pub, BEST_EFFORT), /spool/current_frame_index (pub, RELIABLE), "
+                       "/spool_image_ch_0 (pub, RELIABLE), /spool/current_frame_index (pub, RELIABLE), "
                        "/processing_ack (sub, RELIABLE), /spool/request_next (sub, RELIABLE)")
     
     def start(self):
@@ -298,9 +299,87 @@ class SpoolProcessorNode(Node):
             # Mark that we need SPS/PPS for the first frame of this segment
             self._segment_needs_sps_pps = True
             self._current_segment = oldest
+            
+            # Pre-scan for SPS/PPS if we don't have cached values yet
+            # This is critical for decoder initialization on startup
+            if self._cached_sps is None or self._cached_pps is None:
+                self._prescan_for_sps_pps()
         else:
             logger.warning("[SpoolProcessor] No segments available")
             self._frame_generator = iter([])
+    
+    def _prescan_for_sps_pps(self):
+        """
+        Pre-scan frames to find and cache SPS/PPS NAL units.
+        
+        This is called on startup to ensure we have SPS/PPS available
+        for the decoder before sending any frames. Critical for decoder
+        initialization.
+        """
+        logger.info("[SpoolProcessor] Pre-scanning for SPS/PPS NAL units...")
+        
+        # Read up to 100 frames looking for SPS/PPS
+        frames_scanned = 0
+        temp_frames = []
+        max_scan = 100
+        
+        try:
+            while frames_scanned < max_scan:
+                try:
+                    frame = next(self._frame_generator)
+                    temp_frames.append(frame)
+                    frames_scanned += 1
+                    
+                    # Try to extract SPS/PPS from this frame
+                    sps, pps = extract_sps_pps(frame.data)
+                    if sps:
+                        self._cached_sps = sps
+                        logger.info(f"[SpoolProcessor] Found and cached SPS from frame {frame.index} during pre-scan")
+                    if pps:
+                        self._cached_pps = pps
+                        logger.info(f"[SpoolProcessor] Found and cached PPS from frame {frame.index} during pre-scan")
+                    
+                    # If we found both, we're done
+                    if self._cached_sps and self._cached_pps:
+                        logger.info(f"[SpoolProcessor] Pre-scan complete: found SPS/PPS after scanning {frames_scanned} frames")
+                        break
+                        
+                except StopIteration:
+                    logger.warning(f"[SpoolProcessor] Pre-scan reached end of spool after {frames_scanned} frames")
+                    break
+        except Exception as e:
+            logger.error(f"[SpoolProcessor] Error during SPS/PPS pre-scan: {e}")
+        
+        # Recreate generator with buffered frames at the front
+        # This ensures we process frames in order
+        # Note: We create a list copy and clear temp_frames to avoid holding references
+        buffered_frames_copy = list(temp_frames)
+        temp_frames.clear()  # Clear to allow garbage collection
+        
+        def buffered_generator():
+            # First yield buffered frames
+            for frame in buffered_frames_copy:
+                yield frame
+            # Clear the copy after yielding to free memory
+            buffered_frames_copy.clear()
+            # Then continue with remaining frames
+            try:
+                while True:
+                    yield next(self._frame_generator)
+            except StopIteration:
+                pass
+        
+        self._frame_generator = buffered_generator()
+        
+        if self._cached_sps and self._cached_pps:
+            logger.info("[SpoolProcessor] Pre-scan successful: SPS/PPS cached and ready for decoder")
+        else:
+            missing = []
+            if not self._cached_sps:
+                missing.append("SPS")
+            if not self._cached_pps:
+                missing.append("PPS")
+            logger.warning(f"[SpoolProcessor] Pre-scan incomplete: missing {', '.join(missing)} - decoder may fail to initialize")
     
     def _get_next_frame(self) -> Optional[FrameRecord]:
         """Get the next frame from the spool."""
@@ -397,29 +476,18 @@ class SpoolProcessorNode(Node):
             return True
         
         try:
-            # First, publish the frame index for correlation
-            # This must arrive BEFORE the decoded NV12 frame to avoid race conditions
-            # in BagCounterApp where the frame index is read when the NV12 arrives.
+            # Publish frame index for correlation
+            # This index is enqueued in Ros2FrameServer's pending queue
+            # and will be dequeued when the corresponding decoded NV12 frame arrives
             index_msg = UInt32()
             index_msg.data = record.index
             self._index_pub.publish(index_msg)
             
-            # Brief yield to allow the index message to be sent before the frame.
-            # This is a best-effort ordering hint since:
-            # 1. ROS2 doesn't guarantee ordering across different publishers
-            # 2. The index uses RELIABLE QoS (with acknowledgment) vs frame uses BEST_EFFORT
-            # 3. The decoder pipeline introduces significant latency (10-100ms) that
-            #    makes the arrival order of index vs decoded frame highly predictable
-            # Alternative approaches considered:
-            # - Combined message: Would require custom msg type, breaks existing pipeline
-            # - Sequence numbers: Already implemented via frame index correlation
-            # Note: This delay has negligible impact on throughput (~0.1% at 30fps)
-            time.sleep(0.001)  # 1ms
-            
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
             
-            # Then publish the encoded frame
+            # Publish the encoded frame immediately (no delay needed)
+            # The FIFO queue in Ros2FrameServer will handle proper correlation
             frame_msg = H26XFrame()
             frame_msg.index = record.index
             frame_msg.width = record.width
@@ -469,20 +537,37 @@ class SpoolProcessorNode(Node):
         """
         self._ack_received.clear()
         start_time = time.time()
+        logger.debug(f"[SpoolProcessor] Waiting for ACK for frame {frame_index} (timeout={timeout}s)")
         
         while self._running:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
+                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame_index} after {timeout}s - no ACK received")
                 return False
             
             if self._ack_received.wait(timeout=min(remaining, 1.0)):
+                elapsed = time.time() - start_time
+                
                 if self._ack_frame_index == frame_index:
+                    # Perfect match - consumer processed exactly this frame
+                    logger.info(f"[SpoolProcessor] ✓ ACK matched for frame {frame_index} (elapsed={elapsed:.3f}s)")
                     self._last_ack_time = time.time()
                     return True
-                # ACK was for different frame - this might be a late ACK for a previous frame
-                # or the consumer hasn't caught up yet. Log and keep waiting.
-                logger.debug(f"[SpoolProcessor] ACK mismatch: expected {frame_index}, got {self._ack_frame_index}")
-                self._ack_received.clear()
+                elif self._ack_frame_index > frame_index:
+                    # Consumer is ahead - they've already processed this frame
+                    # This happens after processor restart when consumer was already running
+                    logger.warning(f"[SpoolProcessor] ⚠ Consumer ahead: ACK {self._ack_frame_index} > expected {frame_index}. "
+                                 f"Accepting as success (consumer already processed) (elapsed={elapsed:.3f}s)")
+                    self._last_ack_time = time.time()
+                    return True
+                else:
+                    # ACK was for older frame in the FIFO pending queue
+                    # This is VALID - decoder is processing frames in order
+                    # Accept it as success since consumer is making progress
+                    logger.info(f"[SpoolProcessor] ✓ ACK for pending frame: got {self._ack_frame_index}, published {frame_index}. "
+                               f"Consumer processing queue in order (elapsed={elapsed:.3f}s)")
+                    self._last_ack_time = time.time()
+                    return True
         
         return False
     
@@ -505,7 +590,7 @@ class SpoolProcessorNode(Node):
         self._ack_received.set()
         # Signal startup sync if waiting
         self._startup_complete.set()
-        logger.debug(f"[SpoolProcessor] Received ACK for frame {msg.data}")
+        logger.info(f"[SpoolProcessor] ✓ ACK callback triggered for frame {msg.data}")  # Changed to INFO for visibility
     
     def _request_callback(self, msg):
         """Callback for external pull requests (optional feature)."""
