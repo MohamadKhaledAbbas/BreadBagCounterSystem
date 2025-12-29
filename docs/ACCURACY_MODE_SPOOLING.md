@@ -85,9 +85,45 @@ The processor reads from the spool and publishes at controlled pace:
 
 Features:
 - Reads oldest closed segments in order
-- Publishes exactly one frame at a time
-- Waits for ACK before next frame
-- Timeout and retry logic
+- **Configurable windowed ACK / backpressure** (see below)
+- Out-of-order ACK handling
+- Per-frame timeout and retry logic
+- Graceful degradation (skip frames after max retries)
+
+##### Windowed ACK / Backpressure
+
+The processor supports configurable parallelism via the `spool_inflight_window` setting:
+
+- **`inflight_window=1`** (default): Strict one-at-a-time processing (backward compatible)
+  - Publishes one frame
+  - Waits for ACK before publishing next frame
+  - Maximum reliability, lower throughput
+
+- **`inflight_window>1`** (e.g., 3-5): Multiple frames in flight
+  - Publishes up to N frames without waiting for ACKs
+  - ACKs can arrive out-of-order (frames marked individually)
+  - Frames retired from window in order (maintains correctness)
+  - Improves throughput when consumer has parallel stages
+  - Reduces spool lag risk
+
+**Configuration:**
+```bash
+# Set inflight window via database config
+python config.py --key spool_inflight_window --value 3
+```
+
+**How it works:**
+1. Processor maintains an ordered queue of in-flight frames
+2. Publishes frames up to `inflight_window` limit
+3. ACK callback marks corresponding frame as acknowledged
+4. Window retirement removes acked frames from head (in order)
+5. Timeout/retry logic per frame (doesn't block other frames)
+6. After max retries, frame is skipped to avoid blocking pipeline
+
+**Observability:**
+- `inflight`: Current number of frames in window
+- `out_of_order_acks`: Count of ACKs received out of sequence
+- `oldest_inflight_age`: Age of oldest frame in window (for monitoring)
 
 #### 3. Frame Index Tracking
 
@@ -247,8 +283,9 @@ Configuration is stored in the SQLite database config table. Use `config.py` to 
 | `spool_dir` | `/home/sunrise/BreadCounting/data/spool` | Spool directory |
 | `spool_segment_duration` | `5.0` | Target segment duration (seconds) |
 | `spool_retention_seconds` | `180` | Maximum segment age before deletion |
-| `spool_ack_timeout` | `30.0` | Timeout waiting for ACK (seconds) |
+| `spool_ack_timeout` | `10.0` | Timeout waiting for ACK (seconds) |
 | `spool_retry_count` | `2` | Retries before advancing |
+| `spool_inflight_window` | `1` | Max frames in flight (1=strict serial, 3-5=parallel) |
 
 Example configuration commands:
 
@@ -261,6 +298,9 @@ python config.py --key spool_dir --value /home/sunrise/BreadCounting/data/spool
 
 # Set retention to 5 minutes
 python config.py --key spool_retention_seconds --value 300
+
+# Configure windowed ACK (increase parallelism)
+python config.py --key spool_inflight_window --value 3
 ```
 
 ### ROS2 Environment
@@ -611,19 +651,31 @@ For production deployments, consider these settings:
 # Enable accuracy mode
 python config.py --key accuracy_mode_enabled --value 1
 
-# Set reasonable ACK timeout (30s default, increase if detection is slow)
-python config.py --key spool_ack_timeout --value 30.0
+# Set reasonable ACK timeout (10s default, 30s if detection is very slow)
+python config.py --key spool_ack_timeout --value 10.0
 
 # Set retry count (2-3 recommended)
 python config.py --key spool_retry_count --value 3
 
 # Set retention to match expected processing lag (180s default)
 python config.py --key spool_retention_seconds --value 300
+
+# Configure windowed ACK for better throughput
+# Start with 1 (backward compatible), increase to 3-5 if spool lag occurs
+python config.py --key spool_inflight_window --value 3
 ```
 
 ### Monitoring Checklist
 
-1. **Health Metrics**: Monitor ACK timeouts, frame drops, queue utilization
-2. **Log Analysis**: Watch for WATCHDOG warnings and ACK timeout logs
-3. **Disk Space**: Ensure spool directory has sufficient space (200MB+ recommended)
-4. **CPU/Memory**: Monitor system resources for bottlenecks
+1. **Health Metrics**: Monitor ACK timeouts, frame drops, queue utilization, inflight window size
+2. **Log Analysis**: Watch for WATCHDOG warnings, ACK timeout logs, and spool lag warnings
+3. **Windowed ACK Metrics**: Check `inflight`, `out_of_order_acks`, `oldest_inflight_age` in stats
+4. **Disk Space**: Ensure spool directory has sufficient space (200MB+ recommended)
+5. **CPU/Memory**: Monitor system resources for bottlenecks
+
+**Key metrics to watch:**
+- `inflight`: Should stay below `inflight_window` setting (healthy: <max)
+- `out_of_order_acks`: Normal with window>1 (indicates parallel processing)
+- `oldest_inflight_age`: Should be <ack_timeout (healthy: <10s)
+- `timeouts`: Should be 0 or very low (high values indicate consumer lag)
+- `skipped`: Should be 0 (>0 indicates frames dropped after retries)
