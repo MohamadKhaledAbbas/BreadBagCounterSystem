@@ -193,19 +193,20 @@ class SpoolProcessorNode(Node):
                 depth=10  # Increased from 1 for better reliability
             )
             
-            # Best effort for encoded frames (matches decoder expectations)
-            best_effort_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            # QoS for encoded frames - must match decoder's subscription QoS
+            # The hobot_codec_republish decoder uses RELIABLE by default
+            frame_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=5  # Increased for decoder input buffering
+                depth=10  # Buffering for reliability
             )
 
             # Publisher for encoded frames (to decoder input)
-            # Use BEST_EFFORT to match typical decoder QoS expectations
+            # Use RELIABLE to match decoder's default QoS expectations
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
-                best_effort_qos
+                frame_qos
             )
             
             # Publisher for current frame index (side channel for ACK correlation)
@@ -232,7 +233,7 @@ class SpoolProcessorNode(Node):
             )
             
             logger.info("[SpoolProcessor] ROS2 topics configured: "
-                       "/spool_image_ch_0 (pub, BEST_EFFORT), /spool/current_frame_index (pub, RELIABLE), "
+                       "/spool_image_ch_0 (pub, RELIABLE), /spool/current_frame_index (pub, RELIABLE), "
                        "/processing_ack (sub, RELIABLE), /spool/request_next (sub, RELIABLE)")
     
     def start(self):
