@@ -862,7 +862,7 @@ class BagCounterApp:
             msg = UInt32()
             msg.data = int(frame_index)
             self._ack_publisher.publish(msg)
-            logger.debug(f"[BagCounterApp] Published ACK for frame {frame_index}")
+            logger.info(f"[BagCounterApp] ✓ Published ACK for frame {frame_index}")  # Changed to INFO for visibility
         except Exception as e:
             logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {frame_index}: {e}")
 

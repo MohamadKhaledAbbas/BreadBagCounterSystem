@@ -536,19 +536,23 @@ class SpoolProcessorNode(Node):
         """
         self._ack_received.clear()
         start_time = time.time()
+        logger.debug(f"[SpoolProcessor] Waiting for ACK for frame {frame_index} (timeout={timeout}s)")
         
         while self._running:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
+                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame_index} after {timeout}s - no ACK received")
                 return False
             
             if self._ack_received.wait(timeout=min(remaining, 1.0)):
                 if self._ack_frame_index == frame_index:
+                    elapsed = time.time() - start_time
+                    logger.info(f"[SpoolProcessor] ✓ ACK matched for frame {frame_index} (elapsed={elapsed:.3f}s)")
                     self._last_ack_time = time.time()
                     return True
                 # ACK was for different frame - this might be a late ACK for a previous frame
                 # or the consumer hasn't caught up yet. Log and keep waiting.
-                logger.debug(f"[SpoolProcessor] ACK mismatch: expected {frame_index}, got {self._ack_frame_index}")
+                logger.warning(f"[SpoolProcessor] ⚠ ACK mismatch: expected {frame_index}, got {self._ack_frame_index} (waiting {remaining:.1f}s more)")
                 self._ack_received.clear()
         
         return False
@@ -572,7 +576,7 @@ class SpoolProcessorNode(Node):
         self._ack_received.set()
         # Signal startup sync if waiting
         self._startup_complete.set()
-        logger.debug(f"[SpoolProcessor] Received ACK for frame {msg.data}")
+        logger.info(f"[SpoolProcessor] ✓ ACK callback triggered for frame {msg.data}")  # Changed to INFO for visibility
     
     def _request_callback(self, msg):
         """Callback for external pull requests (optional feature)."""
