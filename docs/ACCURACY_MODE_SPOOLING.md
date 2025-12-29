@@ -322,6 +322,57 @@ If BagCounterApp doesn't ACK:
 2. After retries, log error and advance
 3. Prevents deadlock on stuck frames
 
+### Startup Synchronization
+
+The processor now includes startup synchronization to prevent the "stuck at frame 0" issue:
+1. Processor waits up to 10 seconds (configurable) for consumer to be ready
+2. If an ACK is received during this period, processing starts immediately
+3. If grace period expires, processing begins with a warning
+
+## Troubleshooting
+
+### No Detections / Stuck Pipeline
+
+**Symptoms:**
+- ACK timeout logs for the same frame index repeatedly
+- No detections in BagCounterApp
+- `ros2 topic echo /nv12_images --once` takes 10-15 seconds
+
+**Root Causes and Fixes:**
+
+1. **Frame Index Correlation Issue**
+   - **Cause**: ACK was published with wrong frame index due to race condition
+   - **Fix**: ACK is now published immediately when frame is consumed from Ros2FrameServer
+   - **Verification**: Check logs for matching frame indices in ACK and processor
+
+2. **QoS Mismatch**
+   - **Cause**: Decoder expects BEST_EFFORT but processor used RELIABLE
+   - **Fix**: Frame publisher now uses BEST_EFFORT QoS (depth=5)
+   - **Verification**: `ros2 topic info /spool_image_ch_0 -v` should show matching QoS
+
+3. **Missing SPS/PPS at Segment Boundaries**
+   - **Cause**: Decoder fails to initialize without SPS/PPS NAL units
+   - **Fix**: Processor now caches and prepends SPS/PPS to first frame of each segment
+   - **Verification**: Check logs for "Prepending cached SPS/PPS" messages
+
+4. **Startup Race Condition**
+   - **Cause**: Processor starts before consumer is ready
+   - **Fix**: Added 10-second startup grace period with synchronization
+   - **Verification**: Check for "Waiting for consumer startup" log messages
+
+### Watchdog Warnings
+
+If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
+- Consumer (BagCounterApp) may not be processing frames
+- Detection pipeline may be stuck
+- Network/ROS2 connectivity issues
+
+**Actions:**
+1. Check BagCounterApp logs for errors
+2. Verify ROS2 topics are connected: `ros2 topic list`
+3. Check detector initialization: look for model loading errors
+4. Restart the pipeline if necessary
+
 ## Observability
 
 ### Recorder Logs
@@ -335,8 +386,8 @@ If BagCounterApp doesn't ACK:
 ### Processor Logs
 
 ```
-[SpoolProcessor] Stats: processed=1000, retried=2, skipped=0, timeouts=0
-[SpoolProcessor] Spool: segments=36, current_frame=1000
+[SpoolProcessor] Stats: processed=1000, retried=2, skipped=0, timeouts=0, segments=36, sps_pps_prepends=36
+[SpoolProcessor] Spool: segments=36, current_frame=1000, last_ack_age=0.5s
 ```
 
 ### Key Metrics
@@ -347,6 +398,8 @@ If BagCounterApp doesn't ACK:
 | Segment age | < 180s | Approaching retention | Speed up processing |
 | ACK timeouts | 0 | > 0 | Check BagCounterApp |
 | Frames dropped | 0 | > 0 | Check recorder queue |
+| SPS/PPS prepends | Equal to segments | N/A | Normal behavior |
+| Last ACK age | < 1s | > 60s | Consumer may be stuck |
 
 ## Testing
 
@@ -372,3 +425,30 @@ The decoded NV12 images use BEST_EFFORT QoS because:
 3. **ACK correlation**: Frame index tracking ensures we know which frame was processed
 
 The pull-based architecture eliminates the queue pressure that previously caused drops.
+
+## Production Best Practices
+
+### Recommended Configuration
+
+For production deployments, consider these settings:
+
+```bash
+# Enable accuracy mode
+python config.py --key accuracy_mode_enabled --value 1
+
+# Set reasonable ACK timeout (30s default, increase if detection is slow)
+python config.py --key spool_ack_timeout --value 30.0
+
+# Set retry count (2-3 recommended)
+python config.py --key spool_retry_count --value 3
+
+# Set retention to match expected processing lag (180s default)
+python config.py --key spool_retention_seconds --value 300
+```
+
+### Monitoring Checklist
+
+1. **Health Metrics**: Monitor ACK timeouts, frame drops, queue utilization
+2. **Log Analysis**: Watch for WATCHDOG warnings and ACK timeout logs
+3. **Disk Space**: Ensure spool directory has sufficient space (200MB+ recommended)
+4. **CPU/Memory**: Monitor system resources for bottlenecks

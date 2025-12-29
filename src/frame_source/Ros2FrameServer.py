@@ -71,6 +71,7 @@ class FrameServer(Node, FrameSource):
         # Accuracy Mode: Frame index tracking for ACK correlation
         # Subscribe to /spool/current_frame_index published by SpoolProcessorNode
         self._current_frame_index = 0
+        self._last_yielded_frame_index = 0  # Track the index of the most recently yielded frame
         self._frame_index_lock = threading.Lock()
         
         # Check if accuracy mode is enabled via database config, fall back to environment
@@ -89,7 +90,7 @@ class FrameServer(Node, FrameSource):
             reliable_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=1
+                depth=10  # Increased depth for better buffering
             )
             self._index_sub = self.create_subscription(
                 UInt32,
@@ -167,6 +168,7 @@ class FrameServer(Node, FrameSource):
                 pass
         
         # Enqueue new frame with frame index for accuracy mode
+        # The frame index is captured at enqueue time to ensure correlation
         frame_index = self.get_current_frame_index() if self._accuracy_mode else 0
         self.frame_queue.put((bgr, latency_ms, frame_index))
 
@@ -185,15 +187,33 @@ class FrameServer(Node, FrameSource):
                 # Handle both old format (frame, latency) and new format (frame, latency, index)
                 if len(item) == 3:
                     frame, latency_ms, frame_index = item
-                    # Store the frame index for BagCounterApp to access
+                    # Store the frame index that was associated with THIS frame when it was enqueued
+                    # This is critical for ACK correlation in accuracy mode
                     with self._frame_index_lock:
                         self._current_frame_index = frame_index
+                        self._last_yielded_frame_index = frame_index
+                    if self._accuracy_mode:
+                        logger.debug(f"[Ros2FrameServer] Yielding frame with index {frame_index}")
                     yield frame, latency_ms
                 else:
                     frame, latency_ms = item
                     yield frame, latency_ms
             except queue.Empty:
                 continue
+    
+    def get_last_yielded_frame_index(self) -> int:
+        """
+        Get the frame index of the most recently yielded frame.
+        
+        This is the correct method to use for ACK correlation, as it returns
+        the index that was stored with the frame when it was enqueued,
+        not the most recent index received via subscription.
+        
+        Returns:
+            Frame index of the last yielded frame
+        """
+        with self._frame_index_lock:
+            return getattr(self, '_last_yielded_frame_index', self._current_frame_index)
     
     def frames_with_index(self):
         """

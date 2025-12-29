@@ -845,7 +845,16 @@ class BagCounterApp:
                 )
 
     def _publish_processing_ack(self, frame_index: int):
-        """Publish processing ACK for Accuracy Mode."""
+        """
+        Publish processing ACK for Accuracy Mode.
+        
+        This ACK tells SpoolProcessorNode that the frame with the given index
+        has been consumed from the queue and is being processed. This unblocks
+        the processor to publish the next frame.
+        
+        CRITICAL: This must be called IMMEDIATELY after a frame is consumed,
+        using the frame index that was stored with that specific frame.
+        """
         if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ack_publisher is None:
             return
         try:
@@ -853,8 +862,9 @@ class BagCounterApp:
             msg = UInt32()
             msg.data = int(frame_index)
             self._ack_publisher.publish(msg)
+            logger.debug(f"[BagCounterApp] Published ACK for frame {frame_index}")
         except Exception as e:
-            logger.warning(f"[BagCounterApp] Failed to publish ACK: {e}")
+            logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {frame_index}: {e}")
 
     # --- V3: Async Classification Thread ---
     
@@ -1203,10 +1213,10 @@ class BagCounterApp:
 
             try:
                 frame_count += 1
-                # Accuracy Mode: ACK the currently processed frame index
-                # This unblocks SpoolProcessor to publish the next frame.
-                if getattr(self, "_accuracy_mode", False) and hasattr(self.frame_source, "get_current_frame_index"):
-                    self._publish_processing_ack(self.frame_source.get_current_frame_index())
+                # NOTE: Accuracy Mode ACK is now published in the frame capture loop (run() method)
+                # immediately when a frame is consumed from frame_source.frames().
+                # This ensures the ACK has the correct frame index that was stored with that frame.
+                # DO NOT publish ACK here as it would cause duplicate ACKs and potential race conditions.
 
                 frame_start = time.perf_counter()
                 
@@ -1756,6 +1766,15 @@ class BagCounterApp:
             try:
                 for frame, latencyMs in self.frame_source.frames():
                     frame_count += 1
+                    
+                    # Accuracy Mode: Publish ACK IMMEDIATELY when frame is consumed from frame source
+                    # This is the correct place to ACK because we have the exact frame index
+                    # that was stored with this frame when it was enqueued in Ros2FrameServer
+                    if getattr(self, "_accuracy_mode", False):
+                        if hasattr(self.frame_source, "get_last_yielded_frame_index"):
+                            ack_frame_index = self.frame_source.get_last_yielded_frame_index()
+                            self._publish_processing_ack(ack_frame_index)
+                    
                     current_time = time.perf_counter()
                     if last_frame_time is not None:
                         frame_interval = current_time - last_frame_time
