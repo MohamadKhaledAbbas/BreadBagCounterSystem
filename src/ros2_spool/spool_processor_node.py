@@ -551,10 +551,19 @@ class SpoolProcessorNode(Node):
                     logger.info(f"[SpoolProcessor] ✓ ACK matched for frame {frame_index} (elapsed={elapsed:.3f}s)")
                     self._last_ack_time = time.time()
                     return True
-                # ACK was for different frame - this might be a late ACK for a previous frame
-                # or the consumer hasn't caught up yet. Log and keep waiting.
-                logger.warning(f"[SpoolProcessor] ⚠ ACK mismatch: expected {frame_index}, got {self._ack_frame_index} (waiting {remaining:.1f}s more)")
-                self._ack_received.clear()
+                elif self._ack_frame_index > frame_index:
+                    # Consumer is ahead - they've already processed this frame
+                    # This happens after processor restart when consumer was already running
+                    elapsed = time.time() - start_time
+                    logger.warning(f"[SpoolProcessor] ⚠ Consumer ahead: ACK {self._ack_frame_index} > expected {frame_index}. "
+                                 f"Accepting as success (consumer already processed) (elapsed={elapsed:.3f}s)")
+                    self._last_ack_time = time.time()
+                    return True
+                else:
+                    # ACK was for older frame - consumer processing old buffered frames
+                    # Ignore and keep waiting for current frame's ACK
+                    logger.debug(f"[SpoolProcessor] Ignoring old ACK: got {self._ack_frame_index}, expected {frame_index} (waiting {remaining:.1f}s more)")
+                    self._ack_received.clear()
         
         return False
     
