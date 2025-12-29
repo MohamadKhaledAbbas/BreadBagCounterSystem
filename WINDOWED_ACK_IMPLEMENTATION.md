@@ -236,6 +236,58 @@ python config.py --key spool_inflight_window --value 5  # Higher parallelism
 - No frame drops unless explicitly skipped after retries
 - All ACKs properly correlated with frames
 
+## Post-Deployment Fix: Window Fill Rate Optimization
+
+### Issue Discovered
+After initial deployment with `inflight_window=5`, users reported no significant throughput improvement. Analysis revealed a critical bottleneck in the processor loop: frame publication was throttled by `poll_interval` (1 second default) even when the window had space and frames were available.
+
+### Root Cause
+The original implementation used a single throttling mechanism (`last_spool_check`) intended to prevent hammering an empty spool. However, this throttle was incorrectly applied to ALL frame fetches, including when rapidly filling the window.
+
+**Before (Problematic):**
+```python
+# Only check spool once per poll_interval (1 second!)
+if current_time - last_spool_check >= self.config.poll_interval:
+    frame = self._get_next_frame()
+```
+
+This meant with `inflight_window=5`, the processor would only add ~1 frame per second, completely negating the benefits of the larger window.
+
+### Solution
+Separated the throttling logic into two cases:
+1. **Spool has frames**: Rapidly fill the window (no throttling)
+2. **Spool is empty**: Throttle checks to avoid hammering empty spool
+
+**After (Fixed):**
+```python
+# Track if spool was recently empty
+if spool_was_empty and (current_time - last_spool_empty_time < poll_interval):
+    # Throttle only when spool was recently empty
+    pass
+else:
+    # Rapidly fill window when frames are available
+    frame = self._get_next_frame()
+    if frame is None:
+        spool_was_empty = True
+        last_spool_empty_time = current_time
+    else:
+        spool_was_empty = False
+```
+
+### Expected Improvement
+With this fix and `inflight_window=5`:
+- Processor can publish 5 frames as fast as possible (no artificial delay)
+- Window fills in milliseconds instead of 5 seconds
+- Consumer sees consistent frame delivery rate
+- Throughput limited only by consumer processing and ACK speed
+
+### Validation
+All tests pass with the updated logic:
+- ✅ Windowed ACK unit tests
+- ✅ H.264 NAL parsing tests
+- ✅ Segment I/O tests
+- ✅ Python syntax check
+
 ## Implementation Statistics
 
 - **Lines of code added**: ~350
@@ -257,5 +309,6 @@ Key strengths:
 ✅ Well-documented (code comments, docs, monitoring guide)
 ✅ Secure (CodeQL scan clean, no vulnerabilities)
 ✅ Maintainable (clear code structure, good naming, comments)
+✅ **Post-deployment fix applied** (window fill rate optimization)
 
 The implementation is ready for production deployment.

@@ -959,8 +959,9 @@ class SpoolProcessorNode(Node):
         # Startup synchronization: Wait for consumer READY
         self._wait_for_consumer_ready()
         
-        # Track when we last tried to get a frame (to avoid tight loop on empty spool)
-        last_spool_check = 0.0
+        # Track when spool was last empty (to avoid tight loop on empty spool)
+        last_spool_empty_time = 0.0
+        spool_was_empty = False
         
         while self._running:
             try:
@@ -973,19 +974,26 @@ class SpoolProcessorNode(Node):
                 # Try to fill the window with new frames
                 current_time = time.time()
                 if self._can_publish_frame():
-                    # Avoid tight loop if spool is empty - check at most once per poll_interval
-                    if current_time - last_spool_check >= self.config.poll_interval:
-                        last_spool_check = current_time
-                        
-                        # Get next frame
+                    # If spool was recently empty, throttle checks to avoid hammering empty spool
+                    # Otherwise, rapidly fill the window to maximize throughput
+                    if spool_was_empty and (current_time - last_spool_empty_time < self.config.poll_interval):
+                        # Spool was empty recently, wait before checking again
+                        pass
+                    else:
+                        # Get next frame (no throttling when filling window)
                         frame = self._get_next_frame()
                         
                         if frame is None:
                             # Spool is empty
+                            spool_was_empty = True
+                            last_spool_empty_time = current_time
                             with self._state_lock:
                                 self._state = ProcessorState.SPOOL_EMPTY
                             logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
                         else:
+                            # Got a frame - spool is not empty, reset flag
+                            spool_was_empty = False
+                            
                             # Publish the frame and add to inflight window
                             self._current_frame = frame
                             self._current_frame_index = frame.index
