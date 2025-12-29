@@ -311,6 +311,7 @@ class BagCounterApp:
         self._metadata_subscriber = None
         self._ack_publisher_node = None
         self._current_frame_metadata = None  # Store latest frame metadata for ACK construction
+        self._frame_index_mismatch_count = 0  # Track mismatches for throttling warnings
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
@@ -933,10 +934,13 @@ class BagCounterApp:
             if self._current_frame_metadata is not None:
                 metadata = self._current_frame_metadata
                 
-                # Validate frame index matches
+                # Validate frame index matches (throttle warnings - only log every 100th mismatch)
                 if metadata.frame_index != spool_frame_index:
-                    logger.warning(f"[BagCounterApp] ⚠ Frame index mismatch: "
-                                 f"expected {spool_frame_index}, metadata has {metadata.frame_index}")
+                    self._frame_index_mismatch_count += 1
+                    if self._frame_index_mismatch_count == 1 or self._frame_index_mismatch_count % 100 == 0:
+                        logger.warning(f"[BagCounterApp] ⚠ Frame index mismatch: "
+                                     f"expected {spool_frame_index}, metadata has {metadata.frame_index} "
+                                     f"(total mismatches: {self._frame_index_mismatch_count})")
                 
                 # Construct ACK with full metadata
                 ack = ProcessingAck(
@@ -953,7 +957,7 @@ class BagCounterApp:
                 ack_msg.data = processing_ack_to_ros_string(ack)
                 self._ack_publisher.publish(ack_msg)
                 
-                logger.info(f"[BagCounterApp] ✓ ACK published: frame_index={ack.frame_index}, "
+                logger.debug(f"[BagCounterApp] ✓ ACK published: frame_index={ack.frame_index}, "
                           f"seq={ack.seq}, session={ack.session_id[:8]}")
             else:
                 # Fallback: construct ACK without full metadata (should not happen normally)

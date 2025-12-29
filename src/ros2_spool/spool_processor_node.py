@@ -201,9 +201,11 @@ class SpoolProcessorNode(Node):
         self._frames_skipped = 0
         self._ack_timeouts = 0
         self._ack_rejected_stale = 0  # ACKs rejected due to wrong session
+        self._ack_accepted = 0  # Total ACKs accepted
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
+        self._last_detailed_stats_time = time.time()  # For 2-minute detailed stats
         self._stats_lock = threading.Lock()
         
         # ROS2 publishers and subscribers
@@ -597,9 +599,14 @@ class SpoolProcessorNode(Node):
             
             self._frame_pub.publish(frame_msg)
             
-            # Structured logging
-            logger.info(f"[SpoolProcessor] 📤 Frame published: index={record.index}, seq={seq}, "
-                       f"session={self._session_id[:8]}, segment={self._current_segment}, data_len={len(frame_data)}")
+            # Structured logging - use debug for regular frames, info for milestones
+            if seq % 100 == 0:
+                logger.info(f"[SpoolProcessor] 📤 Milestone: published {seq} frames, "
+                          f"current: index={record.index}, session={self._session_id[:8]}, "
+                          f"segment={self._current_segment}, data_len={len(frame_data)}")
+            else:
+                logger.debug(f"[SpoolProcessor] 📤 Frame published: index={record.index}, seq={seq}, "
+                           f"session={self._session_id[:8]}, segment={self._current_segment}, data_len={len(frame_data)}")
             
             return True, seq, sent_time_sec, sent_time_nsec
             
@@ -655,13 +662,17 @@ class SpoolProcessorNode(Node):
                 # Validate sequence or frame index
                 if ack.seq == expected_seq and ack.frame_index == expected_frame_index:
                     # Perfect match
-                    logger.info(f"[SpoolProcessor] ✓ ACK matched: seq={ack.seq}, "
+                    with self._stats_lock:
+                        self._ack_accepted += 1
+                    logger.debug(f"[SpoolProcessor] ✓ ACK matched: seq={ack.seq}, "
                               f"frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
                     self._last_ack_time = time.time()
                     return True
                 elif ack.frame_index == expected_frame_index:
                     # Frame index matches but seq doesn't - still accept
-                    logger.info(f"[SpoolProcessor] ✓ ACK matched (frame_index): seq={ack.seq} "
+                    with self._stats_lock:
+                        self._ack_accepted += 1
+                    logger.debug(f"[SpoolProcessor] ✓ ACK matched (frame_index): seq={ack.seq} "
                               f"(expected {expected_seq}), frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
                     self._last_ack_time = time.time()
                     return True
@@ -839,6 +850,8 @@ class SpoolProcessorNode(Node):
     def _maybe_log_stats(self):
         """Log statistics periodically."""
         current_time = time.time()
+        
+        # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
                 # Calculate time since last successful ACK (watchdog info)
@@ -869,6 +882,58 @@ class SpoolProcessorNode(Node):
                                   "consumer may be stuck or not processing frames")
             
             self._last_stats_time = current_time
+        
+        # Detailed stats every 2 minutes (120 seconds)
+        if current_time - self._last_detailed_stats_time >= 120.0:
+            with self._stats_lock:
+                ack_accepted = self._ack_accepted
+                ack_rejected = self._ack_rejected_stale
+                total_acks = ack_accepted + ack_rejected
+                ack_accept_rate = (ack_accepted / total_acks * 100) if total_acks > 0 else 0.0
+                ack_reject_rate = (ack_rejected / total_acks * 100) if total_acks > 0 else 0.0
+                
+                # Get spool information for lag detection
+                segments = self._reader.list_segments()
+                oldest_segment = self._reader.get_oldest_segment()
+                newest_segment = max(segments) if segments else None
+                
+                # Calculate spool lag: difference between newest and current segment
+                spool_lag = 0
+                if newest_segment is not None and self._current_segment >= 0:
+                    spool_lag = newest_segment - self._current_segment
+                
+                logger.info("=" * 80)
+                logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
+                logger.info(f"  Session: {self._session_id}")
+                logger.info(f"  ACK Statistics:")
+                logger.info(f"    - Accepted: {ack_accepted} ({ack_accept_rate:.1f}%)")
+                logger.info(f"    - Rejected (stale): {ack_rejected} ({ack_reject_rate:.1f}%)")
+                logger.info(f"    - Total: {total_acks}")
+                logger.info(f"  Frame Processing:")
+                logger.info(f"    - Processed: {self._frames_processed}")
+                logger.info(f"    - Retried: {self._frames_retried}")
+                logger.info(f"    - Skipped: {self._frames_skipped}")
+                logger.info(f"    - Timeouts: {self._ack_timeouts}")
+                logger.info(f"  Spool Status:")
+                logger.info(f"    - Total segments: {len(segments)}")
+                logger.info(f"    - Current segment: {self._current_segment}")
+                logger.info(f"    - Oldest segment: {oldest_segment}")
+                logger.info(f"    - Newest segment: {newest_segment}")
+                logger.info(f"    - Spool lag: {spool_lag} segments")
+                
+                # Warn if spool is falling behind (lag > 10 segments = ~50 seconds at 5s/segment)
+                if spool_lag > 10:
+                    logger.warning(f"  ⚠ SPOOL LAG WARNING: Processor is {spool_lag} segments behind!")
+                    logger.warning(f"     Recording is ahead by ~{spool_lag * 5}s. Processing too slow!")
+                    logger.warning(f"     Consider: reducing ACK timeout, increasing processing speed, or checking consumer.")
+                elif spool_lag > 5:
+                    logger.warning(f"  ⚠ SPOOL LAG NOTICE: Processor is {spool_lag} segments behind (borderline)")
+                else:
+                    logger.info(f"  ✓ Spool lag is healthy ({spool_lag} segments)")
+                
+                logger.info("=" * 80)
+            
+            self._last_detailed_stats_time = current_time
     
     def get_state(self) -> ProcessorState:
         """Get current processor state."""

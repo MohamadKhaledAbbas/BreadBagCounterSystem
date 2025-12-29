@@ -468,6 +468,26 @@ If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
 3. Check detector initialization: look for model loading errors
 4. Restart the pipeline if necessary
 
+### Spool Lag Warnings
+
+The processor monitors spool lag every 2 minutes and warns if falling behind:
+
+**Warning Levels:**
+- `> 10 segments`: Critical lag (~50s behind) - processing too slow
+- `5-10 segments`: Borderline lag (~25-50s behind) - monitor closely
+- `< 5 segments`: Healthy lag
+
+**If you see SPOOL LAG WARNING:**
+1. Processing is slower than recording
+2. Spool directory will grow until retention limit
+3. Old segments will be deleted, causing frame loss
+
+**Solutions:**
+- Reduce ACK timeout to process faster
+- Optimize detection/classification pipeline
+- Check consumer performance (CPU, memory)
+- Increase recording retention window temporarily
+
 ## Observability
 
 ### Recorder Logs
@@ -480,24 +500,66 @@ If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
 
 ### Processor Logs
 
+**Regular Stats (every 10 seconds):**
 ```
-[SpoolProcessor] 🔄 Session started: session_id=a1b2c3d4
-[SpoolProcessor] Waiting for consumer READY (timeout: 10.0s)...
-[SpoolProcessor] ✓ Consumer READY: consumer_session=e5f6g7h8, processor_session=a1b2c3d4
-[SpoolProcessor] 📤 Frame published: index=1000, seq=42, session=a1b2c3d4, segment=36, data_len=15234
-[SpoolProcessor] ✓ ACK matched: seq=42, frame_index=1000, elapsed=0.023s
-[SpoolProcessor] Stats: session=a1b2c3d4, seq=1000, processed=950, retried=2, skipped=0, timeouts=0, ack_rejected=0, segments=36, sps_pps_prepends=36, state=idle
-[SpoolProcessor] Spool: segments=36, current_frame=1000, last_ack_age=0.5s
+[SpoolProcessor] Stats: session=d8489312, seq=4129, processed=950, retried=2, skipped=0, timeouts=0, ack_rejected=0, segments=36, sps_pps_prepends=36, state=idle
+[SpoolProcessor] Spool: segments=36, current_frame=5432, last_ack_age=0.5s
+```
+
+**Detailed Stats (every 2 minutes):**
+```
+================================================================================
+[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)
+  Session: d8489312-8ab4-4c76-b593-d9759133614d
+  ACK Statistics:
+    - Accepted: 2450 (99.9%)
+    - Rejected (stale): 2 (0.1%)
+    - Total: 2452
+  Frame Processing:
+    - Processed: 2448
+    - Retried: 5
+    - Skipped: 0
+    - Timeouts: 2
+  Spool Status:
+    - Total segments: 36
+    - Current segment: 1369
+    - Oldest segment: 1360
+    - Newest segment: 1372
+    - Spool lag: 3 segments
+  ✓ Spool lag is healthy (3 segments)
+================================================================================
+```
+
+**Frame Publishing (milestone every 100 frames):**
+```
+[SpoolProcessor] 📤 Milestone: published 4100 frames, current: index=5432, session=d8489312, segment=1369, data_len=12977
+```
+
+**ACK Matching (debug level):**
+```
+[SpoolProcessor] ✓ ACK matched: seq=4128, frame_index=5431, elapsed=0.027s
 ```
 
 ### Consumer Logs
 
+**Startup:**
 ```
 [BagCounterApp] Accuracy Mode: session_id=e5f6g7h8
 [BagCounterApp] ✓ READY published: session_id=e5f6g7h8
-[BagCounterApp] Frame metadata received: frame_index=1000, seq=42, session_id=a1b2c3d4
-[BagCounterApp] ✓ ACK published: frame_index=1000, seq=42, session=a1b2c3d4
 ```
+
+**Frame Processing (debug level):**
+```
+[BagCounterApp] Frame metadata received: frame_index=5432, seq=4129, session_id=d8489312
+[BagCounterApp] ✓ ACK published: frame_index=5432, seq=4129, session=d8489312
+```
+
+**Frame Index Mismatch (throttled - every 100th occurrence):**
+```
+[BagCounterApp] ⚠ Frame index mismatch: expected 0, metadata has 5431 (total mismatches: 3900)
+```
+
+Note: Frame index mismatches are expected when Ros2FrameServer falls back to index 0 due to timing. The ACK system uses the correct metadata, so processing continues normally.
 
 ### Key Metrics
 
@@ -505,6 +567,8 @@ If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
 |--------|---------|---------|--------|
 | Queue utilization | < 50% | > 80% | Increase queue size |
 | Segment age | < 180s | Approaching retention | Speed up processing |
+| Spool lag | < 5 segments | > 10 segments | Critical: processing too slow |
+| ACK acceptance rate | > 99% | < 95% | Check session ID issues |
 | ACK timeouts | 0 | > 0 | Check BagCounterApp |
 | ACK rejected (stale) | 0 | > 0 | Session mismatch after restart |
 | Frames dropped | 0 | > 0 | Check recorder queue |
