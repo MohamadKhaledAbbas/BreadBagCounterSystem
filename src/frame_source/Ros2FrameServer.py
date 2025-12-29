@@ -65,6 +65,7 @@ class FrameServer(Node, FrameSource):
         self.frames_received = 0
         self.frames_processed = 0
         self.frames_dropped = 0  # Track dropped frames
+        self.frames_index_fallback = 0  # Track fallback to current index (should be rare)
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
@@ -76,7 +77,11 @@ class FrameServer(Node, FrameSource):
         
         # FIFO queue for pending frame indices to correlate with decoded frames
         # This solves the race condition where frame indices arrive before decoded frames
-        self._pending_frame_indices = queue.Queue(maxsize=50)  # Buffer for pending indices
+        # Queue size of 50 provides buffer for:
+        # - 30 FPS: 1.6 seconds of decoder lag
+        # - Typical decoder latency: 10-100ms
+        # - Burst handling during temporary slowdowns
+        self._pending_frame_indices = queue.Queue(maxsize=50)
         
         # Check if accuracy mode is enabled via database config, fall back to environment
         try:
@@ -130,14 +135,23 @@ class FrameServer(Node, FrameSource):
             self._pending_frame_indices.put_nowait(frame_idx)
             logger.debug(f"[Ros2FrameServer] Received frame index: {frame_idx}, queue_size={self._pending_frame_indices.qsize()}")
         except queue.Full:
-            # Queue full - this indicates decoder is falling behind
-            # Drop oldest pending index to make room
+            # Queue full - this indicates decoder is falling behind significantly
+            # We must drop the oldest pending index to prevent blocking the publisher
             try:
                 dropped_idx = self._pending_frame_indices.get_nowait()
                 logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped index {dropped_idx}")
+            except queue.Empty:
+                # Race condition: queue became empty between full check and get
+                # This is rare but harmless - just log it
+                logger.debug(f"[Ros2FrameServer] Pending queue became empty during drop attempt")
+            
+            # Now enqueue the new index (with another try/except for safety)
+            try:
                 self._pending_frame_indices.put_nowait(frame_idx)
-            except (queue.Empty, queue.Full):
-                logger.error(f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx}")
+            except queue.Full:
+                # Extremely rare: queue filled again between operations
+                # This indicates severe decoder stall - log error
+                logger.error(f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx} after drop - decoder severely stalled")
     
     def get_current_frame_index(self) -> int:
         """Get the current frame index for ACK correlation."""
@@ -163,7 +177,7 @@ class FrameServer(Node, FrameSource):
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
                     f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
                     f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%, "
-                    f"pending_indices={pending_queue_size}"
+                    f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}"
                 )
             else:
                 logger.info(
@@ -215,9 +229,17 @@ class FrameServer(Node, FrameSource):
                 logger.debug(f"[Ros2FrameServer] Correlated decoded frame with index {frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
             except queue.Empty:
                 # No pending index - this shouldn't happen in normal operation
-                # Fall back to current index as best-effort
+                # This indicates either:
+                # 1. Frame indices not being published (SpoolProcessor issue)
+                # 2. More decoded frames than published indices (decoder issue)
+                # 3. System startup/shutdown race condition
+                # Fall back to current index as best-effort but track this metric
                 frame_index = self.get_current_frame_index()
-                logger.warning(f"[Ros2FrameServer] No pending frame index available, using current index {frame_index}")
+                self.frames_index_fallback += 1
+                logger.warning(
+                    f"[Ros2FrameServer] No pending frame index available (fallback #{self.frames_index_fallback}), "
+                    f"using current index {frame_index}. This may reintroduce race condition."
+                )
         
         self.frame_queue.put((bgr, latency_ms, frame_index))
 
