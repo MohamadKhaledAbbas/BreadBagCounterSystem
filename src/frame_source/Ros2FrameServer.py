@@ -72,6 +72,16 @@ class FrameServer(Node, FrameSource):
         
         # Accuracy Mode: Frame index tracking for ACK correlation
         # Subscribe to /spool/current_frame_index published by SpoolProcessorNode
+        # 
+        # SINGLE SOURCE OF TRUTH: spool_frame_index
+        # When a frame enters the system, SpoolProcessor assigns ONE canonical ID.
+        # This ID travels WITH the frame through the entire pipeline:
+        # 1. Published to /spool/current_frame_index (for tracking)
+        # 2. Stored in FIFO queue (pending_frame_indices)
+        # 3. Attached to decoded NV12 frame when enqueued
+        # 4. Yielded WITH frame data to BagCounterApp
+        # 5. Echoed back in ACK message
+        # No derived or local indices - ACK only what you were given.
         self._current_frame_index = 0
         self._last_yielded_frame_index = 0  # Track the index of the most recently yielded frame
         self._frame_index_lock = threading.Lock()
@@ -121,26 +131,31 @@ class FrameServer(Node, FrameSource):
         """
         Callback for frame index updates from SpoolProcessorNode.
         
-        This callback receives frame indices BEFORE the corresponding NV12 frames
-        arrive (due to decoder latency). We enqueue them in a FIFO to correlate
-        properly with decoded frames in listener_callback.
+        SINGLE SOURCE OF TRUTH: spool_frame_index
+        This receives the canonical frame ID assigned by SpoolProcessor.
+        Frame indices arrive BEFORE corresponding NV12 frames (decoder latency 10-100ms).
+        We enqueue them in FIFO order to correlate with decoded frames in listener_callback.
+        
+        Args:
+            msg: UInt32 message containing spool_frame_index
         """
-        frame_idx = int(msg.data)
+        spool_frame_idx = int(msg.data)
         
         # Update current index for backwards compatibility
         with self._frame_index_lock:
-            self._current_frame_index = frame_idx
+            self._current_frame_index = spool_frame_idx
         
         # Enqueue to pending queue for proper correlation
         try:
-            self._pending_frame_indices.put_nowait(frame_idx)
-            logger.debug(f"[Ros2FrameServer] Received frame index: {frame_idx}, queue_size={self._pending_frame_indices.qsize()}")
+            self._pending_frame_indices.put_nowait(spool_frame_idx)
+            logger.debug(f"[Ros2FrameServer] Received spool_frame_index: {spool_frame_idx}, queue_size={self._pending_frame_indices.qsize()}")
         except queue.Full:
             # Queue full - this indicates decoder is falling behind significantly
             # We must drop the oldest pending index to prevent blocking the publisher
             try:
                 dropped_idx = self._pending_frame_indices.get_nowait()
-                logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped index {dropped_idx}")
+                logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped spool_frame_index {dropped_idx}")
+                self.frames_index_lost += 1  # Track lost indices
             except queue.Empty:
                 # Race condition: queue became empty between full check and get
                 # This is rare but harmless - just log it
@@ -148,7 +163,7 @@ class FrameServer(Node, FrameSource):
             
             # Now enqueue the new index (with another try/except for safety)
             try:
-                self._pending_frame_indices.put_nowait(frame_idx)
+                self._pending_frame_indices.put_nowait(spool_frame_idx)
             except queue.Full:
                 # Extremely rare: queue filled again between operations
                 # This indicates severe decoder stall - log error and track metric
@@ -227,15 +242,18 @@ class FrameServer(Node, FrameSource):
             except queue.Empty:
                 pass
         
-        # Enqueue new frame with frame index for accuracy mode
-        # In accuracy mode, dequeue the next pending frame index (FIFO correlation)
-        frame_index = 0
+        # Enqueue new frame with spool_frame_index for accuracy mode
+        # SINGLE SOURCE OF TRUTH: spool_frame_index travels WITH the frame
+        # In accuracy mode, dequeue the next pending spool_frame_index (FIFO correlation)
+        spool_frame_index = 0
         if self._accuracy_mode:
             try:
-                # Dequeue the next frame index that corresponds to this decoded frame
-                # This maintains proper correlation even with decoder latency
-                frame_index = self._pending_frame_indices.get_nowait()
-                logger.debug(f"[Ros2FrameServer] Correlated decoded frame with index {frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
+                # Dequeue the next spool_frame_index that corresponds to this decoded frame
+                # This maintains proper correlation even with decoder latency (10-100ms)
+                # The index that was published BEFORE this H.264 frame is now matched
+                # with the decoded NV12 frame that resulted from it.
+                spool_frame_index = self._pending_frame_indices.get_nowait()
+                logger.debug(f"[Ros2FrameServer] Correlated decoded frame with spool_frame_index {spool_frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
             except queue.Empty:
                 # No pending index - this shouldn't happen in normal operation
                 # This indicates either:
@@ -243,22 +261,29 @@ class FrameServer(Node, FrameSource):
                 # 2. More decoded frames than published indices (decoder issue)
                 # 3. System startup/shutdown race condition
                 # Fall back to current index as best-effort but track this metric
-                frame_index = self.get_current_frame_index()
+                spool_frame_index = self.get_current_frame_index()
                 self.frames_index_fallback += 1
                 logger.warning(
                     f"[Ros2FrameServer] No pending frame index available (fallback #{self.frames_index_fallback}), "
-                    f"using current index {frame_index}. This may reintroduce race condition."
+                    f"using current index {spool_frame_index}. This may reintroduce race condition."
                 )
         
-        self.frame_queue.put((bgr, latency_ms, frame_index))
+        # SINGLE SOURCE OF TRUTH: Attach spool_frame_index to frame data
+        # It will travel through the entire pipeline with this frame
+        self.frame_queue.put((bgr, latency_ms, spool_frame_index))
 
     def frames(self):
         """
         Yield frames from the queue.
         
         Yields:
-            Tuple of (frame, latency_ms) for backward compatibility.
-            In accuracy mode, frame_index is also available via get_current_frame_index().
+            Tuple of (frame, latency_ms, spool_frame_index) in accuracy mode.
+            Tuple of (frame, latency_ms) in normal mode (backward compatible).
+            
+        Single Source of Truth:
+            In accuracy mode, spool_frame_index travels WITH the frame data
+            through the entire pipeline. This ensures perfect correlation
+            for ACK - no need to query separate state.
         """
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
         while rclpy.ok():
@@ -266,15 +291,16 @@ class FrameServer(Node, FrameSource):
                 item = self.frame_queue.get(timeout=1)
                 # Handle both old format (frame, latency) and new format (frame, latency, index)
                 if len(item) == 3:
-                    frame, latency_ms, frame_index = item
+                    frame, latency_ms, spool_frame_index = item
                     # Store the frame index that was associated with THIS frame when it was enqueued
                     # This is critical for ACK correlation in accuracy mode
                     with self._frame_index_lock:
-                        self._current_frame_index = frame_index
-                        self._last_yielded_frame_index = frame_index
+                        self._current_frame_index = spool_frame_index
+                        self._last_yielded_frame_index = spool_frame_index
                     if self._accuracy_mode:
-                        logger.debug(f"[Ros2FrameServer] Yielding frame with index {frame_index}")
-                    yield frame, latency_ms
+                        logger.debug(f"[Ros2FrameServer] Yielding frame with spool_frame_index {spool_frame_index}")
+                    # SINGLE SOURCE OF TRUTH: Yield index WITH frame data
+                    yield frame, latency_ms, spool_frame_index
                 else:
                     frame, latency_ms = item
                     yield frame, latency_ms
