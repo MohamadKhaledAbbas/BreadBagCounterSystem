@@ -298,9 +298,81 @@ class SpoolProcessorNode(Node):
             # Mark that we need SPS/PPS for the first frame of this segment
             self._segment_needs_sps_pps = True
             self._current_segment = oldest
+            
+            # Pre-scan for SPS/PPS if we don't have cached values yet
+            # This is critical for decoder initialization on startup
+            if self._cached_sps is None or self._cached_pps is None:
+                self._prescan_for_sps_pps()
         else:
             logger.warning("[SpoolProcessor] No segments available")
             self._frame_generator = iter([])
+    
+    def _prescan_for_sps_pps(self):
+        """
+        Pre-scan frames to find and cache SPS/PPS NAL units.
+        
+        This is called on startup to ensure we have SPS/PPS available
+        for the decoder before sending any frames. Critical for decoder
+        initialization.
+        """
+        logger.info("[SpoolProcessor] Pre-scanning for SPS/PPS NAL units...")
+        
+        # Read up to 100 frames looking for SPS/PPS
+        frames_scanned = 0
+        temp_frames = []
+        max_scan = 100
+        
+        try:
+            while frames_scanned < max_scan:
+                try:
+                    frame = next(self._frame_generator)
+                    temp_frames.append(frame)
+                    frames_scanned += 1
+                    
+                    # Try to extract SPS/PPS from this frame
+                    sps, pps = extract_sps_pps(frame.data)
+                    if sps:
+                        self._cached_sps = sps
+                        logger.info(f"[SpoolProcessor] Found and cached SPS from frame {frame.index} during pre-scan")
+                    if pps:
+                        self._cached_pps = pps
+                        logger.info(f"[SpoolProcessor] Found and cached PPS from frame {frame.index} during pre-scan")
+                    
+                    # If we found both, we're done
+                    if self._cached_sps and self._cached_pps:
+                        logger.info(f"[SpoolProcessor] Pre-scan complete: found SPS/PPS after scanning {frames_scanned} frames")
+                        break
+                        
+                except StopIteration:
+                    logger.warning(f"[SpoolProcessor] Pre-scan reached end of spool after {frames_scanned} frames")
+                    break
+        except Exception as e:
+            logger.error(f"[SpoolProcessor] Error during SPS/PPS pre-scan: {e}")
+        
+        # Recreate generator with buffered frames at the front
+        # This ensures we process frames in order
+        def buffered_generator():
+            # First yield buffered frames
+            for frame in temp_frames:
+                yield frame
+            # Then continue with remaining frames
+            try:
+                while True:
+                    yield next(self._frame_generator)
+            except StopIteration:
+                pass
+        
+        self._frame_generator = buffered_generator()
+        
+        if self._cached_sps and self._cached_pps:
+            logger.info("[SpoolProcessor] Pre-scan successful: SPS/PPS cached and ready for decoder")
+        else:
+            missing = []
+            if not self._cached_sps:
+                missing.append("SPS")
+            if not self._cached_pps:
+                missing.append("PPS")
+            logger.warning(f"[SpoolProcessor] Pre-scan incomplete: missing {', '.join(missing)} - decoder may fail to initialize")
     
     def _get_next_frame(self) -> Optional[FrameRecord]:
         """Get the next frame from the spool."""
