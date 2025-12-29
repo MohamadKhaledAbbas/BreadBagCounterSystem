@@ -284,32 +284,86 @@ class BagCounterApp:
         self.ipc_publisher = FramePublisher(publish_rate_hz=25.0)
 
         # -------------------------
-        # Accuracy Mode: ACK publisher (for SpoolProcessor backpressure)
+        # Accuracy Mode: ACK publisher and READY publisher (for SpoolProcessor backpressure)
         # -------------------------
         self._accuracy_mode = (self.db.get_config_value(constants.accuracy_mode_enabled) == "1")
         self._ack_publisher = None
+        self._ready_publisher = None
+        self._metadata_subscriber = None
         self._ack_publisher_node = None
+        self._current_frame_metadata = None  # Store latest frame metadata for ACK construction
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
-            from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-            from std_msgs.msg import UInt32
+            from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+            from std_msgs.msg import String
+            from src.ros2_spool.messages import (
+                generate_session_id,
+                get_current_time_ros,
+                ProcessingAck,
+                ProcessingReady,
+                processing_ack_to_ros_string,
+                processing_ready_to_ros_string,
+                frame_metadata_from_ros_string
+            )
+            
+            # Store message utilities as instance attributes for later use
+            self._generate_session_id = generate_session_id
+            self._get_current_time_ros = get_current_time_ros
+            self._ProcessingAck = ProcessingAck
+            self._ProcessingReady = ProcessingReady
+            self._processing_ack_to_ros_string = processing_ack_to_ros_string
+            self._processing_ready_to_ros_string = processing_ready_to_ros_string
+            self._frame_metadata_from_ros_string = frame_metadata_from_ros_string
+            
+            # Generate session ID for this consumer instance
+            self._consumer_session_id = generate_session_id()
+            logger.info(f"[BagCounterApp] Accuracy Mode: session_id={self._consumer_session_id[:8]}")
 
-            reliable_qos = QoSProfile(
+            # QoS for READY - TRANSIENT_LOCAL for late joiners
+            ready_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=1,
+                depth=10,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+            )
+            
+            # QoS for ACK and metadata - RELIABLE with good depth
+            control_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=20,
             )
 
-            # Create a dedicated node for publishing ACKs
-            self._ack_publisher_node = rclpy.create_node("processing_ack_publisher")
+            # Create a dedicated node for publishing ACKs and READY
+            self._ack_publisher_node = rclpy.create_node("processing_ack_ready_publisher")
+            
+            # Publisher for ACK messages
             self._ack_publisher = self._ack_publisher_node.create_publisher(
-                UInt32,
+                String,
                 "/processing_ack",
-                reliable_qos,
+                control_qos,
             )
-            logger.info("[BagCounterApp] Accuracy Mode enabled - ACK publisher created on /processing_ack")
-
+            
+            # Publisher for READY messages
+            self._ready_publisher = self._ack_publisher_node.create_publisher(
+                String,
+                "/processing_ready",
+                ready_qos,
+            )
+            
+            # Subscriber for frame metadata
+            self._metadata_subscriber = self._ack_publisher_node.create_subscription(
+                String,
+                "/spool/current_frame_metadata",
+                self._frame_metadata_callback,
+                control_qos
+            )
+            
+            logger.info("[BagCounterApp] Accuracy Mode enabled - "
+                       "ACK publisher on /processing_ack, "
+                       "READY publisher on /processing_ready, "
+                       "metadata subscriber on /spool/current_frame_metadata")
 
         if IS_RDK and self.ros_executor is not None:
             self.ros_executor.add_node(self.ipc_publisher)
@@ -796,6 +850,21 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Snapshot saved: {meta_file}")
 
     # --- Callbacks ---
+    
+    def _frame_metadata_callback(self, msg):
+        """
+        Callback for receiving frame metadata from spool processor.
+        
+        Stores the metadata for use when constructing ACKs.
+        """
+        try:
+            metadata = self._frame_metadata_from_ros_string(msg.data)
+            self._current_frame_metadata = metadata
+            logger.debug(f"[BagCounterApp] Frame metadata received: "
+                        f"frame_index={metadata.frame_index}, seq={metadata.seq}, "
+                        f"session_id={metadata.session_id[:8]}")
+        except Exception as e:
+            logger.error(f"[BagCounterApp] Error parsing frame metadata: {e}")
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
         label = data["label"]
@@ -846,33 +915,98 @@ class BagCounterApp:
 
     def _publish_processing_ack(self, spool_frame_index: int):
         """
-        Publish processing ACK for Accuracy Mode.
+        Publish processing ACK for Accuracy Mode using structured message.
         
-        SINGLE SOURCE OF TRUTH:
-        spool_frame_index is the canonical ID assigned when the frame entered the system.
-        It travels WITH the frame data through the entire pipeline, ensuring perfect
-        correlation for ACK without any separate state queries or timing dependencies.
-        
-        This ACK tells SpoolProcessorNode that the frame with the given spool_frame_index
-        has been consumed from the queue and is being processed. This unblocks
-        the processor to publish the next frame.
+        Uses the frame metadata received from the processor to construct a proper ACK
+        with session_id, seq, and timing information.
         
         Args:
-            spool_frame_index: The canonical frame index that traveled with this frame
+            spool_frame_index: The canonical frame index (for backward compatibility check)
         
-        CRITICAL: This must be called IMMEDIATELY after a frame is consumed,
-        using the spool_frame_index that was extracted from the frame tuple.
+        CRITICAL: This must be called IMMEDIATELY after a frame is consumed.
         """
         if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ack_publisher is None:
             return
+        
         try:
-            from std_msgs.msg import UInt32
-            msg = UInt32()
-            msg.data = int(spool_frame_index)
-            self._ack_publisher.publish(msg)
-            logger.info(f"[BagCounterApp] ✓ Published ACK for spool_frame_index {spool_frame_index}")
+            # Use stored metadata if available, otherwise construct minimal ACK
+            if self._current_frame_metadata is not None:
+                metadata = self._current_frame_metadata
+                
+                # Validate frame index matches
+                if metadata.frame_index != spool_frame_index:
+                    logger.warning(f"[BagCounterApp] ⚠ Frame index mismatch: "
+                                 f"expected {spool_frame_index}, metadata has {metadata.frame_index}")
+                
+                # Construct ACK with full metadata
+                ack = self._ProcessingAck(
+                    frame_index=metadata.frame_index,
+                    session_id=metadata.session_id,
+                    seq=metadata.seq,
+                    sent_time_sec=metadata.sent_time_sec,
+                    sent_time_nsec=metadata.sent_time_nsec,
+                    segment_num=metadata.segment_num
+                )
+                
+                # Publish ACK
+                from std_msgs.msg import String
+                ack_msg = String()
+                ack_msg.data = self._processing_ack_to_ros_string(ack)
+                self._ack_publisher.publish(ack_msg)
+                
+                logger.info(f"[BagCounterApp] ✓ ACK published: frame_index={ack.frame_index}, "
+                          f"seq={ack.seq}, session={ack.session_id[:8]}")
+            else:
+                # Fallback: construct ACK without full metadata (should not happen normally)
+                logger.warning(f"[BagCounterApp] ⚠ No frame metadata available for frame {spool_frame_index}, "
+                             "constructing minimal ACK")
+                
+                sent_time_sec, sent_time_nsec = self._get_current_time_ros()
+                ack = self._ProcessingAck(
+                    frame_index=spool_frame_index,
+                    session_id=self._consumer_session_id,
+                    seq=0,  # Unknown seq
+                    sent_time_sec=sent_time_sec,
+                    sent_time_nsec=sent_time_nsec,
+                    segment_num=-1
+                )
+                
+                from std_msgs.msg import String
+                ack_msg = String()
+                ack_msg.data = self._processing_ack_to_ros_string(ack)
+                self._ack_publisher.publish(ack_msg)
+                
+                logger.info(f"[BagCounterApp] ✓ ACK published (minimal): frame_index={ack.frame_index}")
+                
         except Exception as e:
-            logger.warning(f"[BagCounterApp] Failed to publish ACK for spool_frame_index {spool_frame_index}: {e}")
+            logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {spool_frame_index}: {e}")
+    
+    def _publish_processing_ready(self):
+        """
+        Publish READY signal for Accuracy Mode.
+        
+        This tells the spool processor that the consumer is ready to process frames.
+        Should be called after all publishers/subscribers are initialized.
+        """
+        if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ready_publisher is None:
+            return
+        
+        try:
+            ready_time_sec, ready_time_nsec = self._get_current_time_ros()
+            ready = self._ProcessingReady(
+                session_id=self._consumer_session_id,
+                ready_time_sec=ready_time_sec,
+                ready_time_nsec=ready_time_nsec
+            )
+            
+            from std_msgs.msg import String
+            ready_msg = String()
+            ready_msg.data = self._processing_ready_to_ros_string(ready)
+            self._ready_publisher.publish(ready_msg)
+            
+            logger.info(f"[BagCounterApp] ✓ READY published: session_id={ready.session_id[:8]}")
+        except Exception as e:
+            logger.error(f"[BagCounterApp] Failed to publish READY: {e}")
 
     # --- V3: Async Classification Thread ---
     
@@ -1754,6 +1888,12 @@ class BagCounterApp:
 
         self.config_watcher.start()
         logger.debug("[BagCounterApp] Config watcher started")
+        
+        # Accuracy Mode: Publish READY signal after initialization
+        if self._accuracy_mode:
+            # Give ROS2 a moment to establish connections
+            time.sleep(0.5)
+            self._publish_processing_ready()
 
         if self.testing_mode:
             logger.info("[BagCounterApp] TESTING MODE: Inline processing, no input queue, zero frame drops.")
