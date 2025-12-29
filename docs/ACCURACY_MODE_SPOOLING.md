@@ -94,25 +94,87 @@ Features:
 Since NV12 decoded frames don't carry the original H.264 index, we use a side-channel:
 
 ```
-SpoolProcessor → /spool/current_frame_index → Ros2FrameServer
-                                                     │
-                                                     ▼
-                                               BagCounterApp
-                                                     │
-                                                     ▼
-                       /processing_ack ← ACK with frame index
+SpoolProcessor → /spool/current_frame_metadata → BagCounterApp
+      │                                                 │
+      │                                                 ▼
+      ▼                                          /processing_ready
+ /spool_image_ch_0                                     ▼
+      │                                          BagCounterApp processes
+      ▼                                                 │
+   Decoder                                              ▼
+      │                                           /processing_ack
+      ▼                                                 │
+BagCounterApp ◄──────────────────────────────────────┘
 ```
 
-### Topic-Based Pull Protocol
+### Production-Grade ACK Protocol
 
-Since this repository is not built with colcon/ament, we cannot add custom `.srv` types. Instead, we implement pull using standard message types:
+The ACK mechanism uses structured messages with session tracking to ensure reliability:
+
+**Messages:**
+
+1. **ProcessingReady** (JSON over std_msgs/String)
+   - Published by BagCounterApp on startup
+   - Topic: `/processing_ready`
+   - QoS: RELIABLE, TRANSIENT_LOCAL (for late joiners)
+   - Fields:
+     - `session_id` (string): UUID of consumer session
+     - `ready_time_sec` (int64): Timestamp seconds
+     - `ready_time_nsec` (uint32): Timestamp nanoseconds
+
+2. **FrameMetadata** (JSON over std_msgs/String)
+   - Published by SpoolProcessor for each frame
+   - Topic: `/spool/current_frame_metadata`
+   - QoS: RELIABLE, depth=20
+   - Fields:
+     - `frame_index` (uint32): Frame index
+     - `session_id` (string): Processor session UUID
+     - `seq` (uint64): Monotonic sequence number
+     - `sent_time_sec` (int64): Timestamp seconds
+     - `sent_time_nsec` (uint32): Timestamp nanoseconds
+     - `segment_num` (int32): Optional segment number (-1 if not set)
+
+3. **ProcessingAck** (JSON over std_msgs/String)
+   - Published by BagCounterApp after frame processing
+   - Topic: `/processing_ack`
+   - QoS: RELIABLE, depth=20
+   - Fields: Same as FrameMetadata
+
+**Protocol Flow:**
+
+1. **Startup Handshake:**
+   - BagCounterApp starts, generates `session_id`
+   - Publishes `ProcessingReady` with its `session_id`
+   - SpoolProcessor waits for `ProcessingReady` (timeout: 10s)
+
+2. **Frame Processing:**
+   - SpoolProcessor assigns `seq` number, publishes frame
+   - Publishes `FrameMetadata` with frame context
+   - BagCounterApp receives metadata, stores it
+   - After consuming frame, publishes `ProcessingAck` with matching metadata
+   - SpoolProcessor validates `session_id` and `seq` before accepting ACK
+
+3. **Restart Safety:**
+   - Stale ACKs with wrong `session_id` are rejected
+   - Processor won't start until READY received for current session
+   - Each restart gets new session IDs
+
+### Topic-Based Pull Protocol
 
 | Topic | Type | Direction | Purpose |
 |-------|------|-----------|---------|
 | `/spool_image_ch_0` | H26XFrame | Pub | Encoded frames to decoder |
-| `/spool/current_frame_index` | UInt32 | Pub | Frame index for correlation |
-| `/processing_ack` | UInt32 | Pub | ACK with processed frame index |
+| `/spool/current_frame_metadata` | String (JSON) | Pub | Frame metadata for ACK correlation |
+| `/processing_ready` | String (JSON) | Pub | Consumer ready signal |
+| `/processing_ack` | String (JSON) | Pub | ACK with full frame context |
 | `/spool/request_next` | UInt32 | Sub | Optional: external pull request |
+
+**QoS Configuration:**
+
+- **READY topic**: RELIABLE + TRANSIENT_LOCAL (for late joiners)
+- **ACK/Metadata topics**: RELIABLE + KEEP_LAST (depth=20)
+- **Frame topic**: RELIABLE + KEEP_LAST (depth=10)
+
 
 ## Segment File Format
 
@@ -324,10 +386,43 @@ If BagCounterApp doesn't ACK:
 
 ### Startup Synchronization
 
-The processor now includes startup synchronization to prevent the "stuck at frame 0" issue:
-1. Processor waits up to 10 seconds (configurable) for consumer to be ready
-2. If an ACK is received during this period, processing starts immediately
-3. If grace period expires, processing begins with a warning
+The processor includes production-grade startup handshake:
+1. **Consumer startup**: BagCounterApp generates session_id and publishes READY
+2. **Processor waits**: Waits up to 10 seconds for READY signal
+3. **Session validation**: Only processes frames for the current session
+4. **Late joiner support**: TRANSIENT_LOCAL durability allows processor to see READY even if it starts later
+
+### Restart Scenarios
+
+**Scenario 1: Processor restarts while Consumer running**
+- Processor generates new session_id
+- Waits for READY from consumer
+- Consumer may still have old session_id - will continue with old session
+- Processor ignores ACKs with old session_id
+- **Resolution**: Restart consumer to sync session_ids, or processor accepts that consumer will keep old session
+
+**Scenario 2: Consumer restarts while Processor running**
+- Consumer generates new session_id
+- Publishes READY with new session_id
+- Processor sees READY and starts processing
+- Consumer receives frames with processor's session_id
+- Consumer ACKs with processor's session_id (from metadata)
+- **Result**: Clean synchronization
+
+**Scenario 3: Both restart simultaneously**
+- Both generate new session_ids
+- Consumer publishes READY first
+- Processor sees READY and starts
+- Both use processor's session_id from frame metadata
+- **Result**: Clean synchronization
+
+### Session ID Mismatch Recovery
+
+If you see "ACK rejected: wrong session_id" warnings:
+1. Check both processor and consumer logs for session_ids
+2. Verify READY was published and received
+3. If mismatch persists, restart both processes
+4. Check TRANSIENT_LOCAL QoS is working (use `ros2 topic info -v`)
 
 ## Troubleshooting
 
@@ -386,8 +481,22 @@ If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
 ### Processor Logs
 
 ```
-[SpoolProcessor] Stats: processed=1000, retried=2, skipped=0, timeouts=0, segments=36, sps_pps_prepends=36
+[SpoolProcessor] 🔄 Session started: session_id=a1b2c3d4
+[SpoolProcessor] Waiting for consumer READY (timeout: 10.0s)...
+[SpoolProcessor] ✓ Consumer READY: consumer_session=e5f6g7h8, processor_session=a1b2c3d4
+[SpoolProcessor] 📤 Frame published: index=1000, seq=42, session=a1b2c3d4, segment=36, data_len=15234
+[SpoolProcessor] ✓ ACK matched: seq=42, frame_index=1000, elapsed=0.023s
+[SpoolProcessor] Stats: session=a1b2c3d4, seq=1000, processed=950, retried=2, skipped=0, timeouts=0, ack_rejected=0, segments=36, sps_pps_prepends=36, state=idle
 [SpoolProcessor] Spool: segments=36, current_frame=1000, last_ack_age=0.5s
+```
+
+### Consumer Logs
+
+```
+[BagCounterApp] Accuracy Mode: session_id=e5f6g7h8
+[BagCounterApp] ✓ READY published: session_id=e5f6g7h8
+[BagCounterApp] Frame metadata received: frame_index=1000, seq=42, session_id=a1b2c3d4
+[BagCounterApp] ✓ ACK published: frame_index=1000, seq=42, session=a1b2c3d4
 ```
 
 ### Key Metrics
@@ -397,9 +506,11 @@ If you see "WATCHDOG: No ACK received in X.Xs", this indicates:
 | Queue utilization | < 50% | > 80% | Increase queue size |
 | Segment age | < 180s | Approaching retention | Speed up processing |
 | ACK timeouts | 0 | > 0 | Check BagCounterApp |
+| ACK rejected (stale) | 0 | > 0 | Session mismatch after restart |
 | Frames dropped | 0 | > 0 | Check recorder queue |
 | SPS/PPS prepends | Equal to segments | N/A | Normal behavior |
 | Last ACK age | < 1s | > 60s | Consumer may be stuck |
+| Session ID | Matches | Mismatch | Restart synchronization issue |
 
 ## Testing
 
