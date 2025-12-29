@@ -88,7 +88,7 @@ class AppConfig:
         else "data/model/classify_yolo_small_v7.pt"
     )
 
-    db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
+    db_path: str = os.getenv("DB_PATH", "/home/sunrise/BreadCounting/data/db/bag_events.db")
     
     # V2: Recording and snapshot directories
     recording_dir: str = os.getenv("RECORDING_DIR", "data/recordings")

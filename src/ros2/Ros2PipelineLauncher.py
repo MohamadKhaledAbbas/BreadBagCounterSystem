@@ -1,4 +1,5 @@
 import sys
+
 sys.path.append("/home/sunrise/BreadCounting")
 
 import os
@@ -68,7 +69,7 @@ def generate_launch_description():
                  'in_format': 'h264',
                  'out_mode': 'shared_mem',
                  'out_format': 'nv12',
-                 'sub_topic': '/rtsp_image_ch_0',
+                 'sub_topic': '/spool_image_ch_0',
                  'dump_output': False,
                  'pub_topic': '/nv12_images'
             }

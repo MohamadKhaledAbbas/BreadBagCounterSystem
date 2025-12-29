@@ -8,9 +8,13 @@ import numpy as np
 import rclpy
 from hbm_img_msgs.msg import HbmMsg1080P
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from std_msgs.msg import UInt32
 
+from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
+from src.logging.Database import DatabaseManager
+from src import constants
 
 from src.utils.AppLogging import logger
 
@@ -20,6 +24,11 @@ class FrameServer(Node, FrameSource):
     ROS 2 Subscriber that listens for incoming frames and buffers the latest
     frame for consumption by the main logic thread. This node is designed
     to be added to an external SingleThreadedExecutor.
+    
+    Accuracy Mode Support:
+    - Subscribes to /spool/current_frame_index for frame index tracking
+    - Attaches frame index to each yielded frame for ACK correlation
+    - Enables BagCounterApp to acknowledge specific processed frames
     """
 
     def __init__(self, topic='/nv12_images', target_fps=30.0):
@@ -59,12 +68,54 @@ class FrameServer(Node, FrameSource):
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
+        # Accuracy Mode: Frame index tracking for ACK correlation
+        # Subscribe to /spool/current_frame_index published by SpoolProcessorNode
+        self._current_frame_index = 0
+        self._frame_index_lock = threading.Lock()
+        
+        # Check if accuracy mode is enabled via database config, fall back to environment
+        try:
+            db = DatabaseManager(db_path=AppConfig.db_path)
+            accuracy_mode_config = db.get_config_value(constants.accuracy_mode_enabled)
+            db.close()
+            if accuracy_mode_config is not None:
+                self._accuracy_mode = accuracy_mode_config == '1'
+            else:
+                self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        except Exception:
+            self._accuracy_mode = os.getenv('ACCURACY_MODE', '').lower() in ('1', 'true', 'yes')
+        
+        if self._accuracy_mode:
+            reliable_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1
+            )
+            self._index_sub = self.create_subscription(
+                UInt32,
+                '/spool/current_frame_index',
+                self._frame_index_callback,
+                reliable_qos
+            )
+            logger.info("[Ros2FrameServer] Accuracy Mode enabled - subscribing to /spool/current_frame_index")
+        
         logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only)")
 
         # --- REMOVED ---
         # Removed the internal _ros_spin_thread logic.
         # The execution (spinning) is now handled by the external ExecutorThread.
         # ---------------
+    
+    def _frame_index_callback(self, msg):
+        """Callback for frame index updates from SpoolProcessorNode."""
+        with self._frame_index_lock:
+            self._current_frame_index = int(msg.data)
+        logger.debug(f"[Ros2FrameServer] Received frame index: {msg.data}")
+    
+    def get_current_frame_index(self) -> int:
+        """Get the current frame index for ACK correlation."""
+        with self._frame_index_lock:
+            return int(self._current_frame_index)
 
     def listener_callback(self, msg):
         now = time.time()
@@ -115,15 +166,50 @@ class FrameServer(Node, FrameSource):
             except queue.Empty:
                 pass
         
-        # Enqueue new frame
-        self.frame_queue.put((bgr, latency_ms))
+        # Enqueue new frame with frame index for accuracy mode
+        frame_index = self.get_current_frame_index() if self._accuracy_mode else 0
+        self.frame_queue.put((bgr, latency_ms, frame_index))
 
     def frames(self):
+        """
+        Yield frames from the queue.
+        
+        Yields:
+            Tuple of (frame, latency_ms) for backward compatibility.
+            In accuracy mode, frame_index is also available via get_current_frame_index().
+        """
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
         while rclpy.ok():
             try:
-                frame, latency_ms = self.frame_queue.get(timeout=1)
-                yield frame, latency_ms
+                item = self.frame_queue.get(timeout=1)
+                # Handle both old format (frame, latency) and new format (frame, latency, index)
+                if len(item) == 3:
+                    frame, latency_ms, frame_index = item
+                    # Store the frame index for BagCounterApp to access
+                    with self._frame_index_lock:
+                        self._current_frame_index = frame_index
+                    yield frame, latency_ms
+                else:
+                    frame, latency_ms = item
+                    yield frame, latency_ms
+            except queue.Empty:
+                continue
+    
+    def frames_with_index(self):
+        """
+        Yield frames with frame index for accuracy mode.
+        
+        Yields:
+            Tuple of (frame, latency_ms, frame_index)
+        """
+        while rclpy.ok():
+            try:
+                item = self.frame_queue.get(timeout=1)
+                if len(item) == 3:
+                    yield item
+                else:
+                    frame, latency_ms = item
+                    yield frame, latency_ms, 0
             except queue.Empty:
                 continue
 

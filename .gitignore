@@ -19,8 +19,11 @@ reports/
 *.pt
 *.onnx
 *.engine
-*.bin
 data/model/*.pt
 data/model/*.onnx
 data/model/*.engine
 data/model/*.bin
+
+# Spool files (accuracy mode)
+data/spool/
+*.tmp
