@@ -759,6 +759,8 @@ class SpoolProcessorNode(Node):
                 return
             
             # Find and mark the corresponding inflight frame as acked
+            # Note: Linear search is acceptable for small windows (1-10 frames typical)
+            # For larger windows, consider adding a seq->frame mapping dict
             with self._inflight_lock:
                 found = False
                 for i, inflight in enumerate(self._inflight_frames):
@@ -863,6 +865,9 @@ class SpoolProcessorNode(Node):
         """
         current_time = time.time()
         
+        # Note: We create a list copy to safely iterate while holding the lock
+        # and potentially calling _publish_frame. For small windows (1-10 frames),
+        # this copy is inexpensive and avoids complex iteration patterns.
         with self._inflight_lock:
             for inflight in list(self._inflight_frames):
                 # Skip already acked frames

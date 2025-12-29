@@ -362,9 +362,9 @@ def test_oldest_inflight_age():
         age = time.time() - oldest.publish_time
         assert age >= 4.9 and age <= 5.1, f"Oldest age should be ~5 seconds, got {age:.1f}s"
     
-    # Empty window should return 0.0
-    empty_frames = deque()
-    age = 0.0 if not empty_frames else (time.time() - empty_frames[0].publish_time)
+    # Test empty window
+    inflight_frames.clear()
+    age = 0.0 if not inflight_frames else (time.time() - inflight_frames[0].publish_time)
     assert age == 0.0, f"Empty window should return age 0.0, got {age}"
     
     print("✓ test_oldest_inflight_age passed")
