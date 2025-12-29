@@ -44,13 +44,25 @@ from src.spool.h264_nal import extract_sps_pps, is_idr_frame, detect_frame_type
 from src.logging.Database import DatabaseManager
 from src import constants
 
+# Import message definitions
+from src.ros2_spool.messages import (
+    generate_session_id,
+    get_current_time_ros,
+    FrameMetadata,
+    ProcessingAck,
+    ProcessingReady,
+    processing_ack_from_ros_string,
+    processing_ready_from_ros_string,
+    frame_metadata_to_ros_string
+)
+
 # ROS2 imports (only on RDK platform)
 if IS_RDK:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
     from img_msgs.msg import H26XFrame
-    from std_msgs.msg import UInt32
+    from std_msgs.msg import UInt32, String
     from builtin_interfaces.msg import Time
 else:
     # Stub for non-RDK development
@@ -69,9 +81,9 @@ class ProcessorState(Enum):
     """State of the processor."""
     IDLE = "idle"
     WAITING_FOR_ACK = "waiting_for_ack"
+    WAITING_FOR_READY = "waiting_for_ready"  # Waiting for consumer ready signal
     SPOOL_EMPTY = "spool_empty"
     STOPPED = "stopped"
-    STARTUP_SYNC = "startup_sync"  # Waiting for initial ACK
 
 
 # Default configuration values
@@ -144,11 +156,15 @@ class SpoolProcessorNode(Node):
         # Load configuration from database if not provided
         self.config = config or load_config_from_db()
         
+        # Generate unique session ID for this run
+        self._session_id = generate_session_id()
+        
         logger.info(f"[SpoolProcessor] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "
                    f"ack_timeout={self.config.ack_timeout}s, "
                    f"retry_count={self.config.retry_count}, "
-                   f"startup_grace={self.config.startup_grace_period}s")
+                   f"startup_grace={self.config.startup_grace_period}s, "
+                   f"session_id={self._session_id}")
         
         # Initialize components
         self._reader = SegmentReader(self.config.spool_dir)
@@ -157,17 +173,22 @@ class SpoolProcessorNode(Node):
         self._current_frame_index: int = 0
         self._current_segment: int = -1  # Track current segment for SPS/PPS handling
         
+        # Sequence counter for published frames
+        self._seq_counter: int = 0
+        self._seq_lock = threading.Lock()
+        
         # SPS/PPS caching for segment boundary handling
         self._cached_sps: Optional[bytes] = None
         self._cached_pps: Optional[bytes] = None
         self._segment_needs_sps_pps: bool = True  # First frame of segment needs SPS/PPS
         
         # State management
-        self._state = ProcessorState.STARTUP_SYNC
+        self._state = ProcessorState.WAITING_FOR_READY
         self._state_lock = threading.Lock()
         self._ack_received = threading.Event()
-        self._ack_frame_index: int = -1
-        self._startup_complete = threading.Event()
+        self._ready_received = threading.Event()
+        self._last_ack: Optional[ProcessingAck] = None
+        self._consumer_session_id: Optional[str] = None  # Session ID from consumer's READY
         self._last_ack_time: float = 0.0  # Track last successful ACK for watchdog
         
         # Processing thread
@@ -179,6 +200,7 @@ class SpoolProcessorNode(Node):
         self._frames_retried = 0
         self._frames_skipped = 0
         self._ack_timeouts = 0
+        self._ack_rejected_stale = 0  # ACKs rejected due to wrong session
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
@@ -186,15 +208,22 @@ class SpoolProcessorNode(Node):
         
         # ROS2 publishers and subscribers
         if IS_RDK:
-            # QoS for reliable messaging with increased depth for robustness
-            reliable_qos = QoSProfile(
+            # QoS for READY topic - TRANSIENT_LOCAL for late joiners
+            ready_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=10  # Increased from 1 for better reliability
+                depth=10,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+            )
+            
+            # QoS for ACK and metadata - RELIABLE with good depth
+            control_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=20  # Higher depth for control messages
             )
             
             # QoS for encoded frames - must match decoder's subscription QoS
-            # The hobot_codec_republish decoder uses RELIABLE by default
             frame_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
@@ -202,26 +231,33 @@ class SpoolProcessorNode(Node):
             )
 
             # Publisher for encoded frames (to decoder input)
-            # Use RELIABLE to match decoder's default QoS expectations
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
                 frame_qos
             )
             
-            # Publisher for current frame index (side channel for ACK correlation)
-            self._index_pub = self.create_publisher(
-                UInt32,
-                '/spool/current_frame_index',
-                reliable_qos
+            # Publisher for frame metadata (replaces /spool/current_frame_index)
+            self._metadata_pub = self.create_publisher(
+                String,
+                '/spool/current_frame_metadata',
+                control_qos
+            )
+            
+            # Subscriber for processing READY
+            self._ready_sub = self.create_subscription(
+                String,
+                '/processing_ready',
+                self._ready_callback,
+                ready_qos
             )
             
             # Subscriber for processing ACK
             self._ack_sub = self.create_subscription(
-                UInt32,
+                String,
                 '/processing_ack',
                 self._ack_callback,
-                reliable_qos
+                control_qos
             )
             
             # Optional: Pull request topic (for external control)
@@ -229,12 +265,14 @@ class SpoolProcessorNode(Node):
                 UInt32,
                 '/spool/request_next',
                 self._request_callback,
-                reliable_qos
+                control_qos
             )
             
             logger.info("[SpoolProcessor] ROS2 topics configured: "
-                       "/spool_image_ch_0 (pub, RELIABLE), /spool/current_frame_index (pub, RELIABLE), "
-                       "/processing_ack (sub, RELIABLE), /spool/request_next (sub, RELIABLE)")
+                       "/spool_image_ch_0 (pub, RELIABLE), "
+                       "/spool/current_frame_metadata (pub, RELIABLE), "
+                       "/processing_ready (sub, TRANSIENT_LOCAL), "
+                       "/processing_ack (sub, RELIABLE)")
     
     def start(self):
         """Start the processor."""
@@ -270,7 +308,7 @@ class SpoolProcessorNode(Node):
         
         # Wake up any waiting threads
         self._ack_received.set()
-        self._startup_complete.set()
+        self._ready_received.set()
         
         # Wait for processor thread
         if self._processor_thread:
@@ -281,10 +319,13 @@ class SpoolProcessorNode(Node):
         # Log final stats
         with self._stats_lock:
             logger.info(f"[SpoolProcessor] Final stats: "
+                       f"session={self._session_id[:8]}, "
+                       f"seq={self._seq_counter}, "
                        f"processed={self._frames_processed}, "
                        f"retried={self._frames_retried}, "
                        f"skipped={self._frames_skipped}, "
                        f"timeouts={self._ack_timeouts}, "
+                       f"ack_rejected={self._ack_rejected_stale}, "
                        f"segments={self._segments_processed}, "
                        f"sps_pps_prepends={self._sps_pps_prepends}")
         
@@ -470,18 +511,37 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps = False
         return data
     
-    def _publish_frame(self, record: FrameRecord) -> bool:
-        """Publish a frame to the decoder input topic."""
+    def _publish_frame(self, record: FrameRecord) -> tuple:
+        """
+        Publish a frame to the decoder input topic with metadata.
+        
+        Returns:
+            Tuple of (success: bool, seq: int, sent_time_sec: int, sent_time_nsec: int)
+        """
         if not IS_RDK:
-            return True
+            return True, 0, 0, 0
         
         try:
-            # Publish frame index for correlation
-            # This index is enqueued in Ros2FrameServer's pending queue
-            # and will be dequeued when the corresponding decoded NV12 frame arrives
-            index_msg = UInt32()
-            index_msg.data = record.index
-            self._index_pub.publish(index_msg)
+            # Get next sequence number
+            with self._seq_lock:
+                seq = self._seq_counter
+                self._seq_counter += 1
+            
+            # Get send timestamp
+            sent_time_sec, sent_time_nsec = get_current_time_ros()
+            
+            # Publish frame metadata for ACK correlation
+            metadata = FrameMetadata(
+                frame_index=record.index,
+                session_id=self._session_id,
+                seq=seq,
+                sent_time_sec=sent_time_sec,
+                sent_time_nsec=sent_time_nsec,
+                segment_num=self._current_segment
+            )
+            metadata_msg = String()
+            metadata_msg.data = frame_metadata_to_ros_string(metadata)
+            self._metadata_pub.publish(metadata_msg)
             
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
@@ -515,111 +575,136 @@ class SpoolProcessorNode(Node):
             
             self._frame_pub.publish(frame_msg)
             
-            logger.debug(f"[SpoolProcessor] Published frame {record.index} (data_len={len(frame_data)})")
-            return True
+            # Structured logging
+            logger.info(f"[SpoolProcessor] 📤 Frame published: index={record.index}, seq={seq}, "
+                       f"session={self._session_id[:8]}, segment={self._current_segment}, data_len={len(frame_data)}")
+            
+            return True, seq, sent_time_sec, sent_time_nsec
             
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error publishing frame: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return False
+            return False, 0, 0, 0
     
-    def _wait_for_ack(self, frame_index: int, timeout: float) -> bool:
+    def _wait_for_ack(self, expected_seq: int, expected_frame_index: int, timeout: float) -> bool:
         """
-        Wait for ACK for a specific frame index.
+        Wait for ACK for a specific frame sequence.
         
         Args:
-            frame_index: Expected frame index in ACK
+            expected_seq: Expected sequence number in ACK
+            expected_frame_index: Expected frame index
             timeout: Maximum time to wait
             
         Returns:
-            True if ACK received, False on timeout
+            True if valid ACK received, False on timeout
         """
         self._ack_received.clear()
         start_time = time.time()
-        logger.debug(f"[SpoolProcessor] Waiting for ACK for frame {frame_index} (timeout={timeout}s)")
+        logger.debug(f"[SpoolProcessor] Waiting for ACK: seq={expected_seq}, "
+                    f"frame_index={expected_frame_index}, timeout={timeout}s")
         
         while self._running:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
-                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame_index} after {timeout}s - no ACK received")
+                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout: seq={expected_seq}, "
+                             f"frame_index={expected_frame_index}, timeout={timeout}s")
                 return False
             
             if self._ack_received.wait(timeout=min(remaining, 1.0)):
                 elapsed = time.time() - start_time
                 
-                if self._ack_frame_index == frame_index:
-                    # Perfect match - consumer processed exactly this frame
-                    logger.info(f"[SpoolProcessor] ✓ ACK matched for frame {frame_index} (elapsed={elapsed:.3f}s)")
+                if self._last_ack is None:
+                    logger.warning("[SpoolProcessor] ⚠ ACK event set but no ACK data available")
+                    continue
+                
+                ack = self._last_ack
+                
+                # Validate session ID
+                if ack.session_id != self._session_id:
+                    with self._stats_lock:
+                        self._ack_rejected_stale += 1
+                    logger.warning(f"[SpoolProcessor] ⚠ ACK rejected: wrong session_id. "
+                                 f"Expected {self._session_id[:8]}, got {ack.session_id[:8]}. "
+                                 f"Stale ACK count: {self._ack_rejected_stale}")
+                    self._ack_received.clear()
+                    continue
+                
+                # Validate sequence or frame index
+                if ack.seq == expected_seq and ack.frame_index == expected_frame_index:
+                    # Perfect match
+                    logger.info(f"[SpoolProcessor] ✓ ACK matched: seq={ack.seq}, "
+                              f"frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
                     self._last_ack_time = time.time()
                     return True
-                elif self._ack_frame_index > frame_index:
-                    # Consumer is ahead - they've already processed this frame
-                    # This happens after processor restart when consumer was already running
-                    logger.warning(f"[SpoolProcessor] ⚠ Consumer ahead: ACK {self._ack_frame_index} > expected {frame_index}. "
-                                 f"Accepting as success (consumer already processed) (elapsed={elapsed:.3f}s)")
+                elif ack.frame_index == expected_frame_index:
+                    # Frame index matches but seq doesn't - still accept
+                    logger.info(f"[SpoolProcessor] ✓ ACK matched (frame_index): seq={ack.seq} "
+                              f"(expected {expected_seq}), frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
                     self._last_ack_time = time.time()
                     return True
                 else:
-                    # ACK was for older frame in the FIFO pending queue
-                    # This is VALID - decoder is processing frames in order
-                    # Accept it as success since consumer is making progress
-                    logger.info(f"[SpoolProcessor] ✓ ACK for pending frame: got {self._ack_frame_index}, published {frame_index}. "
-                               f"Consumer processing queue in order (elapsed={elapsed:.3f}s)")
-                    self._last_ack_time = time.time()
-                    return True
+                    # Neither matches - continue waiting
+                    logger.debug(f"[SpoolProcessor] ACK mismatch: got seq={ack.seq}, frame_index={ack.frame_index}; "
+                               f"expected seq={expected_seq}, frame_index={expected_frame_index}")
+                    self._ack_received.clear()
+                    continue
         
         return False
     
-    def _wait_for_any_ack(self, timeout: float) -> bool:
-        """
-        Wait for any ACK to arrive (used for startup synchronization).
-        
-        Args:
-            timeout: Maximum time to wait
-            
-        Returns:
-            True if any ACK received, False on timeout
-        """
-        self._ack_received.clear()
-        return self._ack_received.wait(timeout=timeout)
+    def _ready_callback(self, msg):
+        """Callback for processing READY messages."""
+        try:
+            ready = processing_ready_from_ros_string(msg.data)
+            self._consumer_session_id = ready.session_id
+            self._ready_received.set()
+            logger.info(f"[SpoolProcessor] ✓ READY received from consumer: session_id={ready.session_id[:8]}")
+        except Exception as e:
+            logger.error(f"[SpoolProcessor] Error parsing READY message: {e}")
     
     def _ack_callback(self, msg):
         """Callback for processing ACK messages."""
-        self._ack_frame_index = msg.data
-        self._ack_received.set()
-        # Signal startup sync if waiting
-        self._startup_complete.set()
-        logger.info(f"[SpoolProcessor] ✓ ACK callback triggered for frame {msg.data}")  # Changed to INFO for visibility
+        try:
+            ack = processing_ack_from_ros_string(msg.data)
+            self._last_ack = ack
+            self._ack_received.set()
+            logger.debug(f"[SpoolProcessor] ACK callback: seq={ack.seq}, frame_index={ack.frame_index}, "
+                        f"session_id={ack.session_id[:8]}")
+        except Exception as e:
+            logger.error(f"[SpoolProcessor] Error parsing ACK message: {e}")
     
     def _request_callback(self, msg):
         """Callback for external pull requests (optional feature)."""
         # This allows external control of frame advancement
         logger.debug(f"[SpoolProcessor] Received request {msg.data}")
     
-    def _wait_for_consumer_startup(self) -> bool:
+    def _wait_for_consumer_ready(self) -> bool:
         """
         Wait for consumer (BagCounterApp) to be ready before processing.
         
-        This prevents the "stuck at frame 0" scenario by allowing the consumer
-        time to initialize and start listening for frames.
+        The consumer publishes a READY message with the session_id it's prepared
+        to serve. This ensures proper startup handshake.
         
         Returns:
-            True if consumer is ready (ACK received), False if grace period expired
+            True if consumer is ready, False if timeout
         """
         with self._state_lock:
-            self._state = ProcessorState.STARTUP_SYNC
+            self._state = ProcessorState.WAITING_FOR_READY
         
-        logger.info(f"[SpoolProcessor] Waiting for consumer startup (grace period: {self.config.startup_grace_period}s)...")
+        logger.info(f"[SpoolProcessor] 🔄 Session started: session_id={self._session_id}")
+        logger.info(f"[SpoolProcessor] Waiting for consumer READY (timeout: {self.config.startup_grace_period}s)...")
         
-        # Wait for the grace period - if we receive any ACK, consumer is ready
-        if self._startup_complete.wait(timeout=self.config.startup_grace_period):
-            logger.info("[SpoolProcessor] Consumer ready - received initial ACK")
+        # Wait for READY signal from consumer
+        if self._ready_received.wait(timeout=self.config.startup_grace_period):
+            # Check if consumer is ready for our session or any session
+            if self._consumer_session_id:
+                logger.info(f"[SpoolProcessor] ✓ Consumer READY: consumer_session={self._consumer_session_id[:8]}, "
+                          f"processor_session={self._session_id[:8]}")
             return True
         
-        # Grace period expired - proceed anyway with warning
-        logger.warning(f"[SpoolProcessor] Consumer startup grace period ({self.config.startup_grace_period}s) expired - "
-                      "proceeding without initial ACK. Consumer may not be ready.")
+        # Timeout - proceed anyway with warning
+        logger.warning(f"[SpoolProcessor] ⚠ Consumer READY timeout ({self.config.startup_grace_period}s) - "
+                      "proceeding without explicit READY signal. Consumer may not be synchronized.")
         return False
     
     def _processor_loop(self):
@@ -640,9 +725,8 @@ class SpoolProcessorNode(Node):
         """
         logger.info("[SpoolProcessor] Processing loop started")
         
-        # Startup synchronization: Give consumer time to initialize
-        # This prevents the common "stuck at frame 0" scenario
-        self._wait_for_consumer_startup()
+        # Startup synchronization: Wait for consumer READY
+        self._wait_for_consumer_ready()
         
         while self._running:
             try:
@@ -693,22 +777,26 @@ class SpoolProcessorNode(Node):
             True if successfully processed (ACK received), False otherwise
         """
         retries = 0
+        seq = 0
+        sent_time_sec = 0
+        sent_time_nsec = 0
         
         while retries <= self.config.retry_count and self._running:
             with self._state_lock:
                 self._state = ProcessorState.IDLE
             
-            # Publish frame
-            if not self._publish_frame(frame):
-                logger.warning(f"[SpoolProcessor] Failed to publish frame {frame.index}")
+            # Publish frame (gets new seq number each time)
+            success, seq, sent_time_sec, sent_time_nsec = self._publish_frame(frame)
+            if not success:
+                logger.warning(f"[SpoolProcessor] 🔴 Failed to publish frame {frame.index}")
                 retries += 1
                 continue
             
             with self._state_lock:
                 self._state = ProcessorState.WAITING_FOR_ACK
             
-            # Wait for ACK
-            if self._wait_for_ack(frame.index, self.config.ack_timeout):
+            # Wait for ACK with session and seq validation
+            if self._wait_for_ack(seq, frame.index, self.config.ack_timeout):
                 return True
             
             # Timeout - retry
@@ -718,11 +806,12 @@ class SpoolProcessorNode(Node):
             if retries < self.config.retry_count:
                 with self._stats_lock:
                     self._frames_retried += 1
-                logger.warning(f"[SpoolProcessor] ACK timeout for frame {frame.index}, "
+                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame.index}, seq={seq}, "
                               f"retry {retries + 1}/{self.config.retry_count}")
             
             retries += 1
         
+        logger.error(f"[SpoolProcessor] 🔴 Frame {frame.index} failed after {retries} attempts")
         return False
     
     def _maybe_log_stats(self):
@@ -734,10 +823,13 @@ class SpoolProcessorNode(Node):
                 ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
                 
                 logger.info(f"[SpoolProcessor] Stats: "
+                           f"session={self._session_id[:8]}, "
+                           f"seq={self._seq_counter}, "
                            f"processed={self._frames_processed}, "
                            f"retried={self._frames_retried}, "
                            f"skipped={self._frames_skipped}, "
                            f"timeouts={self._ack_timeouts}, "
+                           f"ack_rejected={self._ack_rejected_stale}, "
                            f"segments={self._segments_processed}, "
                            f"sps_pps_prepends={self._sps_pps_prepends}, "
                            f"state={self._state.value}")
@@ -751,7 +843,7 @@ class SpoolProcessorNode(Node):
                 
                 # Watchdog warning if ACKs are stale
                 if ack_staleness > self.config.ack_timeout * 2 and self._last_ack_time > 0:
-                    logger.warning(f"[SpoolProcessor] WATCHDOG: No ACK received in {ack_staleness:.1f}s - "
+                    logger.warning(f"[SpoolProcessor] ⚠ WATCHDOG: No ACK received in {ack_staleness:.1f}s - "
                                   "consumer may be stuck or not processing frames")
             
             self._last_stats_time = current_time
