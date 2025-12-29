@@ -125,7 +125,52 @@ sleep 10
 ros2 node list | grep codec
 ```
 
-#### Issue 2: QoS Mismatch
+#### Issue 2: Decoder Not Initializing (No SPS/PPS)
+
+**Symptoms:**
+- Decoder node is running ✓
+- Subscribed to `/spool_image_ch_0` ✓
+- But NOT publishing to `/nv12_images` ✗
+- `sps_pps_prepends=0` in SpoolProcessor stats
+- `ros2 topic hz /spool_image_ch_0` shows 0.033 Hz (one frame per 30s)
+
+**Root Cause:**
+Decoder can't initialize without SPS/PPS (Sequence Parameter Set / Picture Parameter Set) NAL units. If the first frame sent doesn't contain SPS/PPS and none are cached, decoder fails silently.
+
+**Fix:**
+This is now fixed automatically via pre-scanning (commit 2da2c7c). SpoolProcessor scans up to 100 frames on startup to find and cache SPS/PPS before sending any frames to the decoder.
+
+**Verification:**
+```bash
+# Check pre-scan logs
+grep "Pre-scanning for SPS/PPS" /home/sunrise/BreadCounting/data/logs/spool-processor.log
+# Should see: "Found and cached SPS/PPS"
+
+# Check that SPS/PPS prepending is working
+grep "sps_pps_prepends" /home/sunrise/BreadCounting/data/logs/spool-processor.log
+# Should show sps_pps_prepends > 0
+
+# Verify decoder is now publishing
+ros2 topic hz /nv12_images
+# Should show ~30 Hz
+```
+
+If pre-scan fails to find SPS/PPS:
+```bash
+# Check if segments contain any IDR frames
+python3 -c "
+from src.spool.segment_io import SegmentReader
+from src.spool.h264_nal import extract_sps_pps
+reader = SegmentReader('/home/sunrise/BreadCounting/data/spool')
+for frame in reader.read_frames():
+    sps, pps = extract_sps_pps(frame.data)
+    if sps or pps:
+        print(f'Frame {frame.index}: SPS={bool(sps)}, PPS={bool(pps)}')
+        break
+"
+```
+
+#### Issue 3: QoS Mismatch
 
 **Symptoms:**
 - Decoder runs but doesn't receive frames
@@ -140,21 +185,38 @@ grep "best_effort_qos" /home/sunrise/BreadCounting/src/ros2_spool/spool_processo
 # Should see depth=5, BEST_EFFORT
 ```
 
-#### Issue 3: Missing SPS/PPS
+#### Issue 3: QoS Mismatch
+
+**Symptoms:**
+- Decoder runs but doesn't receive frames
+- `ros2 topic info /spool_image_ch_0 -v` shows no subscribers
+
+**Fix:**
+QoS should already be BEST_EFFORT. If mismatch occurs, check:
+```bash
+# Check SpoolProcessor QoS
+grep "best_effort_qos" /home/sunrise/BreadCounting/src/ros2_spool/spool_processor_node.py
+
+# Should see depth=5, BEST_EFFORT
+```
+
+#### Issue 4: Missing SPS/PPS (Legacy - Fixed)
 
 **Symptoms:**
 - Decoder receives frames but doesn't decode
 - Logs show "Invalid NAL unit" or "No SPS/PPS"
 
 **Fix:**
-Already implemented - SpoolProcessor prepends SPS/PPS. Verify:
+This is now handled automatically by pre-scan and prepending logic. If you still see issues:
 ```bash
-grep "Prepending cached SPS" /home/sunrise/BreadCounting/data/logs/*.log
+# Verify pre-scan is enabled
+grep "prescan_for_sps_pps" /home/sunrise/BreadCounting/src/ros2_spool/spool_processor_node.py
 
-# Should see messages when segments change
+# Check prepending is working
+grep "Prepending cached SPS" /home/sunrise/BreadCounting/data/logs/*.log
 ```
 
-#### Issue 4: Wrong Topic Configuration
+#### Issue 5: Wrong Topic Configuration
 
 **Symptoms:**
 - Everything appears to run but no frames flow
@@ -229,18 +291,33 @@ ros2 topic hz /processing_ack
 [SpoolProcessor] Published frame 22725
 ```
 
-**Broken System (Decoder Not Working):**
+**Broken System (Decoder Not Initialized - No SPS/PPS):**
 ```
 [SpoolProcessor] Published frame 22724
-[Ros2FrameServer] Received frame index: 22724, queue_size=8
-[SpoolProcessor] ACK timeout for frame 22724, retry 1/2
-[Ros2FrameServer] Received frame index: 22724, queue_size=9  ← Growing!
-[SpoolProcessor] ACK timeout for frame 22724, retry 2/2
-[Ros2FrameServer] Received frame index: 22724, queue_size=10 ← Still growing!
+[SpoolProcessor] ACK timeout for frame 22724, retry 1/2 ← 30 seconds later
+[SpoolProcessor] Published frame 22724
+[SpoolProcessor] ACK timeout for frame 22724, retry 2/2 ← 30 seconds later
 [SpoolProcessor] Frame 22724 skipped after retries
+[SpoolProcessor] Stats: sps_pps_prepends=0 ← No SPS/PPS prepending!
 ```
 
-Key difference: NO "Correlated decoded frame" messages = Decoder problem
+Key indicators:
+- Frames published every 30 seconds (= retry timeout)
+- `sps_pps_prepends=0` means decoder never received SPS/PPS
+- NO "Correlated decoded frame" messages
+- `ros2 topic hz /nv12_images` shows "not published"
+
+**Fixed System (With Pre-scan):**
+```
+[SpoolProcessor] Pre-scanning for SPS/PPS NAL units...
+[SpoolProcessor] Found and cached SPS from frame 22724
+[SpoolProcessor] Found and cached PPS from frame 22724
+[SpoolProcessor] Pre-scan complete: found SPS/PPS after scanning 1 frames
+[SpoolProcessor] Published frame 22724 (data_len=7834)
+[Ros2FrameServer] Correlated decoded frame with index 22724
+[BagCounterApp] Published ACK for frame 22724
+[SpoolProcessor] Stats: sps_pps_prepends=1, processed=1
+```
 
 ### Performance Metrics
 
