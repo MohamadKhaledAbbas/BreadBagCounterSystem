@@ -1216,6 +1216,15 @@ class BagCounterApp:
                 # NOTE: Accuracy Mode ACK is now published in the frame capture loop (run() method)
                 # immediately when a frame is consumed from frame_source.frames().
                 # This ensures the ACK has the correct frame index that was stored with that frame.
+                # 
+                # HISTORICAL CONTEXT (why ACK was moved from here):
+                # Previously, ACK was published here using get_current_frame_index(), but this
+                # caused a race condition: the frame index in Ros2FrameServer could be updated
+                # by the subscription callback before the logic thread processed the frame,
+                # resulting in ACKs with mismatched indices and pipeline deadlock.
+                # Moving the ACK to the capture loop ensures we use the index that was
+                # captured when the specific frame was enqueued, not a potentially newer index.
+                #
                 # DO NOT publish ACK here as it would cause duplicate ACKs and potential race conditions.
 
                 frame_start = time.perf_counter()
