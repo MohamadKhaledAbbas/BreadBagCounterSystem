@@ -392,25 +392,35 @@ class SpoolProcessorNode(Node):
             logger.error(f"[SpoolProcessor] Error during SPS/PPS pre-scan: {e}")
         
         # Recreate generator with buffered frames at the front
-        # This ensures we process frames in order
-        # Note: We create a list copy and clear temp_frames to avoid holding references
-        buffered_frames_copy = list(temp_frames)
-        temp_frames.clear()  # Clear to allow garbage collection
-        
-        def buffered_generator():
-            # First yield buffered frames
-            for frame in buffered_frames_copy:
-                yield frame
-            # Clear the copy after yielding to free memory
-            buffered_frames_copy.clear()
-            # Then continue with remaining frames
-            try:
-                while True:
-                    yield next(self._frame_generator)
-            except StopIteration:
-                pass
-        
-        self._frame_generator = buffered_generator()
+        # This avoids the "generator already executing" issue by creating a fresh generator
+        # from the original source and prepending the buffered frames
+        oldest = self._current_segment
+        if oldest is not None:
+            # Get a fresh generator from the reader
+            fresh_generator = self._reader.read_frames(start_segment=oldest)
+            
+            # Create iterator that yields buffered frames first, then continues with fresh generator
+            def buffered_generator():
+                # First yield all buffered frames
+                for frame in temp_frames:
+                    yield frame
+                # Then yield from fresh generator, skipping frames we already buffered
+                frames_to_skip = len(temp_frames)
+                skipped = 0
+                try:
+                    while True:
+                        frame = next(fresh_generator)
+                        if skipped < frames_to_skip:
+                            skipped += 1
+                            continue
+                        yield frame
+                except StopIteration:
+                    pass
+            
+            self._frame_generator = buffered_generator()
+        else:
+            # Fallback: just use buffered frames if no segment available
+            self._frame_generator = iter(temp_frames)
         
         if self._cached_sps and self._cached_pps:
             logger.info("[SpoolProcessor] Pre-scan successful: SPS/PPS cached and ready for decoder")
@@ -444,17 +454,29 @@ class SpoolProcessorNode(Node):
                 if self._current_segment >= 0:
                     self._segments_processed += 1
             self._segment_needs_sps_pps = True  # New segment will need SPS/PPS
-            self._init_frame_generator()
-            try:
-                frame = next(self._frame_generator)
-                # Extract and cache SPS/PPS if present
-                sps, pps = extract_sps_pps(frame.data)
-                if sps:
-                    self._cached_sps = sps
-                if pps:
-                    self._cached_pps = pps
-                return frame
-            except StopIteration:
+            
+            # Don't call _init_frame_generator which may do prescan again
+            # Instead, directly get the next segment and create a fresh generator
+            oldest = self._reader.get_oldest_segment()
+            if oldest is not None:
+                logger.info(f"[SpoolProcessor] Starting from segment {oldest}")
+                self._frame_generator = self._reader.read_frames(start_segment=oldest)
+                self._current_segment = oldest
+                
+                try:
+                    frame = next(self._frame_generator)
+                    # Extract and cache SPS/PPS if present
+                    sps, pps = extract_sps_pps(frame.data)
+                    if sps:
+                        self._cached_sps = sps
+                    if pps:
+                        self._cached_pps = pps
+                    return frame
+                except StopIteration:
+                    return None
+            else:
+                logger.debug("[SpoolProcessor] No more segments available")
+                self._frame_generator = iter([])
                 return None
     
     def _maybe_prepend_sps_pps(self, data: bytes) -> bytes:
