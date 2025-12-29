@@ -74,6 +74,10 @@ class FrameServer(Node, FrameSource):
         self._last_yielded_frame_index = 0  # Track the index of the most recently yielded frame
         self._frame_index_lock = threading.Lock()
         
+        # FIFO queue for pending frame indices to correlate with decoded frames
+        # This solves the race condition where frame indices arrive before decoded frames
+        self._pending_frame_indices = queue.Queue(maxsize=50)  # Buffer for pending indices
+        
         # Check if accuracy mode is enabled via database config, fall back to environment
         try:
             db = DatabaseManager(db_path=AppConfig.db_path)
@@ -108,10 +112,32 @@ class FrameServer(Node, FrameSource):
         # ---------------
     
     def _frame_index_callback(self, msg):
-        """Callback for frame index updates from SpoolProcessorNode."""
+        """
+        Callback for frame index updates from SpoolProcessorNode.
+        
+        This callback receives frame indices BEFORE the corresponding NV12 frames
+        arrive (due to decoder latency). We enqueue them in a FIFO to correlate
+        properly with decoded frames in listener_callback.
+        """
+        frame_idx = int(msg.data)
+        
+        # Update current index for backwards compatibility
         with self._frame_index_lock:
-            self._current_frame_index = int(msg.data)
-        logger.debug(f"[Ros2FrameServer] Received frame index: {msg.data}")
+            self._current_frame_index = frame_idx
+        
+        # Enqueue to pending queue for proper correlation
+        try:
+            self._pending_frame_indices.put_nowait(frame_idx)
+            logger.debug(f"[Ros2FrameServer] Received frame index: {frame_idx}, queue_size={self._pending_frame_indices.qsize()}")
+        except queue.Full:
+            # Queue full - this indicates decoder is falling behind
+            # Drop oldest pending index to make room
+            try:
+                dropped_idx = self._pending_frame_indices.get_nowait()
+                logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped index {dropped_idx}")
+                self._pending_frame_indices.put_nowait(frame_idx)
+            except (queue.Empty, queue.Full):
+                logger.error(f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx}")
     
     def get_current_frame_index(self) -> int:
         """Get the current frame index for ACK correlation."""
@@ -168,8 +194,20 @@ class FrameServer(Node, FrameSource):
                 pass
         
         # Enqueue new frame with frame index for accuracy mode
-        # The frame index is captured at enqueue time to ensure correlation
-        frame_index = self.get_current_frame_index() if self._accuracy_mode else 0
+        # In accuracy mode, dequeue the next pending frame index (FIFO correlation)
+        frame_index = 0
+        if self._accuracy_mode:
+            try:
+                # Dequeue the next frame index that corresponds to this decoded frame
+                # This maintains proper correlation even with decoder latency
+                frame_index = self._pending_frame_indices.get_nowait()
+                logger.debug(f"[Ros2FrameServer] Correlated decoded frame with index {frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
+            except queue.Empty:
+                # No pending index - this shouldn't happen in normal operation
+                # Fall back to current index as best-effort
+                frame_index = self.get_current_frame_index()
+                logger.warning(f"[Ros2FrameServer] No pending frame index available, using current index {frame_index}")
+        
         self.frame_queue.put((bgr, latency_ms, frame_index))
 
     def frames(self):

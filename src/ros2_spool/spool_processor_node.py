@@ -19,7 +19,7 @@ Usage:
 
 Configuration (via database config table):
     spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 30.0)
+    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0)
     spool_retry_count: Number of retries before advancing (default: 2)
 """
 
@@ -76,7 +76,7 @@ class ProcessorState(Enum):
 
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
-DEFAULT_ACK_TIMEOUT = 30.0
+DEFAULT_ACK_TIMEOUT = 10.0  # Reduced from 30.0 - should be much faster with FIFO correlation
 DEFAULT_RETRY_COUNT = 2
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
@@ -397,29 +397,18 @@ class SpoolProcessorNode(Node):
             return True
         
         try:
-            # First, publish the frame index for correlation
-            # This must arrive BEFORE the decoded NV12 frame to avoid race conditions
-            # in BagCounterApp where the frame index is read when the NV12 arrives.
+            # Publish frame index for correlation
+            # This index is enqueued in Ros2FrameServer's pending queue
+            # and will be dequeued when the corresponding decoded NV12 frame arrives
             index_msg = UInt32()
             index_msg.data = record.index
             self._index_pub.publish(index_msg)
             
-            # Brief yield to allow the index message to be sent before the frame.
-            # This is a best-effort ordering hint since:
-            # 1. ROS2 doesn't guarantee ordering across different publishers
-            # 2. The index uses RELIABLE QoS (with acknowledgment) vs frame uses BEST_EFFORT
-            # 3. The decoder pipeline introduces significant latency (10-100ms) that
-            #    makes the arrival order of index vs decoded frame highly predictable
-            # Alternative approaches considered:
-            # - Combined message: Would require custom msg type, breaks existing pipeline
-            # - Sequence numbers: Already implemented via frame index correlation
-            # Note: This delay has negligible impact on throughput (~0.1% at 30fps)
-            time.sleep(0.001)  # 1ms
-            
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
             
-            # Then publish the encoded frame
+            # Publish the encoded frame immediately (no delay needed)
+            # The FIFO queue in Ros2FrameServer will handle proper correlation
             frame_msg = H26XFrame()
             frame_msg.index = record.index
             frame_msg.width = record.width
