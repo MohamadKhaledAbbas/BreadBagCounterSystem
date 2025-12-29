@@ -8,6 +8,7 @@ using Python dataclasses and provide conversion utilities to/from ROS2 messages.
 These messages replace the simple UInt32 ACK with structured, session-aware protocol.
 """
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -163,8 +164,6 @@ def get_current_time_ros() -> tuple:
 # These functions convert between our dataclasses and ROS2 String messages
 # We use String messages with JSON encoding as a workaround since we can't
 # define custom message types without colcon/ament
-
-import json
 
 
 def processing_ack_to_ros_string(ack: ProcessingAck) -> str:

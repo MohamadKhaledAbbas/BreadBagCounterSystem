@@ -47,9 +47,28 @@ from src.counting.FramePublisherNode import FramePublisher
 
 if IS_RDK:
     from rclpy.node import Node
+    from std_msgs.msg import String
+    from src.ros2_spool.messages import (
+        generate_session_id,
+        get_current_time_ros,
+        ProcessingAck,
+        ProcessingReady,
+        processing_ack_to_ros_string,
+        processing_ready_to_ros_string,
+        frame_metadata_from_ros_string
+    )
 else:
     class Node:
         pass
+    # Stubs for non-RDK platforms
+    generate_session_id = lambda: "stub-session-id"
+    get_current_time_ros = lambda: (0, 0)
+    ProcessingAck = None
+    ProcessingReady = None
+    processing_ack_to_ros_string = lambda x: ""
+    processing_ready_to_ros_string = lambda x: ""
+    frame_metadata_from_ros_string = lambda x: None
+
 
 
 class BagCounterApp:
@@ -296,25 +315,6 @@ class BagCounterApp:
         if IS_RDK and self._accuracy_mode:
             import rclpy
             from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-            from std_msgs.msg import String
-            from src.ros2_spool.messages import (
-                generate_session_id,
-                get_current_time_ros,
-                ProcessingAck,
-                ProcessingReady,
-                processing_ack_to_ros_string,
-                processing_ready_to_ros_string,
-                frame_metadata_from_ros_string
-            )
-            
-            # Store message utilities as instance attributes for later use
-            self._generate_session_id = generate_session_id
-            self._get_current_time_ros = get_current_time_ros
-            self._ProcessingAck = ProcessingAck
-            self._ProcessingReady = ProcessingReady
-            self._processing_ack_to_ros_string = processing_ack_to_ros_string
-            self._processing_ready_to_ros_string = processing_ready_to_ros_string
-            self._frame_metadata_from_ros_string = frame_metadata_from_ros_string
             
             # Generate session ID for this consumer instance
             self._consumer_session_id = generate_session_id()
@@ -858,7 +858,7 @@ class BagCounterApp:
         Stores the metadata for use when constructing ACKs.
         """
         try:
-            metadata = self._frame_metadata_from_ros_string(msg.data)
+            metadata = frame_metadata_from_ros_string(msg.data)
             self._current_frame_metadata = metadata
             logger.debug(f"[BagCounterApp] Frame metadata received: "
                         f"frame_index={metadata.frame_index}, seq={metadata.seq}, "
@@ -939,7 +939,7 @@ class BagCounterApp:
                                  f"expected {spool_frame_index}, metadata has {metadata.frame_index}")
                 
                 # Construct ACK with full metadata
-                ack = self._ProcessingAck(
+                ack = ProcessingAck(
                     frame_index=metadata.frame_index,
                     session_id=metadata.session_id,
                     seq=metadata.seq,
@@ -949,9 +949,8 @@ class BagCounterApp:
                 )
                 
                 # Publish ACK
-                from std_msgs.msg import String
                 ack_msg = String()
-                ack_msg.data = self._processing_ack_to_ros_string(ack)
+                ack_msg.data = processing_ack_to_ros_string(ack)
                 self._ack_publisher.publish(ack_msg)
                 
                 logger.info(f"[BagCounterApp] ✓ ACK published: frame_index={ack.frame_index}, "
@@ -961,8 +960,8 @@ class BagCounterApp:
                 logger.warning(f"[BagCounterApp] ⚠ No frame metadata available for frame {spool_frame_index}, "
                              "constructing minimal ACK")
                 
-                sent_time_sec, sent_time_nsec = self._get_current_time_ros()
-                ack = self._ProcessingAck(
+                sent_time_sec, sent_time_nsec = get_current_time_ros()
+                ack = ProcessingAck(
                     frame_index=spool_frame_index,
                     session_id=self._consumer_session_id,
                     seq=0,  # Unknown seq
@@ -971,9 +970,8 @@ class BagCounterApp:
                     segment_num=-1
                 )
                 
-                from std_msgs.msg import String
                 ack_msg = String()
-                ack_msg.data = self._processing_ack_to_ros_string(ack)
+                ack_msg.data = processing_ack_to_ros_string(ack)
                 self._ack_publisher.publish(ack_msg)
                 
                 logger.info(f"[BagCounterApp] ✓ ACK published (minimal): frame_index={ack.frame_index}")
@@ -992,16 +990,15 @@ class BagCounterApp:
             return
         
         try:
-            ready_time_sec, ready_time_nsec = self._get_current_time_ros()
-            ready = self._ProcessingReady(
+            ready_time_sec, ready_time_nsec = get_current_time_ros()
+            ready = ProcessingReady(
                 session_id=self._consumer_session_id,
                 ready_time_sec=ready_time_sec,
                 ready_time_nsec=ready_time_nsec
             )
             
-            from std_msgs.msg import String
             ready_msg = String()
-            ready_msg.data = self._processing_ready_to_ros_string(ready)
+            ready_msg.data = processing_ready_to_ros_string(ready)
             self._ready_publisher.publish(ready_msg)
             
             logger.info(f"[BagCounterApp] ✓ READY published: session_id={ready.session_id[:8]}")

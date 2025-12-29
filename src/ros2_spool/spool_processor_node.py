@@ -511,7 +511,7 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps = False
         return data
     
-    def _publish_frame(self, record: FrameRecord) -> tuple:
+    def _publish_frame(self, record: FrameRecord) -> tuple[bool, int, int, int]:
         """
         Publish a frame to the decoder input topic with metadata.
         
