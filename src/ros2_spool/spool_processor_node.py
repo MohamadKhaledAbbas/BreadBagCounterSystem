@@ -351,10 +351,16 @@ class SpoolProcessorNode(Node):
         
         # Recreate generator with buffered frames at the front
         # This ensures we process frames in order
+        # Note: We create a list copy and clear temp_frames to avoid holding references
+        buffered_frames_copy = list(temp_frames)
+        temp_frames.clear()  # Clear to allow garbage collection
+        
         def buffered_generator():
             # First yield buffered frames
-            for frame in temp_frames:
+            for frame in buffered_frames_copy:
                 yield frame
+            # Clear the copy after yielding to free memory
+            buffered_frames_copy.clear()
             # Then continue with remaining frames
             try:
                 while True:

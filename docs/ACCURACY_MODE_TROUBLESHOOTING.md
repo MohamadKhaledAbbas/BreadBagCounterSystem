@@ -185,21 +185,6 @@ grep "best_effort_qos" /home/sunrise/BreadCounting/src/ros2_spool/spool_processo
 # Should see depth=5, BEST_EFFORT
 ```
 
-#### Issue 3: QoS Mismatch
-
-**Symptoms:**
-- Decoder runs but doesn't receive frames
-- `ros2 topic info /spool_image_ch_0 -v` shows no subscribers
-
-**Fix:**
-QoS should already be BEST_EFFORT. If mismatch occurs, check:
-```bash
-# Check SpoolProcessor QoS
-grep "best_effort_qos" /home/sunrise/BreadCounting/src/ros2_spool/spool_processor_node.py
-
-# Should see depth=5, BEST_EFFORT
-```
-
 #### Issue 4: Missing SPS/PPS (Legacy - Fixed)
 
 **Symptoms:**
