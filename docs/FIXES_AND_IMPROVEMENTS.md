@@ -2,6 +2,41 @@
 
 This document catalogs potential improvements, optimizations, and fixes identified during code review of the BreadBag Counter System. Items are organized by priority and area.
 
+## Critical: Understanding the Frame Rate Bottleneck
+
+### Root Cause Analysis (December 2024)
+
+**Problem Statement:** Frame acquisition averages ~65ms (15 FPS), while detection only takes ~26.6ms. Where is the ~40ms gap?
+
+**Answer:** The ~40ms "gap" is **NOT a bug** - it's expected behavior due to the frame source rate limit.
+
+**Key Finding:** The frame acquisition rate is limited by the **SpoolProcessor**, which runs in ACK-FREE mode with `target_fps=25.0`. This means:
+- SpoolProcessor publishes H.264 frames at 25 FPS target
+- Decoder processes H.264 → NV12 (takes variable time)
+- Detection is **faster** than the source (26.6ms detection = 37 FPS theoretical max)
+- The consumer (detection) waits idle for ~40ms between frames
+
+**Implication:** Detection performance is good! The bottleneck is upstream:
+1. SpoolProcessor target_fps limits output to 25 FPS
+2. Observed ~15 FPS suggests additional latency in decoder or network
+
+**To verify this diagnosis, check the new timing metrics:**
+```
+[Ros2FrameServer] Stats: ..., avg_callback=X.XXms (reshape=X.XXms, nv12_copy=X.XXms, bgr_cvt=X.XXms)
+[BagCounterApp] Frame acquisition stats: frames=X, avg_interval=X.Xms, acquisition_fps=X.X, avg_detect=X.Xms, theoretical_max_fps=X.X, bottleneck=source, nv12=yes
+```
+
+- `bottleneck=source` confirms the frame source is slower than detection
+- `theoretical_max_fps` shows what FPS detection could handle if fed faster
+- `nv12=yes` confirms NV12 direct path is being used
+
+**Potential Solutions:**
+1. Increase `spool_target_fps` in SpoolProcessor config (if decoder can keep up)
+2. Investigate decoder performance and network latency
+3. Consider frame buffering to smooth variable decoder latency
+
+---
+
 ## High Priority
 
 ### 1. Direct NV12 Input for Detection (IMPLEMENTED ✅)

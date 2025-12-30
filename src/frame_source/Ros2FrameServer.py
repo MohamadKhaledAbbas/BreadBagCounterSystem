@@ -177,6 +177,28 @@ class FrameServer(Node, FrameSource):
         """Get the current frame index for ACK correlation."""
         with self._frame_index_lock:
             return int(self._current_frame_index)
+    
+    def _get_timing_stats_string(self) -> str:
+        """
+        V6: Get formatted timing stats string and reset counters.
+        
+        Returns:
+            Formatted string with timing stats, or empty string if no data
+        """
+        if not hasattr(self, '_timing_stats') or self._timing_stats['count'] == 0:
+            return ""
+        
+        count = self._timing_stats['count']
+        stats_str = (
+            f", avg_callback={self._timing_stats['callback'] / count:.2f}ms"
+            f" (reshape={self._timing_stats['reshape'] / count:.2f}ms"
+            f", nv12_copy={self._timing_stats['nv12_copy'] / count:.2f}ms"
+            f", bgr_cvt={self._timing_stats['bgr_convert'] / count:.2f}ms)"
+        )
+        # Reset timing stats
+        self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
+        return stats_str
+
 
     def listener_callback(self, msg):
         now = time.time()
@@ -193,6 +215,9 @@ class FrameServer(Node, FrameSource):
             queue_utilization = (self.frame_queue.qsize() / self.frame_queue.maxsize) * 100
             drop_rate = (self.frames_dropped / self.frames_received * 100) if self.frames_received > 0 else 0.0
             
+            # V6: Get timing stats (resets counters)
+            timing_stats_str = self._get_timing_stats_string()
+            
             # Include pending index queue stats for accuracy mode
             if self._accuracy_mode:
                 pending_queue_size = self._pending_frame_indices.qsize()
@@ -207,24 +232,18 @@ class FrameServer(Node, FrameSource):
                     stats_msg += f", LOST_INDICES={self.frames_index_lost}"
                 
                 # V6: Add timing stats
-                if hasattr(self, '_timing_stats') and self._timing_stats['count'] > 0:
-                    count = self._timing_stats['count']
-                    stats_msg += (
-                        f", avg_callback={self._timing_stats['callback'] / count:.2f}ms"
-                        f" (reshape={self._timing_stats['reshape'] / count:.2f}ms"
-                        f", nv12_copy={self._timing_stats['nv12_copy'] / count:.2f}ms"
-                        f", bgr_cvt={self._timing_stats['bgr_convert'] / count:.2f}ms)"
-                    )
-                    # Reset timing stats
-                    self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
-                
+                stats_msg += timing_stats_str
                 logger.info(stats_msg)
             else:
-                logger.info(
+                stats_msg = (
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
                     f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
                     f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%"
                 )
+                # V6: Add timing stats for non-accuracy mode too
+                stats_msg += timing_stats_str
+                logger.info(stats_msg)
+                logger.info(stats_msg)
             self.last_stats_log_time = now
         
         # V6: Time each operation

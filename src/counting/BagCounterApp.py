@@ -2013,10 +2013,35 @@ class BagCounterApp:
                         avg_interval = frame_interval_sum / frame_interval_count
                         if avg_interval > TIMING_EPSILON:
                             acquisition_fps = 1.0 / avg_interval
+                            # V6: Calculate theoretical max FPS based on detection time
+                            # Minimum detection time threshold (1ms) to prevent extreme FPS values
+                            MIN_DETECT_TIME_MS = 1.0
+                            # Hysteresis threshold (1ms) to prevent oscillating bottleneck indicator  
+                            BOTTLENECK_HYSTERESIS_SEC = 0.001
+                            
+                            avg_detect_time = (
+                                sum(self._recent_detection_times) / len(self._recent_detection_times)
+                                if len(self._recent_detection_times) > 0 else 0.0
+                            )
+                            # Cap theoretical FPS at 1000 to prevent unrealistic values
+                            if avg_detect_time >= MIN_DETECT_TIME_MS:
+                                theoretical_max_fps = min(1000.0, 1000.0 / avg_detect_time)
+                            else:
+                                theoretical_max_fps = 0.0  # Insufficient data
+                            
+                            # Determine bottleneck: "source" if frame arrival is slower than detection
+                            # Add hysteresis to prevent oscillating between states
+                            bottleneck = "source" if avg_interval > (avg_detect_time / 1000.0 + BOTTLENECK_HYSTERESIS_SEC) else "detection"
+                            
+                            # V6: Include NV12 path indicator
+                            nv12_indicator = "yes" if nv12_data is not None else "no"
+                            
                             logger.info(
                                 f"[BagCounterApp] Frame acquisition stats: "
                                 f"frames={frame_count}, avg_interval={avg_interval * 1000:.1f}ms, "
-                                f"acquisition_fps={acquisition_fps:.1f}"
+                                f"acquisition_fps={acquisition_fps:.1f}, "
+                                f"avg_detect={avg_detect_time:.1f}ms, theoretical_max_fps={theoretical_max_fps:.1f}, "
+                                f"bottleneck={bottleneck}, nv12={nv12_indicator}"
                             )
                         else:
                             logger.warning(
