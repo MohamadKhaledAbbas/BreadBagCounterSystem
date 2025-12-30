@@ -243,3 +243,288 @@ class BpuClassifier(BaseClassifier):
         self.nv12_buffer[self.area + 1::2] = yuv420p[v_start:]
 
         return self.nv12_buffer
+
+    def predict_batch(self, images, use_true_batch=True):
+        """
+        V7: Batch classification for multiple ROI images.
+        
+        Processes multiple images in batches for improved throughput when classifying
+        multiple ROIs (e.g., during track classification).
+        
+        Args:
+            images: List of numpy arrays (ROI images) to classify
+            use_true_batch: If True, attempt true batch inference via BPU.
+                           If False or BPU batch fails, use sequential processing.
+            
+        Returns:
+            List of tuples (label, confidence), one per image
+        """
+        if self.model is None:
+            return [("Unknown", 0.0) for _ in images]
+        
+        batch_size = len(images)
+        if batch_size == 0:
+            return []
+        
+        # Single image - use regular predict
+        if batch_size == 1:
+            return [self.predict(images[0])]
+        
+        t_batch_start = cv2.getTickCount()
+        
+        # 1. Preprocess all images
+        t_preprocess_start = cv2.getTickCount()
+        batch_tensors = []
+        valid_indices = []  # Track which images are valid
+        
+        for idx, image in enumerate(images):
+            # Validate input
+            if image is None or not isinstance(image, np.ndarray) or image.size == 0 or len(image.shape) != 3:
+                logger.debug(f"[BpuClassifier] Batch: Invalid image at index {idx}, skipping")
+                continue
+            
+            try:
+                # Preprocess and create a copy (since _preprocess reuses buffer)
+                input_tensor = self._preprocess(image)
+                batch_tensors.append(input_tensor.copy())
+                valid_indices.append(idx)
+            except Exception as e:
+                logger.debug(f"[BpuClassifier] Batch: Preprocess failed at index {idx}: {e}")
+                continue
+        
+        t_preprocess_end = cv2.getTickCount()
+        preprocess_time_ms = (t_preprocess_end - t_preprocess_start) * 1000 / cv2.getTickFrequency()
+        
+        # If no valid images, return all Unknown
+        if len(batch_tensors) == 0:
+            return [("Unknown", 0.0) for _ in images]
+        
+        # 2. Batch inference
+        t_inference_start = cv2.getTickCount()
+        batch_probs = []
+        true_batch_used = False
+        
+        if use_true_batch and len(batch_tensors) > 1:
+            try:
+                # True batch inference: Stack tensors and pass to BPU in single call
+                batch_input = np.stack(batch_tensors, axis=0)
+                
+                # Attempt true batch forward pass
+                batch_outputs = self.model[0].forward(batch_input)
+                
+                # Check if output is batched
+                if batch_outputs and len(batch_outputs) > 0:
+                    first_output = batch_outputs[0].buffer
+                    
+                    if len(first_output.shape) > 1 and first_output.shape[0] == len(batch_tensors):
+                        # Outputs are batched - extract probabilities for each image
+                        true_batch_used = True
+                        for i in range(len(batch_tensors)):
+                            probs = first_output[i].flatten()
+                            
+                            # Apply softmax if needed
+                            if probs.max() > 1.0 or probs.min() < 0.0:
+                                exp_scores = np.exp(probs - np.max(probs))
+                                probs = exp_scores / np.sum(exp_scores)
+                            
+                            batch_probs.append(probs)
+                    else:
+                        logger.debug(
+                            f"[BpuClassifier] Model output shape {first_output.shape} doesn't match "
+                            f"batch_size={len(batch_tensors)}, falling back to sequential"
+                        )
+                        
+            except Exception as e:
+                logger.debug(f"[BpuClassifier] True batch inference attempt failed: {e}")
+        
+        # Sequential fallback if true batch wasn't used or failed
+        if not true_batch_used:
+            batch_probs = []
+            for tensor in batch_tensors:
+                try:
+                    outputs = self.model[0].forward(tensor)
+                    probs = outputs[0].buffer.flatten()
+                    
+                    # Apply softmax if needed
+                    if probs.max() > 1.0 or probs.min() < 0.0:
+                        exp_scores = np.exp(probs - np.max(probs))
+                        probs = exp_scores / np.sum(exp_scores)
+                    
+                    batch_probs.append(probs)
+                except Exception as e:
+                    logger.debug(f"[BpuClassifier] Sequential inference failed: {e}")
+                    batch_probs.append(None)
+        
+        t_inference_end = cv2.getTickCount()
+        inference_time_ms = (t_inference_end - t_inference_start) * 1000 / cv2.getTickFrequency()
+        
+        # 3. Post-process and build results
+        t_postprocess_start = cv2.getTickCount()
+        
+        # Initialize results with Unknown for all images
+        results = [("Unknown", 0.0) for _ in images]
+        
+        # Map batch results back to original indices
+        for batch_idx, orig_idx in enumerate(valid_indices):
+            if batch_idx < len(batch_probs) and batch_probs[batch_idx] is not None:
+                probs = batch_probs[batch_idx]
+                top_id = int(np.argmax(probs))
+                confidence = float(probs[top_id])
+                label = self._class_names.get(top_id, "Unknown")
+                results[orig_idx] = (label, confidence)
+        
+        t_postprocess_end = cv2.getTickCount()
+        postprocess_time_ms = (t_postprocess_end - t_postprocess_start) * 1000 / cv2.getTickFrequency()
+        
+        # 4. Log batch timing metrics
+        t_batch_end = cv2.getTickCount()
+        total_batch_time_ms = (t_batch_end - t_batch_start) * 1000 / cv2.getTickFrequency()
+        
+        # Track batch timing statistics
+        if not hasattr(self, '_batch_counter'):
+            self._batch_counter = 0
+            self._batch_timing_sum = {
+                'preprocess': 0, 'inference': 0, 'postprocess': 0,
+                'total': 0, 'batch_sizes': [], 'true_batch_count': 0
+            }
+        
+        self._batch_counter += 1
+        self._batch_timing_sum['preprocess'] += preprocess_time_ms
+        self._batch_timing_sum['inference'] += inference_time_ms
+        self._batch_timing_sum['postprocess'] += postprocess_time_ms
+        self._batch_timing_sum['total'] += total_batch_time_ms
+        self._batch_timing_sum['batch_sizes'].append(batch_size)
+        if true_batch_used:
+            self._batch_timing_sum['true_batch_count'] += 1
+        
+        # Log every 20 batches
+        if self._batch_counter % 20 == 0:
+            total_images = sum(self._batch_timing_sum['batch_sizes'])
+            avg_batch_size = total_images / len(self._batch_timing_sum['batch_sizes'])
+            avg_total = self._batch_timing_sum['total'] / self._batch_counter
+            avg_per_image = avg_total / avg_batch_size if avg_batch_size > 0 else 0
+            true_batch_pct = (self._batch_timing_sum['true_batch_count'] / self._batch_counter) * 100
+            
+            logger.info(
+                f"[BpuClassifier] Batch stats (20 batches): "
+                f"avg_batch_size={avg_batch_size:.1f}, "
+                f"avg_time_per_image={avg_per_image:.2f}ms, "
+                f"avg_batch_time={avg_total:.2f}ms, "
+                f"true_batch_used={true_batch_pct:.1f}%"
+            )
+            
+            # Reset counters
+            self._batch_timing_sum = {
+                'preprocess': 0, 'inference': 0, 'postprocess': 0,
+                'total': 0, 'batch_sizes': [], 'true_batch_count': 0
+            }
+        
+        return results
+
+    def predict_batch_probs(self, images, use_true_batch=True):
+        """
+        V7: Batch classification with full probability vectors.
+        
+        Similar to predict_batch but returns full probability vectors for each image,
+        required for trust-weighted log-evidence accumulation.
+        
+        Args:
+            images: List of numpy arrays (ROI images) to classify
+            use_true_batch: If True, attempt true batch inference via BPU.
+            
+        Returns:
+            List of tuples (label, confidence, probs_dict), one per image
+        """
+        if self.model is None:
+            return [("Unknown", 0.0, {"Unknown": 1.0}) for _ in images]
+        
+        batch_size = len(images)
+        if batch_size == 0:
+            return []
+        
+        # Single image - use regular predict_probs
+        if batch_size == 1:
+            return [self.predict_probs(images[0])]
+        
+        # Preprocess all images
+        batch_tensors = []
+        valid_indices = []
+        
+        for idx, image in enumerate(images):
+            if image is None or not isinstance(image, np.ndarray) or image.size == 0 or len(image.shape) != 3:
+                continue
+            
+            try:
+                input_tensor = self._preprocess(image)
+                batch_tensors.append(input_tensor.copy())
+                valid_indices.append(idx)
+            except Exception:
+                continue
+        
+        if len(batch_tensors) == 0:
+            return [("Unknown", 0.0, {"Unknown": 1.0}) for _ in images]
+        
+        # Batch inference
+        batch_probs = []
+        true_batch_used = False
+        
+        if use_true_batch and len(batch_tensors) > 1:
+            try:
+                batch_input = np.stack(batch_tensors, axis=0)
+                batch_outputs = self.model[0].forward(batch_input)
+                
+                if batch_outputs and len(batch_outputs) > 0:
+                    first_output = batch_outputs[0].buffer
+                    
+                    if len(first_output.shape) > 1 and first_output.shape[0] == len(batch_tensors):
+                        true_batch_used = True
+                        for i in range(len(batch_tensors)):
+                            probs = first_output[i].flatten()
+                            if probs.max() > 1.0 or probs.min() < 0.0:
+                                exp_scores = np.exp(probs - np.max(probs))
+                                probs = exp_scores / np.sum(exp_scores)
+                            batch_probs.append(probs)
+            except Exception as e:
+                logger.debug(f"[BpuClassifier] Batch probs inference failed: {e}")
+        
+        if not true_batch_used:
+            batch_probs = []
+            for tensor in batch_tensors:
+                try:
+                    outputs = self.model[0].forward(tensor)
+                    probs = outputs[0].buffer.flatten()
+                    if probs.max() > 1.0 or probs.min() < 0.0:
+                        exp_scores = np.exp(probs - np.max(probs))
+                        probs = exp_scores / np.sum(exp_scores)
+                    batch_probs.append(probs)
+                except Exception:
+                    batch_probs.append(None)
+        
+        # Build results with probability dictionaries
+        results = [("Unknown", 0.0, {"Unknown": 1.0}) for _ in images]
+        
+        for batch_idx, orig_idx in enumerate(valid_indices):
+            if batch_idx < len(batch_probs) and batch_probs[batch_idx] is not None:
+                probs = batch_probs[batch_idx]
+                
+                # Ensure probabilities are normalized
+                probs_sum = np.sum(probs)
+                if probs_sum > 0:
+                    probs = probs / probs_sum
+                
+                top_id = int(np.argmax(probs))
+                confidence = float(probs[top_id])
+                label = self._class_names.get(top_id, "Unknown")
+                
+                # Build probability dictionary
+                probs_dict = {}
+                for class_id, class_name in self._class_names.items():
+                    if class_id < len(probs):
+                        probs_dict[class_name] = float(probs[class_id])
+                
+                if not probs_dict:
+                    probs_dict = {label: confidence}
+                
+                results[orig_idx] = (label, confidence, probs_dict)
+        
+        return results

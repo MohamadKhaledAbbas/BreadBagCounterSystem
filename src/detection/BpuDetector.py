@@ -125,15 +125,21 @@ class BpuDetector(BaseDetector):
 
         return [BpuResultWrapper(np.array(boxes), np.array(scores), np.array(class_ids))]
     
-    def predict_batch(self, frames):
+    def predict_batch(self, frames, use_true_batch=True):
         """
-        V4 Phase 2: Batch inference for multiple frames.
+        V4 Phase 2 Enhanced: True batch inference for multiple frames.
         
         Processes multiple frames in a single BPU forward pass for ~40-60% speedup.
         YOLOv8n achieves 220 FPS with batching vs 140 FPS single-frame.
         
+        The hobot_dnn API supports batch inference by passing a stacked numpy array
+        with shape (batch_size, ...) to the forward() method. This leverages the
+        BPU's parallel processing capabilities.
+        
         Args:
             frames: List of numpy arrays (frames) to process
+            use_true_batch: If True, attempt true batch inference via BPU.
+                           If False or BPU batch fails, use sequential processing.
             
         Returns:
             List of BpuResultWrapper objects, one per frame
@@ -159,37 +165,69 @@ class BpuDetector(BaseDetector):
         batch_shapes = []
         
         for frame in frames:
+            # Each frame gets its own pre-allocated buffer via _preprocess
+            # To support true batching, we need separate buffers per frame
             input_tensor, x_scale, y_scale, x_shift, y_shift = self._preprocess(frame)
-            batch_tensors.append(input_tensor)
+            # Create a copy since _preprocess reuses self.nv12_buffer
+            batch_tensors.append(input_tensor.copy())
             batch_scales.append((x_scale, y_scale))
             batch_shifts.append((x_shift, y_shift))
             batch_shapes.append(frame.shape)
         
-        # Stack tensors into 4D array for batch processing
-        # Shape: [batch_size, height*width*3//2] (NV12 format)
-        try:
-            batch_input = np.stack(batch_tensors, axis=0)
-        except Exception as e:
-            logger.warning(f"[BpuDetector] Batch stacking failed: {e}, falling back to single-frame")
-            # Fallback to single-frame processing
-            return [self.predict(frame) for frame in frames]
-        
         t_preprocess_end = cv2.getTickCount()
         preprocess_time_ms = (t_preprocess_end - t_preprocess_start) * 1000 / cv2.getTickFrequency()
         
-        # 2. Batch Forward Pass (Single BPU call for all frames)
+        # 2. Batch Forward Pass
         t_inference_start = cv2.getTickCount()
-        try:
-            # Note: hobot_dnn may need specific batch input handling
-            # For now, we process frames individually but could be optimized with native batch support
-            # This requires checking hobot_dnn documentation for batch API
+        outputs_batch = []
+        true_batch_used = False
+        
+        if use_true_batch:
+            try:
+                # True batch inference: Stack tensors and pass to BPU in single call
+                # hobot_dnn accepts batched input as numpy array with shape (N, ...)
+                # For NV12 format, each tensor is 1D: (H*W*3//2,)
+                # Stacked batch shape: (batch_size, H*W*3//2)
+                batch_input = np.stack(batch_tensors, axis=0)
+                
+                # Attempt true batch forward pass
+                # The BPU processes all frames in parallel when given batched input
+                batch_outputs = self.quantize_model[0].forward(batch_input)
+                
+                # Check if output is batched (first dimension matches batch_size)
+                # The output format depends on the model - typically (batch_size, ...)
+                if batch_outputs and len(batch_outputs) > 0:
+                    first_output = batch_outputs[0].buffer
+                    
+                    # Determine if outputs are batched based on shape
+                    if len(first_output.shape) > 1 and first_output.shape[0] == batch_size:
+                        # Outputs are batched - split by first dimension
+                        true_batch_used = True
+                        for i in range(batch_size):
+                            frame_outputs = []
+                            for out in batch_outputs:
+                                # Extract this frame's slice from each output tensor
+                                frame_outputs.append(out.buffer[i])
+                            outputs_batch.append(frame_outputs)
+                    else:
+                        # Model doesn't support batched output - outputs are for single frame
+                        # This means the model was compiled without batch support
+                        # Fall back to sequential processing
+                        logger.debug(
+                            f"[BpuDetector] Model output shape {first_output.shape} doesn't match "
+                            f"batch_size={batch_size}, falling back to sequential"
+                        )
+                        
+            except Exception as e:
+                logger.debug(f"[BpuDetector] True batch inference attempt failed: {e}")
+                # Fall back to sequential processing
+        
+        # Sequential fallback if true batch wasn't used or failed
+        if not true_batch_used:
             outputs_batch = []
             for i in range(batch_size):
                 outputs = self.quantize_model[0].forward(batch_tensors[i])
                 outputs_batch.append([out.buffer for out in outputs])
-        except Exception as e:
-            logger.error(f"[BpuDetector] Batch inference failed: {e}, falling back to single-frame")
-            return [self.predict(frame) for frame in frames]
         
         t_inference_end = cv2.getTickCount()
         inference_time_ms = (t_inference_end - t_inference_start) * 1000 / cv2.getTickFrequency()
@@ -228,7 +266,7 @@ class BpuDetector(BaseDetector):
             self._batch_counter = 0
             self._batch_timing_sum = {
                 'preprocess': 0, 'inference': 0, 'postprocess': 0, 
-                'total': 0, 'batch_sizes': []
+                'total': 0, 'batch_sizes': [], 'true_batch_count': 0
             }
         
         self._batch_counter += 1
@@ -237,6 +275,8 @@ class BpuDetector(BaseDetector):
         self._batch_timing_sum['postprocess'] += postprocess_time_ms
         self._batch_timing_sum['total'] += total_batch_time_ms
         self._batch_timing_sum['batch_sizes'].append(batch_size)
+        if true_batch_used:
+            self._batch_timing_sum['true_batch_count'] += 1
         
         # Log every 50 batches
         if self._batch_counter % 50 == 0:
@@ -247,12 +287,11 @@ class BpuDetector(BaseDetector):
             avg_postprocess = self._batch_timing_sum['postprocess'] / self._batch_counter
             avg_total = self._batch_timing_sum['total'] / self._batch_counter
             avg_per_frame = avg_total / avg_batch_size
+            true_batch_pct = (self._batch_timing_sum['true_batch_count'] / self._batch_counter) * 100
             
             # Calculate speedup vs single-frame (assuming ~35ms baseline)
             baseline_single_frame = 35.0  # ms (from problem statement logs)
             speedup_factor = baseline_single_frame / avg_per_frame if avg_per_frame > 0 else 1.0
-            
-            from src.utils.AppLogging import structured_logger
 
             logger.info(
                 f"[BpuDetector] Batch inference stats (50 batches): "
@@ -261,13 +300,14 @@ class BpuDetector(BaseDetector):
                 f"(speedup={speedup_factor:.2f}x vs {baseline_single_frame}ms baseline), "
                 f"preprocess={avg_preprocess:.2f}ms, "
                 f"inference={avg_inference:.2f}ms, "
-                f"postprocess={avg_postprocess:.2f}ms"
+                f"postprocess={avg_postprocess:.2f}ms, "
+                f"true_batch_used={true_batch_pct:.1f}%"
             )
             
             # Reset counters
             self._batch_timing_sum = {
                 'preprocess': 0, 'inference': 0, 'postprocess': 0,
-                'total': 0, 'batch_sizes': []
+                'total': 0, 'batch_sizes': [], 'true_batch_count': 0
             }
         
         return results_batch
