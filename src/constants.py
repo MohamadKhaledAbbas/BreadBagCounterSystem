@@ -17,6 +17,9 @@ spool_segment_duration = "spool_segment_duration"
 spool_retention_seconds = "spool_retention_seconds"
 spool_ack_timeout = "spool_ack_timeout"
 spool_retry_count = "spool_retry_count"
+spool_max_in_flight = "spool_max_in_flight"
+spool_publish_idle_sleep_ms = "spool_publish_idle_sleep_ms"
+spool_empty_poll_interval = "spool_empty_poll_interval"
 
 CONFIG_KEYS = [
     show_ui_screen_key,
@@ -37,4 +40,7 @@ CONFIG_KEYS = [
     spool_retention_seconds,
     spool_ack_timeout,
     spool_retry_count,
+    spool_max_in_flight,
+    spool_publish_idle_sleep_ms,
+    spool_empty_poll_interval,
 ]

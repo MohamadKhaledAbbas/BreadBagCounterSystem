@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Spool Processor Node for Accuracy Mode.
+Spool Processor Node for Accuracy Mode (Credit-Based Flow Control).
 
-This node reads H.264 frames from the spool and publishes them at a
-controlled pace, waiting for ACK from BagCounterApp before sending
-the next frame. This implements strict backpressure to prevent drops.
+This node reads H.264 frames from the spool and publishes them using a
+credit-based, best-effort, bounded in-flight window design. Unlike the
+previous blocking ACK design, this implementation allows multiple frames
+in-flight for higher throughput while maintaining backpressure.
 
 Architecture:
 1. Spool Reader: Reads frames from oldest closed segments
-2. Pull Mechanism: Topic-based request/response (no custom .srv required)
-   - Request topic: /spool/request_next (std_msgs/UInt32 with request_id)
-   - Response topic: /spool/next_frame (img_msgs/H26XFrame)
-3. Pump: Publishes frames to /spool_image_ch_0 for decoder
-4. ACK Handler: Waits for /processing_ack before next frame
+2. Credit-Based Publisher: Publishes frames while in_flight < max_in_flight
+3. Non-Blocking ACK: ACK callback frees credit without blocking publish loop
+4. Timeout Handling: Expired frames are marked and credit is freed
 
 Usage:
     python -m src.ros2_spool.spool_processor_node
 
 Configuration (via database config table):
     spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0)
-    spool_retry_count: Number of retries before advancing (default: 2)
+    spool_ack_timeout: Timeout for in-flight frames in seconds (default: 10.0)
+    spool_max_in_flight: Maximum frames in-flight (default: 10)
+    spool_publish_idle_sleep_ms: Milliseconds to sleep when idle (default: 5)
+    spool_empty_poll_interval: Seconds to wait when spool empty (default: 1.0)
 """
 
 import os
@@ -28,9 +29,10 @@ import sys
 import time
 import signal
 import threading
-from typing import Optional, Generator
+from typing import Optional, Generator, Dict
 from dataclasses import dataclass
 from enum import Enum
+from collections import deque
 
 from src.config.settings import AppConfig
 
@@ -80,7 +82,8 @@ else:
 class ProcessorState(Enum):
     """State of the processor."""
     IDLE = "idle"
-    WAITING_FOR_ACK = "waiting_for_ack"
+    PUBLISHING = "publishing"  # Actively publishing frames (credit available)
+    BACKPRESSURE = "backpressure"  # In-flight window full, waiting for ACKs
     WAITING_FOR_READY = "waiting_for_ready"  # Waiting for consumer ready signal
     SPOOL_EMPTY = "spool_empty"
     STOPPED = "stopped"
@@ -88,12 +91,15 @@ class ProcessorState(Enum):
 
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
-DEFAULT_ACK_TIMEOUT = 10.0  # Reduced from 30.0 - should be much faster with FIFO correlation
-DEFAULT_RETRY_COUNT = 2
-DEFAULT_POLL_INTERVAL = 1.0
+DEFAULT_ACK_TIMEOUT = 10.0  # Timeout for in-flight frames (marks as expired, frees credit)
+DEFAULT_RETRY_COUNT = 2  # Deprecated: retained for backward compatibility
+DEFAULT_POLL_INTERVAL = 1.0  # Only used when spool is empty
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
+DEFAULT_MAX_IN_FLIGHT = 10  # Maximum frames in-flight before backpressure
+DEFAULT_PUBLISH_IDLE_SLEEP_MS = 5  # Milliseconds to sleep in publish loop when idle
+DEFAULT_EMPTY_POLL_INTERVAL = 1.0  # Seconds to wait when spool is empty
 
 
 @dataclass
@@ -101,11 +107,24 @@ class ProcessorConfig:
     """Configuration for the spool processor."""
     spool_dir: str = DEFAULT_SPOOL_DIR
     ack_timeout: float = DEFAULT_ACK_TIMEOUT
-    retry_count: int = DEFAULT_RETRY_COUNT
-    poll_interval: float = DEFAULT_POLL_INTERVAL
+    retry_count: int = DEFAULT_RETRY_COUNT  # Deprecated: retained for backward compatibility
+    poll_interval: float = DEFAULT_POLL_INTERVAL  # Deprecated: use empty_poll_interval
     stats_interval: float = DEFAULT_STATS_INTERVAL
     startup_grace_period: float = DEFAULT_STARTUP_GRACE_PERIOD
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
+    max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
+    publish_idle_sleep_ms: int = DEFAULT_PUBLISH_IDLE_SLEEP_MS
+    empty_poll_interval: float = DEFAULT_EMPTY_POLL_INTERVAL
+
+
+@dataclass
+class InFlightFrame:
+    """Tracks a frame that has been published but not yet ACKed."""
+    seq: int
+    frame_index: int
+    sent_time: float
+    segment_num: int
+    expired: bool = False
 
 
 def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
@@ -116,6 +135,9 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
         spool_dir = db.get_config_value(constants.spool_dir)
         ack_timeout = db.get_config_value(constants.spool_ack_timeout)
         retry_count = db.get_config_value(constants.spool_retry_count)
+        max_in_flight = db.get_config_value(constants.spool_max_in_flight)
+        publish_idle_sleep_ms = db.get_config_value(constants.spool_publish_idle_sleep_ms)
+        empty_poll_interval = db.get_config_value(constants.spool_empty_poll_interval)
         
         db.close()
         
@@ -123,6 +145,9 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
             spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
             ack_timeout=float(ack_timeout) if ack_timeout else DEFAULT_ACK_TIMEOUT,
             retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
+            max_in_flight=int(max_in_flight) if max_in_flight else DEFAULT_MAX_IN_FLIGHT,
+            publish_idle_sleep_ms=int(publish_idle_sleep_ms) if publish_idle_sleep_ms else DEFAULT_PUBLISH_IDLE_SLEEP_MS,
+            empty_poll_interval=float(empty_poll_interval) if empty_poll_interval else DEFAULT_EMPTY_POLL_INTERVAL,
         )
     except Exception as e:
         logger.warning(f"[SpoolProcessor] Failed to load config from DB: {e}, using defaults")
@@ -131,23 +156,23 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
 
 class SpoolProcessorNode(Node):
     """
-    ROS2 Node that processes spooled H.264 frames with strict backpressure.
+    ROS2 Node that processes spooled H.264 frames with credit-based flow control.
     
-    The processor ensures exactly one frame is in flight at a time:
-    1. Read next frame from spool
-    2. Publish frame index to /spool/current_frame_index
-    3. Publish encoded frame to /spool_image_ch_0
-    4. Wait for ACK on /processing_ack with matching index
-    5. Only then proceed to next frame
+    The processor implements a bounded in-flight window for best-effort throughput:
+    1. Continuously publishes frames while in_flight < max_in_flight
+    2. ACK callback frees credit (does not block publish loop)
+    3. Backpressure naturally occurs when in-flight window fills
+    4. Timeout handling marks expired frames and frees credit
     
-    This design implements strict pull-based processing where BagCounterApp
-    controls the pace.
+    This design allows high throughput (target 20 FPS) while maintaining
+    backpressure control.
     
     Production Reliability Features:
     - Startup synchronization: Waits for consumer before processing
-    - Watchdog: Auto-recovery from stuck ACK states
+    - Credit-based flow control: Bounded in-flight window prevents overload
+    - Out-of-order ACK handling: Any in-flight frame can be ACKed
+    - Timeout handling: Expired frames free credit to prevent deadlock
     - SPS/PPS caching: Prepends to segment boundaries for decoder init
-    - Graceful degradation: Advances after max retries to prevent deadlock
     """
     
     def __init__(self, config: Optional[ProcessorConfig] = None):
@@ -162,7 +187,7 @@ class SpoolProcessorNode(Node):
         logger.info(f"[SpoolProcessor] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "
                    f"ack_timeout={self.config.ack_timeout}s, "
-                   f"retry_count={self.config.retry_count}, "
+                   f"max_in_flight={self.config.max_in_flight}, "
                    f"startup_grace={self.config.startup_grace_period}s, "
                    f"session_id={self._session_id}")
         
@@ -177,6 +202,11 @@ class SpoolProcessorNode(Node):
         self._seq_counter: int = 0
         self._seq_lock = threading.Lock()
         
+        # Credit-based flow control: in-flight tracking
+        self._in_flight: Dict[int, InFlightFrame] = {}  # seq -> InFlightFrame
+        self._in_flight_order: deque = deque()  # Ordered list of seq numbers for FIFO timeout checking
+        self._in_flight_lock = threading.Lock()
+        
         # SPS/PPS caching for segment boundary handling
         self._cached_sps: Optional[bytes] = None
         self._cached_pps: Optional[bytes] = None
@@ -185,9 +215,7 @@ class SpoolProcessorNode(Node):
         # State management
         self._state = ProcessorState.WAITING_FOR_READY
         self._state_lock = threading.Lock()
-        self._ack_received = threading.Event()
         self._ready_received = threading.Event()
-        self._last_ack: Optional[ProcessingAck] = None
         self._consumer_session_id: Optional[str] = None  # Session ID from consumer's READY
         self._last_ack_time: float = 0.0  # Track last successful ACK for watchdog
         
@@ -197,15 +225,17 @@ class SpoolProcessorNode(Node):
         
         # Statistics
         self._frames_processed = 0
-        self._frames_retried = 0
+        self._frames_published = 0  # Total frames published (includes retries in old design)
         self._frames_skipped = 0
-        self._ack_timeouts = 0
+        self._ack_timeouts = 0  # Frames that expired due to timeout
         self._ack_rejected_stale = 0  # ACKs rejected due to wrong session
         self._ack_accepted = 0  # Total ACKs accepted
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
         self._last_detailed_stats_time = time.time()  # For 2-minute detailed stats
+        self._publish_rate_window: deque = deque(maxlen=100)  # Track publish times for rate estimation
+        self._ack_rate_window: deque = deque(maxlen=100)  # Track ACK times for rate estimation
         self._stats_lock = threading.Lock()
         
         # ROS2 publishers and subscribers
@@ -309,7 +339,6 @@ class SpoolProcessorNode(Node):
             self._state = ProcessorState.STOPPED
         
         # Wake up any waiting threads
-        self._ack_received.set()
         self._ready_received.set()
         
         # Wait for processor thread
@@ -320,14 +349,17 @@ class SpoolProcessorNode(Node):
         
         # Log final stats
         with self._stats_lock:
+            with self._in_flight_lock:
+                in_flight_count = len(self._in_flight)
             logger.info(f"[SpoolProcessor] Final stats: "
                        f"session={self._session_id[:8]}, "
-                       f"seq={self._seq_counter}, "
+                       f"published={self._frames_published}, "
+                       f"acked={self._ack_accepted}, "
                        f"processed={self._frames_processed}, "
-                       f"retried={self._frames_retried}, "
                        f"skipped={self._frames_skipped}, "
                        f"timeouts={self._ack_timeouts}, "
                        f"ack_rejected={self._ack_rejected_stale}, "
+                       f"in_flight={in_flight_count}, "
                        f"segments={self._segments_processed}, "
                        f"sps_pps_prepends={self._sps_pps_prepends}")
         
@@ -535,15 +567,15 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps = False
         return data
     
-    def _publish_frame(self, record: FrameRecord) -> tuple[bool, int, int, int]:
+    def _publish_frame(self, record: FrameRecord) -> tuple[bool, int]:
         """
-        Publish a frame to the decoder input topic with metadata.
+        Publish a frame to the decoder input topic with metadata and track in-flight.
         
         Returns:
-            Tuple of (success: bool, seq: int, sent_time_sec: int, sent_time_nsec: int)
+            Tuple of (success: bool, seq: int)
         """
         if not IS_RDK:
-            return True, 0, 0, 0
+            return True, 0
         
         try:
             # Get next sequence number
@@ -553,6 +585,7 @@ class SpoolProcessorNode(Node):
             
             # Get send timestamp
             sent_time_sec, sent_time_nsec = get_current_time_ros()
+            sent_time = time.time()
             
             # Publish frame metadata for ACK correlation
             metadata = FrameMetadata(
@@ -570,8 +603,7 @@ class SpoolProcessorNode(Node):
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
             
-            # Publish the encoded frame immediately (no delay needed)
-            # The FIFO queue in Ros2FrameServer will handle proper correlation
+            # Publish the encoded frame
             frame_msg = H26XFrame()
             frame_msg.index = record.index
             frame_msg.width = record.width
@@ -584,14 +616,12 @@ class SpoolProcessorNode(Node):
             frame_msg.pts.nanosec = record.pts_nsec
             
             # Convert encoding string to list of 12 unsigned integers (as expected by H26XFrame)
-            # The encoding field in H26XFrame is a sequence of 12 bytes (uint8 array)
             if isinstance(record.encoding, str):
                 encoding_bytes = record.encoding.encode('utf-8')[:12]
             elif isinstance(record.encoding, bytes):
                 encoding_bytes = record.encoding[:12]
             else:
                 encoding_bytes = bytes(record.encoding)[:12]
-            # Pad to exactly 12 bytes
             encoding_padded = list(encoding_bytes) + [0] * (12 - len(encoding_bytes))
             frame_msg.encoding = encoding_padded
             
@@ -599,91 +629,41 @@ class SpoolProcessorNode(Node):
             
             self._frame_pub.publish(frame_msg)
             
+            # Track in-flight frame
+            with self._in_flight_lock:
+                in_flight_frame = InFlightFrame(
+                    seq=seq,
+                    frame_index=record.index,
+                    sent_time=sent_time,
+                    segment_num=self._current_segment
+                )
+                self._in_flight[seq] = in_flight_frame
+                self._in_flight_order.append(seq)
+            
+            # Update statistics
+            with self._stats_lock:
+                self._frames_published += 1
+                self._publish_rate_window.append(sent_time)
+            
             # Structured logging - use debug for regular frames, info for milestones
             if seq % 100 == 0:
+                with self._in_flight_lock:
+                    in_flight_count = len(self._in_flight)
                 logger.info(f"[SpoolProcessor] 📤 Milestone: published {seq} frames, "
                           f"current: index={record.index}, session={self._session_id[:8]}, "
-                          f"segment={self._current_segment}, data_len={len(frame_data)}")
+                          f"segment={self._current_segment}, in_flight={in_flight_count}/{self.config.max_in_flight}")
             else:
                 logger.debug(f"[SpoolProcessor] 📤 Frame published: index={record.index}, seq={seq}, "
-                           f"session={self._session_id[:8]}, segment={self._current_segment}, data_len={len(frame_data)}")
+                           f"session={self._session_id[:8]}, segment={self._current_segment}")
             
-            return True, seq, sent_time_sec, sent_time_nsec
+            return True, seq
             
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error publishing frame: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return False, 0, 0, 0
+            return False, 0
     
-    def _wait_for_ack(self, expected_seq: int, expected_frame_index: int, timeout: float) -> bool:
-        """
-        Wait for ACK for a specific frame sequence.
-        
-        Args:
-            expected_seq: Expected sequence number in ACK
-            expected_frame_index: Expected frame index
-            timeout: Maximum time to wait
-            
-        Returns:
-            True if valid ACK received, False on timeout
-        """
-        self._ack_received.clear()
-        start_time = time.time()
-        logger.debug(f"[SpoolProcessor] Waiting for ACK: seq={expected_seq}, "
-                    f"frame_index={expected_frame_index}, timeout={timeout}s")
-        
-        while self._running:
-            remaining = timeout - (time.time() - start_time)
-            if remaining <= 0:
-                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout: seq={expected_seq}, "
-                             f"frame_index={expected_frame_index}, timeout={timeout}s")
-                return False
-            
-            if self._ack_received.wait(timeout=min(remaining, 1.0)):
-                elapsed = time.time() - start_time
-                
-                if self._last_ack is None:
-                    logger.warning("[SpoolProcessor] ⚠ ACK event set but no ACK data available")
-                    continue
-                
-                ack = self._last_ack
-                
-                # Validate session ID
-                if ack.session_id != self._session_id:
-                    with self._stats_lock:
-                        self._ack_rejected_stale += 1
-                    logger.warning(f"[SpoolProcessor] ⚠ ACK rejected: wrong session_id. "
-                                 f"Expected {self._session_id[:8]}, got {ack.session_id[:8]}. "
-                                 f"Stale ACK count: {self._ack_rejected_stale}")
-                    self._ack_received.clear()
-                    continue
-                
-                # Validate sequence or frame index
-                if ack.seq == expected_seq and ack.frame_index == expected_frame_index:
-                    # Perfect match
-                    with self._stats_lock:
-                        self._ack_accepted += 1
-                    logger.debug(f"[SpoolProcessor] ✓ ACK matched: seq={ack.seq}, "
-                              f"frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
-                    self._last_ack_time = time.time()
-                    return True
-                elif ack.frame_index == expected_frame_index:
-                    # Frame index matches but seq doesn't - still accept
-                    with self._stats_lock:
-                        self._ack_accepted += 1
-                    logger.debug(f"[SpoolProcessor] ✓ ACK matched (frame_index): seq={ack.seq} "
-                              f"(expected {expected_seq}), frame_index={ack.frame_index}, elapsed={elapsed:.3f}s")
-                    self._last_ack_time = time.time()
-                    return True
-                else:
-                    # Neither matches - continue waiting
-                    logger.debug(f"[SpoolProcessor] ACK mismatch: got seq={ack.seq}, frame_index={ack.frame_index}; "
-                               f"expected seq={expected_seq}, frame_index={expected_frame_index}")
-                    self._ack_received.clear()
-                    continue
-        
-        return False
     
     def _ready_callback(self, msg):
         """Callback for processing READY messages."""
@@ -696,15 +676,102 @@ class SpoolProcessorNode(Node):
             logger.error(f"[SpoolProcessor] Error parsing READY message: {e}")
     
     def _ack_callback(self, msg):
-        """Callback for processing ACK messages."""
+        """
+        Callback for processing ACK messages (credit-based).
+        
+        This callback frees credit for any in-flight frame that is ACKed.
+        It does not block the publish loop - credit is simply released
+        when ACK arrives.
+        """
         try:
             ack = processing_ack_from_ros_string(msg.data)
-            self._last_ack = ack
-            self._ack_received.set()
-            logger.debug(f"[SpoolProcessor] ACK callback: seq={ack.seq}, frame_index={ack.frame_index}, "
-                        f"session_id={ack.session_id[:8]}")
+            
+            # Validate session ID
+            if ack.session_id != self._session_id:
+                with self._stats_lock:
+                    self._ack_rejected_stale += 1
+                logger.warning(f"[SpoolProcessor] ⚠ ACK rejected: wrong session_id. "
+                             f"Expected {self._session_id[:8]}, got {ack.session_id[:8]}. "
+                             f"Stale ACK count: {self._ack_rejected_stale}")
+                return
+            
+            # Find and free the in-flight frame (out-of-order ACKs are OK)
+            with self._in_flight_lock:
+                if ack.seq in self._in_flight:
+                    in_flight_frame = self._in_flight[ack.seq]
+                    elapsed = time.time() - in_flight_frame.sent_time
+                    
+                    # Remove from tracking
+                    del self._in_flight[ack.seq]
+                    # Note: We don't remove from _in_flight_order deque as it's used for timeout scanning
+                    # Timeout scanner will skip already-deleted entries
+                    
+                    # Update statistics
+                    with self._stats_lock:
+                        self._ack_accepted += 1
+                        self._ack_rate_window.append(time.time())
+                        self._frames_processed += 1
+                    
+                    self._last_ack_time = time.time()
+                    
+                    logger.debug(f"[SpoolProcessor] ✓ ACK received: seq={ack.seq}, "
+                               f"frame_index={ack.frame_index}, elapsed={elapsed:.3f}s, "
+                               f"in_flight={len(self._in_flight)}/{self.config.max_in_flight}")
+                else:
+                    # ACK for frame not in flight (could be duplicate or very late)
+                    logger.debug(f"[SpoolProcessor] ACK for non-in-flight frame: seq={ack.seq}, "
+                               f"frame_index={ack.frame_index}")
+                    
         except Exception as e:
-            logger.error(f"[SpoolProcessor] Error parsing ACK message: {e}")
+            logger.error(f"[SpoolProcessor] Error in ACK callback: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
+    def _check_and_expire_timeouts(self):
+        """
+        Check for timed-out in-flight frames and free credit.
+        
+        This method scans the oldest in-flight frames and marks any that
+        have exceeded ack_timeout as expired, freeing credit to prevent deadlock.
+        """
+        current_time = time.time()
+        expired_seqs = []
+        
+        with self._in_flight_lock:
+            # Scan from oldest to newest (in_flight_order is FIFO)
+            while self._in_flight_order:
+                seq = self._in_flight_order[0]
+                
+                # Check if frame still exists (might have been ACKed)
+                if seq not in self._in_flight:
+                    self._in_flight_order.popleft()
+                    continue
+                
+                in_flight_frame = self._in_flight[seq]
+                age = current_time - in_flight_frame.sent_time
+                
+                # If oldest frame hasn't timed out, none have (FIFO order)
+                if age < self.config.ack_timeout:
+                    break
+                
+                # Frame has timed out - mark as expired and free credit
+                if not in_flight_frame.expired:
+                    in_flight_frame.expired = True
+                    expired_seqs.append(seq)
+                    logger.warning(f"[SpoolProcessor] ⏱ Frame timeout: seq={seq}, "
+                                 f"frame_index={in_flight_frame.frame_index}, "
+                                 f"age={age:.1f}s, freeing credit")
+                    
+                    # Remove from tracking to free credit
+                    del self._in_flight[seq]
+                    self._in_flight_order.popleft()
+                    
+                    # Update statistics
+                    with self._stats_lock:
+                        self._ack_timeouts += 1
+                else:
+                    # Already expired, just remove
+                    self._in_flight_order.popleft()
     
     def _request_callback(self, msg):
         """Callback for external pull requests (optional feature)."""
@@ -740,56 +807,87 @@ class SpoolProcessorNode(Node):
                       "proceeding without explicit READY signal. Consumer may not be synchronized.")
         return False
     
+    
     def _processor_loop(self):
         """
-        Main processing loop with strict backpressure.
+        Main processing loop with credit-based flow control.
         
-        This loop ensures exactly one frame is in flight:
+        This loop implements bounded in-flight window:
         1. Wait for consumer startup (startup sync)
-        2. Get next frame from spool
-        3. Publish frame
-        4. Wait for ACK (with retry)
-        5. Repeat
+        2. Continuously publish frames while in_flight < max_in_flight
+        3. Check for timeouts and free credit for expired frames
+        4. Sleep briefly when backpressure or spool empty
+        5. No per-frame blocking on ACK - ACK callback frees credit asynchronously
         
         Production reliability features:
         - Startup synchronization: Wait for consumer before first frame
-        - Watchdog: Detect and recover from stuck states
-        - Graceful degradation: Advance after max retries
+        - Credit-based backpressure: Window fills naturally when consumer slows
+        - Timeout handling: Expired frames free credit to prevent deadlock
+        - High throughput: Target 20 FPS when consumer can keep up
         """
-        logger.info("[SpoolProcessor] Processing loop started")
+        logger.info("[SpoolProcessor] Processing loop started (credit-based flow control)")
         
         # Startup synchronization: Wait for consumer READY
         self._wait_for_consumer_ready()
         
+        last_timeout_check = time.time()
+        timeout_check_interval = 0.5  # Check for timeouts every 500ms
+        
         while self._running:
             try:
-                # Get next frame
+                # Periodically check for and expire timed-out frames
+                current_time = time.time()
+                if current_time - last_timeout_check >= timeout_check_interval:
+                    self._check_and_expire_timeouts()
+                    last_timeout_check = current_time
+                
+                # Check if we have credit available
+                with self._in_flight_lock:
+                    in_flight_count = len(self._in_flight)
+                    has_credit = in_flight_count < self.config.max_in_flight
+                
+                if not has_credit:
+                    # Backpressure: in-flight window is full
+                    with self._state_lock:
+                        self._state = ProcessorState.BACKPRESSURE
+                    logger.debug(f"[SpoolProcessor] Backpressure: in_flight={in_flight_count}/{self.config.max_in_flight}, waiting for ACKs...")
+                    time.sleep(self.config.publish_idle_sleep_ms / 1000.0)
+                    continue
+                
+                # Get next frame from spool
                 frame = self._get_next_frame()
                 
                 if frame is None:
-                    # Spool is empty, wait and retry
+                    # Spool is empty, wait longer before retrying
                     with self._state_lock:
                         self._state = ProcessorState.SPOOL_EMPTY
                     logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
-                    time.sleep(self.config.poll_interval)
+                    time.sleep(self.config.empty_poll_interval)
                     continue
                 
+                # Update state and current frame tracking
+                with self._state_lock:
+                    self._state = ProcessorState.PUBLISHING
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
-                # Process frame with retry logic
-                success = self._process_frame_with_retry(frame)
+                # Publish frame (non-blocking, adds to in-flight tracking)
+                success, seq = self._publish_frame(frame)
                 
-                if success:
-                    with self._stats_lock:
-                        self._frames_processed += 1
-                else:
+                if not success:
                     with self._stats_lock:
                         self._frames_skipped += 1
-                    logger.warning(f"[SpoolProcessor] Frame {frame.index} skipped after retries")
+                    logger.warning(f"[SpoolProcessor] 🔴 Failed to publish frame {frame.index}")
+                    time.sleep(0.1)  # Brief pause on error
+                    continue
                 
                 # Log stats periodically
                 self._maybe_log_stats()
+                
+                # Brief sleep to prevent CPU spinning in tight loop
+                # Only sleep if we're not under backpressure (have credit available)
+                if self.config.publish_idle_sleep_ms > 0:
+                    time.sleep(self.config.publish_idle_sleep_ms / 1000.0)
                 
             except Exception as e:
                 logger.error(f"[SpoolProcessor] Error in processing loop: {e}")
@@ -799,56 +897,8 @@ class SpoolProcessorNode(Node):
         
         logger.info("[SpoolProcessor] Processing loop stopped")
     
-    def _process_frame_with_retry(self, frame: FrameRecord) -> bool:
-        """
-        Process a frame with retry logic.
-        
-        Args:
-            frame: Frame record to process
-            
-        Returns:
-            True if successfully processed (ACK received), False otherwise
-        """
-        retries = 0
-        seq = 0
-        sent_time_sec = 0
-        sent_time_nsec = 0
-        
-        while retries <= self.config.retry_count and self._running:
-            with self._state_lock:
-                self._state = ProcessorState.IDLE
-            
-            # Publish frame (gets new seq number each time)
-            success, seq, sent_time_sec, sent_time_nsec = self._publish_frame(frame)
-            if not success:
-                logger.warning(f"[SpoolProcessor] 🔴 Failed to publish frame {frame.index}")
-                retries += 1
-                continue
-            
-            with self._state_lock:
-                self._state = ProcessorState.WAITING_FOR_ACK
-            
-            # Wait for ACK with session and seq validation
-            if self._wait_for_ack(seq, frame.index, self.config.ack_timeout):
-                return True
-            
-            # Timeout - retry
-            with self._stats_lock:
-                self._ack_timeouts += 1
-            
-            if retries < self.config.retry_count:
-                with self._stats_lock:
-                    self._frames_retried += 1
-                logger.warning(f"[SpoolProcessor] ⏱ ACK timeout for frame {frame.index}, seq={seq}, "
-                              f"retry {retries + 1}/{self.config.retry_count}")
-            
-            retries += 1
-        
-        logger.error(f"[SpoolProcessor] 🔴 Frame {frame.index} failed after {retries} attempts")
-        return False
-    
     def _maybe_log_stats(self):
-        """Log statistics periodically."""
+        """Log statistics periodically with credit-based flow control metrics."""
         current_time = time.time()
         
         # Regular stats every 10 seconds
@@ -857,16 +907,35 @@ class SpoolProcessorNode(Node):
                 # Calculate time since last successful ACK (watchdog info)
                 ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
                 
+                # Calculate publish rate (frames/sec) from recent window
+                publish_rate = 0.0
+                if len(self._publish_rate_window) >= 2:
+                    time_span = self._publish_rate_window[-1] - self._publish_rate_window[0]
+                    if time_span > 0:
+                        publish_rate = len(self._publish_rate_window) / time_span
+                
+                # Calculate ACK rate (frames/sec) from recent window
+                ack_rate = 0.0
+                if len(self._ack_rate_window) >= 2:
+                    time_span = self._ack_rate_window[-1] - self._ack_rate_window[0]
+                    if time_span > 0:
+                        ack_rate = len(self._ack_rate_window) / time_span
+                
+                # Get in-flight count
+                with self._in_flight_lock:
+                    in_flight_count = len(self._in_flight)
+                
                 logger.info(f"[SpoolProcessor] Stats: "
                            f"session={self._session_id[:8]}, "
-                           f"seq={self._seq_counter}, "
+                           f"published={self._frames_published}, "
+                           f"acked={self._ack_accepted}, "
                            f"processed={self._frames_processed}, "
-                           f"retried={self._frames_retried}, "
                            f"skipped={self._frames_skipped}, "
                            f"timeouts={self._ack_timeouts}, "
                            f"ack_rejected={self._ack_rejected_stale}, "
-                           f"segments={self._segments_processed}, "
-                           f"sps_pps_prepends={self._sps_pps_prepends}, "
+                           f"in_flight={in_flight_count}/{self.config.max_in_flight}, "
+                           f"pub_rate={publish_rate:.1f}fps, "
+                           f"ack_rate={ack_rate:.1f}fps, "
                            f"state={self._state.value}")
                 
                 # Log spool status
@@ -880,6 +949,11 @@ class SpoolProcessorNode(Node):
                 if ack_staleness > self.config.ack_timeout * 2 and self._last_ack_time > 0:
                     logger.warning(f"[SpoolProcessor] ⚠ WATCHDOG: No ACK received in {ack_staleness:.1f}s - "
                                   "consumer may be stuck or not processing frames")
+                
+                # Warn if in-flight window is consistently full (backpressure)
+                if in_flight_count >= self.config.max_in_flight:
+                    logger.warning(f"[SpoolProcessor] ⚠ BACKPRESSURE: In-flight window full ({in_flight_count}/{self.config.max_in_flight}) - "
+                                  "consumer may be slower than publisher")
             
             self._last_stats_time = current_time
         
@@ -891,6 +965,24 @@ class SpoolProcessorNode(Node):
                 total_acks = ack_accepted + ack_rejected
                 ack_accept_rate = (ack_accepted / total_acks * 100) if total_acks > 0 else 0.0
                 ack_reject_rate = (ack_rejected / total_acks * 100) if total_acks > 0 else 0.0
+                
+                # Calculate publish rate from window
+                publish_rate = 0.0
+                if len(self._publish_rate_window) >= 2:
+                    time_span = self._publish_rate_window[-1] - self._publish_rate_window[0]
+                    if time_span > 0:
+                        publish_rate = len(self._publish_rate_window) / time_span
+                
+                # Calculate ACK rate from window
+                ack_rate = 0.0
+                if len(self._ack_rate_window) >= 2:
+                    time_span = self._ack_rate_window[-1] - self._ack_rate_window[0]
+                    if time_span > 0:
+                        ack_rate = len(self._ack_rate_window) / time_span
+                
+                # Get in-flight count
+                with self._in_flight_lock:
+                    in_flight_count = len(self._in_flight)
                 
                 # Get spool information for lag detection
                 segments = self._reader.list_segments()
@@ -905,13 +997,18 @@ class SpoolProcessorNode(Node):
                 logger.info("=" * 80)
                 logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
                 logger.info(f"  Session: {self._session_id}")
+                logger.info(f"  Flow Control:")
+                logger.info(f"    - In-flight: {in_flight_count}/{self.config.max_in_flight}")
+                logger.info(f"    - Publish rate: {publish_rate:.1f} fps")
+                logger.info(f"    - ACK rate: {ack_rate:.1f} fps")
+                logger.info(f"    - Last ACK age: {current_time - self._last_ack_time:.1f}s" if self._last_ack_time > 0 else "    - Last ACK age: N/A")
                 logger.info(f"  ACK Statistics:")
                 logger.info(f"    - Accepted: {ack_accepted} ({ack_accept_rate:.1f}%)")
                 logger.info(f"    - Rejected (stale): {ack_rejected} ({ack_reject_rate:.1f}%)")
                 logger.info(f"    - Total: {total_acks}")
                 logger.info(f"  Frame Processing:")
-                logger.info(f"    - Processed: {self._frames_processed}")
-                logger.info(f"    - Retried: {self._frames_retried}")
+                logger.info(f"    - Published: {self._frames_published}")
+                logger.info(f"    - Processed (ACKed): {self._frames_processed}")
                 logger.info(f"    - Skipped: {self._frames_skipped}")
                 logger.info(f"    - Timeouts: {self._ack_timeouts}")
                 logger.info(f"  Spool Status:")
@@ -920,12 +1017,13 @@ class SpoolProcessorNode(Node):
                 logger.info(f"    - Oldest segment: {oldest_segment}")
                 logger.info(f"    - Newest segment: {newest_segment}")
                 logger.info(f"    - Spool lag: {spool_lag} segments")
+                logger.info(f"    - SPS/PPS prepends: {self._sps_pps_prepends}")
                 
                 # Warn if spool is falling behind (lag > 10 segments = ~50 seconds at 5s/segment)
                 if spool_lag > 10:
                     logger.warning(f"  ⚠ SPOOL LAG WARNING: Processor is {spool_lag} segments behind!")
                     logger.warning(f"     Recording is ahead by ~{spool_lag * 5}s. Processing too slow!")
-                    logger.warning(f"     Consider: reducing ACK timeout, increasing processing speed, or checking consumer.")
+                    logger.warning(f"     Consider: increasing max_in_flight, checking consumer performance.")
                 elif spool_lag > 5:
                     logger.warning(f"  ⚠ SPOOL LAG NOTICE: Processor is {spool_lag} segments behind (borderline)")
                 else:
