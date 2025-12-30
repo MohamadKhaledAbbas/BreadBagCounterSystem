@@ -110,15 +110,17 @@ class FrameServer(Node, FrameSource):
             reliable_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
                 history=QoSHistoryPolicy.KEEP_LAST,
-                depth=10  # Increased depth for better buffering
+                depth=20  # Increased depth to match metadata publisher
             )
+            # Subscribe to frame metadata (contains frame_index) instead of deprecated UInt32 topic
+            from std_msgs.msg import String
             self._index_sub = self.create_subscription(
-                UInt32,
-                '/spool/current_frame_index',
-                self._frame_index_callback,
+                String,
+                '/spool/current_frame_metadata',
+                self._frame_metadata_callback,
                 reliable_qos
             )
-            logger.info("[Ros2FrameServer] Accuracy Mode enabled - subscribing to /spool/current_frame_index")
+            logger.info("[Ros2FrameServer] Accuracy Mode enabled - subscribing to /spool/current_frame_metadata")
         
         logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only)")
 
@@ -127,51 +129,59 @@ class FrameServer(Node, FrameSource):
         # The execution (spinning) is now handled by the external ExecutorThread.
         # ---------------
     
-    def _frame_index_callback(self, msg):
+    def _frame_metadata_callback(self, msg):
         """
-        Callback for frame index updates from SpoolProcessorNode.
+        Callback for frame metadata updates from SpoolProcessorNode.
         
-        SINGLE SOURCE OF TRUTH: spool_frame_index
-        This receives the canonical frame ID assigned by SpoolProcessor.
+        SINGLE SOURCE OF TRUTH: frame_index from FrameMetadata
+        This receives the canonical frame ID assigned by SpoolProcessor along with
+        full metadata (seq, session_id, etc.). We only need frame_index for correlation.
         Frame indices arrive BEFORE corresponding NV12 frames (decoder latency 10-100ms).
         We enqueue them in FIFO order to correlate with decoded frames in listener_callback.
         
         Args:
-            msg: UInt32 message containing spool_frame_index
+            msg: String message containing JSON-encoded FrameMetadata
         """
-        spool_frame_idx = int(msg.data)
-        
-        # Update current index for backwards compatibility
-        with self._frame_index_lock:
-            self._current_frame_index = spool_frame_idx
-        
-        # Enqueue to pending queue for proper correlation
         try:
-            self._pending_frame_indices.put_nowait(spool_frame_idx)
-            logger.debug(f"[Ros2FrameServer] Received spool_frame_index: {spool_frame_idx}, queue_size={self._pending_frame_indices.qsize()}")
-        except queue.Full:
-            # Queue full - this indicates decoder is falling behind significantly
-            # We must drop the oldest pending index to prevent blocking the publisher
-            try:
-                dropped_idx = self._pending_frame_indices.get_nowait()
-                logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped spool_frame_index {dropped_idx}")
-                self.frames_index_lost += 1  # Track lost indices
-            except queue.Empty:
-                # Race condition: queue became empty between full check and get
-                # This is rare but harmless - just log it
-                logger.debug(f"[Ros2FrameServer] Pending queue became empty during drop attempt")
+            # Parse metadata to extract frame_index
+            import json
+            metadata_dict = json.loads(msg.data)
+            spool_frame_idx = int(metadata_dict['frame_index'])
             
-            # Now enqueue the new index (with another try/except for safety)
+            # Update current index for backwards compatibility
+            with self._frame_index_lock:
+                self._current_frame_index = spool_frame_idx
+            
+            # Enqueue to pending queue for proper correlation
             try:
                 self._pending_frame_indices.put_nowait(spool_frame_idx)
+                logger.debug(f"[Ros2FrameServer] Received frame_index from metadata: {spool_frame_idx}, "
+                           f"queue_size={self._pending_frame_indices.qsize()}")
             except queue.Full:
-                # Extremely rare: queue filled again between operations
-                # This indicates severe decoder stall - log error and track metric
-                self.frames_index_lost += 1
-                logger.error(
-                    f"[Ros2FrameServer] Failed to enqueue frame index {frame_idx} after drop - "
-                    f"decoder severely stalled (lost_indices={self.frames_index_lost})"
-                )
+                # Queue full - this indicates decoder is falling behind significantly
+                # We must drop the oldest pending index to prevent blocking the publisher
+                try:
+                    dropped_idx = self._pending_frame_indices.get_nowait()
+                    logger.warning(f"[Ros2FrameServer] Pending index queue full, dropped frame_index {dropped_idx}")
+                    self.frames_index_lost += 1  # Track lost indices
+                except queue.Empty:
+                    # Race condition: queue became empty between full check and get
+                    # This is rare but harmless - just log it
+                    logger.debug(f"[Ros2FrameServer] Pending queue became empty during drop attempt")
+                
+                # Now enqueue the new index (with another try/except for safety)
+                try:
+                    self._pending_frame_indices.put_nowait(spool_frame_idx)
+                except queue.Full:
+                    # Extremely rare: queue filled again between operations
+                    # This indicates severe decoder stall - log error and track metric
+                    self.frames_index_lost += 1
+                    logger.error(
+                        f"[Ros2FrameServer] Failed to enqueue frame index {spool_frame_idx} after drop - "
+                        f"decoder severely stalled (lost_indices={self.frames_index_lost})"
+                    )
+        except Exception as e:
+            logger.error(f"[Ros2FrameServer] Error parsing frame metadata: {e}")
     
     def get_current_frame_index(self) -> int:
         """Get the current frame index for ACK correlation."""
