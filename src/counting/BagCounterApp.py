@@ -310,8 +310,18 @@ class BagCounterApp:
         self._ready_publisher = None
         self._metadata_subscriber = None
         self._ack_publisher_node = None
-        self._current_frame_metadata = None  # Store latest frame metadata for ACK construction
+        self._current_frame_metadata = None  # Store latest frame metadata for ACK construction (deprecated, kept for fallback)
         self._frame_index_mismatch_count = 0  # Track mismatches for throttling warnings
+        
+        # Credit-based flow control: metadata cache for proper ACK correlation
+        # Maps frame_index -> FrameMetadata for consumed frames
+        # Bounded to prevent memory growth (LRU eviction when exceeding max size)
+        from collections import OrderedDict
+        self._metadata_cache = OrderedDict()  # frame_index -> FrameMetadata
+        self._metadata_cache_max_size = 100  # Bound cache size (2x max_in_flight is safe)
+        self._metadata_cache_hits = 0
+        self._metadata_cache_misses = 0
+        self._metadata_cache_evictions = 0
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
@@ -527,6 +537,29 @@ class BagCounterApp:
             f"SkipCapBlocks: {self._skip_cap_blocks}"
             f"{smart_skip_info}"
         )
+        
+        # Accuracy Mode: Log metadata cache stats
+        if getattr(self, "_accuracy_mode", False):
+            cache_size = len(self._metadata_cache)
+            cache_hits = self._metadata_cache_hits
+            cache_misses = self._metadata_cache_misses
+            cache_evictions = self._metadata_cache_evictions
+            total_lookups = cache_hits + cache_misses
+            hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0.0
+            
+            logger.info(
+                f"[AccuracyMode] Metadata cache: {cache_size}/{self._metadata_cache_max_size} "
+                f"| Lookups: hits={cache_hits}, misses={cache_misses} (hit_rate={hit_rate:.1f}%) "
+                f"| Evictions: {cache_evictions}"
+            )
+            
+            # Warn if high miss rate (indicates correlation issues)
+            if total_lookups > 100 and hit_rate < 95.0:
+                logger.warning(
+                    f"[AccuracyMode] ⚠ Low metadata cache hit rate: {hit_rate:.1f}% "
+                    f"(hits={cache_hits}, misses={cache_misses}). "
+                    f"This may indicate frame/metadata correlation issues."
+                )
         
         if input_utilization > self.QUEUE_WARNING_THRESHOLD:
             # Enhanced warning with root cause information
@@ -856,14 +889,29 @@ class BagCounterApp:
         """
         Callback for receiving frame metadata from spool processor.
         
-        Stores the metadata for use when constructing ACKs.
+        Stores the metadata in cache keyed by frame_index for proper ACK correlation.
+        This enables credit-based flow control with multiple frames in-flight.
         """
         try:
             metadata = frame_metadata_from_ros_string(msg.data)
+            
+            # Store in cache keyed by frame_index for later lookup
+            self._metadata_cache[metadata.frame_index] = metadata
+            
+            # Also update global latest (for fallback only)
             self._current_frame_metadata = metadata
-            logger.debug(f"[BagCounterApp] Frame metadata received: "
+            
+            # Evict oldest entries if cache exceeds max size (LRU)
+            while len(self._metadata_cache) > self._metadata_cache_max_size:
+                # Remove oldest entry (first item in OrderedDict)
+                evicted_frame_index, _ = self._metadata_cache.popitem(last=False)
+                self._metadata_cache_evictions += 1
+                logger.debug(f"[BagCounterApp] Metadata cache evicted frame_index={evicted_frame_index}, "
+                           f"size={len(self._metadata_cache)}/{self._metadata_cache_max_size}")
+            
+            logger.debug(f"[BagCounterApp] Frame metadata cached: "
                         f"frame_index={metadata.frame_index}, seq={metadata.seq}, "
-                        f"session_id={metadata.session_id[:8]}")
+                        f"session_id={metadata.session_id[:8]}, cache_size={len(self._metadata_cache)}")
         except Exception as e:
             logger.error(f"[BagCounterApp] Error parsing frame metadata: {e}")
 
@@ -918,31 +966,30 @@ class BagCounterApp:
         """
         Publish processing ACK for Accuracy Mode using structured message.
         
-        Uses the frame metadata received from the processor to construct a proper ACK
-        with session_id, seq, and timing information.
+        Uses metadata cache to retrieve the correct metadata for the specific frame being ACKed.
+        This ensures proper credit release in credit-based flow control with multiple frames in-flight.
         
         Args:
-            spool_frame_index: The canonical frame index (for backward compatibility check)
+            spool_frame_index: The frame index to ACK (must match metadata.frame_index)
         
-        CRITICAL: This must be called IMMEDIATELY after a frame is consumed.
+        CRITICAL: This must be called IMMEDIATELY after a frame is consumed to ensure
+        the metadata is still in cache (bounded cache may evict old entries).
         """
         if not IS_RDK or not getattr(self, "_accuracy_mode", False) or self._ack_publisher is None:
             return
         
         try:
-            # Use stored metadata if available, otherwise construct minimal ACK
-            if self._current_frame_metadata is not None:
-                metadata = self._current_frame_metadata
+            # Lookup metadata from cache by frame_index
+            metadata = self._metadata_cache.get(spool_frame_index)
+            
+            if metadata is not None:
+                # Cache hit - use the correct metadata for this specific frame
+                self._metadata_cache_hits += 1
                 
-                # Validate frame index matches (throttle warnings - only log every 100th mismatch)
-                if metadata.frame_index != spool_frame_index:
-                    self._frame_index_mismatch_count += 1
-                    if self._frame_index_mismatch_count == 1 or self._frame_index_mismatch_count % 100 == 0:
-                        logger.warning(f"[BagCounterApp] ⚠ Frame index mismatch: "
-                                     f"expected {spool_frame_index}, metadata has {metadata.frame_index} "
-                                     f"(total mismatches: {self._frame_index_mismatch_count})")
+                # Remove from cache after use to free memory
+                del self._metadata_cache[spool_frame_index]
                 
-                # Construct ACK with full metadata
+                # Construct ACK with correct metadata
                 ack = ProcessingAck(
                     frame_index=metadata.frame_index,
                     session_id=metadata.session_id,
@@ -960,28 +1007,54 @@ class BagCounterApp:
                 logger.debug(f"[BagCounterApp] ✓ ACK published: frame_index={ack.frame_index}, "
                           f"seq={ack.seq}, session={ack.session_id[:8]}")
             else:
-                # Fallback: construct ACK without full metadata (should not happen normally)
-                logger.warning(f"[BagCounterApp] ⚠ No frame metadata available for frame {spool_frame_index}, "
-                             "constructing minimal ACK")
+                # Cache miss - metadata not available for this frame_index
+                self._metadata_cache_misses += 1
                 
-                sent_time_sec, sent_time_nsec = get_current_time_ros()
-                ack = ProcessingAck(
-                    frame_index=spool_frame_index,
-                    session_id=self._consumer_session_id,
-                    seq=0,  # Unknown seq
-                    sent_time_sec=sent_time_sec,
-                    sent_time_nsec=sent_time_nsec,
-                    segment_num=-1
-                )
+                # Log warning (throttled - every 10th miss)
+                if self._metadata_cache_misses == 1 or self._metadata_cache_misses % 10 == 0:
+                    logger.warning(f"[BagCounterApp] ⚠ Metadata cache miss for frame_index={spool_frame_index} "
+                                 f"(total misses: {self._metadata_cache_misses}, hits: {self._metadata_cache_hits}). "
+                                 f"Cache size: {len(self._metadata_cache)}/{self._metadata_cache_max_size}")
                 
-                ack_msg = String()
-                ack_msg.data = processing_ack_to_ros_string(ack)
-                self._ack_publisher.publish(ack_msg)
-                
-                logger.info(f"[BagCounterApp] ✓ ACK published (minimal): frame_index={ack.frame_index}")
-                
+                # Fallback: try using latest metadata (old behavior, may have wrong seq)
+                if self._current_frame_metadata is not None:
+                    metadata = self._current_frame_metadata
+                    
+                    # Validate frame index matches
+                    if metadata.frame_index != spool_frame_index:
+                        self._frame_index_mismatch_count += 1
+                        if self._frame_index_mismatch_count == 1 or self._frame_index_mismatch_count % 100 == 0:
+                            logger.warning(f"[BagCounterApp] ⚠ Frame index mismatch in fallback: "
+                                         f"expected {spool_frame_index}, metadata has {metadata.frame_index} "
+                                         f"(total mismatches: {self._frame_index_mismatch_count})")
+                    
+                    # Construct ACK with fallback metadata (may have wrong seq!)
+                    ack = ProcessingAck(
+                        frame_index=metadata.frame_index,
+                        session_id=metadata.session_id,
+                        seq=metadata.seq,
+                        sent_time_sec=metadata.sent_time_sec,
+                        sent_time_nsec=metadata.sent_time_nsec,
+                        segment_num=metadata.segment_num
+                    )
+                    
+                    # Publish ACK
+                    ack_msg = String()
+                    ack_msg.data = processing_ack_to_ros_string(ack)
+                    self._ack_publisher.publish(ack_msg)
+                    
+                    logger.debug(f"[BagCounterApp] ✓ ACK published (fallback): frame_index={ack.frame_index}, "
+                              f"seq={ack.seq}, session={ack.session_id[:8]}")
+                else:
+                    # No metadata available at all - skip ACK
+                    # Better to skip than publish ACK with completely wrong seq
+                    logger.warning(f"[BagCounterApp] ⚠ No metadata available for frame {spool_frame_index}, "
+                                 "skipping ACK (better than wrong seq)")
+                    
         except Exception as e:
-            logger.warning(f"[BagCounterApp] Failed to publish ACK for frame {spool_frame_index}: {e}")
+            logger.error(f"[BagCounterApp] Error publishing processing ACK: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
     
     def _publish_processing_ready(self):
         """
