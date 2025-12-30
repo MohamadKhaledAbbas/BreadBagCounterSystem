@@ -182,6 +182,9 @@ class FrameServer(Node, FrameSource):
         now = time.time()
         self.frames_received += 1
         
+        # V6: Detailed timing metrics for performance analysis
+        t_callback_start = time.perf_counter()
+        
         # No time-based frame skipping - rely only on leaky queue
         self.frames_processed += 1
         
@@ -202,6 +205,19 @@ class FrameServer(Node, FrameSource):
                 # Add lost_indices to output if non-zero (severe stall indicator)
                 if self.frames_index_lost > 0:
                     stats_msg += f", LOST_INDICES={self.frames_index_lost}"
+                
+                # V6: Add timing stats
+                if hasattr(self, '_timing_stats') and self._timing_stats['count'] > 0:
+                    count = self._timing_stats['count']
+                    stats_msg += (
+                        f", avg_callback={self._timing_stats['callback'] / count:.2f}ms"
+                        f" (reshape={self._timing_stats['reshape'] / count:.2f}ms"
+                        f", nv12_copy={self._timing_stats['nv12_copy'] / count:.2f}ms"
+                        f", bgr_cvt={self._timing_stats['bgr_convert'] / count:.2f}ms)"
+                    )
+                    # Reset timing stats
+                    self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
+                
                 logger.info(stats_msg)
             else:
                 logger.info(
@@ -211,21 +227,39 @@ class FrameServer(Node, FrameSource):
                 )
             self.last_stats_log_time = now
         
+        # V6: Time each operation
+        t_reshape_start = time.perf_counter()
         img = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
         try:
             # NV12 conversion logic
             nv12_img = img.reshape((msg.height * 3 // 2, msg.width))
+            t_reshape_end = time.perf_counter()
             
             # V5 Optimization: Store raw NV12 data to avoid redundant conversions
             # The BPU expects NV12 format, so we can skip BGR→NV12 conversion in detector
             # by passing raw NV12 directly
+            t_nv12_copy_start = time.perf_counter()
             nv12_data = nv12_img.copy()  # Copy to ensure data persists after message is released
+            t_nv12_copy_end = time.perf_counter()
             
             # Still convert to BGR for visualization, classification, and other components
+            t_bgr_start = time.perf_counter()
             bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
+            t_bgr_end = time.perf_counter()
         except Exception as e:
             self.get_logger().error(f"Frame conversion error: {e}")
             return
+        
+        # V6: Accumulate timing stats
+        if not hasattr(self, '_timing_stats'):
+            self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
+        
+        t_callback_end = time.perf_counter()
+        self._timing_stats['callback'] += (t_callback_end - t_callback_start) * 1000
+        self._timing_stats['reshape'] += (t_reshape_end - t_reshape_start) * 1000
+        self._timing_stats['nv12_copy'] += (t_nv12_copy_end - t_nv12_copy_start) * 1000
+        self._timing_stats['bgr_convert'] += (t_bgr_end - t_bgr_start) * 1000
+        self._timing_stats['count'] += 1
 
         latency_ms = (now - self.last_frame_time) * 1000
         self.last_frame_time = now

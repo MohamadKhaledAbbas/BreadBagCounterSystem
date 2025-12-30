@@ -1335,10 +1335,21 @@ class BagCounterApp:
 
         TIMING_LOG_INTERVAL = 30
         frame_count = 0
+        
+        # V6: Timing stats for performance analysis
+        _logic_timing_stats = {
+            'queue_dequeue': 0,
+            'packet_extract': 0,
+            'detection': 0,
+            'total': 0,
+            'count': 0
+        }
 
         while self.is_running:
             try:
+                t_dequeue_start = time.perf_counter()
                 frame_packet = self.input_queue.get(timeout=1.0)
+                t_dequeue_end = time.perf_counter()
             except queue.Empty:
                 if not self.is_running:
                     break
@@ -1355,6 +1366,8 @@ class BagCounterApp:
                 continue
 
             try:
+                t_extract_start = time.perf_counter()
+                
                 # V5 Optimization: Extract frame and optional NV12 data from packet
                 # Supports both dict format (V5) and direct frame (backward compatible)
                 if isinstance(frame_packet, dict):
@@ -1366,6 +1379,8 @@ class BagCounterApp:
                     frame = frame_packet
                     nv12_data = None
                     frame_size = None
+                
+                t_extract_end = time.perf_counter()
                 
                 frame_count += 1
                 # NOTE: Accuracy Mode ACK is now published in the frame capture loop (run() method)
@@ -1628,6 +1643,34 @@ class BagCounterApp:
                     detections = self.detector.predict(frame, nv12_data=nv12_data, frame_size=frame_size)
                     detect_end = time.perf_counter()
                     detect_time = (detect_end - detect_start) * 1000
+                    
+                    # V6: Accumulate timing stats
+                    _logic_timing_stats['queue_dequeue'] += (t_dequeue_end - t_dequeue_start) * 1000
+                    _logic_timing_stats['packet_extract'] += (t_extract_end - t_extract_start) * 1000
+                    _logic_timing_stats['detection'] += detect_time
+                    _logic_timing_stats['total'] += (detect_end - t_dequeue_start) * 1000
+                    _logic_timing_stats['count'] += 1
+                    
+                    # V6: Log timing stats periodically
+                    if _logic_timing_stats['count'] >= 100:
+                        count = _logic_timing_stats['count']
+                        nv12_used = "yes" if nv12_data is not None else "no"
+                        logger.info(
+                            f"[LogicThread] Avg timing (100 frames): "
+                            f"queue_dequeue={_logic_timing_stats['queue_dequeue']/count:.2f}ms, "
+                            f"packet_extract={_logic_timing_stats['packet_extract']/count:.2f}ms, "
+                            f"detection={_logic_timing_stats['detection']/count:.2f}ms, "
+                            f"total={_logic_timing_stats['total']/count:.2f}ms, "
+                            f"nv12_used={nv12_used}"
+                        )
+                        # Reset
+                        _logic_timing_stats = {
+                            'queue_dequeue': 0,
+                            'packet_extract': 0,
+                            'detection': 0,
+                            'total': 0,
+                            'count': 0
+                        }
                     
                     # V3: Track detection time for adaptive skipping
                     self._recent_detection_times.append(detect_time)
