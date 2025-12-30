@@ -42,7 +42,8 @@ class UltralyticsDetector(BaseDetector):
             return []
         
         if len(frames) == 1:
-            return self.predict(frames[0])
+            # Wrap single result in list to maintain consistent return type
+            return [self.predict(frames[0])[0]]
         
         # Ultralytics YOLO supports passing a list of images for batch inference
         # This leverages the underlying batch processing capabilities
