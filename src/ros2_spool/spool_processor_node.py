@@ -119,9 +119,21 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
         
         db.close()
         
+        # Parse and validate ack_timeout - must be > 0, else use default
+        parsed_ack_timeout = DEFAULT_ACK_TIMEOUT
+        if ack_timeout:
+            try:
+                parsed_value = float(ack_timeout)
+                if parsed_value > 0:
+                    parsed_ack_timeout = parsed_value
+                else:
+                    logger.warning(f"[SpoolProcessor] Invalid spool_ack_timeout={ack_timeout} (must be > 0), using default {DEFAULT_ACK_TIMEOUT}s")
+            except (ValueError, TypeError):
+                logger.warning(f"[SpoolProcessor] Failed to parse spool_ack_timeout={ack_timeout}, using default {DEFAULT_ACK_TIMEOUT}s")
+        
         return ProcessorConfig(
             spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
-            ack_timeout=float(ack_timeout) if ack_timeout else DEFAULT_ACK_TIMEOUT,
+            ack_timeout=parsed_ack_timeout,
             retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
         )
     except Exception as e:
