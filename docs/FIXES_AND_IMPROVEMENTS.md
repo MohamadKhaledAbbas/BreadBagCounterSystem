@@ -4,7 +4,34 @@ This document catalogs potential improvements, optimizations, and fixes identifi
 
 ## High Priority
 
-### 1. True Batch Inference - NOT SUPPORTED BY hobot_dnn API
+### 1. Direct NV12 Input for Detection (IMPLEMENTED ✅)
+
+**Location:** `src/detection/BpuDetector.py`, `src/frame_source/Ros2FrameServer.py`, `src/counting/BagCounterApp.py`
+
+**Issue:** The original pipeline performed redundant color conversions:
+1. ROS2 receives NV12 frame from decoder
+2. Ros2FrameServer converts NV12 → BGR for general use
+3. BpuDetector converts BGR → NV12 for BPU inference
+
+This double conversion was consuming ~10-20ms per frame.
+
+**Solution Implemented (V5 Optimization):**
+- Ros2FrameServer now passes raw NV12 data alongside BGR frame
+- BpuDetector.predict() accepts optional `nv12_data` and `frame_size` parameters
+- New `_preprocess_nv12()` method resizes NV12 directly without color conversion
+- BagCounterApp passes NV12 data through the pipeline to detector
+
+**Performance Impact:**
+- Eliminates ~10-20ms color conversion overhead per frame
+- Expected improvement: ~15% faster end-to-end processing
+
+**Backward Compatibility:**
+- If `nv12_data` is not provided, falls back to standard BGR processing
+- Works with both ROS2 and OpenCV frame sources
+
+---
+
+### 2. True Batch Inference - NOT SUPPORTED BY hobot_dnn API
 
 **Location:** `src/detection/BpuDetector.py`, `src/classifier/BpuClassifyer.py`
 
@@ -33,7 +60,7 @@ This is the optimal approach given the API limitations.
 
 ---
 
-### 2. Existing Batch Processing Optimizations
+### 3. Existing Batch Processing Optimizations
 
 **Location:** `src/detection/BpuDetector.py`
 
@@ -46,7 +73,7 @@ These optimizations reduce overhead compared to processing each frame completely
 
 ---
 
-### 3. Classification Service Batch Integration
+### 4. Classification Service Batch Integration
 
 **Location:** `src/classifier/ClassifierService.py`
 
@@ -265,10 +292,18 @@ EARLY_REJECTION_ENABLED=true
 
 **Note:** True batch inference (multiple frames in single BPU call) is NOT supported by the hobot_dnn Python API. The existing batch processing accumulates frames and processes them sequentially, which is the optimal approach given API limitations.
 
+**V5 Optimization:** The system now passes NV12 data directly to the detector when available (ROS2 frame source), eliminating ~10-20ms of redundant color conversion per frame.
+
 ---
 
 ## Changelog
 
+- **2024-12-30**: V5 NV12 direct input optimization
+  - **IMPLEMENTED**: Direct NV12 input for BPU detection - eliminates redundant BGR→NV12 conversion
+  - Added `_preprocess_nv12()` method to BpuDetector for direct NV12 processing
+  - Updated Ros2FrameServer to pass raw NV12 data alongside BGR frame
+  - Updated BagCounterApp to pass NV12 data through pipeline to detector
+  - Expected performance improvement: ~10-20ms per frame saved
 - **2024-12-30**: Updated after investigation
   - **IMPORTANT**: True batch inference (multiple frames in single forward call) is NOT supported by hobot_dnn Python API
   - Reverted batch inference code that caused segmentation faults

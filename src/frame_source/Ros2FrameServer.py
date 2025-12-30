@@ -215,6 +215,13 @@ class FrameServer(Node, FrameSource):
         try:
             # NV12 conversion logic
             nv12_img = img.reshape((msg.height * 3 // 2, msg.width))
+            
+            # V5 Optimization: Store raw NV12 data to avoid redundant conversions
+            # The BPU expects NV12 format, so we can skip BGR→NV12 conversion in detector
+            # by passing raw NV12 directly
+            nv12_data = nv12_img.copy()  # Copy to ensure data persists after message is released
+            
+            # Still convert to BGR for visualization, classification, and other components
             bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
         except Exception as e:
             self.get_logger().error(f"Frame conversion error: {e}")
@@ -268,17 +275,30 @@ class FrameServer(Node, FrameSource):
                     f"using current index {spool_frame_index}. This may reintroduce race condition."
                 )
         
+        # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
+        # Frame format: (bgr, latency_ms, spool_frame_index, nv12_data, (height, width))
         # SINGLE SOURCE OF TRUTH: Attach spool_frame_index to frame data
         # It will travel through the entire pipeline with this frame
-        self.frame_queue.put((bgr, latency_ms, spool_frame_index))
+        frame_size = (msg.height, msg.width)
+        self.frame_queue.put((bgr, latency_ms, spool_frame_index, nv12_data, frame_size))
 
     def frames(self):
         """
         Yield frames from the queue.
         
+        V5 Optimization: Now yields NV12 data alongside BGR frame.
+        
         Yields:
-            Tuple of (frame, latency_ms, spool_frame_index) in accuracy mode.
-            Tuple of (frame, latency_ms) in normal mode (backward compatible).
+            Tuple of (frame, latency_ms, spool_frame_index, nv12_data, frame_size) - full format
+            Tuple of (frame, latency_ms, spool_frame_index) - accuracy mode (backward compatible)
+            Tuple of (frame, latency_ms) - normal mode (backward compatible)
+            
+        Where:
+            - frame: BGR numpy array for visualization/classification
+            - latency_ms: Frame latency in milliseconds
+            - spool_frame_index: Frame index for ACK correlation
+            - nv12_data: Raw NV12 numpy array for direct BPU inference (avoids BGR→NV12 conversion)
+            - frame_size: Tuple (height, width) of the original frame
             
         Single Source of Truth:
             In accuracy mode, spool_frame_index travels WITH the frame data
@@ -289,8 +309,21 @@ class FrameServer(Node, FrameSource):
         while rclpy.ok():
             try:
                 item = self.frame_queue.get(timeout=1)
-                # Handle both old format (frame, latency) and new format (frame, latency, index)
-                if len(item) == 3:
+                
+                # V5: Handle new format with NV12 data (5 elements)
+                if len(item) == 5:
+                    frame, latency_ms, spool_frame_index, nv12_data, frame_size = item
+                    # Store the frame index that was associated with THIS frame when it was enqueued
+                    with self._frame_index_lock:
+                        self._current_frame_index = spool_frame_index
+                        self._last_yielded_frame_index = spool_frame_index
+                    if self._accuracy_mode:
+                        logger.debug(f"[Ros2FrameServer] Yielding frame with spool_frame_index {spool_frame_index}, nv12_shape={nv12_data.shape}")
+                    # V5: Yield full frame data including NV12
+                    yield frame, latency_ms, spool_frame_index, nv12_data, frame_size
+                    
+                # Handle old format (frame, latency, index) - backward compatible
+                elif len(item) == 3:
                     frame, latency_ms, spool_frame_index = item
                     # Store the frame index that was associated with THIS frame when it was enqueued
                     # This is critical for ACK correlation in accuracy mode
