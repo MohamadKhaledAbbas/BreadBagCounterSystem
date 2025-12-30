@@ -21,9 +21,10 @@ import json
 import queue
 import threading
 import time
+import traceback
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
-from collections import deque
+from collections import deque, OrderedDict
 
 from src.counting.Visualizer import Visualizer
 from src.classifier.ClassifierService import ClassifierService
@@ -316,7 +317,6 @@ class BagCounterApp:
         # Credit-based flow control: metadata cache for proper ACK correlation
         # Maps frame_index -> FrameMetadata for consumed frames
         # Bounded to prevent memory growth (LRU eviction when exceeding max size)
-        from collections import OrderedDict
         self._metadata_cache = OrderedDict()  # frame_index -> FrameMetadata
         self._metadata_cache_max_size = 100  # Bound cache size (2x max_in_flight is safe)
         self._metadata_cache_hits = 0
@@ -1053,7 +1053,6 @@ class BagCounterApp:
                     
         except Exception as e:
             logger.error(f"[BagCounterApp] Error publishing processing ACK: {e}")
-            import traceback
             logger.debug(traceback.format_exc())
     
     def _publish_processing_ready(self):

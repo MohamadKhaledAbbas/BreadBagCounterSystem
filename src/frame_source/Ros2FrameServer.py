@@ -2,6 +2,7 @@ import os
 import queue
 import threading
 import time
+import json
 
 import cv2
 import numpy as np
@@ -9,7 +10,7 @@ import rclpy
 from hbm_img_msgs.msg import HbmMsg1080P
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import UInt32
+from std_msgs.msg import UInt32, String
 
 from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
@@ -113,7 +114,6 @@ class FrameServer(Node, FrameSource):
                 depth=20  # Increased depth to match metadata publisher
             )
             # Subscribe to frame metadata (contains frame_index) instead of deprecated UInt32 topic
-            from std_msgs.msg import String
             self._index_sub = self.create_subscription(
                 String,
                 '/spool/current_frame_metadata',
@@ -144,7 +144,6 @@ class FrameServer(Node, FrameSource):
         """
         try:
             # Parse metadata to extract frame_index
-            import json
             metadata_dict = json.loads(msg.data)
             spool_frame_idx = int(metadata_dict['frame_index'])
             
