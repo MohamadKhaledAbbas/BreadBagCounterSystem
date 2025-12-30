@@ -2384,7 +2384,7 @@ class TrackingConfig:
     """
     
     # === Phase 2: Batch Inference (CRITICAL for 2.5x speedup) ===
-    detection_batch_enabled: bool = _parse_bool_env("DETECTION_BATCH_ENABLED", True)
+    detection_batch_enabled: bool = _parse_bool_env("DETECTION_BATCH_ENABLED", False)
     """
     Enable BPU batch inference for detection.
     

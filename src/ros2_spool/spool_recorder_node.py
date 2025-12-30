@@ -79,25 +79,13 @@ class SpoolConfig:
     stats_interval: float = DEFAULT_STATS_INTERVAL
 
 
-def load_config_from_db(db_path: str = AppConfig.db_path) -> SpoolConfig:
+def load_default_config() -> SpoolConfig:
     """Load spool configuration from database config table."""
-    try:
-        db = DatabaseManager(db_path)
-        
-        spool_dir = db.get_config_value(constants.spool_dir)
-        segment_duration = db.get_config_value(constants.spool_segment_duration)
-        retention_seconds = db.get_config_value(constants.spool_retention_seconds)
-        
-        db.close()
-        
-        return SpoolConfig(
-            spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
-            segment_duration=float(segment_duration) if segment_duration else DEFAULT_SEGMENT_DURATION,
-            retention_seconds=float(retention_seconds) if retention_seconds else DEFAULT_RETENTION_SECONDS,
-        )
-    except Exception as e:
-        logger.warning(f"[SpoolRecorder] Failed to load config from DB: {e}, using defaults")
-        return SpoolConfig()
+    return SpoolConfig(
+        spool_dir=DEFAULT_SPOOL_DIR,
+        segment_duration=DEFAULT_SEGMENT_DURATION,
+        retention_seconds=DEFAULT_RETENTION_SECONDS,
+    )
 
 
 class SpoolRecorderNode(Node):
@@ -115,7 +103,7 @@ class SpoolRecorderNode(Node):
         super().__init__('spool_recorder')
         
         # Load configuration from database if not provided
-        self.config = config or load_config_from_db()
+        self.config = config or load_default_config()
         
         logger.info(f"[SpoolRecorder] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "

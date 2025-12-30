@@ -71,7 +71,7 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2025-12-29-v2.1.0"
+    APP_VERSION: str = "2025-12-30-v2.2.0"
 
     video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\Brown_Orange_Overlay_20251128010005_20251128011157.mp4")
 
@@ -88,7 +88,10 @@ class AppConfig:
         else "data/model/classify_yolo_small_v7.pt"
     )
 
-    db_path: str = os.getenv("DB_PATH", "/home/sunrise/BreadCounting/data/db/bag_events.db")
+    if IS_RDK:
+        db_path: str = os.getenv("DB_PATH", "/home/sunrise/BreadCounting/data/db/bag_events.db")
+    else:
+        db_path: str = os.getenv("DB_PATH", "data/db/bag_events.db")
     
     # V2: Recording and snapshot directories
     recording_dir: str = os.getenv("RECORDING_DIR", "data/recordings")

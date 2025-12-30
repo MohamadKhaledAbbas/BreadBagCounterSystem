@@ -108,7 +108,7 @@ DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
 DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
-DEFAULT_TARGET_FPS = 25.0  # V6: Target FPS for ACK-free mode
+DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
 
 
 @dataclass
@@ -126,64 +126,15 @@ class ProcessorConfig:
     target_fps: float = DEFAULT_TARGET_FPS
 
 
-def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
+def load_default_config() -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
-    try:
-        db = DatabaseManager(db_path)
-        
-        spool_dir = db.get_config_value(constants.spool_dir)
-        ack_timeout = db.get_config_value(constants.spool_ack_timeout)
-        retry_count = db.get_config_value(constants.spool_retry_count)
-        ack_free_mode = db.get_config_value(constants.spool_ack_free_mode)
-        target_fps = db.get_config_value(constants.spool_target_fps)
-        
-        db.close()
-        
-        # Parse and validate ack_timeout - must be > 0, else use default
-        parsed_ack_timeout = DEFAULT_ACK_TIMEOUT
-        if ack_timeout:
-            try:
-                parsed_value = float(ack_timeout)
-                if parsed_value > 0:
-                    parsed_ack_timeout = parsed_value
-                else:
-                    logger.warning(f"[SpoolProcessor] Invalid spool_ack_timeout={ack_timeout} (must be > 0), using default {DEFAULT_ACK_TIMEOUT}s")
-            except (ValueError, TypeError):
-                logger.warning(f"[SpoolProcessor] Failed to parse spool_ack_timeout={ack_timeout}, using default {DEFAULT_ACK_TIMEOUT}s")
-        
-        # V6: Parse ack_free_mode - default to True for production-grade operation
-        parsed_ack_free_mode = DEFAULT_ACK_FREE_MODE
-        if ack_free_mode is not None:
-            if isinstance(ack_free_mode, bool):
-                parsed_ack_free_mode = ack_free_mode
-            elif isinstance(ack_free_mode, str):
-                parsed_ack_free_mode = ack_free_mode.lower() in ('true', '1', 'yes', 'on')
-            elif isinstance(ack_free_mode, (int, float)):
-                parsed_ack_free_mode = bool(ack_free_mode)
-        
-        # V6: Parse target_fps - must be > 0
-        parsed_target_fps = DEFAULT_TARGET_FPS
-        if target_fps:
-            try:
-                parsed_value = float(target_fps)
-                if parsed_value > 0:
-                    parsed_target_fps = parsed_value
-                else:
-                    logger.warning(f"[SpoolProcessor] Invalid spool_target_fps={target_fps} (must be > 0), using default {DEFAULT_TARGET_FPS}")
-            except (ValueError, TypeError):
-                logger.warning(f"[SpoolProcessor] Failed to parse spool_target_fps={target_fps}, using default {DEFAULT_TARGET_FPS}")
-        
-        return ProcessorConfig(
-            spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
-            ack_timeout=parsed_ack_timeout,
-            retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
-            ack_free_mode=parsed_ack_free_mode,
-            target_fps=parsed_target_fps,
-        )
-    except Exception as e:
-        logger.warning(f"[SpoolProcessor] Failed to load config from DB: {e}, using defaults")
-        return ProcessorConfig()
-
+    return ProcessorConfig(
+        spool_dir=DEFAULT_SPOOL_DIR,
+        ack_timeout=DEFAULT_ACK_TIMEOUT,
+        retry_count=DEFAULT_RETRY_COUNT,
+        ack_free_mode=DEFAULT_ACK_FREE_MODE,
+        target_fps=DEFAULT_TARGET_FPS,
+    )
 
 class SpoolProcessorNode(Node):
     """
@@ -217,7 +168,7 @@ class SpoolProcessorNode(Node):
         super().__init__('spool_processor')
         
         # Load configuration from database if not provided
-        self.config = config or load_config_from_db()
+        self.config = config or load_default_config()
         
         # Generate unique session ID for this run
         self._session_id = generate_session_id()
