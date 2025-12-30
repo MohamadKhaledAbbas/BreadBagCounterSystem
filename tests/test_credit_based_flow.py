@@ -27,7 +27,7 @@ class InFlightFrame:
 
 
 # Constants from spool_processor_node
-DEFAULT_MAX_IN_FLIGHT = 10
+DEFAULT_MAX_IN_FLIGHT = 20
 DEFAULT_ACK_TIMEOUT = 10.0
 
 
@@ -253,8 +253,8 @@ def test_processor_config_defaults():
     print("Testing credit-based flow control defaults...")
     
     # Test constants directly since we can't import ProcessorConfig
-    assert DEFAULT_MAX_IN_FLIGHT == 10, \
-        f"max_in_flight default should be 10, got {DEFAULT_MAX_IN_FLIGHT}"
+    assert DEFAULT_MAX_IN_FLIGHT == 20, \
+        f"max_in_flight default should be 20, got {DEFAULT_MAX_IN_FLIGHT}"
     
     assert DEFAULT_ACK_TIMEOUT == 10.0, \
         f"ack_timeout default should be 10.0, got {DEFAULT_ACK_TIMEOUT}"

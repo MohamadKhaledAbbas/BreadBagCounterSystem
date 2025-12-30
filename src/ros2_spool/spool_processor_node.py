@@ -97,8 +97,8 @@ DEFAULT_POLL_INTERVAL = 1.0  # Only used when spool is empty
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_MAX_IN_FLIGHT = 10  # Maximum frames in-flight before backpressure
-DEFAULT_PUBLISH_IDLE_SLEEP_MS = 5  # Milliseconds to sleep in publish loop when idle
+DEFAULT_MAX_IN_FLIGHT = 20  # Maximum frames in-flight before backpressure (increased for better throughput)
+DEFAULT_PUBLISH_IDLE_SLEEP_MS = 1  # Milliseconds to sleep in publish loop when idle (reduced for higher throughput)
 DEFAULT_EMPTY_POLL_INTERVAL = 1.0  # Seconds to wait when spool is empty
 
 
@@ -884,10 +884,11 @@ class SpoolProcessorNode(Node):
                 # Log stats periodically
                 self._maybe_log_stats()
                 
-                # Brief sleep to prevent CPU spinning in tight loop
-                # Only sleep if we're not under backpressure (have credit available)
-                if self.config.publish_idle_sleep_ms > 0:
-                    time.sleep(self.config.publish_idle_sleep_ms / 1000.0)
+                # No sleep here - continue immediately to publish next frame if credit available
+                # Sleep only happens when:
+                # 1. Backpressure (no credit) - line 854
+                # 2. Spool empty - line 865
+                # 3. Publish error - line 881
                 
             except Exception as e:
                 logger.error(f"[SpoolProcessor] Error in processing loop: {e}")

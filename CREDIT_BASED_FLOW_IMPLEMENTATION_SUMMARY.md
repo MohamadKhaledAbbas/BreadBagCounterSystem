@@ -66,6 +66,8 @@ Major refactoring:
 - Added `_check_and_expire_timeouts()` method
 - Updated `ProcessorState` enum (removed WAITING_FOR_ACK, added PUBLISHING/BACKPRESSURE)
 - Enhanced stats logging with rates and in-flight metrics
+- **Performance optimization:** Removed unconditional sleep after successful publish
+- **Increased defaults:** max_in_flight=20 (was 10), publish_idle_sleep_ms=1 (was 5)
 
 ## Files Created
 
@@ -97,15 +99,15 @@ Updated to reference credit-based design and new configuration keys.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `spool_max_in_flight` | `10` | Maximum frames in-flight |
-| `spool_publish_idle_sleep_ms` | `5` | Sleep duration in publish loop |
+| `spool_max_in_flight` | `20` | Maximum frames in-flight (increased for better throughput) |
+| `spool_publish_idle_sleep_ms` | `1` | Sleep during backpressure only (reduced from 5ms) |
 | `spool_empty_poll_interval` | `1.0` | Poll interval when spool empty |
 | `spool_ack_timeout` | `10.0` | Timeout for in-flight frames |
 
 ### Setting Configuration
 
 ```bash
-python config.py --key spool_max_in_flight --value 10
+python config.py --key spool_max_in_flight --value 20
 python config.py --key spool_ack_timeout --value 10.0
 python config.py --key spool_publish_idle_sleep_ms --value 5
 ```

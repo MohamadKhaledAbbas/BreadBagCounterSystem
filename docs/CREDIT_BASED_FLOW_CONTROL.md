@@ -28,10 +28,10 @@ The SpoolProcessor implements a **credit-based, best-effort, bounded in-flight w
 │  │      frame = get_next_frame()                                │   │
 │  │      publish_frame(frame)                                    │   │
 │  │      track_in_flight(frame)       ◄─── Add to tracking      │   │
-│  │      sleep(5ms)                   ◄─── Brief sleep          │   │
+│  │      # NO SLEEP - continue immediately                       │   │
 │  │    else:                                                     │   │
 │  │      # Backpressure: wait for ACKs                           │   │
-│  │      sleep(5ms)                                              │   │
+│  │      sleep(1ms)                                              │   │
 │  │                                                               │   │
 │  │    check_timeouts()               ◄─── Free credit for old  │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -124,8 +124,8 @@ class InFlightFrame:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `spool_max_in_flight` | `10` | Maximum frames in-flight before backpressure |
-| `spool_publish_idle_sleep_ms` | `5` | Milliseconds to sleep in publish loop |
+| `spool_max_in_flight` | `20` | Maximum frames in-flight before backpressure |
+| `spool_publish_idle_sleep_ms` | `1` | Milliseconds to sleep during backpressure only |
 | `spool_empty_poll_interval` | `1.0` | Seconds to wait when spool is empty |
 | `spool_ack_timeout` | `10.0` | Seconds before frame is marked expired |
 
@@ -134,14 +134,14 @@ class InFlightFrame:
 Use `config.py` or database CLI:
 
 ```bash
-# Set max in-flight (recommended: 10-20 for best throughput)
-python config.py --key spool_max_in_flight --value 10
+# Set max in-flight (default now 20; increase to 30-50 for even higher throughput)
+python config.py --key spool_max_in_flight --value 20
 
 # Set timeout (lower = faster recovery from stuck frames)
 python config.py --key spool_ack_timeout --value 10.0
 
-# Set idle sleep (lower = higher CPU, higher throughput)
-python config.py --key spool_publish_idle_sleep_ms --value 5
+# Set idle sleep (only used during backpressure, can be 0 for max throughput)
+python config.py --key spool_publish_idle_sleep_ms --value 1
 
 # Set empty poll interval
 python config.py --key spool_empty_poll_interval --value 1.0
@@ -151,19 +151,21 @@ python config.py --key spool_empty_poll_interval --value 1.0
 
 ### Maximizing Throughput
 
-**Goal: Achieve 20 FPS throughput**
+**Goal: Achieve 20+ FPS throughput**
 
 1. **Increase `max_in_flight`**: Higher window allows more frames in transit
-   - Start with 10, increase to 20 if consumer can handle it
+   - Default now 20 (up from 10)
+   - Increase to 30-50 for even higher throughput if consumer can handle it
    - Monitor backpressure warnings in logs
 
-2. **Reduce `publish_idle_sleep_ms`**: Less sleep = faster publishing
-   - Default 5ms is reasonable
-   - Can reduce to 1ms for maximum throughput (higher CPU)
+2. **No sleep in hot path**: Sleep removed from successful publish path
+   - Only sleeps during backpressure (no credit) or errors
+   - `publish_idle_sleep_ms` now only used during backpressure
+   - Can set to 0 for absolute maximum throughput
 
 3. **Monitor publish rate**: Check `pub_rate=X.Xfps` in logs
-   - Should approach 20 FPS when consumer keeps up
-   - If stuck at ~10 FPS, increase `max_in_flight`
+   - Should approach 20+ FPS when consumer keeps up
+   - If stuck at ~12 FPS, increase `max_in_flight` to 30-50
 
 4. **Check in-flight saturation**: Look for `in_flight=X/Y` in logs
    - If consistently at max, increase `max_in_flight`
