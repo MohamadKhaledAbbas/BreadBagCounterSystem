@@ -124,7 +124,7 @@ tracker_stats = tracker.get_tracker_stats()
 policy.set_last_processed_frame(tracker_stats['last_processed_frame_index'])
 ```
 
-### 6. ACK-Free Flow Control (Section 1️⃣0️⃣)
+### 6. ACK-Free Flow Control (Section 10)
 
 **Per-frame ACKs are fundamentally incompatible with real-time video processing.**
 

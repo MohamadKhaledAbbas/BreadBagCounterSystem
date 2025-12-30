@@ -25,8 +25,8 @@ It **does not work** for:
 #### ❌ ACK Reordering
 
 ```
-ACK received for frame 59
-Processor waiting for frame 4704
+Processor published frame 105, waiting for ACK
+ACK received for frame 102 (still processing in pipeline)
 ```
 
 This happens because:
