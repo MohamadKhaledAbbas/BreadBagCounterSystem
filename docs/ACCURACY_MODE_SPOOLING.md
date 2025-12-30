@@ -13,8 +13,10 @@ RTSP Source → H.264 Decode → NV12 Images → Detection → Classification �
 Under load, the pipeline may drop frames due to queue pressure, leading to missed bag counts. Accuracy Mode solves this by:
 
 1. **Spooling H.264 frames to disk** before decoding
-2. **Pull-based replay** where processing controls the pace
-3. **Strict backpressure** ensuring exactly one frame in flight
+2. **Credit-based publishing** with bounded in-flight window for high throughput
+3. **Backpressure control** when consumer slows down
+
+**Note:** For detailed information on the credit-based flow control design, see [CREDIT_BASED_FLOW_CONTROL.md](CREDIT_BASED_FLOW_CONTROL.md).
 
 ## Architecture
 
@@ -40,16 +42,17 @@ Accuracy Mode uses a two-process architecture:
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Process 2: Processor (pull-paced replay)                               │
+│  Process 2: Processor (credit-based replay)                             │
 │  ┌───────────────────┐   ┌───────────────────┐   ┌──────────────────┐  │
-│  │ Spool Reader      │──→│ Pump/Controller   │──→│ H.264 Publisher  │  │
-│  │ (read segments)   │   │ (wait for ACK)    │   │ /spool_image_ch_0│  │
+│  │ Spool Reader      │──→│ Credit Controller │──→│ H.264 Publisher  │  │
+│  │ (read segments)   │   │ (in-flight mgmt)  │   │ /spool_image_ch_0│  │
 │  └───────────────────┘   └───────────────────┘   └──────────────────┘  │
 │                                    ▲                       │            │
 │                                    │                       ▼            │
 │  ┌───────────────────┐            │           ┌──────────────────────┐ │
 │  │ ACK Subscriber    │────────────┘           │ HW Decoder           │ │
-│  │ /processing_ack   │                        │ (hobot_codec)        │ │
+│  │ /processing_ack   │  (non-blocking,        │ (hobot_codec)        │ │
+│  │                   │   frees credit)         │                      │ │
 │  └───────────────────┘                        └──────────────────────┘ │
 │                                                           │             │
 │                                                           ▼             │
@@ -78,16 +81,19 @@ Features:
 
 #### 2. Spool Processor (`spool_processor_node.py`)
 
-The processor reads from the spool and publishes at controlled pace:
+The processor reads from the spool and publishes with credit-based flow control:
 
 - **Input**: Segment files from spool directory
 - **Output**: `/spool_image_ch_0` (img_msgs/msg/H26XFrame)
 
 Features:
 - Reads oldest closed segments in order
-- Publishes exactly one frame at a time
-- Waits for ACK before next frame
-- Timeout and retry logic
+- Credit-based publishing (bounded in-flight window)
+- Non-blocking ACK handling
+- Timeout-based credit recovery
+- Target throughput: 20 FPS
+
+See [CREDIT_BASED_FLOW_CONTROL.md](CREDIT_BASED_FLOW_CONTROL.md) for detailed flow control design.
 
 #### 3. Frame Index Tracking
 
@@ -247,8 +253,11 @@ Configuration is stored in the SQLite database config table. Use `config.py` to 
 | `spool_dir` | `/home/sunrise/BreadCounting/data/spool` | Spool directory |
 | `spool_segment_duration` | `5.0` | Target segment duration (seconds) |
 | `spool_retention_seconds` | `180` | Maximum segment age before deletion |
-| `spool_ack_timeout` | `30.0` | Timeout waiting for ACK (seconds) |
-| `spool_retry_count` | `2` | Retries before advancing |
+| `spool_ack_timeout` | `10.0` | Timeout for in-flight frames (seconds) |
+| `spool_max_in_flight` | `10` | Maximum frames in-flight (credit-based) |
+| `spool_publish_idle_sleep_ms` | `5` | Milliseconds to sleep in publish loop |
+| `spool_empty_poll_interval` | `1.0` | Seconds to wait when spool is empty |
+| `spool_retry_count` | `2` | (Deprecated) Retained for compatibility |
 
 Example configuration commands:
 
@@ -261,7 +270,14 @@ python config.py --key spool_dir --value /home/sunrise/BreadCounting/data/spool
 
 # Set retention to 5 minutes
 python config.py --key spool_retention_seconds --value 300
+
+# Credit-based flow control settings
+python config.py --key spool_max_in_flight --value 10
+python config.py --key spool_ack_timeout --value 10.0
+python config.py --key spool_publish_idle_sleep_ms --value 5
 ```
+
+**Note:** For detailed tuning guidance on credit-based flow control, see [CREDIT_BASED_FLOW_CONTROL.md](CREDIT_BASED_FLOW_CONTROL.md).
 
 ### ROS2 Environment
 
