@@ -27,26 +27,4 @@ class UltralyticsDetector(BaseDetector):
         return self._class_names if self._class_names is not None else self.model.names
 
     def predict_batch(self, frames):
-        """
-        V4: Batch inference for multiple frames using Ultralytics YOLO.
-        
-        Ultralytics YOLO natively supports batch inference by passing a list of frames.
-        
-        Args:
-            frames: List of numpy arrays (frames) to process
-            
-        Returns:
-            List of result objects, one per frame
-        """
-        if len(frames) == 0:
-            return []
-        
-        if len(frames) == 1:
-            # Wrap single result in list to maintain consistent return type
-            return [self.predict(frames[0])[0]]
-        
-        # Ultralytics YOLO supports passing a list of images for batch inference
-        # This leverages the underlying batch processing capabilities
-        results = self.model.predict(frames, verbose=False)
-        
-        return results
+        raise NotImplementedError()

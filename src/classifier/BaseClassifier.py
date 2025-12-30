@@ -1,5 +1,5 @@
 from abc import abstractmethod, ABC
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple
 
 
 class BaseClassifier(ABC):
@@ -34,41 +34,3 @@ class BaseClassifier(ABC):
         label, conf = self.predict(image)
         # Return single-class probs dict (fallback behavior)
         return label, conf, {label: conf}
-
-    def predict_batch(self, images) -> List[Tuple[str, float]]:
-        """
-        Batch classification for multiple images.
-        
-        This method is optional for subclasses. The default implementation
-        processes images sequentially using predict().
-        
-        Subclasses should override this method to provide optimized batch
-        inference when available.
-        
-        Args:
-            images: List of numpy arrays (images) to classify
-            
-        Returns:
-            List of tuples (label, confidence), one per image
-        """
-        # Default implementation: sequential processing
-        return [self.predict(img) for img in images]
-
-    def predict_batch_probs(self, images) -> List[Tuple[str, float, Dict[str, float]]]:
-        """
-        Batch classification with full probability vectors.
-        
-        This method is optional for subclasses. The default implementation
-        processes images sequentially using predict_probs().
-        
-        Subclasses should override this method to provide optimized batch
-        inference when available.
-        
-        Args:
-            images: List of numpy arrays (images) to classify
-            
-        Returns:
-            List of tuples (label, confidence, probs_dict), one per image
-        """
-        # Default implementation: sequential processing
-        return [self.predict_probs(img) for img in images]

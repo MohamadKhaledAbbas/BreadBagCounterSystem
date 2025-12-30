@@ -4,40 +4,49 @@ This document catalogs potential improvements, optimizations, and fixes identifi
 
 ## High Priority
 
-### 1. True Batch Inference Implementation (Implemented - Experimental ⚠️)
+### 1. True Batch Inference - NOT SUPPORTED BY hobot_dnn API
 
 **Location:** `src/detection/BpuDetector.py`, `src/classifier/BpuClassifyer.py`
 
-**Issue:** The original `predict_batch()` method in BpuDetector performed sequential processing (looping through frames one at a time) rather than leveraging true BPU batch inference capabilities.
+**Investigation Results:**
 
-**Impact:** Missing 40-60% potential speedup from hardware-level parallelism.
+After investigation and testing, **true batch inference (passing multiple frames in a single forward call) is NOT supported by the hobot_dnn Python API**. The API only accepts single inputs (batch size = 1). Attempting to pass a stacked tensor with multiple frames causes a **segmentation fault**.
 
-**Solution Implemented:**
-- Enhanced `predict_batch()` to attempt true batch inference by stacking frames and passing to BPU in a single forward call
-- Added automatic fallback to sequential processing if model doesn't support batch input
-- Added timing metrics to track true batch vs sequential usage
-- Added `predict_batch()` and `predict_batch_probs()` to BpuClassifier
+**Key Findings from Documentation:**
+- The `forward()` API in `hobot_dnn.pyeasy_dnn` only supports single input inference (batch size 1)
+- Batch input (N > 1) is not supported at the Python level
+- For batch processing, iterate over inputs and call the API for each sample
+- Reference: [RDK Documentation](https://developer.d-robotics.cc/rdk_doc/en/Basic_Application/pydev_demo_sample/basic_sample/)
 
-**Configuration Flags (all default to False for stability):**
-```python
-detection_batch_enabled: bool = True    # Batch accumulation (stable)
-detection_true_batch_enabled: bool = False  # EXPERIMENTAL - True BPU batch inference
-classification_batch_enabled: bool = False  # EXPERIMENTAL - Batch classification
-classification_true_batch_enabled: bool = False  # EXPERIMENTAL - True BPU batch for classification
-```
+**Current Implementation:**
+The existing `predict_batch()` method in BpuDetector already implements the correct approach:
+- Preprocesses frames in a batch (vectorized)
+- Processes inference sequentially (one frame at a time via `forward()`)
+- Postprocesses results in batch
 
-**How to Enable:** Set environment variables to enable experimental features after testing:
-```bash
-export DETECTION_TRUE_BATCH_ENABLED=true
-export CLASSIFICATION_BATCH_ENABLED=true
-export CLASSIFICATION_TRUE_BATCH_ENABLED=true
-```
+This is the optimal approach given the API limitations.
 
-**WARNING:** These features require models compiled with batch support. Enable only after verifying your model supports batched input.
+**Alternative Options (Future):**
+- Use C++ API if batch inference is supported there
+- Wait for hobot_dnn API updates that may add batch support
+- Consider alternative hardware platforms with native batch support
 
 ---
 
-### 2. Classification Service Batch Integration
+### 2. Existing Batch Processing Optimizations
+
+**Location:** `src/detection/BpuDetector.py`
+
+The current implementation already provides significant optimizations through:
+- **Batch preprocessing**: Multiple frames can be preprocessed in parallel
+- **Batch accumulation**: Frames are accumulated before processing
+- **Batch postprocessing**: Results are postprocessed together
+
+These optimizations reduce overhead compared to processing each frame completely independently.
+
+---
+
+### 3. Classification Service Batch Integration
 
 **Location:** `src/classifier/ClassifierService.py`
 
@@ -48,27 +57,11 @@ export CLASSIFICATION_TRUE_BATCH_ENABLED=true
 2. Calling `classifier.predict_batch()` or `classifier.predict_batch_probs()` in a single call
 3. Mapping results back to individual candidates
 
-**Estimated Impact:** 30-50% reduction in classification time for tracks with multiple ROIs.
-
-**Implementation Sketch:**
-```python
-# In ClassifierService.process():
-if tracking_config.classification_batch_enabled and len(candidates) > 1:
-    # Batch classification path
-    roi_images = [cand['roi'] for cand in candidates]
-    batch_results = self.classifier.predict_batch_probs(roi_images)
-    for idx, (label, conf, probs) in enumerate(batch_results):
-        classifications[idx]['label'] = label
-        classifications[idx]['confidence'] = conf
-        classifications[idx]['probs'] = probs
-else:
-    # Sequential path (existing code)
-    ...
-```
+**Note:** Due to hobot_dnn API limitations (batch inference not supported), this recommendation cannot be implemented directly. The classifier would still need to process ROIs sequentially at the inference level.
 
 ---
 
-### 3. NV12 Buffer Reuse in Batch Processing
+### 4. NV12 Buffer Reuse in Batch Processing
 
 **Location:** `src/detection/BpuDetector.py`, `src/classifier/BpuClassifyer.py`
 
@@ -232,13 +225,10 @@ COMPONENT_LOG_LEVELS = {
 
 **Location:** `tests/`
 
-**Issue:** New batch inference methods lack dedicated unit tests.
-
 **Recommendation:** Add tests for:
 - `BpuDetector.predict_batch()` with various batch sizes
-- `BpuClassifier.predict_batch()` and `predict_batch_probs()`
 - Error handling and fallback behavior
-- True batch vs sequential mode
+- Batch preprocessing performance
 
 ---
 
@@ -249,8 +239,7 @@ COMPONENT_LOG_LEVELS = {
 **Issue:** No standardized way to measure performance improvements.
 
 **Recommendation:** Create benchmark suite that:
-- Measures detection throughput (single vs batch)
-- Measures classification throughput (single vs batch)
+- Measures detection throughput with different batch sizes
 - Tracks latency percentiles (p50, p95, p99)
 - Outputs standardized reports
 
@@ -258,21 +247,15 @@ COMPONENT_LOG_LEVELS = {
 
 ## Configuration Recommendations
 
-### Production Settings (Conservative - Stable)
+### Production Settings
 
-For production use, start with these settings that prioritize stability:
+For production use, use these recommended settings:
 
 ```bash
 # Detection
 DETECTION_BATCH_ENABLED=true
-DETECTION_BATCH_SIZE=2  # Start conservative
-DETECTION_TRUE_BATCH_ENABLED=false  # Experimental - disabled by default
+DETECTION_BATCH_SIZE=2  # Start conservative, tune to 4 if latency allows
 DETECTION_QUEUE_ENABLED=true
-
-# Classification  
-CLASSIFICATION_BATCH_ENABLED=false  # Experimental - disabled by default
-CLASSIFICATION_BATCH_SIZE=8
-CLASSIFICATION_TRUE_BATCH_ENABLED=false  # Experimental - disabled by default
 
 # General
 DEGRADED_MODE_ENABLED=true
@@ -280,23 +263,17 @@ TEMPORAL_DECIMATION_ENABLED=true
 EARLY_REJECTION_ENABLED=true
 ```
 
-### Experimental Settings (Performance - Test First!)
-
-After verifying your models support batch input, you can enable experimental features:
-
-```bash
-# Enable true batch inference for potentially 40-60% speedup
-DETECTION_TRUE_BATCH_ENABLED=true
-CLASSIFICATION_BATCH_ENABLED=true
-CLASSIFICATION_TRUE_BATCH_ENABLED=true
-```
+**Note:** True batch inference (multiple frames in single BPU call) is NOT supported by the hobot_dnn Python API. The existing batch processing accumulates frames and processes them sequentially, which is the optimal approach given API limitations.
 
 ---
 
 ## Changelog
 
+- **2024-12-30**: Updated after investigation
+  - **IMPORTANT**: True batch inference (multiple frames in single forward call) is NOT supported by hobot_dnn Python API
+  - Reverted batch inference code that caused segmentation faults
+  - Documented API limitations and alternative approaches
+  - Updated recommendations to reflect actual API capabilities
 - **2024-12-30**: Initial document created
-  - Added true batch inference implementation (experimental)
   - Documented 15 potential improvements
   - Added configuration recommendations
-  - Set experimental batch features to disabled by default for stability
