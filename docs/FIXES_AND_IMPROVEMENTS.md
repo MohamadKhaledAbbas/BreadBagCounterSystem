@@ -6,34 +6,66 @@ This document catalogs potential improvements, optimizations, and fixes identifi
 
 ### Root Cause Analysis (December 2024)
 
-**Problem Statement:** Frame acquisition averages ~65ms (15 FPS), while detection only takes ~26.6ms. Where is the ~40ms gap?
+**Problem Statement:** Frame acquisition averages ~65ms (15 FPS), while detection only takes ~24-26ms. Where is the ~40ms gap?
 
-**Answer:** The ~40ms "gap" is **NOT a bug** - it's expected behavior due to the frame source rate limit.
+**Answer:** The ~40ms "gap" is **NOT a bug** - it's the **frame wait time**. Detection finishes fast and then waits for the next frame to arrive.
 
-**Key Finding:** The frame acquisition rate is limited by the **SpoolProcessor**, which runs in ACK-FREE mode with `target_fps=25.0`. This means:
-- SpoolProcessor publishes H.264 frames at 25 FPS target
-- Decoder processes H.264 → NV12 (takes variable time)
-- Detection is **faster** than the source (26.6ms detection = 37 FPS theoretical max)
-- The consumer (detection) waits idle for ~40ms between frames
-
-**Implication:** Detection performance is good! The bottleneck is upstream:
-1. SpoolProcessor target_fps limits output to 25 FPS
-2. Observed ~15 FPS suggests additional latency in decoder or network
-
-**To verify this diagnosis, check the new timing metrics:**
+**Timing Metrics Breakdown (from actual logs):**
 ```
-[Ros2FrameServer] Stats: ..., avg_callback=X.XXms (reshape=X.XXms, nv12_copy=X.XXms, bgr_cvt=X.XXms)
-[BagCounterApp] Frame acquisition stats: frames=X, avg_interval=X.Xms, acquisition_fps=X.X, avg_detect=X.Xms, theoretical_max_fps=X.X, bottleneck=source, nv12=yes
+[BpuDetector] Avg timing: preprocess=1.56ms (6.4%), inference=16.51ms (67.7%), postprocess=6.32ms (25.9%), total=24.38ms, nv12_path=100%
+[LogicThread] Avg timing: queue_dequeue=39.34ms, packet_extract=0.03ms, detection=25.45ms, total=64.91ms, nv12_used=yes
 ```
 
-- `bottleneck=source` confirms the frame source is slower than detection
-- `theoretical_max_fps` shows what FPS detection could handle if fed faster
-- `nv12=yes` confirms NV12 direct path is being used
+**Key Insight:** `queue_dequeue=39.34ms` is NOT processing time - it's **waiting time** for the next frame to arrive.
+
+**Why this happens:**
+1. SpoolProcessor publishes at `target_fps=25` → 40ms intervals between frames
+2. Detection takes only ~25ms
+3. After detection completes, logic thread waits ~40ms for the next frame
+4. Total frame-to-frame time: ~65ms = ~15 FPS observed
+
+**Visualization:**
+```
+Time: 0ms      25ms      40ms      65ms      90ms      105ms
+      |--DETECT--|--WAIT--|--DETECT--|--WAIT--|--DETECT--| ...
+      Frame 1            Frame 2            Frame 3
+```
+
+**The NV12 optimization IS working:**
+- `nv12_path=100%` confirms all frames use direct NV12 path
+- `preprocess=1.56ms` is very fast (no BGR→NV12 conversion needed)
+- Detection total is ~24ms (excellent for 1080p on BPU)
+
+**Why detection is faster than observed FPS:**
+- Detection could handle ~40 FPS (1000ms / 25ms)
+- But frames only arrive at ~15 FPS (SpoolProcessor + decoder latency)
+- Detection is **bottlenecked by frame source**, not by processing
 
 **Potential Solutions:**
-1. Increase `spool_target_fps` in SpoolProcessor config (if decoder can keep up)
-2. Investigate decoder performance and network latency
-3. Consider frame buffering to smooth variable decoder latency
+
+1. **Increase SpoolProcessor target_fps** (RECOMMENDED):
+   ```bash
+   # In database config table, set:
+   spool_target_fps = 30  # or higher
+   ```
+   This will reduce frame interval from 40ms to ~33ms, improving max FPS.
+
+2. **Investigate decoder latency**:
+   - Check if decoder can keep up with higher target_fps
+   - Monitor decoder queue size and latency
+   - Consider H.265/HEVC for better compression
+
+3. **Network optimization** (if frames arrive over network):
+   - Increase network buffer sizes
+   - Use UDP for lower latency
+   - Consider local processing if possible
+
+4. **Frame prefetching/pipelining** (ADVANCED):
+   - Start preprocessing next frame while current frame is being detected
+   - Requires careful synchronization
+   - May increase memory usage
+
+---
 
 ---
 

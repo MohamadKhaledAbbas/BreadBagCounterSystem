@@ -243,7 +243,6 @@ class FrameServer(Node, FrameSource):
                 # V6: Add timing stats for non-accuracy mode too
                 stats_msg += timing_stats_str
                 logger.info(stats_msg)
-                logger.info(stats_msg)
             self.last_stats_log_time = now
         
         # V6: Time each operation
