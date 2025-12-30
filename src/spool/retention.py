@@ -70,6 +70,7 @@ class RetentionPolicy:
     - Safe deletion (only closed .bin files)
     - Background cleanup thread option
     - Statistics tracking
+    - V6: Processor progress awareness (retention safety)
     
     Usage:
         policy = RetentionPolicy('/path/to/spool', retention_seconds=180)
@@ -77,6 +78,9 @@ class RetentionPolicy:
         
         # Or manual cleanup:
         deleted = policy.cleanup_once()
+        
+        # V6: Set processor progress to prevent deleting unprocessed data
+        policy.set_last_processed_frame(frame_index)
         
         policy.stop()
     """
@@ -86,7 +90,8 @@ class RetentionPolicy:
         spool_dir: str,
         retention_seconds: float = 180.0,
         cleanup_interval: float = 10.0,
-        min_segments_to_keep: int = 2
+        min_segments_to_keep: int = 2,
+        retention_safety_enabled: bool = True
     ):
         """
         Initialize the retention policy.
@@ -96,20 +101,46 @@ class RetentionPolicy:
             retention_seconds: Maximum age of segments before deletion
             cleanup_interval: Interval between cleanup checks
             min_segments_to_keep: Minimum segments to always keep
+            retention_safety_enabled: V6 - Enable processor progress awareness
         """
         self.spool_dir = Path(spool_dir)
         self.retention_seconds = retention_seconds
         self.cleanup_interval = cleanup_interval
         self.min_segments_to_keep = min_segments_to_keep
+        self.retention_safety_enabled = retention_safety_enabled
         
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         
+        # V6: Processor progress tracking for retention safety
+        self._last_processed_frame: int = 0
+        self._progress_lock = threading.Lock()
+        
         # Statistics
         self.segments_deleted: int = 0
         self.bytes_recovered: int = 0
         self.last_cleanup_time: float = 0.0
+        self.segments_protected_by_progress: int = 0  # V6: Track protected segments
+    
+    def set_last_processed_frame(self, frame_index: int):
+        """
+        V6: Update the last processed frame index.
+        
+        Retention will never delete segments containing frames beyond this index.
+        This ensures processor progress is respected and unprocessed data is preserved.
+        
+        Args:
+            frame_index: Frame index of the last fully processed frame
+        """
+        with self._progress_lock:
+            if frame_index > self._last_processed_frame:
+                self._last_processed_frame = frame_index
+    
+    def get_last_processed_frame(self) -> int:
+        """Get the last processed frame index."""
+        with self._progress_lock:
+            return self._last_processed_frame
     
     def list_segments(self) -> List[Tuple[int, Path, float, int]]:
         """
@@ -128,9 +159,31 @@ class RetentionPolicy:
                 continue
         return sorted(segments, key=lambda x: x[0])
     
+    def _get_segment_frame_range(self, segment_path: Path) -> Optional[Tuple[int, int]]:
+        """
+        V6: Get the frame range for a segment from its metadata.
+        
+        Returns:
+            Tuple of (start_frame, end_frame) or None if not available
+        """
+        meta_path = segment_path.with_suffix('.meta.json')
+        if not meta_path.exists():
+            return None
+        
+        try:
+            import json
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            return (meta.get('start_frame', 0), meta.get('end_frame', 0))
+        except Exception:
+            return None
+    
     def get_expired_segments(self) -> List[Tuple[int, Path, int]]:
         """
         Get list of segments that have exceeded retention.
+        
+        V6: Respects processor progress - segments containing unprocessed frames
+        are protected from deletion regardless of age.
         
         Returns:
             List of tuples (segment_num, path, size) for expired segments
@@ -142,11 +195,28 @@ class RetentionPolicy:
         if len(segments) <= self.min_segments_to_keep:
             return []
         
+        # V6: Get last processed frame for safety check
+        last_processed = self.get_last_processed_frame()
+        
         # Find expired segments (exclude newest min_segments_to_keep)
         expired = []
         for seg_num, path, mtime, size in segments[:-self.min_segments_to_keep]:
             age = current_time - mtime
             if age > self.retention_seconds:
+                # V6: Check if segment contains unprocessed frames
+                if self.retention_safety_enabled and last_processed > 0:
+                    frame_range = self._get_segment_frame_range(path)
+                    if frame_range is not None:
+                        start_frame, end_frame = frame_range
+                        if end_frame > last_processed:
+                            # Segment contains unprocessed frames - protect it
+                            logger.debug(
+                                f"[Retention] Protected segment {seg_num}: contains unprocessed frames "
+                                f"(segment_end={end_frame}, last_processed={last_processed})"
+                            )
+                            self.segments_protected_by_progress += 1
+                            continue
+                
                 expired.append((seg_num, path, size))
         
         return expired
@@ -261,6 +331,10 @@ class RetentionPolicy:
             'bytes_recovered': self.bytes_recovered,
             'bytes_recovered_mb': self.bytes_recovered / (1024 * 1024),
             'last_cleanup_time': self.last_cleanup_time,
+            # V6: Retention safety stats
+            'retention_safety_enabled': self.retention_safety_enabled,
+            'last_processed_frame': self.get_last_processed_frame(),
+            'segments_protected_by_progress': self.segments_protected_by_progress,
         }
 
 

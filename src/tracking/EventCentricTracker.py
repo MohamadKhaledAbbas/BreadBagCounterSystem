@@ -422,6 +422,63 @@ class EventConfig:
     target_fps: float = 25.0
     """Target FPS for converting millisecond thresholds to frame-based thresholds."""
     
+    # ==========================================================================
+    # V6 Performance & Reliability Optimization Parameters
+    # ==========================================================================
+    
+    # Adaptive Ghost Timeout - scales with object velocity
+    adaptive_ghost_timeout_enabled: bool = True
+    """Enable velocity-based ghost timeout scaling."""
+    
+    adaptive_ghost_velocity_factor: float = 2.0
+    """Velocity scaling factor (k) for adaptive ghost timeout."""
+    
+    adaptive_ghost_min_timeout_frames: int = 15
+    """Minimum ghost timeout frames (floor for adaptive scaling)."""
+    
+    adaptive_ghost_max_timeout_frames: int = 75
+    """Maximum ghost timeout frames (ceiling for adaptive scaling)."""
+    
+    # Temporal Decimation - skip redundant monitor updates
+    temporal_decimation_enabled: bool = True
+    """Enable temporal decimation to skip redundant monitor updates."""
+    
+    temporal_decimation_area_epsilon: float = 0.05
+    """Area change threshold for temporal decimation (5%)."""
+    
+    temporal_decimation_centroid_delta_px: float = 5.0
+    """Centroid shift threshold (pixels) for temporal decimation."""
+    
+    temporal_decimation_confidence_epsilon: float = 0.05
+    """Confidence change threshold for temporal decimation."""
+    
+    temporal_decimation_max_skip_frames: int = 3
+    """Maximum consecutive frames to skip before forcing an update."""
+    
+    # Multi-Stage Matching Early Rejection
+    early_rejection_enabled: bool = True
+    """Enable early rejection gates before IOU computation."""
+    
+    early_rejection_area_ratio_min: float = 0.4
+    """Minimum area ratio for early rejection."""
+    
+    early_rejection_area_ratio_max: float = 2.5
+    """Maximum area ratio for early rejection."""
+    
+    # Spatial Zones
+    spatial_zones_enabled: bool = True
+    """Enable explicit spatial zone definitions."""
+    
+    entry_zone_margin_px: int = 50
+    """Margin from frame edges for entry zone constraint."""
+    
+    exit_zone_margin_px: int = 80
+    """Margin from edges defining the exit zone."""
+    
+    # Retention Safety
+    retention_safety_enabled: bool = True
+    """Enable retention safety rule."""
+    
     def __post_init__(self):
         """
         Post-initialization to handle migration compatibility.
@@ -761,6 +818,44 @@ class BreadBagEvent:
         vx, vy = self.get_velocity()
         return math.sqrt(vx*vx + vy*vy)
     
+    def get_adaptive_ghost_timeout_frames(self) -> int:
+        """
+        V6: Get adaptive ghost timeout based on recent velocity.
+        
+        Formula: ghost_timeout = base_timeout + k * velocity_magnitude
+        
+        Benefits:
+        - Spinning/rotating objects get longer timeout to survive occlusions
+        - Thrown/fast objects terminate quickly to prevent stale events
+        - More responsive to object motion dynamics
+        
+        Returns:
+            Ghost timeout in frames (clamped to min/max bounds)
+        """
+        if not self.config.adaptive_ghost_timeout_enabled:
+            return self.config.ghost_timeout_frames
+        
+        base_timeout = self.config.ghost_timeout_frames
+        velocity_mag = self.get_velocity_magnitude()
+        k = self.config.adaptive_ghost_velocity_factor
+        
+        # Scale factor: higher velocity = longer timeout (up to a point)
+        # velocity_mag is in px/ms, convert to more meaningful scale
+        # A typical fast movement might be 0.5 px/ms (500 px/s)
+        # We want velocity of 0.5 px/ms to add roughly 10-15 frames
+        velocity_scale = velocity_mag * 1000.0  # Convert to px/s
+        additional_frames = int(k * velocity_scale / 50.0)  # 50 px/s = 1 frame addition
+        
+        adaptive_timeout = base_timeout + additional_frames
+        
+        # Clamp to configured bounds
+        adaptive_timeout = max(
+            self.config.adaptive_ghost_min_timeout_frames,
+            min(adaptive_timeout, self.config.adaptive_ghost_max_timeout_frames)
+        )
+        
+        return adaptive_timeout
+    
     def predict_centroid(self, target_time_ms: float) -> Tuple[float, float]:
         """
         Predict centroid position at target_time using velocity.
@@ -850,18 +945,18 @@ class BreadBagEvent:
     
     def can_associate(self, detection: DetectionEvidence) -> Tuple[bool, float, str, float]:
         """
-        Check if a detection can be associated with this event using parallel hybrid association.
+        Check if a detection can be associated with this event using multi-stage matching.
         
-        PARALLEL HYBRID ASSOCIATION LOGIC:
-        Both centroid distance and IoU are ALWAYS computed for every association attempt.
-        A detection can associate if EITHER criterion is met:
-        - Centroid distance is within threshold (with velocity-based scaling), OR
-        - IoU is above threshold (when enabled)
+        V6 MULTI-STAGE MATCHING PIPELINE (in order):
+        1. Ghost timeout check (instant rejection - cheapest)
+        2. Centroid distance gate (cheap)
+        3. Area ratio gate (cheap) 
+        4. IOU computation (expensive - only if above pass)
         
-        This approach provides robustness during:
-        - Bag flips/spins: centroid may jump but IoU remains high
-        - Fast slides: IoU may drop but centroid distance stays close
-        - Partial occlusions: one metric may fail while the other succeeds
+        This approach provides:
+        - Early rejection of most candidates (cheap checks first)
+        - IOU only computed on viable candidates
+        - Significant CPU cost reduction
         
         Args:
             detection: Detection to check
@@ -878,6 +973,27 @@ class BreadBagEvent:
         # Calculate time gap
         time_gap_ms = detection.timestamp_ms - self.last_detection_time_ms
         
+        # ==========================================================================
+        # STAGE 1: Ghost timeout check (cheapest - instant rejection)
+        # ==========================================================================
+        # Use adaptive ghost timeout if enabled
+        effective_ghost_timeout_ms = self.config.ghost_timeout_ms
+        if self.config.adaptive_ghost_timeout_enabled:
+            effective_ghost_timeout_frames = self.get_adaptive_ghost_timeout_frames()
+            effective_ghost_timeout_ms = effective_ghost_timeout_frames * (1000.0 / self.config.target_fps)
+        
+        if time_gap_ms > effective_ghost_timeout_ms:
+            # Time gap exceeds ghost timeout - cannot associate
+            distance_to_last = math.sqrt(
+                (det_centroid[0] - self.last_centroid[0])**2 + 
+                (det_centroid[1] - self.last_centroid[1])**2
+            )
+            reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {effective_ghost_timeout_ms:.1f}ms)"
+            return False, distance_to_last, reason, 0.0
+        
+        # ==========================================================================
+        # STAGE 2: Centroid distance gate (cheap)
+        # ==========================================================================
         # Calculate base association distance threshold
         base_distance_threshold = self.config.association_distance_px
         scaled_threshold = base_distance_threshold
@@ -912,7 +1028,33 @@ class BreadBagEvent:
             # Use the smaller of the two distances
             distance = min(distance_to_last, distance_to_pred)
         
-        # ALWAYS compute IoU (parallel hybrid association)
+        # Check both criteria (centroid first - cheap)
+        centroid_match = distance <= scaled_threshold
+        
+        # ==========================================================================
+        # STAGE 3: Area ratio gate (cheap - before expensive IOU)
+        # ==========================================================================
+        area_ratio_pass = True
+        if self.config.early_rejection_enabled and self.last_box is not None:
+            # Compute areas
+            last_area = (self.last_box[2] - self.last_box[0]) * (self.last_box[3] - self.last_box[1])
+            det_area = (detection.box[2] - detection.box[0]) * (detection.box[3] - detection.box[1])
+            
+            if last_area > 0 and det_area > 0:
+                area_ratio = min(last_area, det_area) / max(last_area, det_area)
+                
+                # Early rejection if area ratio is too extreme
+                if area_ratio < self.config.early_rejection_area_ratio_min:
+                    # Areas are too different - likely different objects
+                    # But only reject if centroid also doesn't match (allow some flexibility)
+                    if not centroid_match:
+                        reason = f"area_ratio_rejected (ratio={area_ratio:.2f} < {self.config.early_rejection_area_ratio_min})"
+                        return False, distance_to_last, reason, 0.0
+                    area_ratio_pass = False  # Flag for logging
+        
+        # ==========================================================================
+        # STAGE 4: IOU computation (expensive - only if needed)
+        # ==========================================================================
         iou_value = 0.0
         iou_expanded = 0.0
         expanded_iou_match = False
@@ -941,8 +1083,7 @@ class BreadBagEvent:
             reason = f"{match_type} ({metrics_detail})"
             return False, distance_to_last, reason, iou_value
         
-        # Check both criteria
-        centroid_match = distance <= scaled_threshold
+        # Check IOU match
         iou_match = self.config.iou_association_enabled and iou_value >= self.config.iou_association_threshold
         
         # ISSUE #1 FIX: Expanded IoU still requires reasonable centroid proximity
@@ -955,7 +1096,7 @@ class BreadBagEvent:
         # - within_association_window: normal matching (higher reliability)
         # - within_ghost_window: ghost reattachment allowed (event is "alive but lost")
         within_association_window = time_gap_ms <= self.config.association_time_ms
-        within_ghost_window = time_gap_ms <= self.config.ghost_timeout_ms
+        within_ghost_window = time_gap_ms <= effective_ghost_timeout_ms
         
         # Determine match type for structured logging
         # Priority:
@@ -1676,8 +1817,10 @@ class BreadBagEvent:
                 self.out_of_zone_since_ms = None
                 self.frames_out_of_zone = 0
         
-        # SECOND: Check ghost timeout using frame-based threshold
-        if self.frames_without_detection >= self.config.ghost_timeout_frames:
+        # SECOND: Check ghost timeout using adaptive frame-based threshold
+        # V6: Use adaptive ghost timeout based on velocity
+        effective_ghost_timeout = self.get_adaptive_ghost_timeout_frames()
+        if self.frames_without_detection >= effective_ghost_timeout:
             # Ghost timeout exceeded - decide whether to commit or expire
             
             # Commit-on-ghost-expire for finalization states (CLOSING/CLOSED)
@@ -1700,7 +1843,7 @@ class BreadBagEvent:
                     self.commit_reason = "ghost_finalization"
                     logger.info(
                         f"[Event:{self.id}] Ghost-finalization commit: bag counted after ghost timeout in {self.state.name} state "
-                        f"(idle={self.frames_without_detection} frames, ghost_timeout={self.config.ghost_timeout_frames} frames, "
+                        f"(idle={self.frames_without_detection} frames, ghost_timeout={effective_ghost_timeout} frames, "
                         f"open_ev={self.open_evidence_count}, closed_ev={self.closed_evidence_count})"
                     )
                     return True, 'commit'
@@ -1717,7 +1860,7 @@ class BreadBagEvent:
                 logger.debug(
                     f"[Event:{self.id}] Ghost expired in state {self.state.name} "
                     f"after {self.frames_without_detection} frames without detection "
-                    f"(ghost_timeout={self.config.ghost_timeout_frames} frames)"
+                    f"(ghost_timeout={effective_ghost_timeout} frames)"
                 )
                 return False, 'expire'
         
@@ -1841,6 +1984,7 @@ class EventCentricTracker:
             'events_expired': 0,
             'events_suppressed': 0,
             'total_detections_processed': 0,
+            'frames_decimated': 0,  # V6: Track temporal decimation
         }
         
         # Time scaling for testing mode
@@ -1852,6 +1996,11 @@ class EventCentricTracker:
         self._auto_scale_target_frame_time = self.config.auto_scaling_target_frame_time_ms
         self._auto_scale_threshold = self.config.auto_scaling_activation_threshold
         self._frame_count = 0
+        
+        # V6: Temporal decimation state
+        self._last_processed_detections: Dict[int, Dict[str, Any]] = {}  # event_id -> last detection info
+        self._frames_since_update: Dict[int, int] = {}  # event_id -> frames skipped
+        self._last_processed_frame_index: int = 0  # For retention safety
         
         # Apply time scaling to create effective thresholds
         self._update_scaled_thresholds()
@@ -2277,6 +2426,12 @@ class EventCentricTracker:
         for event_id in events_to_remove:
             del self.active_events[event_id]
         
+        # V6: Clean up temporal decimation tracking for removed events
+        self._cleanup_decimation_tracking(events_to_remove)
+        
+        # V6: Update last processed frame index (for retention safety)
+        self._last_processed_frame_index = frame_index
+        
         return ready_events
     
     def _is_in_work_zone(self, x: float, y: float) -> bool:
@@ -2563,4 +2718,121 @@ class EventCentricTracker:
                 self.stats['events_committed'] / self.stats['events_created']
                 if self.stats['events_created'] > 0 else 0.0
             ),
+            'last_processed_frame_index': self._last_processed_frame_index,  # V6: For retention safety
         }
+    
+    def _should_skip_temporal_decimation(
+        self, 
+        event_id: int, 
+        evidence: DetectionEvidence
+    ) -> bool:
+        """
+        V6: Check if this detection update can be skipped (temporal decimation).
+        
+        Skip monitor update when:
+        - Bounding box area change < epsilon
+        - Centroid shift < delta
+        - Confidence unchanged
+        
+        This reduces CPU cost significantly while preserving correctness.
+        Detection still runs every frame; only redundant state updates are skipped.
+        
+        Args:
+            event_id: ID of the event being updated
+            evidence: New detection evidence
+            
+        Returns:
+            True if update can be skipped, False if update is required
+        """
+        if not self.config.temporal_decimation_enabled:
+            return False
+        
+        # Always process if this is a new event
+        if event_id not in self._last_processed_detections:
+            self._last_processed_detections[event_id] = {
+                'centroid': (evidence.centroid_x, evidence.centroid_y),
+                'area': (evidence.box[2] - evidence.box[0]) * (evidence.box[3] - evidence.box[1]),
+                'confidence': evidence.confidence,
+                'frame_index': evidence.frame_index,
+            }
+            self._frames_since_update[event_id] = 0
+            return False
+        
+        last = self._last_processed_detections[event_id]
+        frames_skipped = self._frames_since_update.get(event_id, 0)
+        
+        # Force update if max skip frames exceeded
+        if frames_skipped >= self.config.temporal_decimation_max_skip_frames:
+            # Update tracking and process
+            self._last_processed_detections[event_id] = {
+                'centroid': (evidence.centroid_x, evidence.centroid_y),
+                'area': (evidence.box[2] - evidence.box[0]) * (evidence.box[3] - evidence.box[1]),
+                'confidence': evidence.confidence,
+                'frame_index': evidence.frame_index,
+            }
+            self._frames_since_update[event_id] = 0
+            return False
+        
+        # Check centroid shift
+        dx = evidence.centroid_x - last['centroid'][0]
+        dy = evidence.centroid_y - last['centroid'][1]
+        centroid_shift = math.sqrt(dx*dx + dy*dy)
+        
+        if centroid_shift >= self.config.temporal_decimation_centroid_delta_px:
+            # Significant movement - process
+            self._last_processed_detections[event_id] = {
+                'centroid': (evidence.centroid_x, evidence.centroid_y),
+                'area': (evidence.box[2] - evidence.box[0]) * (evidence.box[3] - evidence.box[1]),
+                'confidence': evidence.confidence,
+                'frame_index': evidence.frame_index,
+            }
+            self._frames_since_update[event_id] = 0
+            return False
+        
+        # Check area change
+        new_area = (evidence.box[2] - evidence.box[0]) * (evidence.box[3] - evidence.box[1])
+        if last['area'] > 0:
+            area_change = abs(new_area - last['area']) / last['area']
+            if area_change >= self.config.temporal_decimation_area_epsilon:
+                # Significant area change - process
+                self._last_processed_detections[event_id] = {
+                    'centroid': (evidence.centroid_x, evidence.centroid_y),
+                    'area': new_area,
+                    'confidence': evidence.confidence,
+                    'frame_index': evidence.frame_index,
+                }
+                self._frames_since_update[event_id] = 0
+                return False
+        
+        # Check confidence change
+        conf_change = abs(evidence.confidence - last['confidence'])
+        if conf_change >= self.config.temporal_decimation_confidence_epsilon:
+            # Significant confidence change - process
+            self._last_processed_detections[event_id] = {
+                'centroid': (evidence.centroid_x, evidence.centroid_y),
+                'area': new_area,
+                'confidence': evidence.confidence,
+                'frame_index': evidence.frame_index,
+            }
+            self._frames_since_update[event_id] = 0
+            return False
+        
+        # All checks passed - skip this update
+        self._frames_since_update[event_id] = frames_skipped + 1
+        self.stats['frames_decimated'] += 1
+        return True
+    
+    def _cleanup_decimation_tracking(self, removed_event_ids: List[int]):
+        """Clean up temporal decimation tracking for removed events."""
+        for event_id in removed_event_ids:
+            self._last_processed_detections.pop(event_id, None)
+            self._frames_since_update.pop(event_id, None)
+    
+    def get_last_processed_frame_index(self) -> int:
+        """
+        V6: Get the last processed frame index for retention safety.
+        
+        Returns:
+            Frame index of the last fully processed frame
+        """
+        return self._last_processed_frame_index

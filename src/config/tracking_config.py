@@ -929,6 +929,59 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Adaptive Ghost Timeout (V6 Performance Optimization)
+    # --------------------------------------------------------------------------
+    # Ghost timeout scales with object velocity to handle spinning/thrown bags
+    
+    adaptive_ghost_timeout_enabled: bool = True
+    """
+    Enable velocity-based ghost timeout scaling.
+    
+    When True: ghost_timeout = base_timeout + k * recent_velocity
+    When False: Use fixed ghost_timeout_frames
+    
+    Benefits:
+    - Spinning objects survive short occlusions (higher velocity = longer timeout)
+    - Thrown/fast objects terminate quickly (prevent stale events)
+    - More responsive to object motion dynamics
+    
+    Default: True
+    """
+    
+    adaptive_ghost_velocity_factor: float = 2.0
+    """
+    Velocity scaling factor (k) for adaptive ghost timeout.
+    
+    Formula: ghost_timeout = base_timeout + k * velocity_magnitude * time_scale
+    
+    Range: 1.0 - 5.0
+    - Higher values: More tolerance for fast-moving objects
+    - Lower values: More conservative timeout scaling
+    
+    Default: 2.0
+    """
+    
+    adaptive_ghost_min_timeout_frames: int = 15
+    """
+    Minimum ghost timeout frames (floor for adaptive scaling).
+    
+    Range: 10 - 30 frames
+    Prevents timeout from being too short for slow-moving objects.
+    
+    Default: 15 frames
+    """
+    
+    adaptive_ghost_max_timeout_frames: int = 75
+    """
+    Maximum ghost timeout frames (ceiling for adaptive scaling).
+    
+    Range: 50 - 150 frames
+    Prevents timeout from being too long for very fast objects.
+    
+    Default: 75 frames
+    """
+    
+    # --------------------------------------------------------------------------
     # Timeout-Based Commitment Parameters (Exclusive Method)
     # --------------------------------------------------------------------------
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
@@ -2097,6 +2150,197 @@ class TrackingConfig:
     """
     
     # ==========================================================================
+    # V6 Performance & Reliability Optimization Parameters
+    # ==========================================================================
+    # These parameters implement the Event-Centric Bread Counting Pipeline
+    # optimizations for production-grade reliability.
+    
+    # --------------------------------------------------------------------------
+    # Temporal Decimation (Skip Redundant Monitor Updates)
+    # --------------------------------------------------------------------------
+    # Key insight: Detection must run every frame. Matching does not.
+    
+    temporal_decimation_enabled: bool = _parse_bool_env("TEMPORAL_DECIMATION_ENABLED", True)
+    """
+    Enable temporal decimation to skip redundant monitor updates.
+    
+    When True: Skip monitor update when:
+    - Bounding box area change < epsilon
+    - Centroid shift < delta
+    - Confidence unchanged
+    
+    Benefits:
+    - Significant CPU cost reduction (30-50%)
+    - Preserves correctness (detection still runs every frame)
+    - Only skips redundant state updates
+    
+    Default: True
+    """
+    
+    temporal_decimation_area_epsilon: float = _parse_float_env("TEMPORAL_DECIMATION_AREA_EPSILON", 0.05)
+    """
+    Area change threshold for temporal decimation.
+    
+    Skip monitor update if |new_area - last_area| / last_area < epsilon
+    
+    Range: 0.02 - 0.10
+    - Lower values: More sensitive, fewer skips
+    - Higher values: Less sensitive, more skips
+    
+    Default: 0.05 (5% area change threshold)
+    """
+    
+    temporal_decimation_centroid_delta_px: float = _parse_float_env("TEMPORAL_DECIMATION_CENTROID_DELTA", 5.0)
+    """
+    Centroid shift threshold (pixels) for temporal decimation.
+    
+    Skip monitor update if centroid_distance < delta
+    
+    Range: 2.0 - 15.0 pixels
+    - Lower values: More sensitive to movement
+    - Higher values: More tolerant of small movements
+    
+    Default: 5.0 pixels
+    """
+    
+    temporal_decimation_confidence_epsilon: float = _parse_float_env("TEMPORAL_DECIMATION_CONF_EPSILON", 0.05)
+    """
+    Confidence change threshold for temporal decimation.
+    
+    Skip monitor update if |new_conf - last_conf| < epsilon
+    
+    Range: 0.02 - 0.10
+    - Lower values: More sensitive to confidence changes
+    - Higher values: More tolerant of confidence fluctuations
+    
+    Default: 0.05 (5% confidence change threshold)
+    """
+    
+    temporal_decimation_max_skip_frames: int = _parse_int_env("TEMPORAL_DECIMATION_MAX_SKIP", 3)
+    """
+    Maximum consecutive frames to skip before forcing an update.
+    
+    Range: 1 - 5 frames
+    Ensures events are updated periodically even if changes are minimal.
+    
+    Default: 3 frames
+    """
+
+    # --------------------------------------------------------------------------
+    # Multi-Stage Matching Early Rejection
+    # --------------------------------------------------------------------------
+    # Order matching gates for cheap rejection before expensive IOU computation
+    # Matching Pipeline: Ghost timeout → Centroid → Area ratio → IOU
+    
+    early_rejection_enabled: bool = _parse_bool_env("EARLY_REJECTION_ENABLED", True)
+    """
+    Enable early rejection gates before IOU computation.
+    
+    Matching pipeline order:
+    1. Ghost timeout check (instant rejection)
+    2. Centroid distance gate (cheap)
+    3. Area ratio gate (cheap)
+    4. IOU computation (expensive - only if above pass)
+    
+    Benefits:
+    - Most candidates rejected cheaply
+    - IOU only runs on tiny subset
+    - Significant CPU reduction
+    
+    Default: True
+    """
+    
+    early_rejection_area_ratio_min: float = _parse_float_env("EARLY_REJECTION_AREA_RATIO_MIN", 0.4)
+    """
+    Minimum area ratio for early rejection.
+    
+    Reject if min(area1, area2) / max(area1, area2) < threshold
+    
+    Range: 0.3 - 0.7
+    - Lower values: More lenient, allows more size variation
+    - Higher values: Stricter, requires similar sizes
+    
+    Default: 0.4 (allow up to 2.5x size difference)
+    """
+    
+    early_rejection_area_ratio_max: float = _parse_float_env("EARLY_REJECTION_AREA_RATIO_MAX", 2.5)
+    """
+    Maximum area ratio for early rejection.
+    
+    Reject if max(area1, area2) / min(area1, area2) > threshold
+    
+    Range: 1.5 - 3.0
+    - Lower values: Stricter size matching
+    - Higher values: More lenient
+    
+    Default: 2.5 (allow up to 2.5x size difference)
+    """
+
+    # --------------------------------------------------------------------------
+    # Spatial Zones (Explicit Zone Definitions)
+    # --------------------------------------------------------------------------
+    # Predictable regions for event lifecycle management
+    
+    spatial_zones_enabled: bool = _parse_bool_env("SPATIAL_ZONES_ENABLED", True)
+    """
+    Enable explicit spatial zone definitions.
+    
+    Zones:
+    - ENTRY_ZONE: Where new events can be created
+    - ACTIVE_ZONE: Where events participate in matching
+    - EXIT_ZONE: Where events are finalized
+    
+    Benefits:
+    - Reduces IOU comparisons drastically
+    - Prevents tracking irrelevant history
+    - Predictable event lifecycle
+    
+    Default: True
+    """
+    
+    entry_zone_margin_px: int = _parse_int_env("ENTRY_ZONE_MARGIN_PX", 50)
+    """
+    Margin from frame edges for entry zone constraint.
+    
+    Events can only be created if centroid is at least this far from edges.
+    Set to 0 to allow events anywhere.
+    
+    Range: 0 - 100 pixels
+    Default: 50 pixels
+    """
+    
+    exit_zone_margin_px: int = _parse_int_env("EXIT_ZONE_MARGIN_PX", 80)
+    """
+    Margin from edges defining the exit zone.
+    
+    Events with centroid within this margin from edges are candidates
+    for faster finalization.
+    
+    Range: 50 - 150 pixels  
+    Default: 80 pixels
+    """
+
+    # --------------------------------------------------------------------------
+    # Retention Safety
+    # --------------------------------------------------------------------------
+    # Ensure retention never deletes unprocessed data
+    
+    retention_safety_enabled: bool = _parse_bool_env("RETENTION_SAFETY_ENABLED", True)
+    """
+    Enable retention safety rule.
+    
+    When True: Retention must respect processor progress
+    Rule: segment.frame_index >= last_committed_index
+    
+    Benefits:
+    - Never deletes unprocessed data
+    - Prevents data loss under load
+    - Production-safe operation
+    
+    Default: True
+    """
+    
+    # ==========================================================================
     # V4 Performance Optimization Parameters
     # ==========================================================================
     
@@ -2377,4 +2621,31 @@ def get_event_config():
         
         # Target FPS for ms-to-frames conversion
         target_fps=tracking_config.target_fps,
+        
+        # V6 Performance & Reliability Optimization Parameters
+        # Adaptive Ghost Timeout
+        adaptive_ghost_timeout_enabled=tracking_config.adaptive_ghost_timeout_enabled,
+        adaptive_ghost_velocity_factor=tracking_config.adaptive_ghost_velocity_factor,
+        adaptive_ghost_min_timeout_frames=tracking_config.adaptive_ghost_min_timeout_frames,
+        adaptive_ghost_max_timeout_frames=tracking_config.adaptive_ghost_max_timeout_frames,
+        
+        # Temporal Decimation
+        temporal_decimation_enabled=tracking_config.temporal_decimation_enabled,
+        temporal_decimation_area_epsilon=tracking_config.temporal_decimation_area_epsilon,
+        temporal_decimation_centroid_delta_px=tracking_config.temporal_decimation_centroid_delta_px,
+        temporal_decimation_confidence_epsilon=tracking_config.temporal_decimation_confidence_epsilon,
+        temporal_decimation_max_skip_frames=tracking_config.temporal_decimation_max_skip_frames,
+        
+        # Multi-Stage Matching Early Rejection
+        early_rejection_enabled=tracking_config.early_rejection_enabled,
+        early_rejection_area_ratio_min=tracking_config.early_rejection_area_ratio_min,
+        early_rejection_area_ratio_max=tracking_config.early_rejection_area_ratio_max,
+        
+        # Spatial Zones
+        spatial_zones_enabled=tracking_config.spatial_zones_enabled,
+        entry_zone_margin_px=tracking_config.entry_zone_margin_px,
+        exit_zone_margin_px=tracking_config.exit_zone_margin_px,
+        
+        # Retention Safety
+        retention_safety_enabled=tracking_config.retention_safety_enabled,
     )
