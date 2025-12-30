@@ -227,31 +227,45 @@ class RetentionPolicy:
         return expired
 ```
 
-### SpoolProcessor (Non-Blocking Mode)
+### SpoolProcessor (ACK-Free Mode - V6)
 
 ```python
 class SpoolProcessorNode:
-    def _processor_loop(self):
-        """Non-blocking processing loop."""
+    def _processor_loop_ack_free(self):
+        """V6 ACK-Free Processing Loop (Production-Grade)."""
+        frame_interval = 1.0 / self.config.target_fps
+        last_publish_time = 0.0
+        
         while self._running:
             frame = self._get_next_frame()
             if frame is None:
                 time.sleep(self.config.poll_interval)
                 continue
             
-            # Publish frame immediately (no waiting for ACK)
+            # Pace to target FPS
+            current_time = time.time()
+            elapsed = current_time - last_publish_time
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+            
+            # Publish frame immediately (no ACK wait)
             self._publish_frame(frame)
-            
-            # Update progress marker
-            self._update_progress(frame.index)
-            
-            # Check backpressure
-            if self._should_skip_frames():
-                # Intelligent frame skipping (preserve entry/exit)
-                self._skip_non_critical_frames()
+            last_publish_time = time.time()
             
             # Log stats periodically
             self._maybe_log_stats()
+```
+
+## Configuration
+
+Enable ACK-free mode (default in V6):
+
+```bash
+# Enable ACK-free mode (recommended)
+python config.py --key spool_ack_free_mode --value true
+
+# Set target FPS
+python config.py --key spool_target_fps --value 25.0
 ```
 
 ## Migration Path
@@ -261,10 +275,11 @@ class SpoolProcessorNode:
 - ✅ Update RetentionPolicy to respect progress
 - ✅ Document the new architecture
 
-### Phase 2: Non-Blocking Processor (Next)
-- Remove ACK waiting loop
-- Implement sliding window processing
-- Add adaptive backpressure
+### Phase 2: ACK-Free Processor (Completed in V6)
+- ✅ Implement `_processor_loop_ack_free()` method
+- ✅ Add `ack_free_mode` configuration (default: true)
+- ✅ Add `target_fps` configuration for pacing
+- ✅ Keep legacy ACK mode for backward compatibility (deprecated)
 
 ### Phase 3: Deprecate ACK Topics (Future)
 - Keep ACK topics for backward compatibility (optional)

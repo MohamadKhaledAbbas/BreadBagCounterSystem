@@ -17,6 +17,8 @@ spool_segment_duration = "spool_segment_duration"
 spool_retention_seconds = "spool_retention_seconds"
 spool_ack_timeout = "spool_ack_timeout"
 spool_retry_count = "spool_retry_count"
+spool_ack_free_mode = "spool_ack_free_mode"  # V6: Disable ACK-based flow control
+spool_target_fps = "spool_target_fps"  # V6: Target FPS for ACK-free mode
 
 CONFIG_KEYS = [
     show_ui_screen_key,
@@ -37,4 +39,6 @@ CONFIG_KEYS = [
     spool_retention_seconds,
     spool_ack_timeout,
     spool_retry_count,
+    spool_ack_free_mode,
+    spool_target_fps,
 ]

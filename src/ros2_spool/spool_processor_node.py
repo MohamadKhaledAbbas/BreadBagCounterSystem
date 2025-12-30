@@ -2,25 +2,37 @@
 """
 Spool Processor Node for Accuracy Mode.
 
-This node reads H.264 frames from the spool and publishes them at a
-controlled pace, waiting for ACK from BagCounterApp before sending
-the next frame. This implements strict backpressure to prevent drops.
+This node reads H.264 frames from the spool and publishes them to the decoder.
 
-Architecture:
-1. Spool Reader: Reads frames from oldest closed segments
-2. Pull Mechanism: Topic-based request/response (no custom .srv required)
-   - Request topic: /spool/request_next (std_msgs/UInt32 with request_id)
-   - Response topic: /spool/next_frame (img_msgs/H26XFrame)
-3. Pump: Publishes frames to /spool_image_ch_0 for decoder
-4. ACK Handler: Waits for /processing_ack before next frame
+V6 Update: ACK-Free Mode (Production-Grade)
+-------------------------------------------
+Per-frame ACKs are fundamentally incompatible with real-time video processing.
+They cause: ACK reordering, blocking, DDS QoS issues, and false confidence.
+
+When `spool_ack_free_mode=true`, the processor:
+1. Reads frames continuously without waiting for ACK
+2. Publishes at a controlled rate (target_fps)
+3. Never blocks on consumer feedback
+4. Relies on retention guards to protect unprocessed data
+
+This aligns with industry-standard streaming architectures (Kafka, GStreamer, DeepStream).
+
+Legacy ACK Mode (Deprecated):
+----------------------------
+When `spool_ack_free_mode=false` (default for backward compatibility):
+1. Waits for ACK from BagCounterApp before sending next frame
+2. Implements strict backpressure
+3. NOT recommended for production
 
 Usage:
     python -m src.ros2_spool.spool_processor_node
 
 Configuration (via database config table):
     spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0)
-    spool_retry_count: Number of retries before advancing (default: 2)
+    spool_ack_free_mode: Enable ACK-free mode (default: true, recommended)
+    spool_target_fps: Target FPS for ACK-free mode (default: 25.0)
+    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0) - only for legacy mode
+    spool_retry_count: Number of retries before advancing (default: 2) - only for legacy mode
 """
 
 import os
@@ -80,7 +92,8 @@ else:
 class ProcessorState(Enum):
     """State of the processor."""
     IDLE = "idle"
-    WAITING_FOR_ACK = "waiting_for_ack"
+    PUBLISHING = "publishing"  # V6: ACK-free mode - continuously publishing
+    WAITING_FOR_ACK = "waiting_for_ack"  # Legacy mode only
     WAITING_FOR_READY = "waiting_for_ready"  # Waiting for consumer ready signal
     SPOOL_EMPTY = "spool_empty"
     STOPPED = "stopped"
@@ -88,24 +101,29 @@ class ProcessorState(Enum):
 
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
-DEFAULT_ACK_TIMEOUT = 10.0  # Reduced from 30.0 - should be much faster with FIFO correlation
-DEFAULT_RETRY_COUNT = 2
+DEFAULT_ACK_TIMEOUT = 10.0  # Legacy mode only
+DEFAULT_RETRY_COUNT = 2  # Legacy mode only
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
+DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
+DEFAULT_TARGET_FPS = 25.0  # V6: Target FPS for ACK-free mode
 
 
 @dataclass
 class ProcessorConfig:
     """Configuration for the spool processor."""
     spool_dir: str = DEFAULT_SPOOL_DIR
-    ack_timeout: float = DEFAULT_ACK_TIMEOUT
-    retry_count: int = DEFAULT_RETRY_COUNT
+    ack_timeout: float = DEFAULT_ACK_TIMEOUT  # Legacy mode only
+    retry_count: int = DEFAULT_RETRY_COUNT  # Legacy mode only
     poll_interval: float = DEFAULT_POLL_INTERVAL
     stats_interval: float = DEFAULT_STATS_INTERVAL
     startup_grace_period: float = DEFAULT_STARTUP_GRACE_PERIOD
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
+    # V6: ACK-free mode configuration
+    ack_free_mode: bool = DEFAULT_ACK_FREE_MODE
+    target_fps: float = DEFAULT_TARGET_FPS
 
 
 def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
@@ -116,6 +134,8 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
         spool_dir = db.get_config_value(constants.spool_dir)
         ack_timeout = db.get_config_value(constants.spool_ack_timeout)
         retry_count = db.get_config_value(constants.spool_retry_count)
+        ack_free_mode = db.get_config_value(constants.spool_ack_free_mode)
+        target_fps = db.get_config_value(constants.spool_target_fps)
         
         db.close()
         
@@ -131,10 +151,34 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
             except (ValueError, TypeError):
                 logger.warning(f"[SpoolProcessor] Failed to parse spool_ack_timeout={ack_timeout}, using default {DEFAULT_ACK_TIMEOUT}s")
         
+        # V6: Parse ack_free_mode - default to True for production-grade operation
+        parsed_ack_free_mode = DEFAULT_ACK_FREE_MODE
+        if ack_free_mode is not None:
+            if isinstance(ack_free_mode, bool):
+                parsed_ack_free_mode = ack_free_mode
+            elif isinstance(ack_free_mode, str):
+                parsed_ack_free_mode = ack_free_mode.lower() in ('true', '1', 'yes', 'on')
+            elif isinstance(ack_free_mode, (int, float)):
+                parsed_ack_free_mode = bool(ack_free_mode)
+        
+        # V6: Parse target_fps - must be > 0
+        parsed_target_fps = DEFAULT_TARGET_FPS
+        if target_fps:
+            try:
+                parsed_value = float(target_fps)
+                if parsed_value > 0:
+                    parsed_target_fps = parsed_value
+                else:
+                    logger.warning(f"[SpoolProcessor] Invalid spool_target_fps={target_fps} (must be > 0), using default {DEFAULT_TARGET_FPS}")
+            except (ValueError, TypeError):
+                logger.warning(f"[SpoolProcessor] Failed to parse spool_target_fps={target_fps}, using default {DEFAULT_TARGET_FPS}")
+        
         return ProcessorConfig(
             spool_dir=spool_dir if spool_dir else DEFAULT_SPOOL_DIR,
             ack_timeout=parsed_ack_timeout,
             retry_count=int(retry_count) if retry_count else DEFAULT_RETRY_COUNT,
+            ack_free_mode=parsed_ack_free_mode,
+            target_fps=parsed_target_fps,
         )
     except Exception as e:
         logger.warning(f"[SpoolProcessor] Failed to load config from DB: {e}, using defaults")
@@ -143,23 +187,30 @@ def load_config_from_db(db_path: str = AppConfig.db_path) -> ProcessorConfig:
 
 class SpoolProcessorNode(Node):
     """
-    ROS2 Node that processes spooled H.264 frames with strict backpressure.
+    ROS2 Node that processes spooled H.264 frames.
     
-    The processor ensures exactly one frame is in flight at a time:
-    1. Read next frame from spool
-    2. Publish frame index to /spool/current_frame_index
-    3. Publish encoded frame to /spool_image_ch_0
-    4. Wait for ACK on /processing_ack with matching index
-    5. Only then proceed to next frame
+    V6 ACK-Free Mode (Production-Grade, Recommended):
+    ------------------------------------------------
+    When `ack_free_mode=True` (default):
+    1. Reads frames continuously from spool
+    2. Publishes at target_fps rate
+    3. Never blocks on consumer feedback
+    4. Relies on retention guards for data safety
     
-    This design implements strict pull-based processing where BagCounterApp
-    controls the pace.
+    This mode aligns with industry-standard streaming architectures.
+    
+    Legacy ACK Mode (Deprecated):
+    ----------------------------
+    When `ack_free_mode=False`:
+    1. Waits for ACK from BagCounterApp before sending next frame
+    2. Implements strict backpressure
+    3. NOT recommended - causes blocking and deadlocks
     
     Production Reliability Features:
+    - V6: ACK-free continuous processing (no blocking)
     - Startup synchronization: Waits for consumer before processing
-    - Watchdog: Auto-recovery from stuck ACK states
     - SPS/PPS caching: Prepends to segment boundaries for decoder init
-    - Graceful degradation: Advances after max retries to prevent deadlock
+    - Graceful degradation: Continues processing even under load
     """
     
     def __init__(self, config: Optional[ProcessorConfig] = None):
@@ -171,10 +222,16 @@ class SpoolProcessorNode(Node):
         # Generate unique session ID for this run
         self._session_id = generate_session_id()
         
+        # Log mode selection
+        mode_str = "ACK-FREE (V6 Production)" if self.config.ack_free_mode else "LEGACY ACK (Deprecated)"
+        logger.info(f"[SpoolProcessor] Mode: {mode_str}")
+        
         logger.info(f"[SpoolProcessor] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "
-                   f"ack_timeout={self.config.ack_timeout}s, "
-                   f"retry_count={self.config.retry_count}, "
+                   f"ack_free_mode={self.config.ack_free_mode}, "
+                   f"target_fps={self.config.target_fps}, "
+                   f"ack_timeout={self.config.ack_timeout}s (legacy only), "
+                   f"retry_count={self.config.retry_count} (legacy only), "
                    f"startup_grace={self.config.startup_grace_period}s, "
                    f"session_id={self._session_id}")
         
@@ -754,24 +811,106 @@ class SpoolProcessorNode(Node):
     
     def _processor_loop(self):
         """
-        Main processing loop with strict backpressure.
-        
-        This loop ensures exactly one frame is in flight:
-        1. Wait for consumer startup (startup sync)
-        2. Get next frame from spool
-        3. Publish frame
-        4. Wait for ACK (with retry)
-        5. Repeat
-        
-        Production reliability features:
-        - Startup synchronization: Wait for consumer before first frame
-        - Watchdog: Detect and recover from stuck states
-        - Graceful degradation: Advance after max retries
+        Main processing loop - dispatches to ACK-free or legacy mode.
         """
         logger.info("[SpoolProcessor] Processing loop started")
         
         # Startup synchronization: Wait for consumer READY
         self._wait_for_consumer_ready()
+        
+        if self.config.ack_free_mode:
+            self._processor_loop_ack_free()
+        else:
+            self._processor_loop_legacy()
+        
+        logger.info("[SpoolProcessor] Processing loop stopped")
+    
+    def _processor_loop_ack_free(self):
+        """
+        V6 ACK-Free Processing Loop (Production-Grade).
+        
+        This loop processes frames continuously without waiting for ACKs:
+        1. Read frame from spool
+        2. Publish immediately
+        3. Pace to target_fps
+        4. Never block
+        
+        Benefits:
+        - No deadlocks (impossible)
+        - Maximum throughput
+        - Stable latency
+        - Production-safe
+        
+        The consumer processes frames at its own pace. Retention guards
+        protect unprocessed data from deletion.
+        """
+        logger.info(f"[SpoolProcessor] ACK-FREE mode active: target_fps={self.config.target_fps}")
+        
+        frame_interval = 1.0 / self.config.target_fps
+        last_publish_time = 0.0
+        
+        with self._state_lock:
+            self._state = ProcessorState.PUBLISHING
+        
+        while self._running:
+            try:
+                # Get next frame
+                frame = self._get_next_frame()
+                
+                if frame is None:
+                    # Spool is empty, wait and retry
+                    with self._state_lock:
+                        self._state = ProcessorState.SPOOL_EMPTY
+                    logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
+                    time.sleep(self.config.poll_interval)
+                    with self._state_lock:
+                        self._state = ProcessorState.PUBLISHING
+                    continue
+                
+                self._current_frame = frame
+                self._current_frame_index = frame.index
+                
+                # Pace to target FPS (non-blocking pacing)
+                current_time = time.time()
+                elapsed = current_time - last_publish_time
+                if elapsed < frame_interval:
+                    time.sleep(frame_interval - elapsed)
+                
+                # Publish frame (no ACK wait)
+                success, seq, _, _ = self._publish_frame(frame)
+                last_publish_time = time.time()
+                
+                if success:
+                    with self._stats_lock:
+                        self._frames_processed += 1
+                else:
+                    with self._stats_lock:
+                        self._frames_skipped += 1
+                    logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
+                
+                # Log stats periodically
+                self._maybe_log_stats()
+                
+            except Exception as e:
+                logger.error(f"[SpoolProcessor] Error in ACK-free loop: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                time.sleep(0.1)
+    
+    def _processor_loop_legacy(self):
+        """
+        Legacy ACK-Based Processing Loop (Deprecated).
+        
+        This loop waits for ACK before sending next frame:
+        1. Get next frame from spool
+        2. Publish frame
+        3. Wait for ACK (with retry)
+        4. Repeat
+        
+        WARNING: This mode can cause blocking, deadlocks, and throughput issues.
+        Use ACK-free mode for production.
+        """
+        logger.warning("[SpoolProcessor] LEGACY ACK mode active (deprecated) - consider enabling ACK-free mode")
         
         while self._running:
             try:
@@ -789,7 +928,7 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
-                # Process frame with retry logic
+                # Process frame with retry logic (waits for ACK)
                 success = self._process_frame_with_retry(frame)
                 
                 if success:
@@ -804,16 +943,14 @@ class SpoolProcessorNode(Node):
                 self._maybe_log_stats()
                 
             except Exception as e:
-                logger.error(f"[SpoolProcessor] Error in processing loop: {e}")
+                logger.error(f"[SpoolProcessor] Error in legacy loop: {e}")
                 import traceback
                 logger.debug(traceback.format_exc())
                 time.sleep(1.0)
-        
-        logger.info("[SpoolProcessor] Processing loop stopped")
     
     def _process_frame_with_retry(self, frame: FrameRecord) -> bool:
         """
-        Process a frame with retry logic.
+        Process a frame with retry logic (Legacy ACK mode only).
         
         Args:
             frame: Frame record to process
