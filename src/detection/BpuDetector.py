@@ -4,6 +4,7 @@ from typing import Dict, List
 from scipy.special import softmax
 from src.detection.BaseDetection import BaseDetector
 from src.utils.PerformanceChecker import run_with_timing
+from src.config.tracking_config import tracking_config
 
 from src.utils.AppLogging import logger
 
@@ -125,7 +126,7 @@ class BpuDetector(BaseDetector):
 
         return [BpuResultWrapper(np.array(boxes), np.array(scores), np.array(class_ids))]
     
-    def predict_batch(self, frames, use_true_batch=True):
+    def predict_batch(self, frames, use_true_batch=None):
         """
         V4 Phase 2 Enhanced: True batch inference for multiple frames.
         
@@ -140,10 +141,15 @@ class BpuDetector(BaseDetector):
             frames: List of numpy arrays (frames) to process
             use_true_batch: If True, attempt true batch inference via BPU.
                            If False or BPU batch fails, use sequential processing.
+                           If None, uses tracking_config.detection_true_batch_enabled.
             
         Returns:
             List of BpuResultWrapper objects, one per frame
         """
+        # Use config value if not explicitly specified
+        if use_true_batch is None:
+            use_true_batch = tracking_config.detection_true_batch_enabled
+        
         if self.quantize_model is None:
             return [BpuResultWrapper([], [], []) for _ in frames]
         

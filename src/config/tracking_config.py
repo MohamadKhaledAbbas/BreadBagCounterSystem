@@ -2431,7 +2431,7 @@ class TrackingConfig:
     Default: 5.0 ms (balance between latency and throughput)
     """
     
-    detection_true_batch_enabled: bool = _parse_bool_env("DETECTION_TRUE_BATCH_ENABLED", True)
+    detection_true_batch_enabled: bool = _parse_bool_env("DETECTION_TRUE_BATCH_ENABLED", False)
     """
     Enable true BPU batch inference (hardware-level parallelism).
     
@@ -2444,7 +2444,10 @@ class TrackingConfig:
     
     Falls back to sequential if true batch fails.
     
-    Default: True (attempt true batch, fallback if needed)
+    WARNING: Experimental feature. Only enable if your model was compiled 
+    with batch support. Default is False for stability.
+    
+    Default: False (conservative - sequential processing)
     """
     
     # === Phase 3: Monitor Processing Optimization ===
@@ -2480,7 +2483,7 @@ class TrackingConfig:
     """
     
     # === Phase 4: Classification Batch Processing ===
-    classification_batch_enabled: bool = _parse_bool_env("CLASSIFICATION_BATCH_ENABLED", True)
+    classification_batch_enabled: bool = _parse_bool_env("CLASSIFICATION_BATCH_ENABLED", False)
     """
     Enable batch processing for classification.
     
@@ -2494,7 +2497,10 @@ class TrackingConfig:
     - Can leverage BPU batch inference for parallel processing
     - 30-50% speedup when classifying multiple ROIs
     
-    Default: True (V7 enhancement - now implemented)
+    WARNING: Experimental feature. Set to False by default for stability.
+    Enable via CLASSIFICATION_BATCH_ENABLED=true after testing.
+    
+    Default: False (conservative - individual classification)
     """
     
     classification_batch_size: int = _parse_int_env("CLASSIFICATION_BATCH_SIZE", 8)
@@ -2512,7 +2518,7 @@ class TrackingConfig:
     Default: 8 (balanced for typical track ROI counts)
     """
     
-    classification_true_batch_enabled: bool = _parse_bool_env("CLASSIFICATION_TRUE_BATCH_ENABLED", True)
+    classification_true_batch_enabled: bool = _parse_bool_env("CLASSIFICATION_TRUE_BATCH_ENABLED", False)
     """
     Enable true BPU batch inference for classification.
     
@@ -2525,7 +2531,10 @@ class TrackingConfig:
     
     Falls back to sequential if true batch fails.
     
-    Default: True (attempt true batch, fallback if needed)
+    WARNING: Experimental feature. Only enable if your model was compiled 
+    with batch support. Default is False for stability.
+    
+    Default: False (conservative - sequential processing)
     """
 
 

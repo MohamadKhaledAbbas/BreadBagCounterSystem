@@ -3,6 +3,7 @@ import numpy as np
 from typing import Tuple, Dict
 from src.classifier.BaseClassifier import BaseClassifier
 from src.utils.AppLogging import logger
+from src.config.tracking_config import tracking_config
 
 # Import BPU Library safely
 try:
@@ -424,7 +425,7 @@ class BpuClassifier(BaseClassifier):
                 'total': 0, 'batch_sizes': [], 'true_batch_count': 0
             }
 
-    def predict_batch(self, images, use_true_batch=True):
+    def predict_batch(self, images, use_true_batch=None):
         """
         V7: Batch classification for multiple ROI images.
         
@@ -435,10 +436,15 @@ class BpuClassifier(BaseClassifier):
             images: List of numpy arrays (ROI images) to classify
             use_true_batch: If True, attempt true batch inference via BPU.
                            If False or BPU batch fails, use sequential processing.
+                           If None, uses tracking_config.classification_true_batch_enabled.
             
         Returns:
             List of tuples (label, confidence), one per image
         """
+        # Use config value if not explicitly specified
+        if use_true_batch is None:
+            use_true_batch = tracking_config.classification_true_batch_enabled
+        
         if self.model is None:
             return [("Unknown", 0.0) for _ in images]
         
@@ -497,7 +503,7 @@ class BpuClassifier(BaseClassifier):
         
         return results
 
-    def predict_batch_probs(self, images, use_true_batch=True):
+    def predict_batch_probs(self, images, use_true_batch=None):
         """
         V7: Batch classification with full probability vectors.
         
@@ -507,10 +513,15 @@ class BpuClassifier(BaseClassifier):
         Args:
             images: List of numpy arrays (ROI images) to classify
             use_true_batch: If True, attempt true batch inference via BPU.
+                           If None, uses tracking_config.classification_true_batch_enabled.
             
         Returns:
             List of tuples (label, confidence, probs_dict), one per image
         """
+        # Use config value if not explicitly specified
+        if use_true_batch is None:
+            use_true_batch = tracking_config.classification_true_batch_enabled
+        
         if self.model is None:
             return [("Unknown", 0.0, {"Unknown": 1.0}) for _ in images]
         

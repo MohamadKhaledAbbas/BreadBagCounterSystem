@@ -4,7 +4,7 @@ This document catalogs potential improvements, optimizations, and fixes identifi
 
 ## High Priority
 
-### 1. True Batch Inference Implementation (Completed ✅)
+### 1. True Batch Inference Implementation (Implemented - Experimental ⚠️)
 
 **Location:** `src/detection/BpuDetector.py`, `src/classifier/BpuClassifyer.py`
 
@@ -18,13 +18,22 @@ This document catalogs potential improvements, optimizations, and fixes identifi
 - Added timing metrics to track true batch vs sequential usage
 - Added `predict_batch()` and `predict_batch_probs()` to BpuClassifier
 
-**Configuration Flags:**
+**Configuration Flags (all default to False for stability):**
 ```python
-detection_batch_enabled: bool = True
-detection_true_batch_enabled: bool = True
-classification_batch_enabled: bool = True
-classification_true_batch_enabled: bool = True
+detection_batch_enabled: bool = True    # Batch accumulation (stable)
+detection_true_batch_enabled: bool = False  # EXPERIMENTAL - True BPU batch inference
+classification_batch_enabled: bool = False  # EXPERIMENTAL - Batch classification
+classification_true_batch_enabled: bool = False  # EXPERIMENTAL - True BPU batch for classification
 ```
+
+**How to Enable:** Set environment variables to enable experimental features after testing:
+```bash
+export DETECTION_TRUE_BATCH_ENABLED=true
+export CLASSIFICATION_BATCH_ENABLED=true
+export CLASSIFICATION_TRUE_BATCH_ENABLED=true
+```
+
+**WARNING:** These features require models compiled with batch support. Enable only after verifying your model supports batched input.
 
 ---
 
@@ -249,21 +258,21 @@ COMPONENT_LOG_LEVELS = {
 
 ## Configuration Recommendations
 
-### Current Optimal Settings for RDK X5
+### Production Settings (Conservative - Stable)
 
-Based on the implementation and documentation, these are recommended production settings:
+For production use, start with these settings that prioritize stability:
 
 ```bash
 # Detection
 DETECTION_BATCH_ENABLED=true
-DETECTION_BATCH_SIZE=2  # Start conservative, tune to 4 if latency allows
-DETECTION_TRUE_BATCH_ENABLED=true
+DETECTION_BATCH_SIZE=2  # Start conservative
+DETECTION_TRUE_BATCH_ENABLED=false  # Experimental - disabled by default
 DETECTION_QUEUE_ENABLED=true
 
 # Classification  
-CLASSIFICATION_BATCH_ENABLED=true
+CLASSIFICATION_BATCH_ENABLED=false  # Experimental - disabled by default
 CLASSIFICATION_BATCH_SIZE=8
-CLASSIFICATION_TRUE_BATCH_ENABLED=true
+CLASSIFICATION_TRUE_BATCH_ENABLED=false  # Experimental - disabled by default
 
 # General
 DEGRADED_MODE_ENABLED=true
@@ -271,11 +280,23 @@ TEMPORAL_DECIMATION_ENABLED=true
 EARLY_REJECTION_ENABLED=true
 ```
 
+### Experimental Settings (Performance - Test First!)
+
+After verifying your models support batch input, you can enable experimental features:
+
+```bash
+# Enable true batch inference for potentially 40-60% speedup
+DETECTION_TRUE_BATCH_ENABLED=true
+CLASSIFICATION_BATCH_ENABLED=true
+CLASSIFICATION_TRUE_BATCH_ENABLED=true
+```
+
 ---
 
 ## Changelog
 
 - **2024-12-30**: Initial document created
-  - Added true batch inference implementation (completed)
+  - Added true batch inference implementation (experimental)
   - Documented 15 potential improvements
   - Added configuration recommendations
+  - Set experimental batch features to disabled by default for stability
