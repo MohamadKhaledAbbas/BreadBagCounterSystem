@@ -162,7 +162,8 @@ def test_timeout_based_credit_release():
     print("Testing timeout-based credit release...")
     
     # Use very short timeout for testing
-    tracker = MockInFlightTracker(max_in_flight=5, ack_timeout=0.1)
+    timeout_value = 0.1
+    tracker = MockInFlightTracker(max_in_flight=5, ack_timeout=timeout_value)
     
     # Add 3 frames
     for i in range(3):
@@ -170,8 +171,8 @@ def test_timeout_based_credit_release():
     
     assert tracker.get_in_flight_count() == 3, "Should have 3 frames in-flight"
     
-    # Wait for timeout
-    time.sleep(0.15)
+    # Wait for timeout (with buffer for processing)
+    time.sleep(timeout_value + 0.05)
     
     # Check for timeouts - should expire all 3 frames
     expired = tracker.check_timeouts()
@@ -223,7 +224,8 @@ def test_mixed_ack_and_timeout():
     """Test behavior with both ACKs and timeouts occurring."""
     print("Testing mixed ACK and timeout behavior...")
     
-    tracker = MockInFlightTracker(max_in_flight=5, ack_timeout=0.1)
+    timeout_value = 0.1
+    tracker = MockInFlightTracker(max_in_flight=5, ack_timeout=timeout_value)
     
     # Add 5 frames
     for i in range(5):
@@ -235,8 +237,8 @@ def test_mixed_ack_and_timeout():
     
     assert tracker.get_in_flight_count() == 3, "Should have 3 frames in-flight (2 ACKed)"
     
-    # Wait for timeout
-    time.sleep(0.15)
+    # Wait for timeout (with buffer for processing)
+    time.sleep(timeout_value + 0.05)
     
     # Check timeouts - should expire remaining 3 frames (0, 2, 4)
     expired = tracker.check_timeouts()
