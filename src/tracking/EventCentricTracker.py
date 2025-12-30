@@ -984,12 +984,9 @@ class BreadBagEvent:
         
         if time_gap_ms > effective_ghost_timeout_ms:
             # Time gap exceeds ghost timeout - cannot associate
-            distance_to_last = math.sqrt(
-                (det_centroid[0] - self.last_centroid[0])**2 + 
-                (det_centroid[1] - self.last_centroid[1])**2
-            )
+            # Return 0.0 for distance since we didn't compute it (early rejection)
             reason = f"time_gap_exceeded ({time_gap_ms:.1f}ms > {effective_ghost_timeout_ms:.1f}ms)"
-            return False, distance_to_last, reason, 0.0
+            return False, 0.0, reason, 0.0
         
         # ==========================================================================
         # STAGE 2: Centroid distance gate (cheap)
@@ -1034,7 +1031,6 @@ class BreadBagEvent:
         # ==========================================================================
         # STAGE 3: Area ratio gate (cheap - before expensive IOU)
         # ==========================================================================
-        area_ratio_pass = True
         if self.config.early_rejection_enabled and self.last_box is not None:
             # Compute areas
             last_area = (self.last_box[2] - self.last_box[0]) * (self.last_box[3] - self.last_box[1])
@@ -1042,18 +1038,22 @@ class BreadBagEvent:
             
             if last_area > 0 and det_area > 0:
                 area_ratio = min(last_area, det_area) / max(last_area, det_area)
+                area_ratio_inverse = max(last_area, det_area) / min(last_area, det_area)
                 
-                # Early rejection if area ratio is too extreme
-                if area_ratio < self.config.early_rejection_area_ratio_min:
+                # Early rejection if area ratio is too extreme (both min and max checks)
+                area_too_different = (
+                    area_ratio < self.config.early_rejection_area_ratio_min or
+                    area_ratio_inverse > self.config.early_rejection_area_ratio_max
+                )
+                
+                if area_too_different:
                     # Areas are too different - likely different objects
-                    # But only reject if centroid also doesn't match (allow some flexibility)
-                    if not centroid_match:
-                        reason = f"area_ratio_rejected (ratio={area_ratio:.2f} < {self.config.early_rejection_area_ratio_min})"
-                        return False, distance_to_last, reason, 0.0
-                    area_ratio_pass = False  # Flag for logging
+                    # Reject regardless of centroid match (true early rejection)
+                    reason = f"area_ratio_rejected (ratio={area_ratio:.2f}, inverse={area_ratio_inverse:.2f})"
+                    return False, distance_to_last, reason, 0.0
         
         # ==========================================================================
-        # STAGE 4: IOU computation (expensive - only if needed)
+        # STAGE 4: IOU computation (expensive - only if above checks pass)
         # ==========================================================================
         iou_value = 0.0
         iou_expanded = 0.0
