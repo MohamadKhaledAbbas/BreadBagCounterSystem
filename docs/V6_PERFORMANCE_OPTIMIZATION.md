@@ -7,6 +7,7 @@ V6 implements production-grade optimizations for the Event-Centric Bread Countin
 - **Bounded computational complexity**
 - **Deterministic behavior under load**
 - **Retention safety** for unprocessed data
+- **Non-blocking flow control** (replaces per-frame ACKs)
 
 ## Key Optimizations
 
@@ -123,6 +124,43 @@ tracker_stats = tracker.get_tracker_stats()
 policy.set_last_processed_frame(tracker_stats['last_processed_frame_index'])
 ```
 
+### 6. ACK-Free Flow Control (Section 1️⃣0️⃣)
+
+**Per-frame ACKs are fundamentally incompatible with real-time video processing.**
+
+The ACK-based mechanism is replaced with:
+- **Monotonic progress tracking** via `last_processed_frame_index`
+- **Retention guards** that respect processor progress
+- **Adaptive backpressure** instead of blocking
+
+**Why ACKs Fail:**
+- ACK reordering (ROS2 async delivery)
+- ACK blocking (processor stops, spool grows)
+- DDS QoS incompatibility (silent rejection)
+- ACK ≠ Processing guarantee (false confidence)
+
+**Industry Rule:**
+> Never use per-frame ACKs for real-time video processing.
+
+**Replacement Architecture:**
+```python
+# Instead of waiting for ACK:
+# 1. Process frames continuously
+# 2. Track progress locally
+# 3. Let retention respect progress
+# 4. Adapt under load (skip frames if needed)
+
+# Progress marker (in EventCentricTracker)
+self._last_processed_frame_index = frame_index
+
+# Retention guard (in RetentionPolicy)
+if segment.max_frame > last_processed_frame:
+    # Protect segment - contains unprocessed data
+    continue
+```
+
+**See:** `docs/ACK_REPLACEMENT_ARCHITECTURE.md` for full details.
+
 ## Expected Results
 
 | Metric | Before | After |
@@ -132,6 +170,8 @@ policy.set_last_processed_frame(tracker_stats['last_processed_frame_index'])
 | Frame drops | Implicit | None |
 | Count accuracy | Good | Stable & deterministic |
 | System stability | Fragile under load | Production-grade |
+| Deadlocks | Possible | **Impossible** |
+| Throughput | Limited | **Maximal** |
 
 ## Monitoring
 
@@ -188,7 +228,11 @@ This implementation follows the core agreement from the optimization plan:
    - Active events must always remain O(1)
    - Prune aggressively via spatial gates
 
-3. **Monitoring must be:**
+3. **Never block on consumer feedback**
+   - Use monotonic progress tracking
+   - Adapt under load instead of deadlock
+
+4. **Monitoring must be:**
    - Deterministic
    - Bounded in complexity
    - Resistant to chaotic motion (spinning, flipping, throwing)
