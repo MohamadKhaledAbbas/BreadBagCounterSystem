@@ -1335,10 +1335,21 @@ class BagCounterApp:
 
         TIMING_LOG_INTERVAL = 30
         frame_count = 0
+        
+        # V6: Timing stats for performance analysis
+        _logic_timing_stats = {
+            'queue_dequeue': 0,
+            'packet_extract': 0,
+            'detection': 0,
+            'total': 0,
+            'count': 0
+        }
 
         while self.is_running:
             try:
-                frame = self.input_queue.get(timeout=1.0)
+                t_dequeue_start = time.perf_counter()
+                frame_packet = self.input_queue.get(timeout=1.0)
+                t_dequeue_end = time.perf_counter()
             except queue.Empty:
                 if not self.is_running:
                     break
@@ -1355,6 +1366,22 @@ class BagCounterApp:
                 continue
 
             try:
+                t_extract_start = time.perf_counter()
+                
+                # V5 Optimization: Extract frame and optional NV12 data from packet
+                # Supports both dict format (V5) and direct frame (backward compatible)
+                if isinstance(frame_packet, dict):
+                    frame = frame_packet['frame']
+                    nv12_data = frame_packet.get('nv12_data')
+                    frame_size = frame_packet.get('frame_size')
+                else:
+                    # Backward compatible: direct frame (old format)
+                    frame = frame_packet
+                    nv12_data = None
+                    frame_size = None
+                
+                t_extract_end = time.perf_counter()
+                
                 frame_count += 1
                 # NOTE: Accuracy Mode ACK is now published in the frame capture loop (run() method)
                 # immediately when a frame is consumed from frame_source.frames().
@@ -1612,9 +1639,38 @@ class BagCounterApp:
                     
                 else:
                     # V3: Single-frame detection (legacy)
-                    detections = self.detector.predict(frame)
+                    # V5 Optimization: Pass NV12 data to avoid redundant color conversion
+                    detections = self.detector.predict(frame, nv12_data=nv12_data, frame_size=frame_size)
                     detect_end = time.perf_counter()
                     detect_time = (detect_end - detect_start) * 1000
+                    
+                    # V6: Accumulate timing stats
+                    _logic_timing_stats['queue_dequeue'] += (t_dequeue_end - t_dequeue_start) * 1000
+                    _logic_timing_stats['packet_extract'] += (t_extract_end - t_extract_start) * 1000
+                    _logic_timing_stats['detection'] += detect_time
+                    _logic_timing_stats['total'] += (detect_end - t_dequeue_start) * 1000
+                    _logic_timing_stats['count'] += 1
+                    
+                    # V6: Log timing stats periodically
+                    if _logic_timing_stats['count'] >= 100:
+                        count = _logic_timing_stats['count']
+                        nv12_used = "yes" if nv12_data is not None else "no"
+                        logger.info(
+                            f"[LogicThread] Avg timing (100 frames): "
+                            f"queue_dequeue={_logic_timing_stats['queue_dequeue']/count:.2f}ms, "
+                            f"packet_extract={_logic_timing_stats['packet_extract']/count:.2f}ms, "
+                            f"detection={_logic_timing_stats['detection']/count:.2f}ms, "
+                            f"total={_logic_timing_stats['total']/count:.2f}ms, "
+                            f"nv12_used={nv12_used}"
+                        )
+                        # Reset
+                        _logic_timing_stats = {
+                            'queue_dequeue': 0,
+                            'packet_extract': 0,
+                            'detection': 0,
+                            'total': 0,
+                            'count': 0
+                        }
                     
                     # V3: Track detection time for adaptive skipping
                     self._recent_detection_times.append(detect_time)
@@ -1925,14 +1981,21 @@ class BagCounterApp:
                 for frame_data in self.frame_source.frames():
                     frame_count += 1
                     
-                    # SINGLE SOURCE OF TRUTH: Extract frame and spool_frame_index from tuple
-                    # In accuracy mode, spool_frame_index travels WITH the frame data
-                    # In normal mode, tuple is (frame, latency) - backward compatible
-                    if len(frame_data) == 3:
+                    # V5 Optimization: Extract frame, NV12 data, and metadata from tuple
+                    # Format can be:
+                    # - (frame, latency, index, nv12_data, frame_size) - V5 with NV12
+                    # - (frame, latency, index) - accuracy mode
+                    # - (frame, latency) - normal mode (backward compatible)
+                    nv12_data = None
+                    frame_size = None
+                    spool_frame_index = None
+                    
+                    if len(frame_data) == 5:
+                        frame, latencyMs, spool_frame_index, nv12_data, frame_size = frame_data
+                    elif len(frame_data) == 3:
                         frame, latencyMs, spool_frame_index = frame_data
                     else:
                         frame, latencyMs = frame_data
-                        spool_frame_index = None
                     
                     # Accuracy Mode: Publish ACK IMMEDIATELY when frame is consumed
                     # CRITICAL: Use spool_frame_index that traveled WITH this specific frame
@@ -1950,10 +2013,35 @@ class BagCounterApp:
                         avg_interval = frame_interval_sum / frame_interval_count
                         if avg_interval > TIMING_EPSILON:
                             acquisition_fps = 1.0 / avg_interval
+                            # V6: Calculate theoretical max FPS based on detection time
+                            # Minimum detection time threshold (1ms) to prevent extreme FPS values
+                            MIN_DETECT_TIME_MS = 1.0
+                            # Hysteresis threshold (1ms) to prevent oscillating bottleneck indicator  
+                            BOTTLENECK_HYSTERESIS_SEC = 0.001
+                            
+                            avg_detect_time = (
+                                sum(self._recent_detection_times) / len(self._recent_detection_times)
+                                if len(self._recent_detection_times) > 0 else 0.0
+                            )
+                            # Cap theoretical FPS at 1000 to prevent unrealistic values
+                            if avg_detect_time >= MIN_DETECT_TIME_MS:
+                                theoretical_max_fps = min(1000.0, 1000.0 / avg_detect_time)
+                            else:
+                                theoretical_max_fps = 0.0  # Insufficient data
+                            
+                            # Determine bottleneck: "source" if frame arrival is slower than detection
+                            # Add hysteresis to prevent oscillating between states
+                            bottleneck = "source" if avg_interval > (avg_detect_time / 1000.0 + BOTTLENECK_HYSTERESIS_SEC) else "detection"
+                            
+                            # V6: Include NV12 path indicator
+                            nv12_indicator = "yes" if nv12_data is not None else "no"
+                            
                             logger.info(
                                 f"[BagCounterApp] Frame acquisition stats: "
                                 f"frames={frame_count}, avg_interval={avg_interval * 1000:.1f}ms, "
-                                f"acquisition_fps={acquisition_fps:.1f}"
+                                f"acquisition_fps={acquisition_fps:.1f}, "
+                                f"avg_detect={avg_detect_time:.1f}ms, theoretical_max_fps={theoretical_max_fps:.1f}, "
+                                f"bottleneck={bottleneck}, nv12={nv12_indicator}"
                             )
                         else:
                             logger.warning(
@@ -1963,15 +2051,23 @@ class BagCounterApp:
                             )
                         frame_interval_sum = 0.0
                         frame_interval_count = 0
+                    
+                    # V5 Optimization: Enqueue frame with NV12 data as a dict for efficient passing
+                    # This avoids redundant BGR→NV12 conversion in detector
+                    frame_packet = {
+                        'frame': frame,
+                        'nv12_data': nv12_data,
+                        'frame_size': frame_size
+                    }
                     try:
-                        self.input_queue.put_nowait(frame)
+                        self.input_queue.put_nowait(frame_packet)
                     except queue.Full:
                         frame_dropped = False
                         try:
                             self.input_queue.get_nowait()
                             frame_dropped = True
                             try:
-                                self.input_queue.put_nowait(frame)
+                                self.input_queue.put_nowait(frame_packet)
                             except queue.Full:
                                 frame_dropped = True
                                 logger.debug(
@@ -1988,7 +2084,7 @@ class BagCounterApp:
                                 )
                         except queue.Empty:
                             try:
-                                self.input_queue.put_nowait(frame)
+                                self.input_queue.put_nowait(frame_packet)
                             except queue.Full:
                                 with self.stats_lock:
                                     self.input_queue_drops += 1

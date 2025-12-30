@@ -62,16 +62,36 @@ class BpuDetector(BaseDetector):
     def class_names(self) -> Dict[int, str]:
         return self._class_names
 
-    def predict(self, frame):
+    def predict(self, frame, nv12_data=None, frame_size=None):
+        """
+        Predict detections on a frame.
+        
+        V5 Optimization: Accepts optional NV12 data to skip BGR→NV12 conversion.
+        
+        Args:
+            frame: BGR numpy array (required for postprocessing with original shape)
+            nv12_data: Optional raw NV12 numpy array for direct BPU input (skips color conversion)
+            frame_size: Optional tuple (height, width) of original frame (required if nv12_data provided)
+        
+        Returns:
+            List containing BpuResultWrapper with detection results
+        """
         if self.quantize_model is None:
             return [BpuResultWrapper([], [], [])]
 
         # Phase 3: Add detailed timing logs for CPU operations
         t_start = cv2.getTickCount()
         
-        # 1. Preprocess (Resize + BGR2NV12)
+        # 1. Preprocess (Resize + optionally skip BGR2NV12 if NV12 provided)
         t_preprocess_start = cv2.getTickCount()
-        input_tensor, x_scale, y_scale, x_shift, y_shift = self._preprocess(frame)
+        
+        if nv12_data is not None and frame_size is not None:
+            # V5 Optimization: Use NV12 data directly - skip BGR→NV12 conversion
+            input_tensor, x_scale, y_scale, x_shift, y_shift = self._preprocess_nv12(nv12_data, frame_size)
+        else:
+            # Standard path: Convert BGR to NV12
+            input_tensor, x_scale, y_scale, x_shift, y_shift = self._preprocess(frame)
+        
         t_preprocess_end = cv2.getTickCount()
         preprocess_time_ms = (t_preprocess_end - t_preprocess_start) * 1000 / cv2.getTickFrequency()
 
@@ -94,27 +114,32 @@ class BpuDetector(BaseDetector):
         if not hasattr(self, '_frame_counter'):
             self._frame_counter = 0
             self._timing_sum = {'preprocess': 0, 'inference': 0, 'postprocess': 0}
+            self._nv12_path_count = 0
         
         self._frame_counter += 1
         self._timing_sum['preprocess'] += preprocess_time_ms
         self._timing_sum['inference'] += inference_time_ms
         self._timing_sum['postprocess'] += postprocess_time_ms
+        if nv12_data is not None:
+            self._nv12_path_count += 1
         
         if self._frame_counter % 100 == 0:
             avg_preprocess = self._timing_sum['preprocess'] / 100
             avg_inference = self._timing_sum['inference'] / 100
             avg_postprocess = self._timing_sum['postprocess'] / 100
             total_avg = avg_preprocess + avg_inference + avg_postprocess
+            nv12_pct = self._nv12_path_count  # Already a percentage (count out of 100)
             
             logger.info(
                 f"[BpuDetector] Avg timing (100 frames): "
                 f"preprocess={avg_preprocess:.2f}ms ({avg_preprocess/total_avg*100:.1f}%), "
                 f"inference={avg_inference:.2f}ms ({avg_inference/total_avg*100:.1f}%), "
                 f"postprocess={avg_postprocess:.2f}ms ({avg_postprocess/total_avg*100:.1f}%), "
-                f"total={total_avg:.2f}ms"
+                f"total={total_avg:.2f}ms, nv12_path={nv12_pct}%"
             )
             # Reset counters
             self._timing_sum = {'preprocess': 0, 'inference': 0, 'postprocess': 0}
+            self._nv12_path_count = 0
 
         # 5. Format Results
         boxes, scores, class_ids = [], [], []
@@ -317,6 +342,87 @@ class BpuDetector(BaseDetector):
         self.nv12_buffer[self.area + 1::2] = yuv_flat[v_start:]
 
         return self.nv12_buffer, x_scale, y_scale, x_shift, y_shift
+
+    def _preprocess_nv12(self, nv12_data, frame_size):
+        """
+        V5 Optimization: Preprocess NV12 data directly without BGR conversion.
+        
+        This method accepts raw NV12 data and resizes it directly to model input size.
+        It avoids the expensive BGR→NV12 conversion in the standard _preprocess() method.
+        
+        NV12 format:
+        - Y plane: full resolution (height x width)
+        - UV plane: half resolution, interleaved (height/2 x width)
+        - Total size: height * width * 3 / 2
+        
+        Args:
+            nv12_data: Raw NV12 numpy array with shape (height * 3 // 2, width)
+            frame_size: Tuple (height, width) of the original frame
+            
+        Returns:
+            Tuple (nv12_buffer, x_scale, y_scale, x_shift, y_shift) for postprocessing
+        """
+        img_h, img_w = frame_size
+        x_scale = min(1.0 * self.input_h / img_h, 1.0 * self.input_w / img_w)
+        y_scale = x_scale
+
+        new_w = int(img_w * x_scale)
+        new_h = int(img_h * y_scale)
+
+        x_shift = (self.input_w - new_w) // 2
+        y_shift = (self.input_h - new_h) // 2
+        
+        # NV12 structure:
+        # - Y plane: rows 0 to height-1
+        # - UV plane: rows height to height*3/2-1 (interleaved U and V)
+        y_plane_height = img_h
+        uv_plane_height = img_h // 2
+        
+        # Extract Y and UV planes from input
+        y_plane = nv12_data[:y_plane_height, :]  # Shape: (height, width)
+        uv_plane = nv12_data[y_plane_height:, :]  # Shape: (height/2, width)
+        
+        # Resize Y plane - use INTER_NEAREST for speed (detection is tolerant to minor artifacts)
+        new_y_h = new_h
+        new_y_w = new_w
+        y_resized = cv2.resize(y_plane, (new_y_w, new_y_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Resize UV plane (maintains 2:1 ratio with Y)
+        new_uv_h = new_h // 2
+        new_uv_w = new_w
+        uv_resized = cv2.resize(uv_plane, (new_uv_w, new_uv_h), interpolation=cv2.INTER_NEAREST)
+        
+        # NV12 Color Values for Neutral Gray Padding:
+        # Y (Luminance): 127 = mid-gray luminance (range 0-255)
+        # U (Cb): 128 = no blue-yellow chrominance (range 0-255, 128 = neutral)
+        # V (Cr): 128 = no red-cyan chrominance (range 0-255, 128 = neutral)
+        # These values produce neutral gray that doesn't bias detection
+        Y_NEUTRAL = 127  # Mid-gray luminance
+        UV_NEUTRAL = 128  # Neutral chrominance (no color bias)
+        
+        # Create padded Y plane with neutral gray background
+        y_padded = np.full((self.input_h, self.input_w), Y_NEUTRAL, dtype=np.uint8)
+        y_padded[y_shift:y_shift + new_y_h, x_shift:x_shift + new_y_w] = y_resized
+        
+        # Create padded UV plane with neutral chrominance
+        uv_target_h = self.input_h // 2
+        uv_padded = np.full((uv_target_h, self.input_w), UV_NEUTRAL, dtype=np.uint8)
+        
+        # Calculate UV padding offsets (UV is half resolution)
+        uv_y_shift = y_shift // 2
+        uv_x_shift = x_shift  # X shift is same for UV (width is same)
+        
+        # Place resized UV into padded UV
+        uv_padded[uv_y_shift:uv_y_shift + new_uv_h, uv_x_shift:uv_x_shift + new_uv_w] = uv_resized
+        
+        # Flatten and write to pre-allocated NV12 buffer
+        # Y plane: area bytes
+        # UV plane: area / 2 bytes (interleaved)
+        self.nv12_buffer[:self.area] = y_padded.reshape(-1)
+        self.nv12_buffer[self.area:] = uv_padded.reshape(-1)
+
+        return self.nv12_buffer, x_scale, y_scale, x_shift, y_shift
+
     def _postprocess(self, outputs, x_scale, y_scale, x_shift, y_shift, orig_shape):
         # YOLOv8 Headless Decoding Logic
         clses = [outputs[0].reshape(-1, self.classes_num), outputs[2].reshape(-1, self.classes_num),
