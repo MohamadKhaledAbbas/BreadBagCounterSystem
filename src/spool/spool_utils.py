@@ -9,6 +9,7 @@ Provides helper functions for:
 
 import os
 import json
+import time
 import zlib
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -175,7 +176,6 @@ def throttled_log(
     Returns:
         True if message was logged, False if throttled
     """
-    import time
     current_time = time.time()
     last_time = throttle_dict.get(key, 0.0)
     

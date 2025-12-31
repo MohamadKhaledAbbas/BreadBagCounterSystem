@@ -40,6 +40,7 @@ import sys
 import time
 import signal
 import threading
+import itertools
 from typing import Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
@@ -124,6 +125,7 @@ DEFAULT_WATCHDOG_TIMEOUT = 30.0  # Seconds without publishing before alert
 DEFAULT_ENABLE_ADAPTIVE_PACING = False  # Reduce FPS on high lag
 DEFAULT_ADAPTIVE_FPS_MIN = 15.0  # Minimum FPS during adaptive pacing
 DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
+ADAPTIVE_FPS_REDUCTION_FACTOR = 0.8  # Multiply current FPS by this on high lag
 
 
 @dataclass
@@ -465,16 +467,8 @@ class SpoolProcessorNode(Node):
                                 next_index=frame.index
                             ))
                             
-                            # Create a generator that yields this frame first, then continues
-                            def resume_generator(first_frame):
-                                yield first_frame
-                                while True:
-                                    try:
-                                        yield next(self._frame_generator)
-                                    except StopIteration:
-                                        break
-                            
-                            self._frame_generator = resume_generator(frame)
+                            # Use itertools.chain to combine first frame with remaining frames
+                            self._frame_generator = itertools.chain([frame], self._frame_generator)
                             break
                             
                 except StopIteration:
@@ -1058,7 +1052,7 @@ class SpoolProcessorNode(Node):
                     old_fps = self._current_target_fps
                     self._current_target_fps = max(
                         self.config.adaptive_fps_min,
-                        self._current_target_fps * 0.8
+                        self._current_target_fps * ADAPTIVE_FPS_REDUCTION_FACTOR
                     )
                     if old_fps != self._current_target_fps:
                         logger.warning(format_structured_log(
