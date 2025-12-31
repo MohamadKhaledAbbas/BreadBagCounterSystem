@@ -41,6 +41,7 @@ from src.utils.platform import IS_RDK
 from src.spool.h264_nal import extract_sps_pps, is_idr_frame
 from src.spool.segment_io import SegmentWriter, FrameRecord
 from src.spool.retention import RetentionPolicy, cleanup_stale_tmp_files
+from src.spool.spool_utils import format_structured_log, throttled_log
 from src.logging.Database import DatabaseManager
 from src import constants
 
@@ -66,6 +67,7 @@ DEFAULT_MAX_SEGMENT_DURATION = 10.0
 DEFAULT_RETENTION_SECONDS = 180.0
 DEFAULT_QUEUE_SIZE = 100
 DEFAULT_STATS_INTERVAL = 10.0
+DEFAULT_DROP_LOG_THROTTLE = 5.0  # Seconds between drop warning logs
 
 
 @dataclass
@@ -77,6 +79,8 @@ class SpoolConfig:
     retention_seconds: float = DEFAULT_RETENTION_SECONDS
     queue_size: int = DEFAULT_QUEUE_SIZE
     stats_interval: float = DEFAULT_STATS_INTERVAL
+    drop_log_throttle: float = DEFAULT_DROP_LOG_THROTTLE
+    enable_backpressure_hook: bool = False  # Future: enable backpressure on drops
 
 
 def load_default_config() -> SpoolConfig:
@@ -121,8 +125,10 @@ class SpoolRecorderNode(Node):
         self._frames_received = 0
         self._frames_dropped = 0
         self._frames_written = 0
+        self._ingress_drop_events = 0  # Number of distinct drop events
         self._last_stats_time = time.time()
         self._stats_lock = threading.Lock()
+        self._drop_log_throttle_dict = {}  # For throttled drop logging
         
         # SPS/PPS cache
         self._cached_sps: Optional[bytes] = None
@@ -196,22 +202,26 @@ class SpoolRecorderNode(Node):
         if self._writer_thread:
             self._writer_thread.join(timeout=5.0)
             if self._writer_thread.is_alive():
-                logger.warning("[SpoolRecorder] Writer thread did not stop in time")
+                logger.error("[SpoolRecorder] ⚠ Writer thread did not stop gracefully within timeout - incomplete stop")
         
         # Stop retention
         if self._retention:
             self._retention.stop()
         
-        # Close writer
+        # Close writer (ensures flush)
         if self._writer:
             self._writer.close()
         
-        # Log final stats
+        # Log final stats with structured format
         with self._stats_lock:
-            logger.info(f"[SpoolRecorder] Final stats: "
-                       f"received={self._frames_received}, "
-                       f"written={self._frames_written}, "
-                       f"dropped={self._frames_dropped}")
+            final_msg = format_structured_log(
+                "[SpoolRecorder] Final stats",
+                frames_received=self._frames_received,
+                frames_written=self._frames_written,
+                frames_dropped=self._frames_dropped,
+                drop_events=self._ingress_drop_events
+            )
+            logger.info(final_msg)
         
         logger.info("[SpoolRecorder] Stopped")
     
@@ -263,18 +273,37 @@ class SpoolRecorderNode(Node):
         try:
             self._frame_queue.put_nowait(record)
         except queue.Full:
-            # Drop oldest frame and retry
+            # Queue overflow - ingress drop detected
+            with self._stats_lock:
+                self._frames_dropped += 1
+                self._ingress_drop_events += 1
+            
+            # Emit throttled high-severity structured log
+            msg = format_structured_log(
+                "🔴 INGRESS DROP: Queue overflow",
+                frame_index=record.index,
+                queue_size=self.config.queue_size,
+                drops_total=self._frames_dropped,
+                drop_events=self._ingress_drop_events
+            )
+            throttled_log(
+                logger.error,
+                msg,
+                key="ingress_drop",
+                throttle_dict=self._drop_log_throttle_dict,
+                min_interval=self.config.drop_log_throttle
+            )
+            
+            # Backpressure hook (for future use)
+            if self.config.enable_backpressure_hook:
+                logger.warning("[SpoolRecorder] Backpressure hook enabled but not implemented yet")
+            
+            # Try to drop oldest frame and retry
             try:
                 self._frame_queue.get_nowait()
                 self._frame_queue.put_nowait(record)
-                with self._stats_lock:
-                    self._frames_dropped += 1
-            except queue.Empty:
+            except (queue.Empty, queue.Full):
                 pass
-            except queue.Full:
-                with self._stats_lock:
-                    self._frames_dropped += 1
-                logger.warning("[SpoolRecorder] Queue full, frame dropped")
     
     def _writer_loop(self):
         """
@@ -324,19 +353,31 @@ class SpoolRecorderNode(Node):
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
                 queue_size = self._frame_queue.qsize()
-                logger.info(f"[SpoolRecorder] Stats: "
-                           f"received={self._frames_received}, "
-                           f"written={self._frames_written}, "
-                           f"dropped={self._frames_dropped}, "
-                           f"queue={queue_size}/{self.config.queue_size}")
+                queue_util = (queue_size / self.config.queue_size * 100) if self.config.queue_size > 0 else 0
+                
+                # Structured stats logging
+                stats_msg = format_structured_log(
+                    "[SpoolRecorder] Stats",
+                    frames_received=self._frames_received,
+                    frames_written=self._frames_written,
+                    frames_dropped=self._frames_dropped,
+                    drop_events=self._ingress_drop_events,
+                    queue_size=queue_size,
+                    queue_max=self.config.queue_size,
+                    queue_util_pct=f"{queue_util:.1f}"
+                )
+                logger.info(stats_msg)
                 
                 # Log retention stats
                 if self._retention:
                     ret_stats = self._retention.get_stats()
-                    logger.info(f"[SpoolRecorder] Retention: "
-                               f"segments={ret_stats['total_segments']}, "
-                               f"size={ret_stats['total_size_mb']:.1f}MB, "
-                               f"oldest_age={ret_stats['oldest_segment_age_seconds']:.1f}s")
+                    ret_msg = format_structured_log(
+                        "[SpoolRecorder] Retention",
+                        total_segments=ret_stats['total_segments'],
+                        total_size_mb=f"{ret_stats['total_size_mb']:.1f}",
+                        oldest_age_sec=f"{ret_stats['oldest_segment_age_seconds']:.1f}"
+                    )
+                    logger.info(ret_msg)
             
             self._last_stats_time = current_time
 

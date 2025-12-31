@@ -53,6 +53,14 @@ from src.utils.AppLogging import logger
 from src.utils.platform import IS_RDK
 from src.spool.segment_io import SegmentReader, FrameRecord
 from src.spool.h264_nal import extract_sps_pps, is_idr_frame, detect_frame_type
+from src.spool.spool_utils import (
+    calculate_crc32,
+    save_processor_state,
+    load_processor_state,
+    ProcessorState,
+    format_structured_log,
+    throttled_log
+)
 from src.logging.Database import DatabaseManager
 from src import constants
 
@@ -109,6 +117,13 @@ DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
 DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
 DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
+DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
+DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
+DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
+DEFAULT_WATCHDOG_TIMEOUT = 30.0  # Seconds without publishing before alert
+DEFAULT_ENABLE_ADAPTIVE_PACING = False  # Reduce FPS on high lag
+DEFAULT_ADAPTIVE_FPS_MIN = 15.0  # Minimum FPS during adaptive pacing
+DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
 
 
 @dataclass
@@ -124,6 +139,14 @@ class ProcessorConfig:
     # V6: ACK-free mode configuration
     ack_free_mode: bool = DEFAULT_ACK_FREE_MODE
     target_fps: float = DEFAULT_TARGET_FPS
+    # V7: Robustness and observability
+    state_file: str = DEFAULT_STATE_FILE
+    spool_lag_warn_threshold: int = DEFAULT_SPOOL_LAG_WARN_THRESHOLD
+    spool_lag_error_threshold: int = DEFAULT_SPOOL_LAG_ERROR_THRESHOLD
+    watchdog_timeout: float = DEFAULT_WATCHDOG_TIMEOUT
+    enable_adaptive_pacing: bool = DEFAULT_ENABLE_ADAPTIVE_PACING
+    adaptive_fps_min: float = DEFAULT_ADAPTIVE_FPS_MIN
+    enable_crc32_logging: bool = DEFAULT_ENABLE_CRC32_LOGGING
 
 
 def load_default_config() -> ProcessorConfig:
@@ -228,6 +251,18 @@ class SpoolProcessorNode(Node):
         self._last_detailed_stats_time = time.time()  # For 2-minute detailed stats
         self._stats_lock = threading.Lock()
         
+        # V7: Robustness counters
+        self._last_published_index: int = -1  # For gap/dup detection
+        self._anomalies_gap: int = 0  # Gap detections
+        self._anomalies_dup: int = 0  # Duplicate detections
+        self._last_publish_time: float = 0.0  # For watchdog
+        self._sps_pps_missing_critical: int = 0  # SPS/PPS unavailable at boundary
+        self._current_target_fps: float = self.config.target_fps  # Adaptive pacing
+        self._throttle_log_dict = {}  # For throttled logging
+        
+        # State file path
+        self._state_file_path = os.path.join(self.config.spool_dir, self.config.state_file)
+        
         # ROS2 publishers and subscribers
         if IS_RDK:
             # QoS for READY topic - TRANSIENT_LOCAL for late joiners
@@ -304,6 +339,17 @@ class SpoolProcessorNode(Node):
         logger.info("[SpoolProcessor] Starting...")
         self._running = True
         
+        # V7: Load persisted state for restart continuity
+        loaded_state = load_processor_state(self._state_file_path)
+        if loaded_state and loaded_state.last_published_index >= 0:
+            self._last_published_index = loaded_state.last_published_index
+            logger.info(format_structured_log(
+                "[SpoolProcessor] Loaded persisted state",
+                last_index=loaded_state.last_published_index,
+                last_segment=loaded_state.last_published_segment,
+                prev_session=loaded_state.session_id[:8]
+            ))
+        
         # Initialize frame generator
         self._init_frame_generator()
         
@@ -336,20 +382,40 @@ class SpoolProcessorNode(Node):
         if self._processor_thread:
             self._processor_thread.join(timeout=5.0)
             if self._processor_thread.is_alive():
-                logger.warning("[SpoolProcessor] Processor thread did not stop in time")
+                logger.error("[SpoolProcessor] ⚠ Processor thread did not stop gracefully within timeout - incomplete stop")
         
-        # Log final stats
+        # V7: Save state before exit
+        if self._last_published_index >= 0:
+            state = ProcessorState(
+                last_published_index=self._last_published_index,
+                last_published_segment=self._current_segment,
+                session_id=self._session_id,
+                timestamp=time.time()
+            )
+            if save_processor_state(self._state_file_path, state):
+                logger.info(format_structured_log(
+                    "[SpoolProcessor] State saved",
+                    last_index=self._last_published_index,
+                    last_segment=self._current_segment
+                ))
+        
+        # Log final stats with structured format
         with self._stats_lock:
-            logger.info(f"[SpoolProcessor] Final stats: "
-                       f"session={self._session_id[:8]}, "
-                       f"seq={self._seq_counter}, "
-                       f"processed={self._frames_processed}, "
-                       f"retried={self._frames_retried}, "
-                       f"skipped={self._frames_skipped}, "
-                       f"timeouts={self._ack_timeouts}, "
-                       f"ack_rejected={self._ack_rejected_stale}, "
-                       f"segments={self._segments_processed}, "
-                       f"sps_pps_prepends={self._sps_pps_prepends}")
+            final_msg = format_structured_log(
+                "[SpoolProcessor] Final stats",
+                session=self._session_id[:8],
+                seq=self._seq_counter,
+                processed=self._frames_processed,
+                retried=self._frames_retried,
+                skipped=self._frames_skipped,
+                timeouts=self._ack_timeouts,
+                ack_rejected=self._ack_rejected_stale,
+                segments=self._segments_processed,
+                sps_pps_prepends=self._sps_pps_prepends,
+                anomalies_gap=self._anomalies_gap,
+                anomalies_dup=self._anomalies_dup
+            )
+            logger.info(final_msg)
         
         logger.info("[SpoolProcessor] Stopped")
     
