@@ -312,6 +312,10 @@ class BagCounterApp:
         self._ack_publisher_node = None
         self._current_frame_metadata = None  # Store latest frame metadata for ACK construction
         self._frame_index_mismatch_count = 0  # Track mismatches for throttling warnings
+        
+        # V7: Idempotency guard - prevent double processing of same frame
+        self._last_processed_frame_index: int = -1
+        self._duplicate_frame_count: int = 0  # Track how many duplicates were skipped
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
@@ -484,6 +488,8 @@ class BagCounterApp:
         """
         Phase 2 Optimization: Extracted queue stats logging to reduce hot path overhead.
         Called every STATS_LOG_INTERVAL seconds from the frame capture thread.
+        
+        V7: Added PIPELINE_STATS logging with consistent keywords.
         """
         input_size = self.input_queue.qsize()
         input_utilization = (input_size / self.INPUT_QUEUE_SIZE) * 100
@@ -497,6 +503,7 @@ class BagCounterApp:
         
         # V4 Phase 1: Detection queue stats
         detection_stats = ""
+        detection_size = 0
         if self.detection_queue_enabled and self.detection_queue is not None:
             detection_size = self.detection_queue.qsize()
             detection_utilization = (detection_size / tracking_config.detection_queue_size) * 100
@@ -516,6 +523,16 @@ class BagCounterApp:
             total_degraded_frames = self._frames_processed_in_degraded + self._frames_skipped_by_pattern
             pattern_skip_rate = (self._frames_skipped_by_pattern / total_degraded_frames) * 100
             smart_skip_info = f" | SmartSkip: {self._frames_skipped_by_pattern} frames (rate={pattern_skip_rate:.1f}% in degraded)"
+        
+        # V7: PIPELINE_STATS log with consistent keywords
+        duplicate_count = getattr(self, '_duplicate_frame_count', 0)
+        logger.info(
+            f"PIPELINE_STATS component=bag_counter "
+            f"detection_queue_size={detection_size} "
+            f"detection_drop={detection_drops} "
+            f"input_queue_util={input_utilization:.1f}% "
+            f"duplicate_frames={duplicate_count}"
+        )
         
         logger.info(
             f"[QueueStats] Input: {input_size}/{self.INPUT_QUEUE_SIZE} "
@@ -1008,6 +1025,33 @@ class BagCounterApp:
             logger.info(f"[BagCounterApp] ✓ READY published: session_id={ready.session_id[:8]}")
         except Exception as e:
             logger.error(f"[BagCounterApp] Failed to publish READY: {e}")
+    
+    def _check_frame_idempotency(self, spool_frame_index: int) -> bool:
+        """
+        V7: Check if this frame has already been processed (idempotency guard).
+        
+        Prevents double-processing of the same frame due to replays, restarts, 
+        or rare reorder scenarios that could cause double counting.
+        
+        Args:
+            spool_frame_index: The frame index to check
+            
+        Returns:
+            True if frame should be processed, False if it's a duplicate
+        """
+        if spool_frame_index <= self._last_processed_frame_index:
+            self._duplicate_frame_count += 1
+            if self._duplicate_frame_count % 100 == 1:
+                logger.warning(
+                    f"[BagCounterApp] ⚠ IDEMPOTENCY: Skipping duplicate/stale frame "
+                    f"index={spool_frame_index} (last_processed={self._last_processed_frame_index}, "
+                    f"total_duplicates={self._duplicate_frame_count})"
+                )
+            return False
+        
+        # Update last processed index
+        self._last_processed_frame_index = spool_frame_index
+        return True
 
     # --- V3: Async Classification Thread ---
     
@@ -2002,6 +2046,10 @@ class BagCounterApp:
                     # This ensures perfect correlation - no separate state queries needed
                     if getattr(self, "_accuracy_mode", False) and spool_frame_index is not None:
                         self._publish_processing_ack(spool_frame_index)
+                        
+                        # V7: Idempotency guard - skip duplicate/stale frames
+                        if not self._check_frame_idempotency(spool_frame_index):
+                            continue
                     
                     current_time = time.perf_counter()
                     if last_frame_time is not None:

@@ -19,6 +19,10 @@ spool_ack_timeout = "spool_ack_timeout"
 spool_retry_count = "spool_retry_count"
 spool_ack_free_mode = "spool_ack_free_mode"  # V6: Disable ACK-based flow control
 spool_target_fps = "spool_target_fps"  # V6: Target FPS for ACK-free mode
+# V7: Reliable pacing and smart skipping configuration
+spool_max_inflight_frames = "spool_max_inflight_frames"  # Max frames in-flight before backpressure
+spool_lag_skip_threshold_seconds = "spool_lag_skip_threshold_seconds"  # Lag threshold to trigger smart skipping
+spool_prefer_idr_skip = "spool_prefer_idr_skip"  # Prefer skipping non-IDR frames when lagged
 
 CONFIG_KEYS = [
     show_ui_screen_key,
@@ -41,4 +45,8 @@ CONFIG_KEYS = [
     spool_retry_count,
     spool_ack_free_mode,
     spool_target_fps,
+    # V7: Reliable pacing config
+    spool_max_inflight_frames,
+    spool_lag_skip_threshold_seconds,
+    spool_prefer_idr_skip,
 ]

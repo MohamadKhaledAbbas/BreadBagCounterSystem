@@ -40,7 +40,7 @@ import sys
 import time
 import signal
 import threading
-from typing import Optional, Generator
+from typing import Optional, Generator, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -109,6 +109,10 @@ DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
 DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
 DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
+# V7: Reliable pacing defaults
+DEFAULT_MAX_INFLIGHT_FRAMES = 10  # Max frames in-flight before backpressure
+DEFAULT_LAG_SKIP_THRESHOLD_SECONDS = 30.0  # Lag threshold to trigger smart skipping
+DEFAULT_PREFER_IDR_SKIP = True  # Prefer skipping non-IDR frames when lagged
 
 
 @dataclass
@@ -124,6 +128,10 @@ class ProcessorConfig:
     # V6: ACK-free mode configuration
     ack_free_mode: bool = DEFAULT_ACK_FREE_MODE
     target_fps: float = DEFAULT_TARGET_FPS
+    # V7: Reliable pacing and smart skipping configuration
+    max_inflight_frames: int = DEFAULT_MAX_INFLIGHT_FRAMES
+    lag_skip_threshold_seconds: float = DEFAULT_LAG_SKIP_THRESHOLD_SECONDS
+    prefer_idr_skip: bool = DEFAULT_PREFER_IDR_SKIP
 
 
 def load_default_config() -> ProcessorConfig:
@@ -134,6 +142,9 @@ def load_default_config() -> ProcessorConfig:
         retry_count=DEFAULT_RETRY_COUNT,
         ack_free_mode=DEFAULT_ACK_FREE_MODE,
         target_fps=DEFAULT_TARGET_FPS,
+        max_inflight_frames=DEFAULT_MAX_INFLIGHT_FRAMES,
+        lag_skip_threshold_seconds=DEFAULT_LAG_SKIP_THRESHOLD_SECONDS,
+        prefer_idr_skip=DEFAULT_PREFER_IDR_SKIP,
     )
 
 class SpoolProcessorNode(Node):
@@ -181,6 +192,8 @@ class SpoolProcessorNode(Node):
                    f"spool_dir={self.config.spool_dir}, "
                    f"ack_free_mode={self.config.ack_free_mode}, "
                    f"target_fps={self.config.target_fps}, "
+                   f"max_inflight={self.config.max_inflight_frames}, "
+                   f"lag_skip_threshold={self.config.lag_skip_threshold_seconds}s, "
                    f"ack_timeout={self.config.ack_timeout}s (legacy only), "
                    f"retry_count={self.config.retry_count} (legacy only), "
                    f"startup_grace={self.config.startup_grace_period}s, "
@@ -227,6 +240,21 @@ class SpoolProcessorNode(Node):
         self._last_stats_time = time.time()
         self._last_detailed_stats_time = time.time()  # For 2-minute detailed stats
         self._stats_lock = threading.Lock()
+        
+        # V7: In-flight tracking for bounded backpressure
+        self._inflight_frames = 0  # Number of frames published but not yet ACKed
+        self._inflight_lock = threading.Lock()
+        self._last_ack_frame_index = 0  # Last frame index acknowledged
+        
+        # V7: Smart skipping statistics
+        self._frames_skipped_smart = 0  # Frames skipped due to lag/smart skip
+        self._lag_skip_enabled = False  # Whether smart skip mode is currently active
+        self._last_lag_seconds = 0.0  # Last calculated spool lag
+        
+        # V7: FPS tracking for PIPELINE_STATS
+        self._fps_publish_window_start = time.time()
+        self._fps_publish_count = 0
+        self._current_fps_pub = 0.0
         
         # ROS2 publishers and subscribers
         if IS_RDK:
@@ -716,13 +744,29 @@ class SpoolProcessorNode(Node):
             logger.error(f"[SpoolProcessor] Error parsing READY message: {e}")
     
     def _ack_callback(self, msg):
-        """Callback for processing ACK messages."""
+        """
+        Callback for processing ACK messages.
+        
+        V7: Also updates in-flight tracking for bounded backpressure.
+        """
         try:
             ack = processing_ack_from_ros_string(msg.data)
             self._last_ack = ack
             self._ack_received.set()
+            
+            # V7: Update in-flight tracking if session matches
+            if ack.session_id == self._session_id:
+                with self._inflight_lock:
+                    # Update last ACKed frame index
+                    if ack.frame_index > self._last_ack_frame_index:
+                        # Decrement inflight by the number of frames acknowledged
+                        frames_acked = ack.frame_index - self._last_ack_frame_index
+                        self._inflight_frames = max(0, self._inflight_frames - frames_acked)
+                        self._last_ack_frame_index = ack.frame_index
+                self._last_ack_time = time.time()
+            
             logger.debug(f"[SpoolProcessor] ACK callback: seq={ack.seq}, frame_index={ack.frame_index}, "
-                        f"session_id={ack.session_id[:8]}")
+                        f"session_id={ack.session_id[:8]}, inflight={self._inflight_frames}")
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error parsing ACK message: {e}")
     
@@ -760,6 +804,94 @@ class SpoolProcessorNode(Node):
                       "proceeding without explicit READY signal. Consumer may not be synchronized.")
         return False
     
+    def _calculate_spool_lag(self) -> Tuple[int, float]:
+        """
+        V7: Calculate current spool lag (how far behind we are).
+        
+        Returns:
+            Tuple of (lag_segments, lag_seconds_estimate)
+        """
+        segments = self._reader.list_segments()
+        if not segments:
+            return (0, 0.0)
+        
+        newest_segment = max(segments)
+        if self._current_segment < 0:
+            return (0, 0.0)
+        
+        lag_segments = newest_segment - self._current_segment
+        # Estimate lag in seconds (assuming ~5s per segment)
+        lag_seconds = lag_segments * 5.0
+        
+        return (lag_segments, lag_seconds)
+    
+    def _should_smart_skip(self, frame: FrameRecord) -> Tuple[bool, str]:
+        """
+        V7: Determine if a frame should be skipped based on lag.
+        
+        Smart skipping policy:
+        - Only skip when lag exceeds threshold
+        - Prefer skipping non-IDR frames to maintain decoder state
+        - Never skip if we're caught up
+        
+        Args:
+            frame: The frame being considered for skipping
+            
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        lag_segments, lag_seconds = self._calculate_spool_lag()
+        self._last_lag_seconds = lag_seconds
+        
+        # Check if lag exceeds threshold
+        if lag_seconds < self.config.lag_skip_threshold_seconds:
+            self._lag_skip_enabled = False
+            return (False, "lag_within_threshold")
+        
+        self._lag_skip_enabled = True
+        
+        # Check if this is an IDR frame (keyframe)
+        if self.config.prefer_idr_skip:
+            frame_is_idr = is_idr_frame(frame.data)
+            if frame_is_idr:
+                # Never skip IDR frames - they're essential for decoder state
+                return (False, "idr_frame_preserved")
+            else:
+                # Skip non-IDR frames when lagged
+                return (True, f"lag_skip_non_idr_{lag_seconds:.1f}s")
+        else:
+            # Simple skip pattern: skip every other frame when lagged
+            # Using frame index to create consistent pattern
+            if frame.index % 2 == 0:
+                return (True, f"lag_skip_even_{lag_seconds:.1f}s")
+            else:
+                return (False, "lag_skip_pattern_keep")
+    
+    def _check_inflight_backpressure(self) -> bool:
+        """
+        V7: Check if we should pause due to in-flight backpressure.
+        
+        Returns:
+            True if we should pause publishing, False otherwise
+        """
+        with self._inflight_lock:
+            return self._inflight_frames >= self.config.max_inflight_frames
+    
+    def _increment_inflight(self):
+        """V7: Increment the in-flight frame counter."""
+        with self._inflight_lock:
+            self._inflight_frames += 1
+    
+    def _update_fps_tracking(self):
+        """V7: Update FPS tracking for PIPELINE_STATS."""
+        self._fps_publish_count += 1
+        now = time.time()
+        elapsed = now - self._fps_publish_window_start
+        if elapsed >= 1.0:
+            self._current_fps_pub = self._fps_publish_count / elapsed
+            self._fps_publish_count = 0
+            self._fps_publish_window_start = now
+    
     def _processor_loop(self):
         """
         Main processing loop - dispatches to ACK-free or legacy mode.
@@ -778,33 +910,57 @@ class SpoolProcessorNode(Node):
     
     def _processor_loop_ack_free(self):
         """
-        V6 ACK-Free Processing Loop (Production-Grade).
+        V7 ACK-Free Processing Loop with Bounded Backpressure and Smart Skipping.
         
-        This loop processes frames continuously without waiting for ACKs:
+        This loop processes frames continuously with controlled pacing:
         1. Read frame from spool
-        2. Publish immediately
-        3. Pace to target_fps
-        4. Never block
+        2. Check in-flight backpressure (wait if at max_inflight)
+        3. Apply smart skip logic if lagged
+        4. Publish at target_fps
+        5. Track in-flight frames
+        
+        V7 Enhancements over V6:
+        - Bounded in-flight window prevents runaway backlog
+        - Smart skipping when lagged (prefer non-IDR)
+        - PIPELINE_STATS logging for observability
+        - Correctness guardrails maintained
         
         Benefits:
-        - No deadlocks (impossible)
-        - Maximum throughput
-        - Stable latency
+        - Controlled backpressure without deadlock
+        - Intentional frame skipping instead of unpredictable drops
+        - Maximum throughput within bounds
         - Production-safe
-        
-        The consumer processes frames at its own pace. Retention guards
-        protect unprocessed data from deletion.
         """
-        logger.info(f"[SpoolProcessor] ACK-FREE mode active: target_fps={self.config.target_fps}")
+        logger.info(f"[SpoolProcessor] ACK-FREE mode active (V7): target_fps={self.config.target_fps}, "
+                   f"max_inflight={self.config.max_inflight_frames}, "
+                   f"lag_skip_threshold={self.config.lag_skip_threshold_seconds}s")
         
         frame_interval = 1.0 / self.config.target_fps
         last_publish_time = 0.0
+        backpressure_wait_count = 0
         
         with self._state_lock:
             self._state = ProcessorState.PUBLISHING
         
         while self._running:
             try:
+                # V7: Check in-flight backpressure
+                backpressure_iterations = 0
+                while self._check_inflight_backpressure() and self._running:
+                    backpressure_iterations += 1
+                    if backpressure_iterations == 1:
+                        backpressure_wait_count += 1
+                        logger.debug(f"[SpoolProcessor] Backpressure: inflight={self._inflight_frames}/{self.config.max_inflight_frames}, waiting...")
+                    # Brief wait to allow ACKs to arrive
+                    time.sleep(0.01)
+                    # Safety: don't wait forever, max 1 second then proceed
+                    if backpressure_iterations > 100:
+                        logger.warning(f"[SpoolProcessor] Backpressure timeout after 1s, proceeding anyway")
+                        break
+                
+                if not self._running:
+                    break
+                
                 # Get next frame
                 frame = self._get_next_frame()
                 
@@ -821,6 +977,16 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
+                # V7: Smart skip decision based on lag
+                should_skip, skip_reason = self._should_smart_skip(frame)
+                if should_skip:
+                    with self._stats_lock:
+                        self._frames_skipped_smart += 1
+                    if self._frames_skipped_smart % 50 == 1:
+                        logger.info(f"[SpoolProcessor] Smart skip: frame={frame.index}, reason={skip_reason}, "
+                                  f"total_smart_skips={self._frames_skipped_smart}")
+                    continue
+                
                 # Pace to target FPS (non-blocking pacing)
                 current_time = time.time()
                 elapsed = current_time - last_publish_time
@@ -832,6 +998,9 @@ class SpoolProcessorNode(Node):
                 last_publish_time = time.time()
                 
                 if success:
+                    # V7: Increment in-flight counter
+                    self._increment_inflight()
+                    self._update_fps_tracking()
                     with self._stats_lock:
                         self._frames_processed += 1
                 else:
@@ -948,7 +1117,11 @@ class SpoolProcessorNode(Node):
         return False
     
     def _maybe_log_stats(self):
-        """Log statistics periodically."""
+        """
+        Log statistics periodically.
+        
+        V7: Added PIPELINE_STATS logging with consistent keywords for observability.
+        """
         current_time = time.time()
         
         # Regular stats every 10 seconds
@@ -957,12 +1130,29 @@ class SpoolProcessorNode(Node):
                 # Calculate time since last successful ACK (watchdog info)
                 ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
                 
+                # V7: PIPELINE_STATS log with consistent keywords
+                with self._inflight_lock:
+                    inflight = self._inflight_frames
+                
+                logger.info(
+                    f"PIPELINE_STATS component=spool_processor "
+                    f"fps_pub={self._current_fps_pub:.1f} "
+                    f"inflight={inflight}/{self.config.max_inflight_frames} "
+                    f"spool_lag_seconds={self._last_lag_seconds:.1f} "
+                    f"skip_enabled={self._lag_skip_enabled} "
+                    f"smart_skips={self._frames_skipped_smart} "
+                    f"processed={self._frames_processed} "
+                    f"skipped={self._frames_skipped}"
+                )
+                
+                # Regular detailed stats
                 logger.info(f"[SpoolProcessor] Stats: "
                            f"session={self._session_id[:8]}, "
                            f"seq={self._seq_counter}, "
                            f"processed={self._frames_processed}, "
                            f"retried={self._frames_retried}, "
                            f"skipped={self._frames_skipped}, "
+                           f"smart_skipped={self._frames_skipped_smart}, "
                            f"timeouts={self._ack_timeouts}, "
                            f"ack_rejected={self._ack_rejected_stale}, "
                            f"segments={self._segments_processed}, "
@@ -974,7 +1164,8 @@ class SpoolProcessorNode(Node):
                 logger.info(f"[SpoolProcessor] Spool: "
                            f"segments={len(segments)}, "
                            f"current_frame={self._current_frame_index}, "
-                           f"last_ack_age={ack_staleness:.1f}s")
+                           f"last_ack_age={ack_staleness:.1f}s, "
+                           f"inflight={inflight}/{self.config.max_inflight_frames}")
                 
                 # Watchdog warning if ACKs are stale
                 if ack_staleness > self.config.ack_timeout * 2 and self._last_ack_time > 0:

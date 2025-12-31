@@ -67,6 +67,10 @@ class FrameServer(Node, FrameSource):
         self.frames_dropped = 0  # Track dropped frames
         self.frames_index_fallback = 0  # Track fallback to current index (should be rare)
         self.frames_index_lost = 0  # Track frame indices that couldn't be enqueued (severe stall)
+        # V7: New correctness metrics
+        self.frames_index_miss_drop = 0  # V7: Frames dropped due to missing index correlation
+        self.frames_index_miss_consecutive = 0  # V7: Consecutive misses (for rate-limiting warnings)
+        self._last_index_miss_warn_time = 0.0  # V7: For rate-limiting warnings
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
@@ -221,11 +225,22 @@ class FrameServer(Node, FrameSource):
             # Include pending index queue stats for accuracy mode
             if self._accuracy_mode:
                 pending_queue_size = self._pending_frame_indices.qsize()
+                
+                # V7: PIPELINE_STATS log with consistent keywords
+                logger.info(
+                    f"PIPELINE_STATS component=frame_server "
+                    f"pending_indices={pending_queue_size} "
+                    f"index_miss_drop={self.frames_index_miss_drop} "
+                    f"queue_util={queue_utilization:.1f}% "
+                    f"drop_rate={drop_rate:.2f}%"
+                )
+                
                 stats_msg = (
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
                     f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
                     f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%, "
-                    f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}"
+                    f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}, "
+                    f"index_miss_drops={self.frames_index_miss_drop}"
                 )
                 # Add lost_indices to output if non-zero (severe stall indicator)
                 if self.frames_index_lost > 0:
@@ -312,20 +327,38 @@ class FrameServer(Node, FrameSource):
                 # The index that was published BEFORE this H.264 frame is now matched
                 # with the decoded NV12 frame that resulted from it.
                 spool_frame_index = self._pending_frame_indices.get_nowait()
+                # V7: Reset consecutive miss counter on success
+                self.frames_index_miss_consecutive = 0
                 logger.debug(f"[Ros2FrameServer] Correlated decoded frame with spool_frame_index {spool_frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
             except queue.Empty:
-                # No pending index - this shouldn't happen in normal operation
-                # This indicates either:
+                # V7: CORRECTNESS GUARDRAIL - Drop frame instead of falling back
+                # No pending index - this MUST NOT proceed to counting pipeline
+                # as it would cause incorrect frame correlation.
+                # 
+                # Possible causes:
                 # 1. Frame indices not being published (SpoolProcessor issue)
                 # 2. More decoded frames than published indices (decoder issue)
                 # 3. System startup/shutdown race condition
-                # Fall back to current index as best-effort but track this metric
-                spool_frame_index = self.get_current_frame_index()
+                #
+                # V7: Drop this frame to maintain counting correctness
+                self.frames_index_miss_drop += 1
+                self.frames_index_miss_consecutive += 1
+                
+                # Rate-limited warning (at most once per second)
+                current_time = time.time()
+                if current_time - self._last_index_miss_warn_time >= 1.0:
+                    logger.warning(
+                        f"[Ros2FrameServer] ⚠ CORRECTNESS: Dropping decoded frame - no pending index "
+                        f"(total_drops={self.frames_index_miss_drop}, consecutive={self.frames_index_miss_consecutive}). "
+                        f"Frame would have unknown index - unsafe for counting."
+                    )
+                    self._last_index_miss_warn_time = current_time
+                
+                # V7: Also track legacy metric for backward compatibility
                 self.frames_index_fallback += 1
-                logger.warning(
-                    f"[Ros2FrameServer] No pending frame index available (fallback #{self.frames_index_fallback}), "
-                    f"using current index {spool_frame_index}. This may reintroduce race condition."
-                )
+                
+                # DO NOT ENQUEUE - return early to drop this frame
+                return
         
         # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
         # Frame format: (bgr, latency_ms, spool_frame_index, nv12_data, (height, width))
