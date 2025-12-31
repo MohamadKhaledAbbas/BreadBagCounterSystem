@@ -952,6 +952,7 @@ class SpoolProcessorNode(Node):
                 backpressure_iterations = 0
                 # Calculate max iterations based on configurable timeout (each iteration = 10ms)
                 max_backpressure_iterations = int(self.config.backpressure_timeout_seconds / 0.01)
+                backpressure_timed_out = False
                 while self._check_inflight_backpressure() and self._running:
                     backpressure_iterations += 1
                     if backpressure_iterations == 1:
@@ -962,6 +963,15 @@ class SpoolProcessorNode(Node):
                     # Safety: don't wait forever, use configurable timeout
                     if backpressure_iterations > max_backpressure_iterations:
                         logger.warning(f"[SpoolProcessor] Backpressure timeout after {self.config.backpressure_timeout_seconds}s, proceeding anyway")
+                        backpressure_timed_out = True
+                        # V7 FIX: Reset inflight counter when timeout occurs - indicates ACKs aren't flowing
+                        # This prevents the counter from growing unboundedly when downstream is stalled
+                        with self._inflight_lock:
+                            old_inflight = self._inflight_frames
+                            # Reset to max_inflight to allow one more frame through
+                            self._inflight_frames = self.config.max_inflight_frames
+                            if old_inflight > self.config.max_inflight_frames + 5:
+                                logger.warning(f"[SpoolProcessor] Reset inflight counter: {old_inflight} -> {self._inflight_frames} (ACKs not flowing)")
                         break
                 
                 if not self._running:
