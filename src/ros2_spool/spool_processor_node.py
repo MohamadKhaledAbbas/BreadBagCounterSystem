@@ -83,7 +83,7 @@ if IS_RDK:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
     from img_msgs.msg import H26XFrame
-    from std_msgs.msg import UInt32, String
+    from std_msgs.msg import String
     from builtin_interfaces.msg import Time
 else:
     # Stub for non-RDK development
@@ -296,18 +296,10 @@ class SpoolProcessorNode(Node):
                 frame_qos
             )
             
-            # Publisher for frame metadata (new format)
+            # Publisher for frame metadata
             self._metadata_pub = self.create_publisher(
                 String,
                 '/spool/current_frame_metadata',
-                control_qos
-            )
-            
-            # V7 FIX: Also publish to legacy /spool/current_frame_index for backward compatibility
-            # Ros2FrameServer still subscribes to this topic for frame correlation
-            self._index_pub = self.create_publisher(
-                UInt32,
-                '/spool/current_frame_index',
                 control_qos
             )
             
@@ -338,7 +330,6 @@ class SpoolProcessorNode(Node):
             logger.info("[SpoolProcessor] ROS2 topics configured: "
                        "/spool_image_ch_0 (pub, RELIABLE), "
                        "/spool/current_frame_metadata (pub, RELIABLE), "
-                       "/spool/current_frame_index (pub, RELIABLE, legacy), "
                        "/processing_ready (sub, TRANSIENT_LOCAL), "
                        "/processing_ack (sub, RELIABLE)")
     
@@ -788,11 +779,6 @@ class SpoolProcessorNode(Node):
             metadata_msg = String()
             metadata_msg.data = frame_metadata_to_ros_string(metadata)
             self._metadata_pub.publish(metadata_msg)
-            
-            # V7 FIX: Also publish to legacy topic for backward compatibility with Ros2FrameServer
-            index_msg = UInt32()
-            index_msg.data = record.index
-            self._index_pub.publish(index_msg)
             
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
