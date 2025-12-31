@@ -204,6 +204,7 @@ class SpoolProcessorNode(Node):
         
         # V7: Robustness counters
         self._last_published_index: int = -1  # For gap/dup detection
+        self._last_published_segment: int = -1  # Track which segment last frame came from
         self._anomalies_gap: int = 0  # Gap detections
         self._anomalies_dup: int = 0  # Duplicate detections
         self._last_publish_time: float = 0.0  # For watchdog
@@ -246,6 +247,7 @@ class SpoolProcessorNode(Node):
         loaded_state = load_processor_state(self._state_file_path)
         if loaded_state and loaded_state.last_published_index >= 0:
             self._last_published_index = loaded_state.last_published_index
+            self._last_published_segment = loaded_state.last_published_segment
             logger.info(format_structured_log(
                 "[SpoolProcessor] Loaded persisted state",
                 last_index=loaded_state.last_published_index,
@@ -512,6 +514,7 @@ class SpoolProcessorNode(Node):
             return frame
         except StopIteration:
             # Segment exhausted, try to reinitialize from new segments
+            old_segment = self._current_segment
             with self._stats_lock:
                 if self._current_segment >= 0:
                     self._segments_processed += 1
@@ -521,7 +524,7 @@ class SpoolProcessorNode(Node):
             # Instead, directly get the next segment and create a fresh generator
             oldest = self._reader.get_oldest_segment()
             if oldest is not None:
-                logger.info(f"[SpoolProcessor] Starting from segment {oldest}")
+                logger.info(f"[SpoolProcessor] Segment transition: {old_segment} → {oldest}")
                 self._frame_generator = self._reader.read_frames(start_segment=oldest)
                 self._current_segment = oldest
                 
@@ -632,33 +635,38 @@ class SpoolProcessorNode(Node):
             return True
         
         try:
-            # V7: Detect gaps and duplicates
-            if self._last_published_index >= 0:
-                expected_index = self._last_published_index + 1
-                if record.index > expected_index:
-                    # Gap detected
-                    gap_size = record.index - expected_index
-                    with self._stats_lock:
-                        self._anomalies_gap += 1
-                    gap_msg = format_structured_log(
-                        "⚠ GAP DETECTED",
-                        expected=expected_index,
-                        actual=record.index,
-                        gap_size=gap_size,
-                        total_gaps=self._anomalies_gap
-                    )
-                    logger.warning(f"[SpoolProcessor] {gap_msg}")
-                elif record.index < expected_index:
-                    # Duplicate or out-of-order
-                    with self._stats_lock:
-                        self._anomalies_dup += 1
-                    dup_msg = format_structured_log(
-                        "⚠ DUPLICATE/OUT-OF-ORDER DETECTED",
-                        expected=expected_index,
-                        actual=record.index,
-                        total_dups=self._anomalies_dup
-                    )
-                    logger.warning(f"[SpoolProcessor] {dup_msg}")
+            # V7: Detect gaps and duplicates WITHIN the same segment only
+            # Frame indices are not continuous across segment boundaries
+            if self._last_published_index >= 0 and hasattr(self, '_last_published_segment'):
+                # Only check for gaps/dups if we're in the same segment
+                if self._last_published_segment == self._current_segment:
+                    expected_index = self._last_published_index + 1
+                    if record.index > expected_index:
+                        # Gap detected within segment
+                        gap_size = record.index - expected_index
+                        with self._stats_lock:
+                            self._anomalies_gap += 1
+                        gap_msg = format_structured_log(
+                            "⚠ GAP DETECTED",
+                            expected=expected_index,
+                            actual=record.index,
+                            gap_size=gap_size,
+                            segment=self._current_segment,
+                            total_gaps=self._anomalies_gap
+                        )
+                        logger.warning(f"[SpoolProcessor] {gap_msg}")
+                    elif record.index < expected_index:
+                        # Duplicate or out-of-order within segment
+                        with self._stats_lock:
+                            self._anomalies_dup += 1
+                        dup_msg = format_structured_log(
+                            "⚠ DUPLICATE/OUT-OF-ORDER DETECTED",
+                            expected=expected_index,
+                            actual=record.index,
+                            segment=self._current_segment,
+                            total_dups=self._anomalies_dup
+                        )
+                        logger.warning(f"[SpoolProcessor] {dup_msg}")
             
             # Get next sequence number
             with self._seq_lock:
@@ -697,8 +705,9 @@ class SpoolProcessorNode(Node):
             
             self._frame_pub.publish(frame_msg)
             
-            # V7: Update last published index (for gap/dup detection and state persistence)
+            # V7: Update last published index and segment (for gap/dup detection and state persistence)
             self._last_published_index = record.index
+            self._last_published_segment = self._current_segment
             self._last_publish_time = time.time()
             
             # V7: Optional CRC32 logging
