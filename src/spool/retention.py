@@ -88,26 +88,32 @@ class RetentionPolicy:
     def __init__(
         self,
         spool_dir: str,
-        retention_seconds: float = 180.0,
+        retention_seconds: float = 300.0,  # V7.1: Increased from 180s to 300s (5 minutes)
         cleanup_interval: float = 10.0,
         min_segments_to_keep: int = 2,
-        retention_safety_enabled: bool = True
+        retention_safety_enabled: bool = True,
+        max_spool_size_bytes: int = 2_147_483_648,  # V7.1: 2GB size limit
+        delete_processed_segments: bool = True  # V7.1: Delete immediately after processing
     ):
         """
         Initialize the retention policy.
         
         Args:
             spool_dir: Directory containing spool files
-            retention_seconds: Maximum age of segments before deletion
+            retention_seconds: Maximum age of segments before deletion (default: 300s = 5min)
             cleanup_interval: Interval between cleanup checks
             min_segments_to_keep: Minimum segments to always keep
             retention_safety_enabled: V6 - Enable processor progress awareness
+            max_spool_size_bytes: V7.1 - Maximum total spool size (default: 2GB)
+            delete_processed_segments: V7.1 - Delete segments immediately after processing
         """
         self.spool_dir = Path(spool_dir)
         self.retention_seconds = retention_seconds
         self.cleanup_interval = cleanup_interval
         self.min_segments_to_keep = min_segments_to_keep
         self.retention_safety_enabled = retention_safety_enabled
+        self.max_spool_size_bytes = max_spool_size_bytes
+        self.delete_processed_segments = delete_processed_segments
         
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -115,6 +121,7 @@ class RetentionPolicy:
         
         # V6: Processor progress tracking for retention safety
         self._last_processed_frame: int = 0
+        self._last_processed_segment: int = -1  # V7.1: Track processed segment for immediate deletion
         self._progress_lock = threading.Lock()
         
         # Statistics
@@ -122,6 +129,49 @@ class RetentionPolicy:
         self.bytes_recovered: int = 0
         self.last_cleanup_time: float = 0.0
         self.segments_protected_by_progress: int = 0  # V6: Track protected segments
+        self.segments_deleted_by_processing: int = 0  # V7.1: Track immediate deletions
+    
+    def set_last_processed_segment(self, segment_num: int):
+        """
+        V7.1: Update the last processed segment number.
+        
+        When delete_processed_segments is enabled, this will trigger immediate
+        deletion of the segment that was just fully processed.
+        
+        Args:
+            segment_num: Segment number that was just fully processed
+        """
+        with self._progress_lock:
+            if segment_num > self._last_processed_segment:
+                old_segment = self._last_processed_segment
+                self._last_processed_segment = segment_num
+                
+                # If enabled, delete the old segment immediately
+                if self.delete_processed_segments and old_segment >= 0:
+                    self._delete_processed_segment(old_segment)
+    
+    def get_last_processed_segment(self) -> int:
+        """Get the last processed segment number."""
+        with self._progress_lock:
+            return self._last_processed_segment
+    
+    def _delete_processed_segment(self, segment_num: int):
+        """Delete a processed segment immediately."""
+        try:
+            segment_file = self.spool_dir / f"seg_{segment_num:06d}.bin"
+            if segment_file.exists():
+                size = segment_file.stat().st_size
+                segment_file.unlink()
+                self.bytes_recovered += size
+                self.segments_deleted += 1
+                self.segments_deleted_by_processing += 1
+                logger.debug(f"[Retention] Deleted processed segment {segment_num} ({size / 1024:.1f}KB)")
+            else:
+                logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
+        except FileNotFoundError:
+            logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
+        except Exception as e:
+            logger.warning(f"[Retention] Error deleting segment {segment_num}: {e}")
     
     def set_last_processed_frame(self, frame_index: int):
         """
@@ -185,6 +235,9 @@ class RetentionPolicy:
         V6: Respects processor progress - segments containing unprocessed frames
         are protected from deletion regardless of age.
         
+        V7.2: Also protects segments at or after processor's current position
+        to prevent race conditions.
+        
         Returns:
             List of tuples (segment_num, path, size) for expired segments
         """
@@ -198,11 +251,26 @@ class RetentionPolicy:
         # V6: Get last processed frame for safety check
         last_processed = self.get_last_processed_frame()
         
+        # V7.2: Get last processed segment number
+        last_processed_segment = self.get_last_processed_segment()
+        
         # Find expired segments (exclude newest min_segments_to_keep)
         expired = []
         for seg_num, path, mtime, size in segments[:-self.min_segments_to_keep]:
             age = current_time - mtime
             if age > self.retention_seconds:
+                # V7.3: NEVER delete segments AFTER processor's current position
+                # The "last_processed_segment" is the segment the processor just finished,
+                # so we protect anything AFTER that (processor may still be transitioning)
+                if self.retention_safety_enabled and last_processed_segment >= 0:
+                    if seg_num > last_processed_segment:
+                        logger.debug(
+                            f"[Retention] Protected segment {seg_num}: after processor position "
+                            f"(last_processed_segment={last_processed_segment})"
+                        )
+                        self.segments_protected_by_progress += 1
+                        continue
+                
                 # V6: Check if segment contains unprocessed frames
                 if self.retention_safety_enabled and last_processed > 0:
                     frame_range = self._get_segment_frame_range(path)
@@ -225,42 +293,93 @@ class RetentionPolicy:
         """
         Perform a single cleanup pass.
         
+        V7.1: Now includes size-based cleanup in addition to age-based.
+        
         Returns:
             Tuple of (segments_deleted, bytes_recovered)
         """
-        expired = self.get_expired_segments()
-        
-        deleted = 0
+        deleted_count = 0
         bytes_freed = 0
         
+        # V7.1: Check total spool size
+        total_size = self._get_total_spool_size()
+        size_exceeded = total_size > self.max_spool_size_bytes
+        
+        if size_exceeded:
+            logger.warning(f"[Retention] Spool size ({total_size / 1024 / 1024:.2f}MB) exceeds limit "
+                          f"({self.max_spool_size_bytes / 1024 / 1024:.2f}MB) - aggressive cleanup")
+        
+        # Get expired segments (age-based)
+        expired = self.get_expired_segments()
+        
+        # V7.1: If size exceeded, also delete oldest processed segments even if not expired
+        if size_exceeded:
+            expired.extend(self._get_oldest_processed_segments(exclude=expired))
+        
+        # Delete expired segments
         for seg_num, path, size in expired:
             try:
-                # Delete segment file
+                if not path.exists():
+                    # Already deleted by immediate cleanup
+                    logger.debug(f"[Retention] Segment {seg_num} already deleted (immediate cleanup)")
+                    continue
+                    
                 path.unlink()
-                deleted += 1
+                deleted_count += 1
                 bytes_freed += size
+                self.segments_deleted += 1
+                self.bytes_recovered += bytes_freed
                 
-                # Also delete metadata file if exists
-                meta_path = path.with_suffix('.meta.json')
-                if meta_path.exists():
-                    try:
-                        meta_size = meta_path.stat().st_size
-                        meta_path.unlink()
-                        bytes_freed += meta_size
-                    except OSError:
-                        pass
+                logger.info(
+                    f"[Retention] Deleted segment {seg_num} "
+                    f"({size / 1024 / 1024:.2f}MB, age: {time.time() - os.stat(str(path)).st_mtime if path.exists() else 0:.1f}s)"
+                )
                 
-                logger.info(f"[Retention] Deleted expired segment {seg_num} "
-                           f"(size: {size / 1024:.1f} KB)")
-                
+                # Check if we've freed enough space
+                if size_exceeded and total_size - bytes_freed <= self.max_spool_size_bytes:
+                    break
+                    
+            except FileNotFoundError:
+                # Already deleted - likely by immediate cleanup
+                logger.debug(f"[Retention] Segment {seg_num} already deleted (immediate cleanup)")
             except Exception as e:
                 logger.warning(f"[Retention] Error deleting segment {seg_num}: {e}")
         
-        self.segments_deleted += deleted
-        self.bytes_recovered += bytes_freed
         self.last_cleanup_time = time.time()
+        return deleted_count, bytes_freed
+    
+    def _get_total_spool_size(self) -> int:
+        """V7.1: Calculate total size of all segment files."""
+        total = 0
+        for seg_num, path, mtime, size in self.list_segments():
+            total += size
+        return total
+    
+    def _get_oldest_processed_segments(self, exclude: List[Tuple[int, Path, int]]) -> List[Tuple[int, Path, int]]:
+        """
+        V7.1: Get oldest segments that have been processed (for size-based cleanup).
         
-        return deleted, bytes_freed
+        Args:
+            exclude: List of segments already marked for deletion
+            
+        Returns:
+            List of tuples (segment_num, path, size) for oldest processed segments
+        """
+        excluded_nums = {seg_num for seg_num, _, _ in exclude}
+        last_processed_seg = self._last_processed_segment
+        
+        # Get all segments older than last processed
+        segments = self.list_segments()
+        processed_segments = []
+        
+        for seg_num, path, mtime, size in segments:
+            if seg_num < last_processed_seg and seg_num not in excluded_nums:
+                processed_segments.append((seg_num, path, size))
+        
+        # Sort by age (oldest first)
+        processed_segments.sort(key=lambda x: x[1].stat().st_mtime)
+        
+        return processed_segments
     
     def _cleanup_loop(self):
         """Background cleanup loop."""
