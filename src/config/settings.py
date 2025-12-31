@@ -84,7 +84,7 @@ class AppConfig:
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
-        "data/model/classify_yolo_small_v7_bayese_224x224_nv12.bin" if IS_RDK
+        "data/model/classify_yolo_small_v8_bayese_224x224_nv12.bin" if IS_RDK
         else "data/model/classify_yolo_small_v8.pt"
     )
 
