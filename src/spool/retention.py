@@ -153,7 +153,7 @@ class RetentionPolicy:
     def _delete_processed_segment(self, segment_num: int):
         """Delete a processed segment immediately."""
         try:
-            segment_file = self.spool_dir / f"seg_{segment_num:010d}.bin"
+            segment_file = self.spool_dir / f"seg_{segment_num:06d}.bin"
             if segment_file.exists():
                 size = segment_file.stat().st_size
                 segment_file.unlink()
@@ -162,7 +162,7 @@ class RetentionPolicy:
                 self.segments_deleted_by_processing += 1
                 logger.info(f"[Retention] Deleted processed segment {segment_num} ({size / 1024 / 1024:.2f}MB)")
         except Exception as e:
-            logger.warning(f"[Retention] Error deleting processed segment {segment_num}: {e}")
+            logger.warning(f"[Retention] Error deleting segment {segment_num}: {e}")
     
     def set_last_processed_frame(self, frame_index: int):
         """
@@ -226,6 +226,9 @@ class RetentionPolicy:
         V6: Respects processor progress - segments containing unprocessed frames
         are protected from deletion regardless of age.
         
+        V7.2: Also protects segments at or after processor's current position
+        to prevent race conditions.
+        
         Returns:
             List of tuples (segment_num, path, size) for expired segments
         """
@@ -239,11 +242,24 @@ class RetentionPolicy:
         # V6: Get last processed frame for safety check
         last_processed = self.get_last_processed_frame()
         
+        # V7.2: Get last processed segment number
+        last_processed_segment = self.get_last_processed_segment()
+        
         # Find expired segments (exclude newest min_segments_to_keep)
         expired = []
         for seg_num, path, mtime, size in segments[:-self.min_segments_to_keep]:
             age = current_time - mtime
             if age > self.retention_seconds:
+                # V7.2: NEVER delete segments at or after processor's current position
+                if self.retention_safety_enabled and last_processed_segment >= 0:
+                    if seg_num >= last_processed_segment:
+                        logger.debug(
+                            f"[Retention] Protected segment {seg_num}: at or after processor position "
+                            f"(processor_segment={last_processed_segment})"
+                        )
+                        self.segments_protected_by_progress += 1
+                        continue
+                
                 # V6: Check if segment contains unprocessed frames
                 if self.retention_safety_enabled and last_processed > 0:
                     frame_range = self._get_segment_frame_range(path)

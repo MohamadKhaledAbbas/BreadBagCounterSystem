@@ -443,7 +443,7 @@ class SpoolProcessorNode(Node):
                 logger.debug(f"[SpoolProcessor] Cached PPS from frame {frame.index}")
             return frame
         except StopIteration:
-            # Segment exhausted, try to reinitialize from new segments
+            # Segment exhausted, try to move to next sequential segment
             old_segment = self._current_segment
             with self._stats_lock:
                 if self._current_segment >= 0:
@@ -455,13 +455,37 @@ class SpoolProcessorNode(Node):
             
             self._segment_needs_sps_pps = True  # New segment will need SPS/PPS
             
-            # Don't call _init_frame_generator which may do prescan again
-            # Instead, directly get the next segment and create a fresh generator
-            oldest = self._reader.get_oldest_segment()
-            if oldest is not None:
-                logger.info(f"[SpoolProcessor] Segment transition: {old_segment} → {oldest}")
-                self._frame_generator = self._reader.read_frames(start_segment=oldest)
-                self._current_segment = oldest
+            # V7.2: Move to NEXT sequential segment, not oldest
+            # This ensures proper sequential processing even when old segments are deleted
+            next_segment = old_segment + 1 if old_segment >= 0 else None
+            
+            # Check if next segment exists, or find the nearest available segment after current
+            available_segments = self._reader.list_segments()
+            target_segment = None
+            
+            if next_segment is not None and next_segment in available_segments:
+                # Next sequential segment exists
+                target_segment = next_segment
+            elif available_segments:
+                # Next segment missing - find nearest segment >= next_segment
+                candidates = [s for s in available_segments if s >= next_segment] if next_segment is not None else available_segments
+                if candidates:
+                    target_segment = min(candidates)
+                    if old_segment >= 0:
+                        skipped = target_segment - next_segment
+                        if skipped > 0:
+                            logger.warning(format_structured_log(
+                                "[SpoolProcessor] ⚠ Segments missing, skipping forward",
+                                old_segment=old_segment,
+                                next_expected=next_segment,
+                                actual=target_segment,
+                                skipped=skipped
+                            ))
+            
+            if target_segment is not None:
+                logger.info(f"[SpoolProcessor] Segment transition: {old_segment} → {target_segment}")
+                self._frame_generator = self._reader.read_frames(start_segment=target_segment)
+                self._current_segment = target_segment
                 
                 try:
                     frame = next(self._frame_generator)
@@ -936,6 +960,33 @@ class SpoolProcessorNode(Node):
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
+                
+                # V7.2: Log recorder vs processor lag with RECORDER_LAG keyword (every 2 minutes)
+                if newest_segment is not None and self._current_segment >= 0:
+                    # Estimate time lag (assuming ~5s per segment average)
+                    time_lag_estimate = spool_lag * 5
+                    if spool_lag > 0:
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] RECORDER_LAG: Recorder ahead of processor",
+                            recorder_segment=newest_segment,
+                            processor_segment=self._current_segment,
+                            lag_segments=spool_lag,
+                            lag_time_estimate=f"~{time_lag_estimate}s"
+                        ))
+                    elif spool_lag < 0:
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] RECORDER_LAG: Processor ahead of recorder (catching up)",
+                            recorder_segment=newest_segment,
+                            processor_segment=self._current_segment,
+                            lag_segments=spool_lag
+                        ))
+                    else:
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] RECORDER_LAG: Processor synchronized with recorder",
+                            recorder_segment=newest_segment,
+                            processor_segment=self._current_segment,
+                            lag_segments=0
+                        ))
                 
                 logger.info("=" * 80)
                 logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
