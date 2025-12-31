@@ -376,10 +376,10 @@ class BagCounterApp:
             self.ros_executor.add_node(self.frame_source)
             logger.debug("[BagCounterApp] FrameSource added to ROS 2 executor")
 
-        self.ros_thread = ExecutorThread(self.ros_executor)
-        self.ros_thread.start()
-        if IS_RDK:
-            logger.debug("[BagCounterApp] ROS 2 executor thread started")
+            self.ros_thread = ExecutorThread(self.ros_executor)
+            self.ros_thread.start()
+            if IS_RDK:
+                logger.debug("[BagCounterApp] ROS 2 executor thread started")
 
         # V3: Log performance configuration
         logger.info(
@@ -2153,15 +2153,15 @@ class BagCounterApp:
         shutdown_ros2_context()
         if IS_RDK:
             logger.debug("[BagCounterApp] ROS 2 context shutdown")
-        if self.ros_thread.is_alive():
-            self.ros_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
             if self.ros_thread.is_alive():
-                logger.warning(
-                    f"[BagCounterApp] ROS thread did not stop within "
-                    f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
-                )
-            else:
-                logger.debug("[BagCounterApp] ROS thread joined")
+                self.ros_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+                if self.ros_thread.is_alive():
+                    logger.warning(
+                        f"[BagCounterApp] ROS thread did not stop within "
+                        f"{THREAD_SHUTDOWN_TIMEOUT}s timeout"
+                    )
+                else:
+                    logger.debug("[BagCounterApp] ROS thread joined")
         if logic_thread is not None and logic_thread.is_alive():
             logic_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
             if logic_thread.is_alive():
