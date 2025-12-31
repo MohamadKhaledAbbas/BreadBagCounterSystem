@@ -941,41 +941,34 @@ class SpoolProcessorNode(Node):
         
         frame_interval = 1.0 / self.config.target_fps
         last_publish_time = 0.0
-        backpressure_wait_count = 0
+        last_inflight_warn_time = 0.0
+        inflight_warn_interval = 10.0  # Log warning at most every 10 seconds
         
         with self._state_lock:
             self._state = ProcessorState.PUBLISHING
         
         while self._running:
             try:
-                # V7: Check in-flight backpressure
-                backpressure_iterations = 0
-                # Calculate max iterations based on configurable timeout (each iteration = 10ms)
-                max_backpressure_iterations = int(self.config.backpressure_timeout_seconds / 0.01)
-                backpressure_timed_out = False
-                while self._check_inflight_backpressure() and self._running:
-                    backpressure_iterations += 1
-                    if backpressure_iterations == 1:
-                        backpressure_wait_count += 1
-                        logger.debug(f"[SpoolProcessor] Backpressure: inflight={self._inflight_frames}/{self.config.max_inflight_frames}, waiting...")
-                    # Brief wait to allow ACKs to arrive
-                    time.sleep(0.01)
-                    # Safety: don't wait forever, use configurable timeout
-                    if backpressure_iterations > max_backpressure_iterations:
-                        logger.warning(f"[SpoolProcessor] Backpressure timeout after {self.config.backpressure_timeout_seconds}s, proceeding anyway")
-                        backpressure_timed_out = True
-                        # V7 FIX: Reset inflight counter when timeout occurs - indicates ACKs aren't flowing
-                        # This prevents the counter from growing unboundedly when downstream is stalled
-                        with self._inflight_lock:
-                            old_inflight = self._inflight_frames
-                            # Reset to max_inflight to allow one more frame through
-                            self._inflight_frames = self.config.max_inflight_frames
-                            if old_inflight > self.config.max_inflight_frames + 5:
-                                logger.warning(f"[SpoolProcessor] Reset inflight counter: {old_inflight} -> {self._inflight_frames} (ACKs not flowing)")
-                        break
+                # V7: Track in-flight but DON'T BLOCK in ACK-free mode
+                # The inflight counter is for metrics/observability only
+                # If ACKs aren't arriving, we continue anyway (that's what ACK-free means)
+                with self._inflight_lock:
+                    current_inflight = self._inflight_frames
                 
-                if not self._running:
-                    break
+                if current_inflight > self.config.max_inflight_frames:
+                    current_time = time.time()
+                    # Rate-limited warning about high inflight count
+                    if current_time - last_inflight_warn_time >= inflight_warn_interval:
+                        logger.warning(
+                            f"[SpoolProcessor] High inflight count: {current_inflight}/{self.config.max_inflight_frames} "
+                            f"(ACKs may not be flowing, but continuing in ACK-free mode)"
+                        )
+                        last_inflight_warn_time = current_time
+                        # Reset inflight counter periodically to prevent unbounded growth
+                        # This is safe because in ACK-free mode, we don't depend on exact ACK tracking
+                        with self._inflight_lock:
+                            self._inflight_frames = 0
+                            logger.info(f"[SpoolProcessor] Reset inflight counter for metrics accuracy")
                 
                 # Get next frame
                 frame = self._get_next_frame()
