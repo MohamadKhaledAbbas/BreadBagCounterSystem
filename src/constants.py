@@ -10,12 +10,6 @@ rtsp_host = "rtsp_host"
 rtsp_port = "rtsp_port"
 is_profiler_enabled = "is_profiler_enabled"
 
-# Spool configuration keys
-spool_dir = "spool_dir"
-spool_segment_duration = "spool_segment_duration"
-spool_retention_seconds = "spool_retention_seconds"
-spool_target_fps = "spool_target_fps"  # Target FPS for spool processing
-
 CONFIG_KEYS = [
     show_ui_screen_key,
     is_development_key,
@@ -28,9 +22,4 @@ CONFIG_KEYS = [
     recording_seconds,
     recording_fps,
     is_profiler_enabled,
-    # Spool config
-    spool_dir,
-    spool_segment_duration,
-    spool_retention_seconds,
-    spool_target_fps,
 ]

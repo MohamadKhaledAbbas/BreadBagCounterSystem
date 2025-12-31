@@ -90,7 +90,7 @@ DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_TARGET_FPS = 40.0  # Target FPS for ACK-free publishing
+DEFAULT_TARGET_FPS = 20.0  # Target FPS for ACK-free publishing
 DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
 DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
 DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
@@ -200,6 +200,7 @@ class SpoolProcessorNode(Node):
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
+        self._last_detailed_stats_time = time.time()
         self._stats_lock = threading.Lock()
         
         # V7: Robustness counters
@@ -214,6 +215,7 @@ class SpoolProcessorNode(Node):
         
         # State file path
         self._state_file_path = os.path.join(self.config.spool_dir, self.config.state_file)
+        self._allow_next_gap = False
         
         # ROS2 publishers and subscribers
         if IS_RDK:
@@ -279,10 +281,6 @@ class SpoolProcessorNode(Node):
         with self._state_lock:
             self._state = ProcessorState.STOPPED
         
-        # Wake up any waiting threads
-        self._ack_received.set()
-        self._ready_received.set()
-        
         # Wait for processor thread
         if self._processor_thread:
             self._processor_thread.join(timeout=5.0)
@@ -311,10 +309,7 @@ class SpoolProcessorNode(Node):
                 session=self._session_id[:8],
                 seq=self._seq_counter,
                 processed=self._frames_processed,
-                retried=self._frames_retried,
                 skipped=self._frames_skipped,
-                timeouts=self._ack_timeouts,
-                ack_rejected=self._ack_rejected_stale,
                 segments=self._segments_processed,
                 sps_pps_prepends=self._sps_pps_prepends,
                 anomalies_gap=self._anomalies_gap,
@@ -441,6 +436,8 @@ class SpoolProcessorNode(Node):
             if pps:
                 self._cached_pps = pps
                 logger.debug(f"[SpoolProcessor] Cached PPS from frame {frame.index}")
+            if sps or pps:
+                self._allow_next_gap = True
             return frame
         except StopIteration:
             # Segment exhausted, try to move to next sequential segment
@@ -592,7 +589,7 @@ class SpoolProcessorNode(Node):
         """
         if not IS_RDK:
             return True
-        
+
         try:
             # V7: Detect gaps and duplicates WITHIN the same segment only
             # Frame indices are not continuous across segment boundaries
@@ -601,19 +598,22 @@ class SpoolProcessorNode(Node):
                 if self._last_published_segment == self._current_segment:
                     expected_index = self._last_published_index + 1
                     if record.index > expected_index:
-                        # Gap detected within segment
-                        gap_size = record.index - expected_index
-                        with self._stats_lock:
-                            self._anomalies_gap += 1
-                        gap_msg = format_structured_log(
-                            "⚠ GAP DETECTED",
-                            expected=expected_index,
-                            actual=record.index,
-                            gap_size=gap_size,
-                            segment=self._current_segment,
-                            total_gaps=self._anomalies_gap
-                        )
-                        logger.warning(f"[SpoolProcessor] {gap_msg}")
+                        if self._allow_next_gap:
+                            self._allow_next_gap = False # Expected no need to log warning when PPS or SPS
+                        else:
+                            gap_size = record.index - expected_index
+                            with self._stats_lock:
+                                self._anomalies_gap += 1
+                            gap_msg = format_structured_log(
+                                "⚠ GAP DETECTED",
+                                expected=expected_index,
+                                actual=record.index,
+                                gap_size=gap_size,
+                                segment=self._current_segment,
+                                total_gaps=self._anomalies_gap
+                            )
+                            logger.warning(f"[SpoolProcessor] {gap_msg}")
+
                     elif record.index < expected_index:
                         # Duplicate or out-of-order within segment
                         with self._stats_lock:
@@ -875,9 +875,6 @@ class SpoolProcessorNode(Node):
         # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
-                # Calculate time since last successful ACK (watchdog info - legacy mode)
-                ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
-                
                 # Compute spool lag
                 segments = self._reader.list_segments()
                 newest_segment = max(segments) if segments else None
@@ -891,12 +888,9 @@ class SpoolProcessorNode(Node):
                     session=self._session_id[:8],
                     seq=self._seq_counter,
                     frames_processed=self._frames_processed,
-                    frames_retried=self._frames_retried,
                     frames_skipped=self._frames_skipped,
                     anomalies_gap=self._anomalies_gap,
                     anomalies_dup=self._anomalies_dup,
-                    ack_timeouts=self._ack_timeouts,
-                    ack_rejected=self._ack_rejected_stale,
                     segments_processed=self._segments_processed,
                     sps_pps_prepends=self._sps_pps_prepends,
                     sps_pps_missing=self._sps_pps_missing_critical,
@@ -911,7 +905,6 @@ class SpoolProcessorNode(Node):
                     current_segment=self._current_segment,
                     current_frame=self._current_frame_index,
                     spool_lag=spool_lag,
-                    last_ack_age=f"{ack_staleness:.1f}"
                 )
                 logger.info(spool_msg)
                 
@@ -930,27 +923,12 @@ class SpoolProcessorNode(Node):
                         threshold=self.config.spool_lag_warn_threshold
                     )
                     logger.warning(f"[SpoolProcessor] {lag_msg}")
-                
-                # Watchdog warning if ACKs are stale (legacy mode)
-                if not self.config.ack_free_mode and ack_staleness > self.config.ack_timeout * 2 and self._last_ack_time > 0:
-                    watchdog_msg = format_structured_log(
-                        "⚠ WATCHDOG: No ACK received",
-                        stalled_seconds=f"{ack_staleness:.1f}",
-                        threshold=self.config.ack_timeout * 2
-                    )
-                    logger.warning(f"[SpoolProcessor] {watchdog_msg}")
             
             self._last_stats_time = current_time
         
         # Detailed stats every 2 minutes (120 seconds)
         if current_time - self._last_detailed_stats_time >= 120.0:
             with self._stats_lock:
-                ack_accepted = self._ack_accepted
-                ack_rejected = self._ack_rejected_stale
-                total_acks = ack_accepted + ack_rejected
-                ack_accept_rate = (ack_accepted / total_acks * 100) if total_acks > 0 else 0.0
-                ack_reject_rate = (ack_rejected / total_acks * 100) if total_acks > 0 else 0.0
-                
                 # Get spool information for lag detection
                 segments = self._reader.list_segments()
                 oldest_segment = self._reader.get_oldest_segment()
@@ -992,14 +970,9 @@ class SpoolProcessorNode(Node):
                 logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
                 logger.info(f"  Session: {self._session_id}")
                 logger.info(f"  ACK Statistics:")
-                logger.info(f"    - Accepted: {ack_accepted} ({ack_accept_rate:.1f}%)")
-                logger.info(f"    - Rejected (stale): {ack_rejected} ({ack_reject_rate:.1f}%)")
-                logger.info(f"    - Total: {total_acks}")
                 logger.info(f"  Frame Processing:")
                 logger.info(f"    - Processed: {self._frames_processed}")
-                logger.info(f"    - Retried: {self._frames_retried}")
                 logger.info(f"    - Skipped: {self._frames_skipped}")
-                logger.info(f"    - Timeouts: {self._ack_timeouts}")
                 logger.info(f"  Spool Status:")
                 logger.info(f"    - Total segments: {len(segments)}")
                 logger.info(f"    - Current segment: {self._current_segment}")

@@ -130,7 +130,14 @@ class RetentionPolicy:
         self.last_cleanup_time: float = 0.0
         self.segments_protected_by_progress: int = 0  # V6: Track protected segments
         self.segments_deleted_by_processing: int = 0  # V7.1: Track immediate deletions
-    
+
+    def get_last_processed_segment(self) -> int:
+        """
+        Return the most recently processed segment number.
+        """
+        with self._progress_lock:
+            return self._last_processed_segment
+
     def set_last_processed_segment(self, segment_num: int):
         """
         V7.1: Update the last processed segment number.

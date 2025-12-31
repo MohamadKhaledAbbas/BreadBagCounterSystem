@@ -1941,9 +1941,6 @@ class BagCounterApp:
             self.ros_executor.remove_node(self.ipc_publisher)
             if isinstance(self.frame_source, Node):
                 self.ros_executor.remove_node(self.frame_source)
-            if getattr(self, "_accuracy_mode", False) and getattr(self, "_ack_publisher_node", None) is not None:
-                self.ros_executor.remove_node(self._ack_publisher_node)
-                self._ack_publisher_node.destroy_node()
         self.ipc_publisher.close_node()
         shutdown_ros2_context()
         if IS_RDK:

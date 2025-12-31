@@ -193,7 +193,6 @@ class FrameServer(Node, FrameSource):
         
         Yields:
             Tuple of (frame, latency_ms, spool_frame_index, nv12_data, frame_size) - full format
-            Tuple of (frame, latency_ms, spool_frame_index) - accuracy mode (backward compatible)
             Tuple of (frame, latency_ms) - normal mode (backward compatible)
             
         Where:
@@ -202,11 +201,6 @@ class FrameServer(Node, FrameSource):
             - spool_frame_index: Frame index for ACK correlation
             - nv12_data: Raw NV12 numpy array for direct BPU inference (avoids BGR→NV12 conversion)
             - frame_size: Tuple (height, width) of the original frame
-            
-        Single Source of Truth:
-            In accuracy mode, spool_frame_index travels WITH the frame data
-            through the entire pipeline. This ensures perfect correlation
-            for ACK - no need to query separate state.
         """
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
         while rclpy.ok():
@@ -216,58 +210,11 @@ class FrameServer(Node, FrameSource):
                 # V5: Handle new format with NV12 data (5 elements)
                 if len(item) == 5:
                     frame, latency_ms, spool_frame_index, nv12_data, frame_size = item
-                    # Store the frame index that was associated with THIS frame when it was enqueued
-                    with self._frame_index_lock:
-                        self._current_frame_index = spool_frame_index
-                        self._last_yielded_frame_index = spool_frame_index
                     # V5: Yield full frame data including NV12
                     yield frame, latency_ms, spool_frame_index, nv12_data, frame_size
-                    
-                # Handle old format (frame, latency, index) - backward compatible
-                elif len(item) == 3:
-                    frame, latency_ms, spool_frame_index = item
-                    # Store the frame index that was associated with THIS frame when it was enqueued
-                    # This is critical for ACK correlation in accuracy mode
-                    with self._frame_index_lock:
-                        self._current_frame_index = spool_frame_index
-                        self._last_yielded_frame_index = spool_frame_index
-                    # SINGLE SOURCE OF TRUTH: Yield index WITH frame data
-                    yield frame, latency_ms, spool_frame_index
                 else:
                     frame, latency_ms = item
                     yield frame, latency_ms
-            except queue.Empty:
-                continue
-    
-    def get_last_yielded_frame_index(self) -> int:
-        """
-        Get the frame index of the most recently yielded frame.
-        
-        This is the correct method to use for ACK correlation, as it returns
-        the index that was stored with the frame when it was enqueued,
-        not the most recent index received via subscription.
-        
-        Returns:
-            Frame index of the last yielded frame
-        """
-        with self._frame_index_lock:
-            return getattr(self, '_last_yielded_frame_index', self._current_frame_index)
-    
-    def frames_with_index(self):
-        """
-        Yield frames with frame index for accuracy mode.
-        
-        Yields:
-            Tuple of (frame, latency_ms, frame_index)
-        """
-        while rclpy.ok():
-            try:
-                item = self.frame_queue.get(timeout=1)
-                if len(item) == 3:
-                    yield item
-                else:
-                    frame, latency_ms = item
-                    yield frame, latency_ms, 0
             except queue.Empty:
                 continue
 
