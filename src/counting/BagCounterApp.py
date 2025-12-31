@@ -312,6 +312,12 @@ class BagCounterApp:
         self._ack_publisher_node = None
         self._current_frame_metadata = None  # Store latest frame metadata for ACK construction
         self._frame_index_mismatch_count = 0  # Track mismatches for throttling warnings
+        
+        # Idempotency: Track last processed frame index to prevent duplicate processing
+        self._last_processed_frame_index = -1  # Start at -1 so first frame (index 0) is processed
+        self._duplicate_frames_dropped = 0  # Counter for dropped duplicate frames
+        self._last_duplicate_warning_time = 0.0  # Rate-limiting for duplicate warnings
+        self._duplicate_warning_interval = 5.0  # Warn at most every 5 seconds
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
@@ -1997,6 +2003,29 @@ class BagCounterApp:
                     else:
                         frame, latencyMs = frame_data
                     
+                    # Idempotency Guard: Skip duplicate/replayed frames
+                    if getattr(self, "_accuracy_mode", False) and spool_frame_index is not None:
+                        if spool_frame_index <= self._last_processed_frame_index:
+                            # Duplicate or replayed frame - skip to prevent double-counting
+                            self._duplicate_frames_dropped += 1
+                            
+                            # Rate-limited warning
+                            current_time = time.time()
+                            if current_time - self._last_duplicate_warning_time >= self._duplicate_warning_interval:
+                                logger.warning(
+                                    f"[BagCounterApp] ⚠ IDEMPOTENCY: Skipping duplicate/replayed frame "
+                                    f"(index={spool_frame_index}, last_processed={self._last_processed_frame_index}, "
+                                    f"total_duplicates={self._duplicate_frames_dropped}). "
+                                    f"This prevents double-counting."
+                                )
+                                self._last_duplicate_warning_time = current_time
+                            
+                            # Skip this frame entirely - do not process or enqueue
+                            continue
+                        
+                        # Update last processed index for idempotency
+                        self._last_processed_frame_index = spool_frame_index
+                    
                     # Accuracy Mode: Publish ACK IMMEDIATELY when frame is consumed
                     # CRITICAL: Use spool_frame_index that traveled WITH this specific frame
                     # This ensures perfect correlation - no separate state queries needed
@@ -2200,7 +2229,8 @@ class BagCounterApp:
             f"detection_drops={detection_drops}, "
             f"classification_drops={class_drops}, "
             f"frames_skipped={self._frames_skipped}, skip_rate={final_skip_rate:.2f}%, "
-            f"skip_cap_blocks={self._skip_cap_blocks}"
+            f"skip_cap_blocks={self._skip_cap_blocks}, "
+            f"duplicate_frames_dropped={getattr(self, '_duplicate_frames_dropped', 0)}"
             f"{smart_skip_stats}"
         )
         logger.info("[BagCounterApp] Shutdown complete")

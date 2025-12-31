@@ -67,8 +67,12 @@ class FrameServer(Node, FrameSource):
         self.frames_dropped = 0  # Track dropped frames
         self.frames_index_fallback = 0  # Track fallback to current index (should be rare)
         self.frames_index_lost = 0  # Track frame indices that couldn't be enqueued (severe stall)
+        self.frames_index_drop_no_pending = 0  # Track frames dropped due to no pending index (correctness)
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
+        self.last_no_pending_warning_time = 0.0  # Rate-limiting for no pending index warnings
+        self.no_pending_warning_interval = 2.0  # Warn at most every 2 seconds
+        self.consecutive_no_pending_drops = 0  # Track consecutive drops for resync detection
         
         # Accuracy Mode: Frame index tracking for ACK correlation
         # Subscribe to /spool/current_frame_index published by SpoolProcessorNode
@@ -225,7 +229,8 @@ class FrameServer(Node, FrameSource):
                     f"[Ros2FrameServer] Stats: received={self.frames_received}, "
                     f"processed={self.frames_processed}, dropped={self.frames_dropped}, "
                     f"drop_rate={drop_rate:.2f}%, queue_util={queue_utilization:.1f}%, "
-                    f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}"
+                    f"pending_indices={pending_queue_size}, fallbacks={self.frames_index_fallback}, "
+                    f"no_pending_drops={self.frames_index_drop_no_pending}"
                 )
                 # Add lost_indices to output if non-zero (severe stall indicator)
                 if self.frames_index_lost > 0:
@@ -312,20 +317,41 @@ class FrameServer(Node, FrameSource):
                 # The index that was published BEFORE this H.264 frame is now matched
                 # with the decoded NV12 frame that resulted from it.
                 spool_frame_index = self._pending_frame_indices.get_nowait()
+                self.consecutive_no_pending_drops = 0  # Reset consecutive drop counter
                 logger.debug(f"[Ros2FrameServer] Correlated decoded frame with spool_frame_index {spool_frame_index}, pending_queue={self._pending_frame_indices.qsize()}")
             except queue.Empty:
-                # No pending index - this shouldn't happen in normal operation
+                # No pending index - this is a CORRECTNESS FAILURE
                 # This indicates either:
                 # 1. Frame indices not being published (SpoolProcessor issue)
                 # 2. More decoded frames than published indices (decoder issue)
                 # 3. System startup/shutdown race condition
-                # Fall back to current index as best-effort but track this metric
-                spool_frame_index = self.get_current_frame_index()
-                self.frames_index_fallback += 1
-                logger.warning(
-                    f"[Ros2FrameServer] No pending frame index available (fallback #{self.frames_index_fallback}), "
-                    f"using current index {spool_frame_index}. This may reintroduce race condition."
-                )
+                # 
+                # CRITICAL: DO NOT enqueue frame with invalid index
+                # Drop the frame to maintain correctness
+                self.frames_index_drop_no_pending += 1
+                self.consecutive_no_pending_drops += 1
+                
+                # Rate-limited warning to avoid log spam
+                current_time = time.time()
+                if current_time - self.last_no_pending_warning_time >= self.no_pending_warning_interval:
+                    logger.warning(
+                        f"[Ros2FrameServer] ⚠ CORRECTNESS FAILURE: No pending frame index available. "
+                        f"Dropping decoded frame (drop #{self.frames_index_drop_no_pending}, "
+                        f"consecutive={self.consecutive_no_pending_drops}). "
+                        f"This prevents invalid frame index attachment (would have been 0)."
+                    )
+                    self.last_no_pending_warning_time = current_time
+                    
+                    # Resync mechanism: if too many consecutive drops, pause briefly to allow indices to catch up
+                    if self.consecutive_no_pending_drops >= 5:
+                        logger.warning(
+                            f"[Ros2FrameServer] ⚠ RESYNC: {self.consecutive_no_pending_drops} consecutive drops detected. "
+                            f"Pausing 100ms to allow pending indices to catch up."
+                        )
+                        time.sleep(0.1)  # Brief pause to allow indices to arrive
+                
+                # DO NOT ENQUEUE - drop the frame
+                return
         
         # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
         # Frame format: (bgr, latency_ms, spool_frame_index, nv12_data, (height, width))

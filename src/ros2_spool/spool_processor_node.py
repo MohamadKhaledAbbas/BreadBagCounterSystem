@@ -109,6 +109,7 @@ DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
 DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
 DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
+DEFAULT_MAX_INFLIGHT_FRAMES = 10  # V6: Max inflight frames for bounded backpressure
 
 
 @dataclass
@@ -124,6 +125,7 @@ class ProcessorConfig:
     # V6: ACK-free mode configuration
     ack_free_mode: bool = DEFAULT_ACK_FREE_MODE
     target_fps: float = DEFAULT_TARGET_FPS
+    max_inflight_frames: int = DEFAULT_MAX_INFLIGHT_FRAMES
 
 
 def load_default_config() -> ProcessorConfig:
@@ -196,6 +198,14 @@ class SpoolProcessorNode(Node):
         # Sequence counter for published frames
         self._seq_counter: int = 0
         self._seq_lock = threading.Lock()
+        
+        # V6: Bounded inflight window for credit-based backpressure
+        # Track inflight frames = published - acknowledged
+        self._published_seq_count: int = 0  # Total frames published
+        self._acked_seq_count: int = 0  # Total frames acknowledged
+        self._inflight_lock = threading.Lock()  # Protect inflight counters
+        self._max_inflight = self.config.max_inflight_frames
+        self._inflight_paused = False  # Track if we're paused due to inflight limit
         
         # SPS/PPS caching for segment boundary handling
         self._cached_sps: Optional[bytes] = None
@@ -619,6 +629,10 @@ class SpoolProcessorNode(Node):
             
             self._frame_pub.publish(frame_msg)
             
+            # Update published counter for inflight tracking
+            with self._inflight_lock:
+                self._published_seq_count = record.index  # Use frame index as counter
+            
             # Structured logging - use debug for regular frames, info for milestones
             if seq % 100 == 0:
                 logger.info(f"[SpoolProcessor] 📤 Milestone: published {seq} frames, "
@@ -721,8 +735,16 @@ class SpoolProcessorNode(Node):
             ack = processing_ack_from_ros_string(msg.data)
             self._last_ack = ack
             self._ack_received.set()
+            
+            # Update acked counter for inflight tracking (monotonic progress)
+            # Use frame_index as a proxy for progress since ACKs may arrive out of order
+            with self._inflight_lock:
+                # Only update if this ACK is for a newer frame
+                if ack.frame_index > self._acked_seq_count:
+                    self._acked_seq_count = ack.frame_index
+            
             logger.debug(f"[SpoolProcessor] ACK callback: seq={ack.seq}, frame_index={ack.frame_index}, "
-                        f"session_id={ack.session_id[:8]}")
+                        f"session_id={ack.session_id[:8]}, inflight={self._get_inflight_count()}")
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error parsing ACK message: {e}")
     
@@ -730,6 +752,16 @@ class SpoolProcessorNode(Node):
         """Callback for external pull requests (optional feature)."""
         # This allows external control of frame advancement
         logger.debug(f"[SpoolProcessor] Received request {msg.data}")
+    
+    def _get_inflight_count(self) -> int:
+        """
+        Get current number of inflight frames (published but not yet acknowledged).
+        
+        Returns:
+            Number of inflight frames
+        """
+        with self._inflight_lock:
+            return max(0, self._published_seq_count - self._acked_seq_count)
     
     def _wait_for_consumer_ready(self) -> bool:
         """
@@ -778,24 +810,28 @@ class SpoolProcessorNode(Node):
     
     def _processor_loop_ack_free(self):
         """
-        V6 ACK-Free Processing Loop (Production-Grade).
+        V6 ACK-Free Processing Loop with Bounded Inflight Window (Production-Grade).
         
-        This loop processes frames continuously without waiting for ACKs:
+        This loop processes frames continuously with controlled backpressure:
         1. Read frame from spool
-        2. Publish immediately
-        3. Pace to target_fps
-        4. Never block
+        2. Check inflight window (published - acked)
+        3. If inflight < max_inflight_frames, publish immediately
+        4. Otherwise, pause briefly until ACKs arrive
+        5. Pace to target_fps
         
         Benefits:
         - No deadlocks (impossible)
-        - Maximum throughput
-        - Stable latency
+        - Controlled backpressure
+        - Prevents correlation failures in Ros2FrameServer
         - Production-safe
         
-        The consumer processes frames at its own pace. Retention guards
-        protect unprocessed data from deletion.
+        The bounded inflight window ensures:
+        - Consumer's pending index queue stays small
+        - Correlation failures are rare/zero
+        - System remains stable under load
         """
-        logger.info(f"[SpoolProcessor] ACK-FREE mode active: target_fps={self.config.target_fps}")
+        logger.info(f"[SpoolProcessor] ACK-FREE mode with bounded inflight window: "
+                   f"target_fps={self.config.target_fps}, max_inflight={self._max_inflight}")
         
         frame_interval = 1.0 / self.config.target_fps
         last_publish_time = 0.0
@@ -805,6 +841,30 @@ class SpoolProcessorNode(Node):
         
         while self._running:
             try:
+                # Check inflight window before getting next frame
+                inflight = self._get_inflight_count()
+                
+                if inflight >= self._max_inflight:
+                    # Inflight limit reached - pause briefly to allow ACKs to arrive
+                    if not self._inflight_paused:
+                        logger.warning(f"[SpoolProcessor] ⚠ Inflight limit reached: {inflight}/{self._max_inflight}. "
+                                     f"Pausing publishing to wait for ACKs (backpressure).")
+                        self._inflight_paused = True
+                    
+                    # Brief pause to allow ACKs to reduce inflight count
+                    time.sleep(0.1)
+                    
+                    # Check again after pause
+                    inflight = self._get_inflight_count()
+                    if inflight >= self._max_inflight:
+                        # Still at limit, continue pausing
+                        continue
+                    else:
+                        # Inflight count reduced, resume publishing
+                        logger.info(f"[SpoolProcessor] ✓ Inflight count reduced to {inflight}/{self._max_inflight}. "
+                                  f"Resuming publishing.")
+                        self._inflight_paused = False
+                
                 # Get next frame
                 frame = self._get_next_frame()
                 
@@ -957,6 +1017,9 @@ class SpoolProcessorNode(Node):
                 # Calculate time since last successful ACK (watchdog info)
                 ack_staleness = current_time - self._last_ack_time if self._last_ack_time > 0 else 0.0
                 
+                # Get inflight count
+                inflight = self._get_inflight_count()
+                
                 logger.info(f"[SpoolProcessor] Stats: "
                            f"session={self._session_id[:8]}, "
                            f"seq={self._seq_counter}, "
@@ -967,6 +1030,7 @@ class SpoolProcessorNode(Node):
                            f"ack_rejected={self._ack_rejected_stale}, "
                            f"segments={self._segments_processed}, "
                            f"sps_pps_prepends={self._sps_pps_prepends}, "
+                           f"inflight={inflight}/{self._max_inflight}, "
                            f"state={self._state.value}")
                 
                 # Log spool status
