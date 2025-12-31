@@ -113,6 +113,8 @@ DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
 DEFAULT_MAX_INFLIGHT_FRAMES = 10  # Max frames in-flight before backpressure
 DEFAULT_LAG_SKIP_THRESHOLD_SECONDS = 30.0  # Lag threshold to trigger smart skipping
 DEFAULT_PREFER_IDR_SKIP = True  # Prefer skipping non-IDR frames when lagged
+DEFAULT_SEGMENT_DURATION_ESTIMATE_SECONDS = 5.0  # Estimated segment duration for lag calc
+DEFAULT_BACKPRESSURE_TIMEOUT_SECONDS = 1.0  # Max time to wait for backpressure relief
 
 
 @dataclass
@@ -132,6 +134,8 @@ class ProcessorConfig:
     max_inflight_frames: int = DEFAULT_MAX_INFLIGHT_FRAMES
     lag_skip_threshold_seconds: float = DEFAULT_LAG_SKIP_THRESHOLD_SECONDS
     prefer_idr_skip: bool = DEFAULT_PREFER_IDR_SKIP
+    segment_duration_estimate_seconds: float = DEFAULT_SEGMENT_DURATION_ESTIMATE_SECONDS
+    backpressure_timeout_seconds: float = DEFAULT_BACKPRESSURE_TIMEOUT_SECONDS
 
 
 def load_default_config() -> ProcessorConfig:
@@ -820,8 +824,8 @@ class SpoolProcessorNode(Node):
             return (0, 0.0)
         
         lag_segments = newest_segment - self._current_segment
-        # Estimate lag in seconds (assuming ~5s per segment)
-        lag_seconds = lag_segments * 5.0
+        # Estimate lag in seconds using configurable segment duration
+        lag_seconds = lag_segments * self.config.segment_duration_estimate_seconds
         
         return (lag_segments, lag_seconds)
     
@@ -946,6 +950,8 @@ class SpoolProcessorNode(Node):
             try:
                 # V7: Check in-flight backpressure
                 backpressure_iterations = 0
+                # Calculate max iterations based on configurable timeout (each iteration = 10ms)
+                max_backpressure_iterations = int(self.config.backpressure_timeout_seconds / 0.01)
                 while self._check_inflight_backpressure() and self._running:
                     backpressure_iterations += 1
                     if backpressure_iterations == 1:
@@ -953,9 +959,9 @@ class SpoolProcessorNode(Node):
                         logger.debug(f"[SpoolProcessor] Backpressure: inflight={self._inflight_frames}/{self.config.max_inflight_frames}, waiting...")
                     # Brief wait to allow ACKs to arrive
                     time.sleep(0.01)
-                    # Safety: don't wait forever, max 1 second then proceed
-                    if backpressure_iterations > 100:
-                        logger.warning(f"[SpoolProcessor] Backpressure timeout after 1s, proceeding anyway")
+                    # Safety: don't wait forever, use configurable timeout
+                    if backpressure_iterations > max_backpressure_iterations:
+                        logger.warning(f"[SpoolProcessor] Backpressure timeout after {self.config.backpressure_timeout_seconds}s, proceeding anyway")
                         break
                 
                 if not self._running:

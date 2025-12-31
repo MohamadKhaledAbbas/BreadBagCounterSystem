@@ -71,6 +71,7 @@ class FrameServer(Node, FrameSource):
         self.frames_index_miss_drop = 0  # V7: Frames dropped due to missing index correlation
         self.frames_index_miss_consecutive = 0  # V7: Consecutive misses (for rate-limiting warnings)
         self._last_index_miss_warn_time = 0.0  # V7: For rate-limiting warnings
+        self._index_miss_warn_interval = 1.0  # V7: Configurable rate limit for warnings (seconds)
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
@@ -344,9 +345,9 @@ class FrameServer(Node, FrameSource):
                 self.frames_index_miss_drop += 1
                 self.frames_index_miss_consecutive += 1
                 
-                # Rate-limited warning (at most once per second)
+                # Rate-limited warning (configurable interval)
                 current_time = time.time()
-                if current_time - self._last_index_miss_warn_time >= 1.0:
+                if current_time - self._last_index_miss_warn_time >= self._index_miss_warn_interval:
                     logger.warning(
                         f"[Ros2FrameServer] ⚠ CORRECTNESS: Dropping decoded frame - no pending index "
                         f"(total_drops={self.frames_index_miss_drop}, consecutive={self.frames_index_miss_consecutive}). "

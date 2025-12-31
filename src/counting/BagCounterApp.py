@@ -316,6 +316,7 @@ class BagCounterApp:
         # V7: Idempotency guard - prevent double processing of same frame
         self._last_processed_frame_index: int = -1
         self._duplicate_frame_count: int = 0  # Track how many duplicates were skipped
+        self._duplicate_warn_frequency: int = 100  # Log warning every N duplicates (configurable)
 
         if IS_RDK and self._accuracy_mode:
             import rclpy
@@ -1041,7 +1042,8 @@ class BagCounterApp:
         """
         if spool_frame_index <= self._last_processed_frame_index:
             self._duplicate_frame_count += 1
-            if self._duplicate_frame_count % 100 == 1:
+            # Log warning every N duplicates (configurable frequency)
+            if self._duplicate_frame_count % self._duplicate_warn_frequency == 1:
                 logger.warning(
                     f"[BagCounterApp] ⚠ IDEMPOTENCY: Skipping duplicate/stale frame "
                     f"index={spool_frame_index} (last_processed={self._last_processed_frame_index}, "
