@@ -1,38 +1,25 @@
 #!/usr/bin/env python3
 """
-Spool Processor Node for Accuracy Mode.
+Spool Processor Node for ACK-Free Video Processing.
 
-This node reads H.264 frames from the spool and publishes them to the decoder.
+This node reads H.264 frames from the spool and publishes them to the decoder
+at a controlled rate without waiting for acknowledgments.
 
-V6 Update: ACK-Free Mode (Production-Grade)
--------------------------------------------
-Per-frame ACKs are fundamentally incompatible with real-time video processing.
-They cause: ACK reordering, blocking, DDS QoS issues, and false confidence.
-
-When `spool_ack_free_mode=true`, the processor:
-1. Reads frames continuously without waiting for ACK
+ACK-Free Architecture:
+---------------------
+1. Reads frames continuously from spool
 2. Publishes at a controlled rate (target_fps)
 3. Never blocks on consumer feedback
 4. Relies on retention guards to protect unprocessed data
 
 This aligns with industry-standard streaming architectures (Kafka, GStreamer, DeepStream).
 
-Legacy ACK Mode (Deprecated):
-----------------------------
-When `spool_ack_free_mode=false` (default for backward compatibility):
-1. Waits for ACK from BagCounterApp before sending next frame
-2. Implements strict backpressure
-3. NOT recommended for production
-
 Usage:
     python -m src.ros2_spool.spool_processor_node
 
 Configuration (via database config table):
     spool_dir: Directory for spool files (default: /home/sunrise/BreadCounting/data/spool)
-    spool_ack_free_mode: Enable ACK-free mode (default: true, recommended)
-    spool_target_fps: Target FPS for ACK-free mode (default: 25.0)
-    spool_ack_timeout: Timeout waiting for ACK in seconds (default: 10.0) - only for legacy mode
-    spool_retry_count: Number of retries before advancing (default: 2) - only for legacy mode
+    spool_target_fps: Target FPS for publishing (default: 40.0)
 """
 
 import os
@@ -65,25 +52,17 @@ from src.spool.spool_utils import (
 from src.logging.Database import DatabaseManager
 from src import constants
 
-# Import message definitions
+# Import message definitions (minimal - only what we need for ACK-free mode)
 from src.ros2_spool.messages import (
-    generate_session_id,
-    get_current_time_ros,
-    FrameMetadata,
-    ProcessingAck,
-    ProcessingReady,
-    processing_ack_from_ros_string,
-    processing_ready_from_ros_string,
-    frame_metadata_to_ros_string
+    generate_session_id
 )
 
 # ROS2 imports (only on RDK platform)
 if IS_RDK:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
     from img_msgs.msg import H26XFrame
-    from std_msgs.msg import String
     from builtin_interfaces.msg import Time
 else:
     # Stub for non-RDK development
@@ -99,25 +78,19 @@ else:
 
 
 class ProcessorState(Enum):
-    """State of the processor."""
+    """State of the processor (ACK-free mode)."""
     IDLE = "idle"
-    PUBLISHING = "publishing"  # V6: ACK-free mode - continuously publishing
-    WAITING_FOR_ACK = "waiting_for_ack"  # Legacy mode only
-    WAITING_FOR_READY = "waiting_for_ready"  # Waiting for consumer ready signal
+    PUBLISHING = "publishing"  # Continuously publishing frames
     SPOOL_EMPTY = "spool_empty"
     STOPPED = "stopped"
 
 
 # Default configuration values
 DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
-DEFAULT_ACK_TIMEOUT = 10.0  # Legacy mode only
-DEFAULT_RETRY_COUNT = 2  # Legacy mode only
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
-DEFAULT_STARTUP_GRACE_PERIOD = 10.0  # Seconds to wait for consumer to start
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_ACK_FREE_MODE = True  # V6: ACK-free mode enabled by default (production-grade)
-DEFAULT_TARGET_FPS = 40.0  # V6: Target FPS for ACK-free mode
+DEFAULT_TARGET_FPS = 40.0  # Target FPS for ACK-free publishing
 DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
 DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
 DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
@@ -130,16 +103,11 @@ ADAPTIVE_FPS_REDUCTION_FACTOR = 0.8  # Multiply current FPS by this on high lag
 
 @dataclass
 class ProcessorConfig:
-    """Configuration for the spool processor."""
+    """Configuration for the spool processor (ACK-free mode only)."""
     spool_dir: str = DEFAULT_SPOOL_DIR
-    ack_timeout: float = DEFAULT_ACK_TIMEOUT  # Legacy mode only
-    retry_count: int = DEFAULT_RETRY_COUNT  # Legacy mode only
     poll_interval: float = DEFAULT_POLL_INTERVAL
     stats_interval: float = DEFAULT_STATS_INTERVAL
-    startup_grace_period: float = DEFAULT_STARTUP_GRACE_PERIOD
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
-    # V6: ACK-free mode configuration
-    ack_free_mode: bool = DEFAULT_ACK_FREE_MODE
     target_fps: float = DEFAULT_TARGET_FPS
     # V7: Robustness and observability
     state_file: str = DEFAULT_STATE_FILE
@@ -155,38 +123,34 @@ def load_default_config() -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
     return ProcessorConfig(
         spool_dir=DEFAULT_SPOOL_DIR,
-        ack_timeout=DEFAULT_ACK_TIMEOUT,
-        retry_count=DEFAULT_RETRY_COUNT,
-        ack_free_mode=DEFAULT_ACK_FREE_MODE,
         target_fps=DEFAULT_TARGET_FPS,
     )
 
 class SpoolProcessorNode(Node):
     """
-    ROS2 Node that processes spooled H.264 frames.
+    Spool Processor Node - ACK-Free Video Streaming.
     
-    V6 ACK-Free Mode (Production-Grade, Recommended):
-    ------------------------------------------------
-    When `ack_free_mode=True` (default):
+    Reads H.264 frames from the spool and publishes them to the decoder
+    at a controlled rate without waiting for acknowledgments.
+    
+    ACK-Free Architecture (Production):
+    ----------------------------------
     1. Reads frames continuously from spool
     2. Publishes at target_fps rate
     3. Never blocks on consumer feedback
     4. Relies on retention guards for data safety
     
-    This mode aligns with industry-standard streaming architectures.
+    This aligns with industry-standard streaming architectures.
     
-    Legacy ACK Mode (Deprecated):
-    ----------------------------
-    When `ack_free_mode=False`:
-    1. Waits for ACK from BagCounterApp before sending next frame
-    2. Implements strict backpressure
-    3. NOT recommended - causes blocking and deadlocks
-    
-    Production Reliability Features:
-    - V6: ACK-free continuous processing (no blocking)
-    - Startup synchronization: Waits for consumer before processing
-    - SPS/PPS caching: Prepends to segment boundaries for decoder init
-    - Graceful degradation: Continues processing even under load
+    V7 Features:
+    -----------
+    - Gap/duplicate detection with anomaly counters
+    - Spool lag monitoring with adaptive pacing
+    - SPS/PPS robustness at segment boundaries
+    - Watchdog for stalled publishing detection
+    - Persisted state for restart continuity
+    - Retention guard for segment existence
+    - Structured logging for machine parsing
     """
     
     def __init__(self, config: Optional[ProcessorConfig] = None):
@@ -199,16 +163,11 @@ class SpoolProcessorNode(Node):
         self._session_id = generate_session_id()
         
         # Log mode selection
-        mode_str = "ACK-FREE (V6 Production)" if self.config.ack_free_mode else "LEGACY ACK (Deprecated)"
-        logger.info(f"[SpoolProcessor] Mode: {mode_str}")
+        logger.info(f"[SpoolProcessor] Mode: ACK-FREE (Production)")
         
         logger.info(f"[SpoolProcessor] Initializing with config: "
                    f"spool_dir={self.config.spool_dir}, "
-                   f"ack_free_mode={self.config.ack_free_mode}, "
                    f"target_fps={self.config.target_fps}, "
-                   f"ack_timeout={self.config.ack_timeout}s (legacy only), "
-                   f"retry_count={self.config.retry_count} (legacy only), "
-                   f"startup_grace={self.config.startup_grace_period}s, "
                    f"session_id={self._session_id}")
         
         # Initialize components
@@ -228,13 +187,8 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps: bool = True  # First frame of segment needs SPS/PPS
         
         # State management
-        self._state = ProcessorState.WAITING_FOR_READY
+        self._state = ProcessorState.IDLE
         self._state_lock = threading.Lock()
-        self._ack_received = threading.Event()
-        self._ready_received = threading.Event()
-        self._last_ack: Optional[ProcessingAck] = None
-        self._consumer_session_id: Optional[str] = None  # Session ID from consumer's READY
-        self._last_ack_time: float = 0.0  # Track last successful ACK for watchdog
         
         # Processing thread
         self._running = False
@@ -242,15 +196,10 @@ class SpoolProcessorNode(Node):
         
         # Statistics
         self._frames_processed = 0
-        self._frames_retried = 0
         self._frames_skipped = 0
-        self._ack_timeouts = 0
-        self._ack_rejected_stale = 0  # ACKs rejected due to wrong session
-        self._ack_accepted = 0  # Total ACKs accepted
         self._segments_processed = 0
         self._sps_pps_prepends = 0
         self._last_stats_time = time.time()
-        self._last_detailed_stats_time = time.time()  # For 2-minute detailed stats
         self._stats_lock = threading.Lock()
         
         # V7: Robustness counters
@@ -267,21 +216,6 @@ class SpoolProcessorNode(Node):
         
         # ROS2 publishers and subscribers
         if IS_RDK:
-            # QoS for READY topic - TRANSIENT_LOCAL for late joiners
-            ready_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=10,
-                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
-            )
-            
-            # QoS for ACK and metadata - RELIABLE with good depth
-            control_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=20  # Higher depth for control messages
-            )
-            
             # QoS for encoded frames - must match decoder's subscription QoS
             frame_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
@@ -290,52 +224,15 @@ class SpoolProcessorNode(Node):
             )
 
             # Publisher for encoded frames (to decoder input)
-            # This is the ONLY essential topic - publishes H.264 frames to hobot_codec
+            # This is the ONLY topic - publishes H.264 frames to hobot_codec
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
                 frame_qos
             )
             
-            # Legacy ACK mode: Additional topics for ACK-based coordination
-            # In ACK-free mode (default), these are not created to keep architecture simple
-            if not self.config.ack_free_mode:
-                # Publisher for frame metadata (legacy mode only)
-                self._metadata_pub = self.create_publisher(
-                    String,
-                    '/spool/current_frame_metadata',
-                    control_qos
-                )
-                
-                # Subscriber for processing READY (legacy mode only)
-                self._ready_sub = self.create_subscription(
-                    String,
-                    '/processing_ready',
-                    self._ready_callback,
-                    ready_qos
-                )
-                
-                # Subscriber for processing ACK (legacy mode only)
-                self._ack_sub = self.create_subscription(
-                    String,
-                    '/processing_ack',
-                    self._ack_callback,
-                    control_qos
-                )
-                
-                logger.info("[SpoolProcessor] ROS2 topics configured (LEGACY ACK MODE): "
-                           "/spool_image_ch_0 (pub), "
-                           "/spool/current_frame_metadata (pub), "
-                           "/processing_ready (sub), "
-                           "/processing_ack (sub)")
-            else:
-                # Set these to None in ACK-free mode
-                self._metadata_pub = None
-                self._ready_sub = None
-                self._ack_sub = None
-                
-                logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
-                           "/spool_image_ch_0 (pub) - Simple, robust architecture")
+            logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
+                       "/spool_image_ch_0 (pub) - Simple, robust architecture")
     
     def start(self):
         """Start the processor."""
@@ -768,23 +665,6 @@ class SpoolProcessorNode(Node):
                 seq = self._seq_counter
                 self._seq_counter += 1
             
-            # Get send timestamp
-            sent_time_sec, sent_time_nsec = get_current_time_ros()
-            
-            # Publish frame metadata for ACK correlation (legacy mode only)
-            if self._metadata_pub is not None:
-                metadata = FrameMetadata(
-                    frame_index=record.index,
-                    session_id=self._session_id,
-                    seq=seq,
-                    sent_time_sec=sent_time_sec,
-                    sent_time_nsec=sent_time_nsec,
-                    segment_num=self._current_segment
-                )
-                metadata_msg = String()
-                metadata_msg.data = frame_metadata_to_ros_string(metadata)
-                self._metadata_pub.publish(metadata_msg)
-            
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
             
@@ -992,19 +872,12 @@ class SpoolProcessorNode(Node):
     
     def _processor_loop(self):
         """
-        Main processing loop - dispatches to ACK-free or legacy mode.
+        Main processing loop - ACK-free continuous publishing.
         """
         logger.info("[SpoolProcessor] Processing loop started")
         
-        # Startup synchronization: Wait for consumer READY (legacy mode only)
-        # In ACK-free mode, we start immediately - no coordination needed
-        if not self.config.ack_free_mode:
-            self._wait_for_consumer_ready()
-        
-        if self.config.ack_free_mode:
-            self._processor_loop_ack_free()
-        else:
-            self._processor_loop_legacy()
+        # Call the ACK-free loop directly
+        self._processor_loop_ack_free()
         
         logger.info("[SpoolProcessor] Processing loop stopped")
     
