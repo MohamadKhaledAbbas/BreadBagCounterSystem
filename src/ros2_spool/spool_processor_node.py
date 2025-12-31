@@ -394,84 +394,14 @@ class SpoolProcessorNode(Node):
         """
         Pre-scan frames to find and cache SPS/PPS NAL units.
         
-        This is called on startup to ensure we have SPS/PPS available
-        for the decoder before sending any frames. Critical for decoder
-        initialization.
+        V7.1: Simplified to avoid frame skipping. SPS/PPS are now cached during
+        normal frame iteration in _get_next_frame(). This eliminates gaps caused
+        by complex frame buffering logic that was consuming frames without properly
+        re-injecting them.
         """
-        logger.info("[SpoolProcessor] Pre-scanning for SPS/PPS NAL units...")
-        
-        # Read up to 100 frames looking for SPS/PPS
-        frames_scanned = 0
-        temp_frames = []
-        max_scan = 100
-        
-        try:
-            while frames_scanned < max_scan:
-                try:
-                    frame = next(self._frame_generator)
-                    temp_frames.append(frame)
-                    frames_scanned += 1
-                    
-                    # Try to extract SPS/PPS from this frame
-                    sps, pps = extract_sps_pps(frame.data)
-                    if sps:
-                        self._cached_sps = sps
-                        logger.info(f"[SpoolProcessor] Found and cached SPS from frame {frame.index} during pre-scan")
-                    if pps:
-                        self._cached_pps = pps
-                        logger.info(f"[SpoolProcessor] Found and cached PPS from frame {frame.index} during pre-scan")
-                    
-                    # If we found both, we're done
-                    if self._cached_sps and self._cached_pps:
-                        logger.info(f"[SpoolProcessor] Pre-scan complete: found SPS/PPS after scanning {frames_scanned} frames")
-                        break
-                        
-                except StopIteration:
-                    logger.warning(f"[SpoolProcessor] Pre-scan reached end of spool after {frames_scanned} frames")
-                    break
-        except Exception as e:
-            logger.error(f"[SpoolProcessor] Error during SPS/PPS pre-scan: {e}")
-        
-        # Recreate generator with buffered frames at the front
-        # This avoids the "generator already executing" issue by creating a fresh generator
-        # from the original source and prepending the buffered frames
-        oldest = self._current_segment
-        if oldest is not None:
-            # Get a fresh generator from the reader
-            fresh_generator = self._reader.read_frames(start_segment=oldest)
-            
-            # Create iterator that yields buffered frames first, then continues with fresh generator
-            def buffered_generator():
-                # First yield all buffered frames
-                for frame in temp_frames:
-                    yield frame
-                # Then yield from fresh generator, skipping frames we already buffered
-                frames_to_skip = len(temp_frames)
-                skipped = 0
-                try:
-                    while True:
-                        frame = next(fresh_generator)
-                        if skipped < frames_to_skip:
-                            skipped += 1
-                            continue
-                        yield frame
-                except StopIteration:
-                    pass
-            
-            self._frame_generator = buffered_generator()
-        else:
-            # Fallback: just use buffered frames if no segment available
-            self._frame_generator = iter(temp_frames)
-        
-        if self._cached_sps and self._cached_pps:
-            logger.info("[SpoolProcessor] Pre-scan successful: SPS/PPS cached and ready for decoder")
-        else:
-            missing = []
-            if not self._cached_sps:
-                missing.append("SPS")
-            if not self._cached_pps:
-                missing.append("PPS")
-            logger.warning(f"[SpoolProcessor] Pre-scan incomplete: missing {', '.join(missing)} - decoder may fail to initialize")
+        logger.info("[SpoolProcessor] SPS/PPS will be cached during normal frame iteration")
+        # Note: SPS/PPS caching happens in _get_next_frame() during normal processing
+        # This avoids the frame skipping issue that occurred with buffered_generator
     
     def _get_next_frame(self) -> Optional[FrameRecord]:
         """
@@ -518,6 +448,11 @@ class SpoolProcessorNode(Node):
             with self._stats_lock:
                 if self._current_segment >= 0:
                     self._segments_processed += 1
+            
+            # V7.1: Notify retention policy that segment is fully processed
+            if hasattr(self, '_retention_policy') and old_segment >= 0:
+                self._retention_policy.set_last_processed_segment(old_segment)
+            
             self._segment_needs_sps_pps = True  # New segment will need SPS/PPS
             
             # Don't call _init_frame_generator which may do prescan again
@@ -872,14 +807,22 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
-                # Pace to target FPS (non-blocking pacing)
-                current_time = time.time()
-                elapsed = current_time - last_publish_time
-                if elapsed < frame_interval:
-                    time.sleep(frame_interval - elapsed)
+                # V7.1: Adaptive frame rate pacing
+                # Pace to target FPS accounting for processing time
+                # If processing took longer than frame_interval, skip sleep (catch up)
+                publish_start = time.time()
                 
                 # Publish frame (no ACK wait)
                 success = self._publish_frame(frame)
+                
+                # Calculate adaptive sleep based on actual processing time
+                publish_end = time.time()
+                processing_time = publish_end - last_publish_time
+                sleep_time = max(0, frame_interval - processing_time)
+                
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                
                 last_publish_time = time.time()
                 
                 if success:
