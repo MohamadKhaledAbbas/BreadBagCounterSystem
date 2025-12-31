@@ -150,6 +150,11 @@ class RetentionPolicy:
                 if self.delete_processed_segments and old_segment >= 0:
                     self._delete_processed_segment(old_segment)
     
+    def get_last_processed_segment(self) -> int:
+        """Get the last processed segment number."""
+        with self._progress_lock:
+            return self._last_processed_segment
+    
     def _delete_processed_segment(self, segment_num: int):
         """Delete a processed segment immediately."""
         try:
@@ -160,7 +165,11 @@ class RetentionPolicy:
                 self.bytes_recovered += size
                 self.segments_deleted += 1
                 self.segments_deleted_by_processing += 1
-                logger.info(f"[Retention] Deleted processed segment {segment_num} ({size / 1024 / 1024:.2f}MB)")
+                logger.debug(f"[Retention] Deleted processed segment {segment_num} ({size / 1024:.1f}KB)")
+            else:
+                logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
+        except FileNotFoundError:
+            logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
         except Exception as e:
             logger.warning(f"[Retention] Error deleting segment {segment_num}: {e}")
     
@@ -250,12 +259,14 @@ class RetentionPolicy:
         for seg_num, path, mtime, size in segments[:-self.min_segments_to_keep]:
             age = current_time - mtime
             if age > self.retention_seconds:
-                # V7.2: NEVER delete segments at or after processor's current position
+                # V7.3: NEVER delete segments AFTER processor's current position
+                # The "last_processed_segment" is the segment the processor just finished,
+                # so we protect anything AFTER that (processor may still be transitioning)
                 if self.retention_safety_enabled and last_processed_segment >= 0:
-                    if seg_num >= last_processed_segment:
+                    if seg_num > last_processed_segment:
                         logger.debug(
-                            f"[Retention] Protected segment {seg_num}: at or after processor position "
-                            f"(processor_segment={last_processed_segment})"
+                            f"[Retention] Protected segment {seg_num}: after processor position "
+                            f"(last_processed_segment={last_processed_segment})"
                         )
                         self.segments_protected_by_progress += 1
                         continue
@@ -308,6 +319,11 @@ class RetentionPolicy:
         # Delete expired segments
         for seg_num, path, size in expired:
             try:
+                if not path.exists():
+                    # Already deleted by immediate cleanup
+                    logger.debug(f"[Retention] Segment {seg_num} already deleted (immediate cleanup)")
+                    continue
+                    
                 path.unlink()
                 deleted_count += 1
                 bytes_freed += size
@@ -316,13 +332,16 @@ class RetentionPolicy:
                 
                 logger.info(
                     f"[Retention] Deleted segment {seg_num} "
-                    f"({size / 1024 / 1024:.2f}MB, age: {time.time() - path.stat().st_mtime:.1f}s)"
+                    f"({size / 1024 / 1024:.2f}MB, age: {time.time() - os.stat(str(path)).st_mtime if path.exists() else 0:.1f}s)"
                 )
                 
                 # Check if we've freed enough space
                 if size_exceeded and total_size - bytes_freed <= self.max_spool_size_bytes:
                     break
                     
+            except FileNotFoundError:
+                # Already deleted - likely by immediate cleanup
+                logger.debug(f"[Retention] Segment {seg_num} already deleted (immediate cleanup)")
             except Exception as e:
                 logger.warning(f"[Retention] Error deleting segment {seg_num}: {e}")
         
