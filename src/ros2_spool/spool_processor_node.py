@@ -290,48 +290,52 @@ class SpoolProcessorNode(Node):
             )
 
             # Publisher for encoded frames (to decoder input)
+            # This is the ONLY essential topic - publishes H.264 frames to hobot_codec
             self._frame_pub = self.create_publisher(
                 H26XFrame,
                 '/spool_image_ch_0',
                 frame_qos
             )
             
-            # Publisher for frame metadata
-            self._metadata_pub = self.create_publisher(
-                String,
-                '/spool/current_frame_metadata',
-                control_qos
-            )
-            
-            # Subscriber for processing READY
-            self._ready_sub = self.create_subscription(
-                String,
-                '/processing_ready',
-                self._ready_callback,
-                ready_qos
-            )
-            
-            # Subscriber for processing ACK
-            self._ack_sub = self.create_subscription(
-                String,
-                '/processing_ack',
-                self._ack_callback,
-                control_qos
-            )
-            
-            # Optional: Pull request topic (for external control)
-            self._request_sub = self.create_subscription(
-                UInt32,
-                '/spool/request_next',
-                self._request_callback,
-                control_qos
-            )
-            
-            logger.info("[SpoolProcessor] ROS2 topics configured: "
-                       "/spool_image_ch_0 (pub, RELIABLE), "
-                       "/spool/current_frame_metadata (pub, RELIABLE), "
-                       "/processing_ready (sub, TRANSIENT_LOCAL), "
-                       "/processing_ack (sub, RELIABLE)")
+            # Legacy ACK mode: Additional topics for ACK-based coordination
+            # In ACK-free mode (default), these are not created to keep architecture simple
+            if not self.config.ack_free_mode:
+                # Publisher for frame metadata (legacy mode only)
+                self._metadata_pub = self.create_publisher(
+                    String,
+                    '/spool/current_frame_metadata',
+                    control_qos
+                )
+                
+                # Subscriber for processing READY (legacy mode only)
+                self._ready_sub = self.create_subscription(
+                    String,
+                    '/processing_ready',
+                    self._ready_callback,
+                    ready_qos
+                )
+                
+                # Subscriber for processing ACK (legacy mode only)
+                self._ack_sub = self.create_subscription(
+                    String,
+                    '/processing_ack',
+                    self._ack_callback,
+                    control_qos
+                )
+                
+                logger.info("[SpoolProcessor] ROS2 topics configured (LEGACY ACK MODE): "
+                           "/spool_image_ch_0 (pub), "
+                           "/spool/current_frame_metadata (pub), "
+                           "/processing_ready (sub), "
+                           "/processing_ack (sub)")
+            else:
+                # Set these to None in ACK-free mode
+                self._metadata_pub = None
+                self._ready_sub = None
+                self._ack_sub = None
+                
+                logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
+                           "/spool_image_ch_0 (pub) - Simple, robust architecture")
     
     def start(self):
         """Start the processor."""
@@ -767,18 +771,19 @@ class SpoolProcessorNode(Node):
             # Get send timestamp
             sent_time_sec, sent_time_nsec = get_current_time_ros()
             
-            # Publish frame metadata for ACK correlation
-            metadata = FrameMetadata(
-                frame_index=record.index,
-                session_id=self._session_id,
-                seq=seq,
-                sent_time_sec=sent_time_sec,
-                sent_time_nsec=sent_time_nsec,
-                segment_num=self._current_segment
-            )
-            metadata_msg = String()
-            metadata_msg.data = frame_metadata_to_ros_string(metadata)
-            self._metadata_pub.publish(metadata_msg)
+            # Publish frame metadata for ACK correlation (legacy mode only)
+            if self._metadata_pub is not None:
+                metadata = FrameMetadata(
+                    frame_index=record.index,
+                    session_id=self._session_id,
+                    seq=seq,
+                    sent_time_sec=sent_time_sec,
+                    sent_time_nsec=sent_time_nsec,
+                    segment_num=self._current_segment
+                )
+                metadata_msg = String()
+                metadata_msg.data = frame_metadata_to_ros_string(metadata)
+                self._metadata_pub.publish(metadata_msg)
             
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
@@ -991,8 +996,10 @@ class SpoolProcessorNode(Node):
         """
         logger.info("[SpoolProcessor] Processing loop started")
         
-        # Startup synchronization: Wait for consumer READY
-        self._wait_for_consumer_ready()
+        # Startup synchronization: Wait for consumer READY (legacy mode only)
+        # In ACK-free mode, we start immediately - no coordination needed
+        if not self.config.ack_free_mode:
+            self._wait_for_consumer_ready()
         
         if self.config.ack_free_mode:
             self._processor_loop_ack_free()

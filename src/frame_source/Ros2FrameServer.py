@@ -125,7 +125,11 @@ class FrameServer(Node, FrameSource):
                 self._frame_metadata_callback,
                 reliable_qos
             )
-            logger.info("[Ros2FrameServer] Accuracy Mode enabled - subscribing to /spool/current_frame_metadata")
+            logger.info("[Ros2FrameServer] Accuracy Mode ENABLED - subscribing to /spool/current_frame_metadata")
+            logger.warning("[Ros2FrameServer] NOTE: Accuracy mode adds complexity. Consider disabling if not using legacy ACK mode.")
+        else:
+            self._index_sub = None
+            logger.info("[Ros2FrameServer] Accuracy Mode DISABLED - Simple architecture, no frame index correlation")
         
         logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only)")
 
