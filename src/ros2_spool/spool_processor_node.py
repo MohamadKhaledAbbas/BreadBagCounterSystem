@@ -619,17 +619,17 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps = False
         return data
     
-    def _publish_frame(self, record: FrameRecord) -> tuple[bool, int, int, int]:
+    def _publish_frame(self, record: FrameRecord) -> bool:
         """
-        Publish a frame to the decoder input topic with metadata.
+        Publish a frame to the decoder input topic.
         
         V7: Includes gap/dup detection and optional CRC32 checksum logging.
         
         Returns:
-            Tuple of (success: bool, seq: int, sent_time_sec: int, sent_time_nsec: int)
+            bool: True if publishing succeeded, False otherwise
         """
         if not IS_RDK:
-            return True, 0, 0, 0
+            return True
         
         try:
             # V7: Detect gaps and duplicates
@@ -738,16 +738,159 @@ class SpoolProcessorNode(Node):
                 )
                 logger.debug(pub_msg)
             
-            return True, seq, sent_time_sec, sent_time_nsec
+            return True
             
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error publishing frame: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return False, 0, 0, 0
+            return False
     
 
-    # Legacy methods removed (ACK-free mode only)
+
+    def _processor_loop(self):
+        """
+        Main processing loop - ACK-free continuous publishing.
+        """
+        logger.info("[SpoolProcessor] Processing loop started")
+        
+        # Call the ACK-free loop directly
+        self._processor_loop_ack_free()
+        
+        logger.info("[SpoolProcessor] Processing loop stopped")
+    
+    def _processor_loop_ack_free(self):
+        """
+        V6/V7 ACK-Free Processing Loop (Production-Grade).
+        
+        This loop processes frames continuously without waiting for ACKs:
+        1. Read frame from spool
+        2. Publish immediately
+        3. Pace to target_fps (adaptive)
+        4. Never block
+        
+        V7 Additions:
+        - Spool lag computation and warnings
+        - Watchdog for stalled publishing
+        - Adaptive pacing on high lag (optional)
+        
+        Benefits:
+        - No deadlocks (impossible)
+        - Maximum throughput
+        - Stable latency
+        - Production-safe
+        
+        The consumer processes frames at its own pace. Retention guards
+        protect unprocessed data from deletion.
+        """
+        logger.info(format_structured_log(
+            "[SpoolProcessor] ACK-FREE mode active",
+            target_fps=self.config.target_fps,
+            adaptive_pacing=self.config.enable_adaptive_pacing
+        ))
+        
+        frame_interval = 1.0 / self._current_target_fps
+        last_publish_time = 0.0
+        
+        with self._state_lock:
+            self._state = ProcessorState.PUBLISHING
+        
+        while self._running:
+            try:
+                # V7: Compute spool lag
+                segments = self._reader.list_segments()
+                newest_segment = max(segments) if segments else None
+                spool_lag = 0
+                if newest_segment is not None and self._current_segment >= 0:
+                    spool_lag = newest_segment - self._current_segment
+                
+                # V7: Check lag thresholds and adaptive pacing
+                if self.config.enable_adaptive_pacing and spool_lag > self.config.spool_lag_error_threshold:
+                    # High lag - reduce FPS temporarily
+                    old_fps = self._current_target_fps
+                    self._current_target_fps = max(
+                        self.config.adaptive_fps_min,
+                        self._current_target_fps * ADAPTIVE_FPS_REDUCTION_FACTOR
+                    )
+                    if old_fps != self._current_target_fps:
+                        logger.warning(format_structured_log(
+                            "[SpoolProcessor] 🐢 Adaptive pacing: Reducing FPS due to high lag",
+                            spool_lag=spool_lag,
+                            old_fps=old_fps,
+                            new_fps=self._current_target_fps
+                        ))
+                        frame_interval = 1.0 / self._current_target_fps
+                elif self.config.enable_adaptive_pacing and spool_lag < self.config.spool_lag_warn_threshold:
+                    # Lag healthy - restore FPS
+                    if self._current_target_fps < self.config.target_fps:
+                        self._current_target_fps = self.config.target_fps
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] 🚀 Adaptive pacing: Restoring FPS",
+                            spool_lag=spool_lag,
+                            fps=self._current_target_fps
+                        ))
+                        frame_interval = 1.0 / self._current_target_fps
+                
+                # V7: Watchdog - check for stalled publishing
+                current_time = time.time()
+                if self._last_publish_time > 0 and (current_time - self._last_publish_time) > self.config.watchdog_timeout:
+                    watchdog_msg = format_structured_log(
+                        "🔴 WATCHDOG: No frames published recently",
+                        stalled_seconds=current_time - self._last_publish_time,
+                        threshold=self.config.watchdog_timeout
+                    )
+                    throttled_log(
+                        logger.error,
+                        f"[SpoolProcessor] {watchdog_msg}",
+                        key="watchdog",
+                        throttle_dict=self._throttle_log_dict,
+                        min_interval=10.0
+                    )
+                
+                # Get next frame
+                frame = self._get_next_frame()
+                
+                if frame is None:
+                    # Spool is empty, wait and retry
+                    with self._state_lock:
+                        self._state = ProcessorState.SPOOL_EMPTY
+                    logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
+                    time.sleep(self.config.poll_interval)
+                    with self._state_lock:
+                        self._state = ProcessorState.PUBLISHING
+                    continue
+                
+                self._current_frame = frame
+                self._current_frame_index = frame.index
+                
+                # Pace to target FPS (non-blocking pacing)
+                current_time = time.time()
+                elapsed = current_time - last_publish_time
+                if elapsed < frame_interval:
+                    time.sleep(frame_interval - elapsed)
+                
+                # Publish frame (no ACK wait)
+                success = self._publish_frame(frame)
+                last_publish_time = time.time()
+                
+                if success:
+                    with self._stats_lock:
+                        self._frames_processed += 1
+                else:
+                    with self._stats_lock:
+                        self._frames_skipped += 1
+                    logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
+                
+                # Log stats periodically
+                self._maybe_log_stats()
+                
+            except Exception as e:
+                logger.error(f"[SpoolProcessor] Error in ACK-free loop: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                time.sleep(0.1)
+    
+
 
     def _maybe_log_stats(self):
         """Log statistics periodically with structured format (V7)."""
