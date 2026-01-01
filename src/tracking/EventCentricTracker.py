@@ -1405,6 +1405,7 @@ class BreadBagEvent:
     def _try_collect_roi(self, detection: DetectionEvidence, frame_img: np.ndarray):
         """
         V4 Phase 3: Supports lazy ROI cropping for memory and CPU efficiency.
+        V7.3: Enhanced validation for invalid crops, aspect ratios, and glare detection.
         
         When lazy_roi_cropping_enabled=True:
         - ROI is not cropped immediately
@@ -1416,6 +1417,13 @@ class BreadBagEvent:
         - Reduces CPU overhead (only crop what's needed)
         - Events that expire never trigger cropping
         - Expected 30-50% reduction in monitor processing time
+        
+        V7.3 Validation Improvements:
+        - Minimum width/height checks after clamping
+        - Aspect ratio validation (reject extreme ratios)
+        - Glare/overexposure detection
+        - Empty crop detection
+        - Frame reference validation in lazy mode
         """
         # Determine class-specific caps (fallback to legacy max_roi_samples)
         max_open_cap = getattr(self.config, "max_open_roi_samples", self.config.max_roi_samples)
@@ -1427,6 +1435,7 @@ class BreadBagEvent:
         if not (roi_is_open or roi_is_closed):
             return
 
+        # V7.3: Clamp bbox and validate
         x1, y1, x2, y2 = map(int, detection.box)
         h, w = frame_img.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
@@ -1434,8 +1443,32 @@ class BreadBagEvent:
 
         roi_width = x2 - x1
         roi_height = y2 - y1
+        
+        # V7.3: Guard against invalid crops (empty or too small after clamping)
+        MIN_WIDTH = 20  # Minimum acceptable width
+        MIN_HEIGHT = 20  # Minimum acceptable height
+        
+        if roi_width < MIN_WIDTH or roi_height < MIN_HEIGHT:
+            logger.debug(
+                f"[ROI] Rejected: invalid crop dimensions after clamping "
+                f"(w={roi_width}, h={roi_height}, min={MIN_WIDTH})"
+            )
+            pipeline_metrics.record_roi_quality(False, 0.0, "invalid_dimensions")
+            return
+        
+        # V7.3: Check aspect ratio (reject extreme ratios)
+        MAX_ASPECT_RATIO = 4.0  # Maximum ratio (width/height or height/width)
+        aspect_ratio = max(roi_width, roi_height) / min(roi_width, roi_height)
+        
+        if aspect_ratio > MAX_ASPECT_RATIO:
+            logger.debug(
+                f"[ROI] Rejected: extreme aspect ratio "
+                f"(ratio={aspect_ratio:.2f}, max={MAX_ASPECT_RATIO}, w={roi_width}, h={roi_height})"
+            )
+            pipeline_metrics.record_roi_quality(False, 0.0, "aspect_ratio")
+            return
 
-        # Size check
+        # Size check (standard minimum)
         if roi_width < self.config.min_roi_size or roi_height < self.config.min_roi_size:
             pipeline_metrics.record_roi_quality(False, 0.0, "size")
             return
@@ -1444,23 +1477,66 @@ class BreadBagEvent:
         lazy_cropping = tracking_config.lazy_roi_cropping_enabled
         
         if lazy_cropping:
+            # V7.3: Validate frame reference in lazy mode
+            if frame_img is None:
+                logger.warning("[ROI] CRITICAL: frame_ref is None in lazy mode, cannot crop ROI")
+                pipeline_metrics.record_roi_quality(False, 0.0, "null_frame_ref")
+                return
+            
             # Lazy mode: Store metadata only, compute quality from small sample
-            # Sample a small region for quality estimation (center 10% of ROI)
-            sample_x1 = x1 + roi_width // 4
-            sample_y1 = y1 + roi_height // 4
-            sample_x2 = x2 - roi_width // 4
-            sample_y2 = y2 - roi_height // 4
-            roi_sample = frame_img[sample_y1:sample_y2, sample_x1:sample_x2].copy()
+            # Sample a small region for quality estimation (center 50% of ROI for better estimates)
+            sample_x1 = max(x1, x1 + roi_width // 4)
+            sample_y1 = max(y1, y1 + roi_height // 4)
+            sample_x2 = min(x2, x2 - roi_width // 4)
+            sample_y2 = min(y2, y2 - roi_height // 4)
+            
+            # Validate sample bounds
+            if sample_x2 <= sample_x1 or sample_y2 <= sample_y1:
+                logger.debug(
+                    f"[ROI] Rejected: invalid sample bounds "
+                    f"(sample_x=[{sample_x1}, {sample_x2}], sample_y=[{sample_y1}, {sample_y2}])"
+                )
+                pipeline_metrics.record_roi_quality(False, 0.0, "invalid_sample")
+                return
+            
+            try:
+                roi_sample = frame_img[sample_y1:sample_y2, sample_x1:sample_x2].copy()
+            except Exception as e:
+                logger.error(f"[ROI] Failed to sample crop: {e}")
+                pipeline_metrics.record_roi_quality(False, 0.0, "sample_error")
+                return
+            
+            # Check if sample is empty
+            if roi_sample.size == 0:
+                logger.debug("[ROI] Rejected: empty sample crop")
+                pipeline_metrics.record_roi_quality(False, 0.0, "empty_sample")
+                return
             
             # Quick quality checks on sample
             mean_brightness = roi_sample.mean()
             if not (self.config.min_brightness <= mean_brightness <= self.config.max_brightness):
                 pipeline_metrics.record_roi_quality(False, 0.0, "brightness")
                 return
+            
+            # V7.3: Quick glare/overexposure check
+            OVEREXPOSURE_THRESHOLD = 0.3  # 30% of pixels near white
+            glare_pct = np.mean(roi_sample > 240)  # Count near-white pixels
+            if glare_pct > OVEREXPOSURE_THRESHOLD:
+                logger.debug(
+                    f"[ROI] Rejected: overexposed/glare detected "
+                    f"(glare_pct={glare_pct:.2f}, threshold={OVEREXPOSURE_THRESHOLD})"
+                )
+                pipeline_metrics.record_roi_quality(False, 0.0, "overexposure")
+                return
 
             # Sharpness check on sample
-            gray_sample = cv2.cvtColor(roi_sample, cv2.COLOR_BGR2GRAY)
-            sharpness = cv2.Laplacian(gray_sample, cv2.CV_64F).var()
+            try:
+                gray_sample = cv2.cvtColor(roi_sample, cv2.COLOR_BGR2GRAY)
+                sharpness = cv2.Laplacian(gray_sample, cv2.CV_64F).var()
+            except Exception as e:
+                logger.error(f"[ROI] Failed to compute sharpness: {e}")
+                pipeline_metrics.record_roi_quality(False, 0.0, "sharpness_error")
+                return
 
             if sharpness < self.config.min_roi_sharpness:
                 pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
@@ -1471,6 +1547,15 @@ class BreadBagEvent:
                 roi_sample, gray_sample, sharpness, (roi_width * roi_height)
             )
             pipeline_metrics.record_roi_quality(True, sharpness, None)
+            
+            # V7.3: Deduplication check - skip if similar ROI already exists
+            if self._is_duplicate_roi(detection.box, quality):
+                logger.debug(
+                    f"[ROI] Rejected: duplicate ROI detected "
+                    f"(quality={quality:.3f})"
+                )
+                pipeline_metrics.record_roi_quality(False, quality, "duplicate")
+                return
 
             # Create lazy candidate (roi=None, frame_ref=frame_img)
             candidate = ROICandidate(
@@ -1490,17 +1575,44 @@ class BreadBagEvent:
             )
         else:
             # Legacy mode: Crop immediately
-            roi = frame_img[y1:y2, x1:x2].copy()
+            try:
+                roi = frame_img[y1:y2, x1:x2].copy()
+            except Exception as e:
+                logger.error(f"[ROI] Failed to crop: {e}")
+                pipeline_metrics.record_roi_quality(False, 0.0, "crop_error")
+                return
+            
+            # Check if crop is empty
+            if roi.size == 0:
+                logger.debug("[ROI] Rejected: empty crop")
+                pipeline_metrics.record_roi_quality(False, 0.0, "empty_crop")
+                return
 
             # Brightness check
             mean_brightness = roi.mean()
             if not (self.config.min_brightness <= mean_brightness <= self.config.max_brightness):
                 pipeline_metrics.record_roi_quality(False, 0.0, "brightness")
                 return
+            
+            # V7.3: Quick glare/overexposure check
+            OVEREXPOSURE_THRESHOLD = 0.3  # 30% of pixels near white
+            glare_pct = np.mean(roi > 240)
+            if glare_pct > OVEREXPOSURE_THRESHOLD:
+                logger.debug(
+                    f"[ROI] Rejected: overexposed/glare detected "
+                    f"(glare_pct={glare_pct:.2f}, threshold={OVEREXPOSURE_THRESHOLD})"
+                )
+                pipeline_metrics.record_roi_quality(False, 0.0, "overexposure")
+                return
 
             # Sharpness check (variance of Laplacian)
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            try:
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            except Exception as e:
+                logger.error(f"[ROI] Failed to compute sharpness: {e}")
+                pipeline_metrics.record_roi_quality(False, 0.0, "sharpness_error")
+                return
 
             if sharpness < self.config.min_roi_sharpness:
                 pipeline_metrics.record_roi_quality(False, sharpness, "sharpness")
@@ -1511,6 +1623,15 @@ class BreadBagEvent:
                 roi, gray, sharpness, (roi_width * roi_height)
             )
             pipeline_metrics.record_roi_quality(True, sharpness, None)
+            
+            # V7.3: Deduplication check
+            if self._is_duplicate_roi(detection.box, quality):
+                logger.debug(
+                    f"[ROI] Rejected: duplicate ROI detected "
+                    f"(quality={quality:.3f})"
+                )
+                pipeline_metrics.record_roi_quality(False, quality, "duplicate")
+                return
 
             candidate = ROICandidate(
                 roi=roi,
@@ -1556,6 +1677,76 @@ class BreadBagEvent:
             removed = self.roi_candidates.pop(worst_idx)
             logger.debug(f"[ROI_CANDIDATE] removed worst closed candidate = {removed}")
             self.closed_roi_count -= 1
+    
+    def _is_duplicate_roi(self, new_bbox: Tuple[float, float, float, float], new_quality: float) -> bool:
+        """
+        V7.3: Check if new ROI candidate is a duplicate of existing ones.
+        
+        Deduplication criteria:
+        - High IoU with existing ROI (>= 0.7)
+        - Quality gain must exceed epsilon (0.05) to replace existing
+        
+        Args:
+            new_bbox: Bounding box of new ROI candidate (x1, y1, x2, y2)
+            new_quality: Quality score of new ROI candidate
+            
+        Returns:
+            True if ROI should be rejected as duplicate, False otherwise
+        """
+        DUPLICATE_IOU_THRESHOLD = 0.7
+        QUALITY_GAIN_EPSILON = 0.05
+        
+        for existing in self.roi_candidates:
+            if existing.bbox is None:
+                continue
+            
+            # Compute IoU with existing ROI
+            iou = self._compute_iou_static(new_bbox, existing.bbox)
+            
+            if iou >= DUPLICATE_IOU_THRESHOLD:
+                # High overlap - check if quality gain is significant
+                quality_gain = new_quality - existing.quality
+                if quality_gain < QUALITY_GAIN_EPSILON:
+                    # Not enough quality gain - reject as duplicate
+                    return True
+        
+        return False
+    
+    def _compute_iou_static(self, box1: Tuple[float, float, float, float], 
+                           box2: Tuple[float, float, float, float]) -> float:
+        """
+        Compute IoU between two bounding boxes.
+        
+        Args:
+            box1: First box (x1, y1, x2, y2)
+            box2: Second box (x1, y1, x2, y2)
+            
+        Returns:
+            IoU value between 0.0 and 1.0
+        """
+        # Compute intersection
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+        # Check if there is an intersection
+        if x2_inter <= x1_inter or y2_inter <= y1_inter:
+            return 0.0
+        
+        inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+        
+        # Compute areas of both boxes
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        # Compute union
+        union_area = area1 + area2 - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+        
+        return inter_area / union_area
     
     def update_ghost_state(self, current_time_ms: float, frame_size: Tuple[int, int], 
                            current_frame_index: int = -1) -> Tuple[bool, str]:
@@ -1870,6 +2061,7 @@ class BreadBagEvent:
     def get_roi_candidates(self) -> List[Dict[str, Any]]:
         """
         V4 Phase 3: Get ROI candidates for classification with lazy cropping support.
+        V7.3: Enhanced with None ROI filtering and validation.
         
         For lazy candidates, this triggers on-demand cropping when the event
         is ready for classification (only after passing all quality gates).
@@ -1877,11 +2069,23 @@ class BreadBagEvent:
         Returns candidates formatted for ClassifierService.
         """
         candidates = []
+        none_roi_count = 0
+        
         for idx, roi_cand in enumerate(self.roi_candidates):
             relative_time = idx / max(1, len(self.roi_candidates) - 1) if len(self.roi_candidates) > 1 else 0.5
             
             # V4 Phase 3: Get ROI (triggers lazy cropping if needed)
             roi = roi_cand.get_roi() if roi_cand.lazy else roi_cand.roi
+            
+            # V7.3: Filter out None ROIs with structured warning
+            if roi is None:
+                none_roi_count += 1
+                logger.warning(
+                    f"[ROI] Dropping None ROI candidate "
+                    f"(idx={idx}, lazy={roi_cand.lazy}, "
+                    f"frame_ref_present={roi_cand.frame_ref is not None if hasattr(roi_cand, 'frame_ref') else 'N/A'})"
+                )
+                continue
             
             candidates.append({
                 'roi': roi,
@@ -1893,6 +2097,14 @@ class BreadBagEvent:
                 'state': 'open' if roi_cand.is_open else 'closed',
                 'bbox': roi_cand.bbox,
             })
+        
+        # V7.3: Log if we dropped any None ROIs
+        if none_roi_count > 0:
+            logger.warning(
+                f"[ROI] Dropped {none_roi_count} None ROI candidates before classification "
+                f"(total_candidates={len(self.roi_candidates)}, valid={len(candidates)})"
+            )
+        
         return candidates
     
     def get_debug_info(self) -> Dict[str, Any]:
