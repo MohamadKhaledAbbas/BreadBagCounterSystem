@@ -31,6 +31,7 @@ import itertools
 from typing import Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from src.config.settings import AppConfig
 
@@ -77,7 +78,7 @@ else:
         def publish(self, msg): pass
 
 
-class ProcessorState(Enum):
+class ProcessorRunState(Enum):
     """State of the processor (ACK-free mode)."""
     IDLE = "idle"
     PUBLISHING = "publishing"  # Continuously publishing frames
@@ -90,13 +91,13 @@ DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_TARGET_FPS = 20.0  # Target FPS for ACK-free publishing
+DEFAULT_TARGET_FPS = 25.0  # Target FPS for ACK-free publishing
 DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
 DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
 DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
 DEFAULT_WATCHDOG_TIMEOUT = 30.0  # Seconds without publishing before alert
-DEFAULT_ENABLE_ADAPTIVE_PACING = False  # Reduce FPS on high lag
-DEFAULT_ADAPTIVE_FPS_MIN = 15.0  # Minimum FPS during adaptive pacing
+DEFAULT_ENABLE_ADAPTIVE_PACING = True  # Reduce FPS on high lag
+DEFAULT_ADAPTIVE_FPS_MIN = 20.0  # Minimum FPS during adaptive pacing
 DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
 ADAPTIVE_FPS_REDUCTION_FACTOR = 0.8  # Multiply current FPS by this on high lag
 
@@ -104,7 +105,7 @@ ADAPTIVE_FPS_REDUCTION_FACTOR = 0.8  # Multiply current FPS by this on high lag
 @dataclass
 class ProcessorConfig:
     """Configuration for the spool processor (ACK-free mode only)."""
-    spool_dir: str = DEFAULT_SPOOL_DIR
+    spool_dir_path: str = DEFAULT_SPOOL_DIR
     poll_interval: float = DEFAULT_POLL_INTERVAL
     stats_interval: float = DEFAULT_STATS_INTERVAL
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
@@ -122,7 +123,7 @@ class ProcessorConfig:
 def load_default_config() -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
     return ProcessorConfig(
-        spool_dir=DEFAULT_SPOOL_DIR,
+        spool_dir_path=DEFAULT_SPOOL_DIR,
         target_fps=DEFAULT_TARGET_FPS,
     )
 
@@ -166,12 +167,15 @@ class SpoolProcessorNode(Node):
         logger.info(f"[SpoolProcessor] Mode: ACK-FREE (Production)")
         
         logger.info(f"[SpoolProcessor] Initializing with config: "
-                   f"spool_dir={self.config.spool_dir}, "
+                   f"spool_dir={self.config.spool_dir_path}, "
                    f"target_fps={self.config.target_fps}, "
                    f"session_id={self._session_id}")
         
         # Initialize components
-        self._reader = SegmentReader(self.config.spool_dir)
+        spool_dir = Path(self.config.spool_dir_path)
+        spool_dir.mkdir(parents=True, exist_ok=True)
+
+        self._reader = SegmentReader(self.config.spool_dir_path)
         self._frame_generator: Optional[Generator] = None
         self._current_frame: Optional[FrameRecord] = None
         self._current_frame_index: int = 0
@@ -187,7 +191,7 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps: bool = True  # First frame of segment needs SPS/PPS
         
         # State management
-        self._state = ProcessorState.IDLE
+        self._state = ProcessorRunState.IDLE
         self._state_lock = threading.Lock()
         
         # Processing thread
@@ -214,7 +218,7 @@ class SpoolProcessorNode(Node):
         self._throttle_log_dict = {}  # For throttled logging
         
         # State file path
-        self._state_file_path = os.path.join(self.config.spool_dir, self.config.state_file)
+        self._state_file_path = os.path.join(self.config.spool_dir_path, self.config.state_file)
         self._allow_next_gap = False
         
         # ROS2 publishers and subscribers
@@ -296,7 +300,7 @@ class SpoolProcessorNode(Node):
         self._running = False
         
         with self._state_lock:
-            self._state = ProcessorState.STOPPED
+            self._state = ProcessorRunState.STOPPED
         
         # Wait for processor thread
         if self._processor_thread:
@@ -791,7 +795,7 @@ class SpoolProcessorNode(Node):
         last_watchdog_check = time.monotonic()
         
         with self._state_lock:
-            self._state = ProcessorState.PUBLISHING
+            self._state = ProcessorRunState.PUBLISHING
         
         while self._running:
             try:
@@ -866,11 +870,11 @@ class SpoolProcessorNode(Node):
                 if frame is None:
                     # Spool is empty, wait and retry
                     with self._state_lock:
-                        self._state = ProcessorState.SPOOL_EMPTY
+                        self._state = ProcessorRunState.SPOOL_EMPTY
                     logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
                     time.sleep(self.config.poll_interval)
                     with self._state_lock:
-                        self._state = ProcessorState.PUBLISHING
+                        self._state = ProcessorRunState.PUBLISHING
                     continue
                 
                 self._current_frame = frame
@@ -895,7 +899,7 @@ class SpoolProcessorNode(Node):
                     frame_interval = 0.025
                     self._current_target_fps = 40.0
                 
-                sleep_time = max(0, frame_interval - processing_time)
+                sleep_time = max(0.03, frame_interval - processing_time)
                 
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -1047,7 +1051,7 @@ class SpoolProcessorNode(Node):
             
             self._last_detailed_stats_time = current_time
     
-    def get_state(self) -> ProcessorState:
+    def get_state(self) -> ProcessorRunState:
         """Get current processor state."""
         with self._state_lock:
             return self._state
