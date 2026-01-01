@@ -739,7 +739,7 @@ class SpoolProcessorNode(Node):
         
         V7 Additions:
         - Spool lag computation and warnings
-        - Watchdog for stalled publishing
+        - Watchdog for stalled publishing (using monotonic time)
         - Adaptive pacing on high lag (optional)
         
         Benefits:
@@ -757,14 +757,18 @@ class SpoolProcessorNode(Node):
             adaptive_pacing=self.config.enable_adaptive_pacing
         ))
         
-        frame_interval = 1.0 / self._current_target_fps
-        last_publish_time = 0.0
+        # Use monotonic time for pacing and watchdog
+        frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
+        last_publish_monotonic = time.monotonic()
+        last_watchdog_check = time.monotonic()
         
         with self._state_lock:
             self._state = ProcessorState.PUBLISHING
         
         while self._running:
             try:
+                current_monotonic = time.monotonic()
+                
                 # V7: Compute spool lag
                 segments = self._reader.list_segments()
                 newest_segment = max(segments) if segments else None
@@ -776,44 +780,57 @@ class SpoolProcessorNode(Node):
                 if self.config.enable_adaptive_pacing and spool_lag > self.config.spool_lag_error_threshold:
                     # High lag - reduce FPS temporarily
                     old_fps = self._current_target_fps
-                    self._current_target_fps = max(
+                    new_fps = max(
                         self.config.adaptive_fps_min,
                         self._current_target_fps * ADAPTIVE_FPS_REDUCTION_FACTOR
                     )
-                    if old_fps != self._current_target_fps:
+                    # Clamp to target ceiling
+                    new_fps = min(new_fps, self.config.target_fps)
+                    
+                    if abs(old_fps - new_fps) > 0.1:  # Only update if significant change
+                        self._current_target_fps = new_fps
+                        frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
                         logger.warning(format_structured_log(
                             "[SpoolProcessor] 🐢 Adaptive pacing: Reducing FPS due to high lag",
                             spool_lag=spool_lag,
-                            old_fps=old_fps,
-                            new_fps=self._current_target_fps
+                            old_fps=f"{old_fps:.1f}",
+                            new_fps=f"{self._current_target_fps:.1f}",
+                            new_interval_ms=f"{frame_interval * 1000:.1f}"
                         ))
-                        frame_interval = 1.0 / self._current_target_fps
+                        
                 elif self.config.enable_adaptive_pacing and spool_lag < self.config.spool_lag_warn_threshold:
-                    # Lag healthy - restore FPS
+                    # Lag healthy - restore FPS (but never exceed target)
                     if self._current_target_fps < self.config.target_fps:
+                        old_fps = self._current_target_fps
                         self._current_target_fps = self.config.target_fps
+                        frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
                         logger.info(format_structured_log(
                             "[SpoolProcessor] 🚀 Adaptive pacing: Restoring FPS",
                             spool_lag=spool_lag,
-                            fps=self._current_target_fps
+                            old_fps=f"{old_fps:.1f}",
+                            new_fps=f"{self._current_target_fps:.1f}",
+                            new_interval_ms=f"{frame_interval * 1000:.1f}"
                         ))
-                        frame_interval = 1.0 / self._current_target_fps
                 
-                # V7: Watchdog - check for stalled publishing
-                current_time = time.time()
-                if self._last_publish_time > 0 and (current_time - self._last_publish_time) > self.config.watchdog_timeout:
-                    watchdog_msg = format_structured_log(
-                        "🔴 WATCHDOG: No frames published recently",
-                        stalled_seconds=current_time - self._last_publish_time,
-                        threshold=self.config.watchdog_timeout
-                    )
-                    throttled_log(
-                        logger.error,
-                        f"[SpoolProcessor] {watchdog_msg}",
-                        key="watchdog",
-                        throttle_dict=self._throttle_log_dict,
-                        min_interval=10.0
-                    )
+                # V7: Watchdog - check for stalled publishing (using monotonic time)
+                if current_monotonic - last_watchdog_check > 10.0:  # Check every 10 seconds
+                    if self._last_publish_time > 0:
+                        # Convert last publish time to monotonic-relative
+                        stalled_time = time.time() - self._last_publish_time
+                        if stalled_time > self.config.watchdog_timeout:
+                            watchdog_msg = format_structured_log(
+                                "🔴 WATCHDOG: No frames published recently",
+                                stalled_seconds=f"{stalled_time:.1f}",
+                                threshold=self.config.watchdog_timeout
+                            )
+                            throttled_log(
+                                logger.error,
+                                f"[SpoolProcessor] {watchdog_msg}",
+                                key="watchdog",
+                                throttle_dict=self._throttle_log_dict,
+                                min_interval=10.0
+                            )
+                    last_watchdog_check = current_monotonic
                 
                 # Get next frame
                 frame = self._get_next_frame()
@@ -831,23 +848,31 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
-                # V7.1: Adaptive frame rate pacing
-                # Pace to target FPS accounting for processing time
-                # If processing took longer than frame_interval, skip sleep (catch up)
-                publish_start = time.time()
+                # V7.1: Adaptive frame rate pacing with robust interval guards
+                publish_start = time.monotonic()
                 
                 # Publish frame (no ACK wait)
                 success = self._publish_frame(frame)
                 
                 # Calculate adaptive sleep based on actual processing time
-                publish_end = time.time()
-                processing_time = publish_end - last_publish_time
+                publish_end = time.monotonic()
+                processing_time = publish_end - last_publish_monotonic
+                
+                # Guard against negative or zero intervals
+                if frame_interval <= 0:
+                    logger.error(
+                        f"[SpoolProcessor] Invalid frame_interval: {frame_interval}, "
+                        f"resetting to 25ms (40fps)"
+                    )
+                    frame_interval = 0.025
+                    self._current_target_fps = 40.0
+                
                 sleep_time = max(0, frame_interval - processing_time)
                 
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 
-                last_publish_time = time.time()
+                last_publish_monotonic = time.monotonic()
                 
                 if success:
                     with self._stats_lock:

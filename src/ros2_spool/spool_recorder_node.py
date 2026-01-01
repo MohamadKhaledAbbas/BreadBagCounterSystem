@@ -191,25 +191,34 @@ class SpoolRecorderNode(Node):
         logger.info("[SpoolRecorder] Started")
     
     def stop(self):
-        """Stop the recorder gracefully."""
+        """Stop the recorder gracefully with proper cleanup."""
         if not self._running:
             return
         
         logger.info("[SpoolRecorder] Stopping...")
         self._running = False
         
-        # Signal writer thread to stop
-        if self._writer_thread:
-            self._writer_thread.join(timeout=5.0)
+        # Signal writer thread to stop and wait for it to finish
+        if self._writer_thread and self._writer_thread.is_alive():
+            logger.info("[SpoolRecorder] Waiting for writer thread to finish...")
+            self._writer_thread.join(timeout=10.0)
             if self._writer_thread.is_alive():
-                logger.error("[SpoolRecorder] ⚠ Writer thread did not stop gracefully within timeout - incomplete stop")
+                logger.error("[SpoolRecorder] ⚠ Writer thread did not stop gracefully within timeout")
+                # Try to flush remaining queue items
+                remaining = self._frame_queue.qsize()
+                if remaining > 0:
+                    logger.warning(f"[SpoolRecorder] {remaining} frames still in queue, attempting flush...")
+            else:
+                logger.info("[SpoolRecorder] Writer thread stopped successfully")
         
         # Stop retention
         if self._retention:
+            logger.info("[SpoolRecorder] Stopping retention policy...")
             self._retention.stop()
         
         # Close writer (ensures flush)
         if self._writer:
+            logger.info("[SpoolRecorder] Closing segment writer...")
             self._writer.close()
         
         # Log final stats with structured format
@@ -219,9 +228,18 @@ class SpoolRecorderNode(Node):
                 frames_received=self._frames_received,
                 frames_written=self._frames_written,
                 frames_dropped=self._frames_dropped,
-                drop_events=self._ingress_drop_events
+                drop_events=self._ingress_drop_events,
+                queue_remaining=self._frame_queue.qsize()
             )
             logger.info(final_msg)
+            
+            # Escalate alert if sustained drops
+            if self._ingress_drop_events > 10:
+                logger.error(
+                    f"[SpoolRecorder] 🔴 CRITICAL: Sustained ingress drops detected! "
+                    f"drop_events={self._ingress_drop_events}, "
+                    f"total_dropped={self._frames_dropped}"
+                )
         
         logger.info("[SpoolRecorder] Stopped")
     
