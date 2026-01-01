@@ -202,12 +202,22 @@ class RetentionPolicy:
             return self._last_processed_segment
     
     def _delete_processed_segment(self, segment_num: int):
-        """Delete a processed segment immediately."""
+        """Delete a processed segment immediately with its metadata."""
         try:
             segment_file = self.spool_dir / f"seg_{segment_num:06d}.bin"
             if segment_file.exists():
                 size = segment_file.stat().st_size
                 segment_file.unlink()
+                
+                # Also delete corresponding .meta.json file if it exists
+                meta_file = segment_file.with_suffix('.meta.json')
+                if meta_file.exists():
+                    try:
+                        meta_file.unlink()
+                        logger.debug(f"[Retention] Also deleted metadata for immediate cleanup of segment {segment_num}")
+                    except Exception as e:
+                        logger.warning(f"[Retention] Error deleting metadata during immediate cleanup of segment {segment_num}: {e}")
+                
                 self.bytes_recovered += size
                 self.segments_deleted += 1
                 self.segments_deleted_by_processing += 1
@@ -218,6 +228,7 @@ class RetentionPolicy:
             logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
         except Exception as e:
             logger.warning(f"[Retention] Error deleting segment {segment_num}: {e}")
+            self.delete_errors += 1
     
     def set_last_processed_frame(self, frame_index: int):
         """
@@ -431,7 +442,18 @@ class RetentionPolicy:
                 except OSError:
                     age = 0.0
                 
+                # Delete the segment file
                 path.unlink()
+                
+                # Also delete corresponding .meta.json file if it exists
+                meta_path = path.with_suffix('.meta.json')
+                if meta_path.exists():
+                    try:
+                        meta_path.unlink()
+                        logger.debug(f"[Retention] Also deleted metadata file for segment {seg_num}")
+                    except Exception as e:
+                        logger.warning(f"[Retention] Error deleting metadata file for segment {seg_num}: {e}")
+                
                 deleted_count += 1
                 bytes_freed += size
                 self.segments_deleted += 1
