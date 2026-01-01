@@ -39,10 +39,9 @@ def create_empty_segment_file(tmpdir: str, segment_num: int) -> str:
 def create_segment_with_frames(tmpdir: str, segment_num: int, num_frames: int = 5) -> str:
     """Create a segment file with actual frame records."""
     writer = SegmentWriter(tmpdir, segment_duration=999, max_segment_duration=999)
-    writer._current_segment = segment_num
     writer.start()
     
-    # Temporarily set the segment number
+    # Set the segment number after start() to override the auto-detected one
     writer._current_segment = segment_num
     
     # Use the segment path directly
