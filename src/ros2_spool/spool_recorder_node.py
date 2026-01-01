@@ -28,6 +28,7 @@ import time
 import queue
 import signal
 import threading
+from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 
@@ -73,7 +74,7 @@ DEFAULT_DROP_LOG_THROTTLE = 5.0  # Seconds between drop warning logs
 @dataclass
 class SpoolConfig:
     """Configuration for the spool recorder."""
-    spool_dir: str = DEFAULT_SPOOL_DIR
+    spool_dir_path: str = DEFAULT_SPOOL_DIR
     segment_duration: float = DEFAULT_SEGMENT_DURATION
     max_segment_duration: float = DEFAULT_MAX_SEGMENT_DURATION
     retention_seconds: float = DEFAULT_RETENTION_SECONDS
@@ -86,7 +87,7 @@ class SpoolConfig:
 def load_default_config() -> SpoolConfig:
     """Load spool configuration from database config table."""
     return SpoolConfig(
-        spool_dir=DEFAULT_SPOOL_DIR,
+        spool_dir_path=DEFAULT_SPOOL_DIR,
         segment_duration=DEFAULT_SEGMENT_DURATION,
         retention_seconds=DEFAULT_RETENTION_SECONDS,
     )
@@ -108,9 +109,12 @@ class SpoolRecorderNode(Node):
         
         # Load configuration from database if not provided
         self.config = config or load_default_config()
+
+        spool_dir = Path(self.config.spool_dir_path)
+        spool_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"[SpoolRecorder] Initializing with config: "
-                   f"spool_dir={self.config.spool_dir}, "
+                   f"spool_dir={self.config.spool_dir_path}, "
                    f"segment_duration={self.config.segment_duration}s, "
                    f"retention={self.config.retention_seconds}s")
         
@@ -157,13 +161,13 @@ class SpoolRecorderNode(Node):
             return
         
         logger.info("[SpoolRecorder] Starting...")
-        
+
         # Clean up stale tmp files from previous crashes
-        cleanup_stale_tmp_files(self.config.spool_dir)
+        cleanup_stale_tmp_files(self.config.spool_dir_path)
         
         # Initialize segment writer
         self._writer = SegmentWriter(
-            spool_dir=self.config.spool_dir,
+            spool_dir=self.config.spool_dir_path,
             segment_duration=self.config.segment_duration,
             max_segment_duration=self.config.max_segment_duration,
             write_metadata=True
@@ -172,7 +176,7 @@ class SpoolRecorderNode(Node):
         
         # Initialize and start retention policy
         self._retention = RetentionPolicy(
-            spool_dir=self.config.spool_dir,
+            spool_dir=self.config.spool_dir_path,
             retention_seconds=self.config.retention_seconds,
             cleanup_interval=10.0,
             min_segments_to_keep=2

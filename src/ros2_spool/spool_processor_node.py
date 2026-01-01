@@ -31,6 +31,7 @@ import itertools
 from typing import Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from src.config.settings import AppConfig
 
@@ -112,7 +113,7 @@ DEFAULT_MIN_FRAME_INTERVAL_MS = 10.0  # V8.1: Reduced from 30ms to 10ms - 30ms w
 @dataclass
 class ProcessorConfig:
     """Configuration for the spool processor (ACK-free mode only)."""
-    spool_dir: str = DEFAULT_SPOOL_DIR
+    spool_dir_path: str = DEFAULT_SPOOL_DIR
     poll_interval: float = DEFAULT_POLL_INTERVAL
     stats_interval: float = DEFAULT_STATS_INTERVAL
     prepend_sps_pps: bool = DEFAULT_SPS_PPS_PREPEND
@@ -133,7 +134,7 @@ class ProcessorConfig:
 def load_default_config() -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
     return ProcessorConfig(
-        spool_dir=DEFAULT_SPOOL_DIR,
+        spool_dir_path=DEFAULT_SPOOL_DIR,
         target_fps=DEFAULT_TARGET_FPS,
     )
 
@@ -177,12 +178,15 @@ class SpoolProcessorNode(Node):
         logger.info(f"[SpoolProcessor] Mode: ACK-FREE (Production)")
         
         logger.info(f"[SpoolProcessor] Initializing with config: "
-                   f"spool_dir={self.config.spool_dir}, "
+                   f"spool_dir={self.config.spool_dir_path}, "
                    f"target_fps={self.config.target_fps}, "
                    f"session_id={self._session_id}")
         
         # Initialize components
-        self._reader = SegmentReader(self.config.spool_dir)
+        spool_dir = Path(self.config.spool_dir_path)
+        spool_dir.mkdir(parents=True, exist_ok=True)
+
+        self._reader = SegmentReader(self.config.spool_dir_path)
         self._frame_generator: Optional[Generator] = None
         self._current_frame: Optional[FrameRecord] = None
         self._current_frame_index: int = 0
@@ -225,7 +229,7 @@ class SpoolProcessorNode(Node):
         self._throttle_log_dict = {}  # For throttled logging
         
         # State file path
-        self._state_file_path = os.path.join(self.config.spool_dir, self.config.state_file)
+        self._state_file_path = os.path.join(self.config.spool_dir_path, self.config.state_file)
         self._allow_next_gap = False
         
         # V8: Initialize retention policy for segment deletion after processing
