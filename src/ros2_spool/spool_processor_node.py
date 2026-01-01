@@ -77,8 +77,12 @@ else:
         def publish(self, msg): pass
 
 
-class ProcessorState(Enum):
-    """State of the processor (ACK-free mode)."""
+class ProcessorRunState(Enum):
+    """Runtime state of the processor (ACK-free mode).
+    
+    Note: Named ProcessorRunState to avoid conflict with ProcessorState dataclass
+    from spool_utils which is used for persistence.
+    """
     IDLE = "idle"
     PUBLISHING = "publishing"  # Continuously publishing frames
     SPOOL_EMPTY = "spool_empty"
@@ -187,7 +191,7 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps: bool = True  # First frame of segment needs SPS/PPS
         
         # State management
-        self._state = ProcessorState.IDLE
+        self._state = ProcessorRunState.IDLE
         self._state_lock = threading.Lock()
         
         # Processing thread
@@ -296,7 +300,7 @@ class SpoolProcessorNode(Node):
         self._running = False
         
         with self._state_lock:
-            self._state = ProcessorState.STOPPED
+            self._state = ProcessorRunState.STOPPED
         
         # Wait for processor thread
         if self._processor_thread:
@@ -420,6 +424,8 @@ class SpoolProcessorNode(Node):
         Get the next frame from the spool.
         
         V7: Includes retention guard - checks if current segment still exists.
+        V7.5: When current segment is missing, jumps forward to nearest available
+              segment >= current_segment (not oldest) to prevent rewinds.
         """
         if self._frame_generator is None:
             self._init_frame_generator()
@@ -440,8 +446,34 @@ class SpoolProcessorNode(Node):
                     throttle_dict=self._throttle_log_dict,
                     min_interval=10.0
                 )
-                # Reinitialize from oldest available segment
-                self._init_frame_generator()
+                # V7.5: Jump to nearest available segment >= current, not oldest
+                # This prevents rewinds when retention deletes the current segment
+                if segments:
+                    candidates = [s for s in segments if s >= self._current_segment]
+                    if candidates:
+                        target_segment = min(candidates)
+                        logger.warning(format_structured_log(
+                            "[SpoolProcessor] ⚠ Jumping forward after segment deletion",
+                            missing_segment=self._current_segment,
+                            target_segment=target_segment
+                        ))
+                    else:
+                        # No segments >= current available, use the minimum available
+                        # (This is the fallback, but at least we log it)
+                        target_segment = min(segments)
+                        logger.warning(format_structured_log(
+                            "[SpoolProcessor] ⚠ No forward segments available, using oldest",
+                            missing_segment=self._current_segment,
+                            target_segment=target_segment
+                        ))
+                    
+                    self._frame_generator = self._reader.read_frames(start_segment=target_segment)
+                    self._current_segment = target_segment
+                    self._segment_needs_sps_pps = True
+                else:
+                    # No segments at all
+                    self._frame_generator = iter([])
+                    return None
         
         try:
             frame = next(self._frame_generator)
@@ -522,7 +554,51 @@ class SpoolProcessorNode(Node):
                         self._cached_pps = pps
                     return frame
                 except StopIteration:
-                    return None
+                    # V7.5: Empty segment - skip forward to next available segment > target
+                    # This prevents infinite loops reopening the same empty segment
+                    throttled_log(
+                        logger.warning,
+                        format_structured_log(
+                            "[SpoolProcessor] ⚠ Empty segment detected, skipping forward",
+                            empty_segment=target_segment
+                        ),
+                        key="empty_segment",
+                        throttle_dict=self._throttle_log_dict,
+                        min_interval=5.0
+                    )
+                    
+                    # Mark this segment as processed
+                    with self._stats_lock:
+                        self._segments_processed += 1
+                    
+                    # Find next segment > target_segment
+                    forward_candidates = [s for s in available_segments if s > target_segment]
+                    if forward_candidates:
+                        next_target = min(forward_candidates)
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] Advancing past empty segment",
+                            empty_segment=target_segment,
+                            next_segment=next_target
+                        ))
+                        self._frame_generator = self._reader.read_frames(start_segment=next_target)
+                        self._current_segment = next_target
+                        self._segment_needs_sps_pps = True
+                        
+                        # Try to get frame from next segment
+                        try:
+                            frame = next(self._frame_generator)
+                            sps, pps = extract_sps_pps(frame.data)
+                            if sps:
+                                self._cached_sps = sps
+                            if pps:
+                                self._cached_pps = pps
+                            return frame
+                        except StopIteration:
+                            # Multiple empty segments - return None and let the main loop retry
+                            return None
+                    else:
+                        # No more segments available after the empty one
+                        return None
             else:
                 logger.debug("[SpoolProcessor] No more segments available")
                 self._frame_generator = iter([])
@@ -791,7 +867,7 @@ class SpoolProcessorNode(Node):
         last_watchdog_check = time.monotonic()
         
         with self._state_lock:
-            self._state = ProcessorState.PUBLISHING
+            self._state = ProcessorRunState.PUBLISHING
         
         while self._running:
             try:
@@ -866,11 +942,11 @@ class SpoolProcessorNode(Node):
                 if frame is None:
                     # Spool is empty, wait and retry
                     with self._state_lock:
-                        self._state = ProcessorState.SPOOL_EMPTY
+                        self._state = ProcessorRunState.SPOOL_EMPTY
                     logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
                     time.sleep(self.config.poll_interval)
                     with self._state_lock:
-                        self._state = ProcessorState.PUBLISHING
+                        self._state = ProcessorRunState.PUBLISHING
                     continue
                 
                 self._current_frame = frame
@@ -1047,7 +1123,7 @@ class SpoolProcessorNode(Node):
             
             self._last_detailed_stats_time = current_time
     
-    def get_state(self) -> ProcessorState:
+    def get_state(self) -> ProcessorRunState:
         """Get current processor state."""
         with self._state_lock:
             return self._state
