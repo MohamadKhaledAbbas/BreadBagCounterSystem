@@ -107,8 +107,15 @@ DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
 ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 # V8: Segment deletion and pacing control
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
-DEFAULT_MIN_FRAME_INTERVAL_MS = 10.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
+DEFAULT_MIN_FRAME_INTERVAL_MS = 20.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
 
+# Add new constants at the top (around line 94-111)
+DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
+DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 15  # Between 5-15 = normal pace
+# Above 15 = high lag, speed up
+
+DEFAULT_ADAPTIVE_FPS_RELAXED = 20.0  # Healthy state - save resources
+DEFAULT_ADAPTIVE_FPS_MAX = 50.0  # High lag state - catch up (15ms min interval)
 
 @dataclass
 class ProcessorConfig:
@@ -235,7 +242,7 @@ class SpoolProcessorNode(Node):
         # V8: Initialize retention policy for segment deletion after processing
         if self.config.delete_processed_segments:
             self._retention_policy = RetentionPolicy(
-                spool_dir=self.config.spool_dir,
+                spool_dir=self.config.spool_dir_path,
                 retention_seconds=300.0,  # 5 minutes fallback retention
                 cleanup_interval=30.0,  # Cleanup check interval
                 min_segments_to_keep=2,  # Always keep at least 2 segments
@@ -924,37 +931,38 @@ class SpoolProcessorNode(Node):
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
-                
-                # V7: Check lag thresholds and adaptive pacing
-                if self.config.enable_adaptive_pacing and spool_lag > self.config.spool_lag_error_threshold:
-                    # High lag - reduce FPS temporarily
-                    old_fps = self._current_target_fps
-                    new_fps = max(
-                        self.config.adaptive_fps_min,
-                        self._current_target_fps * ADAPTIVE_FPS_REDUCTION_FACTOR
-                    )
-                    # Clamp to target ceiling
-                    new_fps = min(new_fps, self.config.target_fps)
-                    
-                    if abs(old_fps - new_fps) > 0.1:  # Only update if significant change
-                        self._current_target_fps = new_fps
-                        frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
-                        logger.warning(format_structured_log(
-                            "[SpoolProcessor] 🐢 Adaptive pacing: Reducing FPS due to high lag",
-                            spool_lag=spool_lag,
-                            old_fps=f"{old_fps:.1f}",
-                            new_fps=f"{self._current_target_fps:.1f}",
-                            new_interval_ms=f"{frame_interval * 1000:.1f}"
-                        ))
-                        
-                elif self.config.enable_adaptive_pacing and spool_lag < self.config.spool_lag_warn_threshold:
-                    # Lag healthy - restore FPS (but never exceed target)
-                    if self._current_target_fps < self.config.target_fps:
+
+                # V7: Check lag thresholds and adaptive pacing (3-tier system)
+                if self.config.enable_adaptive_pacing:
+                    if spool_lag < DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD:
+                        # HEALTHY: < 5 segments - RELAX and save resources
+                        target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 20 FPS
+                        mode_emoji = "😌"
+                        mode_text = "RELAXED - System healthy, conserving resources"
+
+                    elif spool_lag <= DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD:
+                        # NORMAL: 5-15 segments - maintain default pace
+                        target_fps = DEFAULT_TARGET_FPS  # 30 FPS
+                        mode_emoji = "✅"
+                        mode_text = "NORMAL - Maintaining default pace"
+
+                    else:
+                        # HIGH LAG: > 15 segments - SPEED UP to catch up
+                        target_fps = DEFAULT_ADAPTIVE_FPS_MAX  # 66 FPS (15ms intervals)
+                        mode_emoji = "🚀"
+                        mode_text = "CATCHING UP - High lag detected"
+
+                    # Only update if significant change
+                    if abs(self._current_target_fps - target_fps) > 0.1:
                         old_fps = self._current_target_fps
-                        self._current_target_fps = self.config.target_fps
+                        self._current_target_fps = target_fps
                         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
-                        logger.info(format_structured_log(
-                            "[SpoolProcessor] 🚀 Adaptive pacing: Restoring FPS",
+
+                        # Choose appropriate log level based on mode
+                        log_func = logger.info if spool_lag < DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD else logger.warning
+
+                        log_func(format_structured_log(
+                            f"[SpoolProcessor] {mode_emoji} Adaptive pacing: {mode_text}",
                             spool_lag=spool_lag,
                             old_fps=f"{old_fps:.1f}",
                             new_fps=f"{self._current_target_fps:.1f}",
