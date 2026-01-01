@@ -484,6 +484,17 @@ class SpoolProcessorNode(Node):
                 self._frame_generator = self._reader.read_frames(start_segment=target_segment)
                 self._current_segment = target_segment
                 
+                # V7.4: Save state when transitioning segments for cross-process safety
+                # This allows retention policy (in recorder process) to know current position
+                if self._last_published_index >= 0:
+                    state = ProcessorState(
+                        last_published_index=self._last_published_index,
+                        last_published_segment=self._current_segment,
+                        session_id=self._session_id,
+                        timestamp=time.time()
+                    )
+                    save_processor_state(self._state_file_path, state)
+                
                 try:
                     frame = next(self._frame_generator)
                     # Extract and cache SPS/PPS if present

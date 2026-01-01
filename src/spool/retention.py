@@ -13,6 +13,7 @@ Features:
 
 import os
 import time
+import json
 from pathlib import Path
 from typing import List, Optional, Tuple
 import threading
@@ -176,6 +177,39 @@ class RetentionPolicy:
         """
         with self._progress_lock:
             return self._last_processed_segment
+    
+    def _get_processor_current_segment(self) -> int:
+        """
+        Read the processor's current segment from the state file.
+        
+        This allows the retention policy (running in recorder process)
+        to know what segment the processor (running in processor process)
+        is currently reading.
+        
+        Returns:
+            Current segment number being processed, or -1 if unknown
+        """
+        state_file = self.spool_dir / "processor_state.json"
+        if not state_file.exists():
+            return -1
+        
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            # The state file contains last_published_segment
+            # The processor might be reading the NEXT segment after this
+            last_published = state.get('last_published_segment', -1)
+            
+            # To be safe, we should protect:
+            # 1. The last published segment
+            # 2. The next segment (which processor might be reading)
+            # So we return last_published, and the caller should protect >= this
+            return last_published
+            
+        except Exception as e:
+            logger.debug(f"[Retention] Could not read processor state: {e}")
+            return -1
 
     def set_last_processed_segment(self, segment_num: int):
         """
@@ -298,6 +332,9 @@ class RetentionPolicy:
         V7.3: NEVER delete segments >= last_processed_segment unless total spool
         exceeds 2GB cap (force_size_cleanup=True).
         
+        V7.4: FIX - Read processor state from file to protect CURRENT segment
+        being read by processor (in different process).
+        
         Args:
             force_size_cleanup: If True, allows deleting old processed segments
                                 even if not expired by age (for size limit enforcement)
@@ -315,35 +352,49 @@ class RetentionPolicy:
         # V6: Get last processed frame for safety check
         last_processed = self.get_last_processed_frame()
         
-        # V7.2: Get last processed segment number
+        # V7.2: Get last processed segment number (from internal state)
         last_processed_segment = self.get_last_processed_segment()
+        
+        # V7.4: Get processor's CURRENT segment from state file (cross-process)
+        processor_current_segment = self._get_processor_current_segment()
+        
+        # Use the maximum of both to ensure safety
+        # The processor might be reading segment N while last_processed_segment is N-1
+        safe_segment_threshold = max(last_processed_segment, processor_current_segment)
         
         # Find expired segments (exclude newest min_segments_to_keep)
         expired = []
         protected_by_unprocessed = 0
         
         for seg_num, path, mtime, size in segments[:-self.min_segments_to_keep]:
-            # V7.3: CRITICAL PROTECTION - Never delete segments >= last processed segment
+            # V7.4: CRITICAL PROTECTION - Never delete segments >= safe_segment_threshold
+            # This protects both:
+            # 1. The segment the processor last published from
+            # 2. The segment the processor is CURRENTLY reading
             # UNLESS we're in force_size_cleanup mode (spool exceeds 2GB)
-            if self.retention_safety_enabled and last_processed_segment >= 0:
-                if seg_num >= last_processed_segment:
+            if self.retention_safety_enabled and safe_segment_threshold >= 0:
+                if seg_num >= safe_segment_threshold:
                     if not force_size_cleanup:
                         logger.debug(
                             f"[Retention] Protected segment {seg_num}: at or after processor position "
-                            f"(last_processed_segment={last_processed_segment})"
+                            f"(safe_threshold={safe_segment_threshold}, "
+                            f"last_processed_seg={last_processed_segment}, "
+                            f"processor_current_seg={processor_current_segment})"
                         )
                         self.segments_protected_by_progress += 1
                         protected_by_unprocessed += 1
                         continue
                     else:
-                        # In force_size_cleanup mode, we can delete segments >= last_processed
-                        # ONLY if they are significantly older than the current segment
-                        # This allows cleanup of segments that the processor has moved past
-                        # but respects a safety margin
-                        logger.debug(
-                            f"[Retention] Size cleanup: considering segment {seg_num} "
-                            f"(last_processed={last_processed_segment})"
-                        )
+                        # In force_size_cleanup mode, still protect current +1 segment
+                        # to avoid deleting what processor is actively reading
+                        if seg_num >= safe_segment_threshold:
+                            logger.debug(
+                                f"[Retention] Size cleanup: still protecting current segment {seg_num} "
+                                f"(safe_threshold={safe_segment_threshold})"
+                            )
+                            self.segments_protected_by_progress += 1
+                            protected_by_unprocessed += 1
+                            continue
             
             # Check age-based expiration
             age = current_time - mtime
@@ -376,7 +427,7 @@ class RetentionPolicy:
             if force_size_cleanup:
                 logger.warning(
                     f"[Retention] Protected {protected_by_unprocessed} unprocessed segments "
-                    f"even during size-based cleanup (last_processed_segment={last_processed_segment})"
+                    f"even during size-based cleanup (safe_threshold={safe_segment_threshold})"
                 )
         
         return expired
