@@ -188,9 +188,15 @@ class RetentionPolicy:
         
         Returns:
             Current segment number being processed, or -1 if unknown
+            
+        Note: When state file doesn't exist, the retention policy should be
+        conservative and protect more segments rather than fewer.
         """
         state_file = self.spool_dir / "processor_state.json"
         if not state_file.exists():
+            # State file doesn't exist yet - processor hasn't saved state
+            # This is normal during startup or when processor hasn't started
+            # Return -1 to signal "unknown", caller should be conservative
             return -1
         
         try:
@@ -358,9 +364,18 @@ class RetentionPolicy:
         # V7.4: Get processor's CURRENT segment from state file (cross-process)
         processor_current_segment = self._get_processor_current_segment()
         
-        # Use the maximum of both to ensure safety
-        # The processor might be reading segment N while last_processed_segment is N-1
-        safe_segment_threshold = max(last_processed_segment, processor_current_segment)
+        # V7.4: Determine safe threshold for segment protection
+        # When processor state is unknown (-1), we fall back to:
+        # 1. Internal state tracking (last_processed_segment from set_last_processed_segment calls)
+        # 2. Age-based retention + min_segments_to_keep as safety net
+        # This balances safety (don't delete active segments) with cleanup (allow old segment removal)
+        if processor_current_segment >= 0 or last_processed_segment >= 0:
+            # At least one source of state is available - use the maximum
+            safe_segment_threshold = max(last_processed_segment, processor_current_segment)
+        else:
+            # No state available - no processor-based protection active
+            # Fall back to age + min_segments_to_keep only
+            safe_segment_threshold = -1
         
         # Find expired segments (exclude newest min_segments_to_keep)
         expired = []

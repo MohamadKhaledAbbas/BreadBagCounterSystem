@@ -260,6 +260,23 @@ class SpoolProcessorNode(Node):
         # Initialize frame generator
         self._init_frame_generator()
         
+        # V7.4: Save initial state to let retention policy know we're starting
+        # This creates the state file early, reducing the window where retention
+        # might delete segments we're about to read
+        if self._current_segment >= 0:
+            state = ProcessorState(
+                last_published_index=self._last_published_index,
+                last_published_segment=self._current_segment,
+                session_id=self._session_id,
+                timestamp=time.time()
+            )
+            if save_processor_state(self._state_file_path, state):
+                logger.info(format_structured_log(
+                    "[SpoolProcessor] Initial state saved for retention safety",
+                    current_segment=self._current_segment,
+                    last_published_index=self._last_published_index
+                ))
+        
         # Start processing thread
         self._processor_thread = threading.Thread(
             target=self._processor_loop,
