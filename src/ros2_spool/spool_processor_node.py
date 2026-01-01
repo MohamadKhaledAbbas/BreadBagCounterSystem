@@ -95,18 +95,18 @@ DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_TARGET_FPS = 20.0  # Target FPS for ACK-free publishing
+DEFAULT_TARGET_FPS = 30.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
 DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
 DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
 DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
 DEFAULT_WATCHDOG_TIMEOUT = 30.0  # Seconds without publishing before alert
 DEFAULT_ENABLE_ADAPTIVE_PACING = True  # V8: Enable adaptive pacing by default
-DEFAULT_ADAPTIVE_FPS_MIN = 15.0  # Minimum FPS during adaptive pacing
+DEFAULT_ADAPTIVE_FPS_MIN = 20.0  # V8.1: Increased from 15 to 20 FPS minimum
 DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
-ADAPTIVE_FPS_REDUCTION_FACTOR = 0.8  # Multiply current FPS by this on high lag
+ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 # V8: Segment deletion and pacing control
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
-DEFAULT_MIN_FRAME_INTERVAL_MS = 30.0  # Minimum milliseconds between frames to avoid CPU heat
+DEFAULT_MIN_FRAME_INTERVAL_MS = 10.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
 
 
 @dataclass
