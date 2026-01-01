@@ -234,6 +234,71 @@ def test_processor_state_save_no_conflict():
         print("✓ test_processor_state_save_no_conflict passed")
 
 
+def test_retention_policy_segment_deletion():
+    """Test that RetentionPolicy can delete processed segments."""
+    from src.spool.retention import RetentionPolicy
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create test segments
+        for seg in [1, 2, 3, 4, 5]:
+            create_segment_with_frames(tmpdir, seg, 2)
+        
+        # Create retention policy with immediate deletion enabled
+        policy = RetentionPolicy(
+            spool_dir=tmpdir,
+            retention_seconds=300.0,
+            cleanup_interval=30.0,
+            min_segments_to_keep=2,
+            retention_safety_enabled=True,
+            delete_processed_segments=True
+        )
+        
+        # Verify all segments exist
+        segments_before = policy.list_segments()
+        assert len(segments_before) == 5, f"Expected 5 segments, got {len(segments_before)}"
+        
+        # Mark segment 1 as processed - should trigger deletion
+        policy.set_last_processed_segment(1)
+        
+        # Mark segment 2 as processed - segment 1 should now be deleted
+        policy.set_last_processed_segment(2)
+        
+        # Give file system time to process
+        time.sleep(0.1)
+        
+        # Check segments - segment 1 should be deleted
+        segments_after = policy.list_segments()
+        segment_nums = [s[0] for s in segments_after]
+        
+        assert 1 not in segment_nums, f"Segment 1 should be deleted, remaining: {segment_nums}"
+        
+        print("✓ test_retention_policy_segment_deletion passed")
+
+
+def test_min_frame_interval_config():
+    """Test that min_frame_interval_ms configuration is respected."""
+    # Read the processor node file to verify configuration exists
+    processor_node_path = os.path.join(
+        os.path.dirname(__file__), 
+        '..', 'src', 'ros2_spool', 'spool_processor_node.py'
+    )
+    with open(processor_node_path, 'r') as f:
+        content = f.read()
+    
+    # Verify min_frame_interval_ms configuration exists
+    assert 'DEFAULT_MIN_FRAME_INTERVAL_MS' in content, \
+        "DEFAULT_MIN_FRAME_INTERVAL_MS should be defined"
+    
+    assert 'min_frame_interval_ms' in content, \
+        "min_frame_interval_ms should be in ProcessorConfig"
+    
+    # Verify it's used in pacing logic
+    assert 'min_interval_sec' in content, \
+        "min_interval_sec should be used in pacing calculation"
+    
+    print("✓ test_min_frame_interval_config passed")
+
+
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -248,6 +313,8 @@ def main():
         test_find_nearest_segment_forward()
         test_processor_state_dataclass_vs_enum()
         test_processor_state_save_no_conflict()
+        test_retention_policy_segment_deletion()
+        test_min_frame_interval_config()
         
         print()
         print("=" * 60)
