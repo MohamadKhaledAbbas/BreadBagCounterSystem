@@ -382,6 +382,71 @@ def test_get_current_segment_tracking():
         print("✓ test_get_current_segment_tracking passed")
 
 
+def test_get_last_completed_segment():
+    """Test that SegmentReader.get_last_completed_segment() tracks completion correctly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create multiple segments with frames
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            
+            # Write 3 frames per segment
+            for i in range(3):
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        # Create reader and verify initial state
+        reader = SegmentReader(tmpdir)
+        assert reader.get_last_completed_segment() == -1, "Initial last completed should be -1"
+        
+        # Read frames and track when segments complete
+        generator = reader.read_frames()
+        
+        # Read first 3 frames (segment 1) - segment not complete yet until we try to read more
+        for _ in range(3):
+            next(generator)
+        # Note: _last_completed_segment is updated when the generator MOVES to the next segment
+        # So after reading 3 frames, we haven't moved to segment 2 yet
+        assert reader.get_last_completed_segment() == -1, "Segment 1 not complete yet (waiting for move to next)"
+        
+        # Read 4th frame (first of segment 2) - THIS triggers completion of segment 1
+        next(generator)
+        assert reader.get_last_completed_segment() == 1, "Segment 1 should be completed after 4th frame"
+        
+        # Read 5th and 6th frames (rest of segment 2)
+        next(generator)
+        next(generator)
+        assert reader.get_last_completed_segment() == 1, "Still segment 1 - segment 2 not complete yet"
+        
+        # Read 7th frame (first of segment 3) - THIS triggers completion of segment 2
+        next(generator)
+        assert reader.get_last_completed_segment() == 2, "Segment 2 should be completed after 7th frame"
+        
+        # Read remaining 2 frames (rest of segment 3)
+        next(generator)
+        next(generator)
+        assert reader.get_last_completed_segment() == 2, "Still segment 2 - segment 3 not complete yet"
+        
+        # Try to read more - StopIteration will be raised and segment 3 completed
+        try:
+            next(generator)
+        except StopIteration:
+            pass
+        
+        # After StopIteration, segment 3 should be completed
+        assert reader.get_last_completed_segment() == 3, "Last completed should be 3 after exhaustion"
+        
+        print("✓ test_get_last_completed_segment passed")
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Segment I/O Roundtrip")
@@ -401,6 +466,7 @@ if __name__ == "__main__":
         test_large_frame_data()
         test_encoding_type_handling()
         test_get_current_segment_tracking()
+        test_get_last_completed_segment()
         
         print()
         print("=" * 60)

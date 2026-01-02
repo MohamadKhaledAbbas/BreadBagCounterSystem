@@ -462,8 +462,9 @@ class SegmentReader:
         self._current_file: Optional[Any] = None
         
         # Track the segment currently being read (-1 = none)
-        self._segment_lock = threading.Lock()  # Thread-safe access to _current_segment
+        self._segment_lock = threading.Lock()  # Thread-safe access to segment tracking
         self._current_segment: int = -1
+        self._last_completed_segment: int = -1  # Track last fully processed segment
 
         # Segment list caching to avoid repeated filesystem scans
         self._cache_refresh_interval = cache_refresh_interval
@@ -647,6 +648,7 @@ class SegmentReader:
         Note:
             Updates _current_segment as it iterates through segments, allowing
             callers to track progress via get_current_segment().
+            Updates _last_completed_segment AFTER all frames from a segment are yielded.
         """
         segments = self.list_segments()
 
@@ -659,6 +661,9 @@ class SegmentReader:
                 self._current_segment = seg_num
             logger.debug(f"[SegmentReader] Reading segment {seg_num}")
             yield from self.read_segment(seg_num)
+            # Mark segment as completed AFTER all frames are yielded
+            with self._segment_lock:
+                self._last_completed_segment = seg_num
     
     def get_current_segment(self) -> int:
         """
@@ -672,6 +677,19 @@ class SegmentReader:
         """
         with self._segment_lock:
             return self._current_segment
+    
+    def get_last_completed_segment(self) -> int:
+        """
+        Get the last segment that was fully processed (all frames yielded).
+        
+        Returns:
+            The last completed segment number, or -1 if no segment has completed.
+            
+        This is useful for deletion tracking - you should only delete segments
+        that have been fully completed, not the one currently being read.
+        """
+        with self._segment_lock:
+            return self._last_completed_segment
 
 def validate_segment_file(path: str) -> bool:
     """
