@@ -635,6 +635,41 @@ class SegmentReader:
         except Exception as e:
             logger.error(f"[SegmentReader] Error reading segment {segment_num}: {e}")
 
+    def read_single_segment(self, segment_num: int) -> Iterator[FrameRecord]:
+        """
+        Read frames from a SINGLE segment only.
+        
+        V8.7: This method reads exactly one segment and then raises StopIteration.
+        This enables proper per-segment completion tracking and immediate deletion.
+        
+        Args:
+            segment_num: The segment number to read
+            
+        Yields:
+            FrameRecord objects from this segment only
+            
+        Note:
+            Updates _current_segment BEFORE reading starts.
+            Updates _last_completed_segment AFTER all frames from the segment are yielded
+            (even if segment was empty or had errors - we still mark it as "completed"
+            so it can be cleaned up).
+            StopIteration is raised after the last frame of this segment.
+        """
+        # Update current segment BEFORE reading so callers can track progress
+        with self._segment_lock:
+            self._current_segment = segment_num
+        logger.debug(f"[SegmentReader] Reading segment {segment_num}")
+        
+        # Yield all frames from this segment
+        # Note: read_segment() handles file not found and errors internally
+        yield from self.read_segment(segment_num)
+        
+        # Mark segment as completed AFTER generator exhausted
+        # We mark it complete even if empty/error so processor can move forward
+        with self._segment_lock:
+            self._last_completed_segment = segment_num
+        # StopIteration is raised automatically after yield from completes
+    
     def read_frames(self, start_segment: Optional[int] = None) -> Iterator[FrameRecord]:
         """
         Read frames from all segments in order.
@@ -649,6 +684,10 @@ class SegmentReader:
             Updates _current_segment as it iterates through segments, allowing
             callers to track progress via get_current_segment().
             Updates _last_completed_segment AFTER all frames from a segment are yielded.
+            
+        WARNING: This method reads ALL segments continuously. For per-segment
+        completion tracking (e.g., for immediate deletion), use read_single_segment()
+        instead and handle segment transitions manually.
         """
         segments = self.list_segments()
 

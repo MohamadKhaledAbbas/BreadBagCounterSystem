@@ -447,6 +447,56 @@ def test_get_last_completed_segment():
         
         print("✓ test_get_last_completed_segment passed")
 
+
+def test_read_single_segment():
+    """
+    Test that read_single_segment() reads exactly one segment and raises StopIteration.
+    
+    V8.7: This tests the new per-segment generator that enables immediate deletion.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create 3 segments with known frame counts
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            for i in range(3):  # 3 frames per segment
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        reader = SegmentReader(tmpdir)
+        
+        # Read segment 1 only
+        gen1 = reader.read_single_segment(1)
+        frames1 = list(gen1)  # Should exhaust after 3 frames and raise StopIteration
+        assert len(frames1) == 3, f"Segment 1 should have 3 frames, got {len(frames1)}"
+        assert reader.get_last_completed_segment() == 1, "Segment 1 should be completed"
+        
+        # Read segment 2 only
+        gen2 = reader.read_single_segment(2)
+        frames2 = list(gen2)
+        assert len(frames2) == 3, f"Segment 2 should have 3 frames, got {len(frames2)}"
+        assert reader.get_last_completed_segment() == 2, "Segment 2 should be completed"
+        
+        # Read segment 3 only
+        gen3 = reader.read_single_segment(3)
+        frames3 = list(gen3)
+        assert len(frames3) == 3, f"Segment 3 should have 3 frames, got {len(frames3)}"
+        assert reader.get_last_completed_segment() == 3, "Segment 3 should be completed"
+        
+        # Verify total frames
+        total = len(frames1) + len(frames2) + len(frames3)
+        assert total == 9, f"Total frames should be 9, got {total}"
+        
+        print("✓ test_read_single_segment passed")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Segment I/O Roundtrip")
@@ -467,6 +517,7 @@ if __name__ == "__main__":
         test_encoding_type_handling()
         test_get_current_segment_tracking()
         test_get_last_completed_segment()
+        test_read_single_segment()
         
         print()
         print("=" * 60)
