@@ -235,7 +235,7 @@ def test_processor_state_save_no_conflict():
 
 
 def test_retention_policy_segment_deletion():
-    """Test that RetentionPolicy can delete processed segments."""
+    """Test that RetentionPolicy can delete processed segments immediately."""
     from src.spool.retention import RetentionPolicy
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -257,23 +257,72 @@ def test_retention_policy_segment_deletion():
         segments_before = policy.list_segments()
         assert len(segments_before) == 5, f"Expected 5 segments, got {len(segments_before)}"
         
-        # Mark segment 1 as processed - should trigger deletion
+        # Mark segment 1 as processed - should delete segment 1 immediately
         policy.set_last_processed_segment(1)
-        
-        # Mark segment 2 as processed - segment 1 should now be deleted
-        policy.set_last_processed_segment(2)
         
         # Give file system time to process
         time.sleep(0.1)
         
-        # Check segments - segment 1 should be deleted
+        # Check segments - segment 1 should be deleted immediately
         segments_after = policy.list_segments()
         segment_nums = [s[0] for s in segments_after]
         
         assert 1 not in segment_nums, f"Segment 1 should be deleted, remaining: {segment_nums}"
+        assert 2 in segment_nums, f"Segment 2 should still exist, remaining: {segment_nums}"
         
         print("✓ test_retention_policy_segment_deletion passed")
 
+
+def test_retention_policy_handles_gaps():
+    """Test that RetentionPolicy correctly handles gaps in segment numbers."""
+    from src.spool.retention import RetentionPolicy
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create test segments with gaps (simulating segments that were already deleted)
+        for seg in [5, 7, 8, 10]:  # Note: 6, 9 are missing
+            create_segment_with_frames(tmpdir, seg, 2)
+        
+        # Create retention policy with immediate deletion enabled
+        policy = RetentionPolicy(
+            spool_dir=tmpdir,
+            retention_seconds=300.0,
+            cleanup_interval=30.0,
+            min_segments_to_keep=1,
+            retention_safety_enabled=True,
+            delete_processed_segments=True
+        )
+        
+        # Verify initial state
+        segments_before = policy.list_segments()
+        assert len(segments_before) == 4, f"Expected 4 segments, got {len(segments_before)}"
+        
+        # Process segment 5 - should delete 5 directly
+        policy.set_last_processed_segment(5)
+        time.sleep(0.1)
+        
+        segments = policy.list_segments()
+        segment_nums = [s[0] for s in segments]
+        assert 5 not in segment_nums, f"Segment 5 should be deleted, remaining: {segment_nums}"
+        
+        # Process segment 7 (skipping 6 which doesn't exist) - should delete 7 directly
+        policy.set_last_processed_segment(7)
+        time.sleep(0.1)
+        
+        segments = policy.list_segments()
+        segment_nums = [s[0] for s in segments]
+        assert 7 not in segment_nums, f"Segment 7 should be deleted, remaining: {segment_nums}"
+        assert 8 in segment_nums, f"Segment 8 should still exist, remaining: {segment_nums}"
+        
+        # Process segment 8 and 10 directly
+        policy.set_last_processed_segment(8)
+        policy.set_last_processed_segment(10)
+        time.sleep(0.1)
+        
+        segments = policy.list_segments()
+        segment_nums = [s[0] for s in segments]
+        assert len(segment_nums) == 0, f"All segments should be deleted, remaining: {segment_nums}"
+        
+        print("✓ test_retention_policy_handles_gaps passed")
 
 def test_min_frame_interval_config():
     """Test that min_frame_interval_ms configuration is respected."""
@@ -314,6 +363,7 @@ def main():
         test_processor_state_dataclass_vs_enum()
         test_processor_state_save_no_conflict()
         test_retention_policy_segment_deletion()
+        test_retention_policy_handles_gaps()
         test_min_frame_interval_config()
         
         print()

@@ -219,22 +219,31 @@ class RetentionPolicy:
 
     def set_last_processed_segment(self, segment_num: int):
         """
-        V7.1: Update the last processed segment number.
+        V8.5: Update the last processed segment number and delete it immediately.
         
         When delete_processed_segments is enabled, this will trigger immediate
         deletion of the segment that was just fully processed.
+        
+        SIMPLIFIED DESIGN: We directly delete the segment that completed,
+        not the previous one. This handles gaps correctly (e.g., if we skip
+        from segment 5 to 7, segment 5 is still deleted when it completes).
         
         Args:
             segment_num: Segment number that was just fully processed
         """
         with self._progress_lock:
+            # Update tracking to highest segment number seen
+            # (only update if larger to track progress correctly)
             if segment_num > self._last_processed_segment:
-                old_segment = self._last_processed_segment
                 self._last_processed_segment = segment_num
-                
-                # If enabled, delete the old segment immediately
-                if self.delete_processed_segments and old_segment >= 0:
-                    self._delete_processed_segment(old_segment)
+            
+            # V8.5: Delete the segment that just completed (not the previous one!)
+            # This ensures segments are deleted immediately when processed,
+            # even if there are gaps in segment numbers.
+            # We delete regardless of whether it's larger than _last_processed_segment
+            # because gaps in segment numbers should be handled correctly.
+            if self.delete_processed_segments and segment_num >= 0:
+                self._delete_processed_segment(segment_num)
     
     def get_last_processed_segment(self) -> int:
         """Get the last processed segment number."""
