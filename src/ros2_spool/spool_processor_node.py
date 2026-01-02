@@ -136,6 +136,8 @@ class ProcessorConfig:
     # V8: Segment deletion and pacing control
     delete_processed_segments: bool = DEFAULT_DELETE_PROCESSED_SEGMENTS
     min_frame_interval_ms: float = DEFAULT_MIN_FRAME_INTERVAL_MS
+    # V8.2: Segment list caching for performance
+    segment_list_cache_interval: float = 1.0  # Refresh segment list cache every 1 second
 
 
 def load_default_config() -> ProcessorConfig:
@@ -193,7 +195,10 @@ class SpoolProcessorNode(Node):
         spool_dir = Path(self.config.spool_dir_path)
         spool_dir.mkdir(parents=True, exist_ok=True)
 
-        self._reader = SegmentReader(self.config.spool_dir_path)
+        self._reader = SegmentReader(
+            self.config.spool_dir_path,
+            cache_refresh_interval=self.config.segment_list_cache_interval
+        )
         self._frame_generator: Optional[Generator] = None
         self._current_frame: Optional[FrameRecord] = None
         self._current_frame_index: int = 0
@@ -384,25 +389,73 @@ class SpoolProcessorNode(Node):
     
     def _init_frame_generator(self):
         """
-        Initialize the frame generator from oldest segment.
+        Initialize the frame generator from correct resume position.
         
-        V7: Supports seeking to last published frame + 1 for restart continuity.
+        V8: Fixed to use last_published_segment for resume (not oldest segment).
+        This ensures correct restart behavior when segments are deleted and
+        frame indices are not monotonic across segments.
+        
+        Resume logic:
+        1. If no persisted state: start from oldest segment
+        2. If persisted state exists:
+           a. Try to start from last_published_segment
+           b. If that segment is missing, find nearest segment >= it
+           c. Within resume segment, skip frames with index <= last_published_index
         """
-        oldest = self._reader.get_oldest_segment()
-        if oldest is not None:
-            logger.info(f"[SpoolProcessor] Starting from segment {oldest}")
-            self._frame_generator = self._reader.read_frames(start_segment=oldest)
-            # Mark that we need SPS/PPS for the first frame of this segment
-            self._segment_needs_sps_pps = True
-            self._current_segment = oldest
+        # Determine starting segment
+        start_segment = None
+        
+        if self._last_published_segment >= 0:
+            # V8: Resume from last published segment (or nearest available >= it)
+            segments = self._reader.list_segments(use_cache=False)  # Critical operation - no cache
             
-            # V7: If we have persisted state, skip already-published frames
-            if self._last_published_index >= 0:
+            if self._last_published_segment in segments:
+                # Exact match - resume from this segment
+                start_segment = self._last_published_segment
+                logger.info(format_structured_log(
+                    "[SpoolProcessor] Resuming from last published segment",
+                    last_published_segment=self._last_published_segment,
+                    last_published_index=self._last_published_index
+                ))
+            else:
+                # Segment was deleted - find nearest available segment >= last_published
+                candidates = [s for s in segments if s >= self._last_published_segment]
+                if candidates:
+                    start_segment = min(candidates)
+                    logger.warning(format_structured_log(
+                        "[SpoolProcessor] Resume segment missing, jumping forward",
+                        last_published_segment=self._last_published_segment,
+                        resume_segment=start_segment,
+                        skipped_segments=start_segment - self._last_published_segment
+                    ))
+                else:
+                    # No segments >= last published - fall back to oldest (shouldn't happen normally)
+                    start_segment = min(segments) if segments else None
+                    if start_segment:
+                        logger.warning(format_structured_log(
+                            "[SpoolProcessor] No forward segments for resume, using oldest (unusual)",
+                            last_published_segment=self._last_published_segment,
+                            oldest_available=start_segment
+                        ))
+        else:
+            # No persisted state - start from oldest segment
+            start_segment = self._reader.get_oldest_segment()
+        
+        if start_segment is not None:
+            logger.info(f"[SpoolProcessor] Starting from segment {start_segment}")
+            self._frame_generator = self._reader.read_frames(start_segment=start_segment)
+            self._segment_needs_sps_pps = True
+            self._current_segment = start_segment
+            
+            # V8: If resuming, skip already-published frames WITHIN the resume segment
+            # Frame indices are only comparable within the same segment
+            if self._last_published_segment >= 0 and start_segment == self._last_published_segment:
                 target_index = self._last_published_index + 1
                 skipped = 0
                 logger.info(format_structured_log(
-                    "[SpoolProcessor] Seeking to resume position",
-                    last_published=self._last_published_index,
+                    "[SpoolProcessor] Seeking to resume position within segment",
+                    resume_segment=start_segment,
+                    last_published_index=self._last_published_index,
                     target_index=target_index
                 ))
                 
@@ -417,7 +470,7 @@ class SpoolProcessorNode(Node):
                         if pps:
                             self._cached_pps = pps
                         
-                        if frame.index < target_index:
+                        if frame.index <= self._last_published_index:
                             skipped += 1
                             continue
                         else:
@@ -433,15 +486,27 @@ class SpoolProcessorNode(Node):
                             break
                             
                 except StopIteration:
-                    logger.warning(format_structured_log(
-                        "[SpoolProcessor] Reached end of spool while seeking",
+                    # Reached end of resume segment - generator will naturally continue to next segment
+                    logger.info(format_structured_log(
+                        "[SpoolProcessor] Reached end of resume segment while seeking",
                         skipped_frames=skipped,
-                        target_was=target_index
+                        target_was=target_index,
+                        resume_segment=start_segment
                     ))
-                    self._frame_generator = iter([])
+                    # Generator is already exhausted, will naturally move to next segment
+            elif self._last_published_segment >= 0 and start_segment > self._last_published_segment:
+                # Jumped forward to a different segment - don't skip by index
+                # (indices are not comparable across segments)
+                logger.info(format_structured_log(
+                    "[SpoolProcessor] Starting from segment ahead of last published, no index skipping",
+                    last_published_segment=self._last_published_segment,
+                    start_segment=start_segment
+                ))
+                # Pre-scan for SPS/PPS if needed
+                if self._cached_sps is None or self._cached_pps is None:
+                    self._prescan_for_sps_pps()
             else:
-                # Pre-scan for SPS/PPS if we don't have cached values yet
-                # This is critical for decoder initialization on startup
+                # Starting fresh (no resume) - pre-scan for SPS/PPS
                 if self._cached_sps is None or self._cached_pps is None:
                     self._prescan_for_sps_pps()
         else:
@@ -1060,7 +1125,7 @@ class SpoolProcessorNode(Node):
         # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
-                # Compute spool lag
+                # Compute spool lag (uses cached segment list)
                 segments = self._reader.list_segments()
                 newest_segment = max(segments) if segments else None
                 spool_lag = 0
@@ -1071,6 +1136,9 @@ class SpoolProcessorNode(Node):
                 segments_deleted = 0
                 if self._retention_policy is not None:
                     segments_deleted = self._retention_policy.segments_deleted_by_processing
+                
+                # V8.2: Get cache statistics for performance monitoring
+                cache_stats = self._reader.get_cache_stats()
                 
                 # Structured stats logging
                 stats_msg = format_structured_log(
@@ -1085,7 +1153,8 @@ class SpoolProcessorNode(Node):
                     segments_deleted=segments_deleted,
                     sps_pps_prepends=self._sps_pps_prepends,
                     sps_pps_missing=self._sps_pps_missing_critical,
-                    state=self._state.value
+                    state=self._state.value,
+                    cache_hit_rate=f"{cache_stats['hit_rate_pct']:.1f}%"
                 )
                 logger.info(stats_msg)
                 
@@ -1098,6 +1167,17 @@ class SpoolProcessorNode(Node):
                     spool_lag=spool_lag,
                 )
                 logger.info(spool_msg)
+                
+                # V8.2: Log cache performance (only when cache misses occur to avoid spam)
+                if cache_stats['misses'] > 0:
+                    cache_msg = format_structured_log(
+                        "[SpoolProcessor] Cache stats",
+                        hits=cache_stats['hits'],
+                        misses=cache_stats['misses'],
+                        hit_rate=f"{cache_stats['hit_rate_pct']:.1f}%",
+                        refresh_interval=f"{cache_stats['refresh_interval_sec']:.1f}s"
+                    )
+                    logger.debug(cache_msg)
                 
                 # Warn on spool lag thresholds
                 if spool_lag >= self.config.spool_lag_error_threshold:

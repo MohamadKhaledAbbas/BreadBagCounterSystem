@@ -442,6 +442,7 @@ class SegmentReader:
     - Iterator interface for frame-by-frame access
     - Automatic segment progression
     - Metadata reading
+    - Cached segment list with configurable refresh rate
     
     Usage:
         reader = SegmentReader('/path/to/spool')
@@ -449,32 +450,90 @@ class SegmentReader:
             process(record)
     """
     
-    def __init__(self, spool_dir: str):
+    def __init__(self, spool_dir: str, cache_refresh_interval: float = 1.0):
         """
         Initialize the segment reader.
         
         Args:
             spool_dir: Directory containing segment files
+            cache_refresh_interval: How often to refresh the segment list cache (seconds).
+                                   Default 1.0 Hz prevents excessive filesystem scans.
         """
         self.spool_dir = Path(spool_dir)
         self._current_file: Optional[Any] = None
         self._current_segment: int = 0
+        
+        # Segment list caching to avoid repeated filesystem scans
+        self._cache_refresh_interval = cache_refresh_interval
+        self._cached_segments: Optional[List[int]] = None
+        self._cache_time: float = 0.0
+        self._cache_lock = threading.Lock()
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
     
-    def list_segments(self) -> List[int]:
+    def list_segments(self, use_cache: bool = True) -> List[int]:
         """
         List all available segment numbers (completed .bin files only).
+        
+        Optimized to use os.scandir() for fast directory scanning instead of
+        pathlib.glob(), which is critical for performance as the spool directory
+        grows. This prevents the processor from falling behind over time.
+        
+        Args:
+            use_cache: If True, use cached result if within refresh interval.
+                      If False, always scan filesystem (for critical operations).
         
         Returns:
             Sorted list of segment numbers
         """
+        # Check cache if enabled
+        if use_cache:
+            with self._cache_lock:
+                current_time = time.time()
+                if (self._cached_segments is not None and 
+                    current_time - self._cache_time < self._cache_refresh_interval):
+                    self._cache_hits += 1
+                    return self._cached_segments.copy()  # Return copy to prevent external mutation
+                self._cache_misses += 1
+        
+        # Cache miss or disabled - scan filesystem
         segments = []
-        for f in self.spool_dir.glob("seg_*.bin"):
-            try:
-                num = int(f.stem.split('_')[1])
-                segments.append(num)
-            except (IndexError, ValueError):
-                continue
-        return sorted(segments)
+        try:
+            # Use os.scandir() for fast directory traversal (10-100x faster than glob)
+            with os.scandir(self.spool_dir) as it:
+                for entry in it:
+                    # Fast path: check extension first (string operation)
+                    if not entry.name.endswith('.bin'):
+                        continue
+                    # Only check prefix if extension matches
+                    if not entry.name.startswith('seg_'):
+                        continue
+                    # Extract segment number using simple string slicing
+                    # Format: seg_NNNNNN.bin (6 digits)
+                    try:
+                        # Extract the numeric part between 'seg_' and '.bin'
+                        num_str = entry.name[4:10]  # Characters 4-9 (6 digits)
+                        num = int(num_str)
+                        segments.append(num)
+                    except (ValueError, IndexError):
+                        # Skip malformed filenames
+                        continue
+        except FileNotFoundError:
+            # Directory doesn't exist yet
+            segments = []
+        except Exception as e:
+            logger.warning(f"[SegmentReader] Error listing segments: {e}")
+            segments = []
+        
+        result = sorted(segments)
+        
+        # Update cache
+        if use_cache:
+            with self._cache_lock:
+                self._cached_segments = result.copy()
+                self._cache_time = time.time()
+        
+        return result
     
     def get_oldest_segment(self) -> Optional[int]:
         """Get the oldest available segment number."""
@@ -485,6 +544,24 @@ class SegmentReader:
         """Get the newest available segment number."""
         segments = self.list_segments()
         return segments[-1] if segments else None
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Get segment list cache statistics for performance monitoring.
+        
+        Returns:
+            Dictionary with cache hits, misses, and hit rate
+        """
+        with self._cache_lock:
+            total = self._cache_hits + self._cache_misses
+            hit_rate = (self._cache_hits / total * 100.0) if total > 0 else 0.0
+            return {
+                'hits': self._cache_hits,
+                'misses': self._cache_misses,
+                'hit_rate_pct': hit_rate,
+                'refresh_interval_sec': self._cache_refresh_interval,
+                'cache_age_sec': time.time() - self._cache_time if self._cached_segments else None
+            }
     
     def read_segment_metadata(self, segment_num: int) -> Optional[SegmentMetadata]:
         """Read metadata for a specific segment."""
