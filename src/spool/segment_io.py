@@ -460,8 +460,10 @@ class SegmentReader:
         """
         self.spool_dir = Path(spool_dir)
         self._current_file: Optional[Any] = None
-        self._current_segment: int = -1  # Track the segment currently being read (-1 = none)
+        
+        # Track the segment currently being read (-1 = none)
         self._segment_lock = threading.Lock()  # Thread-safe access to _current_segment
+        self._current_segment: int = -1
 
         # Segment list caching to avoid repeated filesystem scans
         self._cache_refresh_interval = cache_refresh_interval
