@@ -556,10 +556,11 @@ class SpoolProcessorNode(Node):
                     throttle_dict=self._throttle_log_dict,
                     min_interval=10.0
                 )
-                # V7.5: Jump to nearest available segment >= current, not oldest
+                # V7.5: Jump to nearest available segment > current, not >= current
                 # This prevents rewinds when retention deletes the current segment
+                # CRITICAL: Use > not >= to never jump backward (segment already processed)
                 if segments:
-                    candidates = [s for s in segments if s >= self._current_segment]
+                    candidates = [s for s in segments if s > self._current_segment]
                     if candidates:
                         target_segment = min(candidates)
                         logger.warning(format_structured_log(
@@ -568,14 +569,15 @@ class SpoolProcessorNode(Node):
                             target_segment=target_segment
                         ))
                     else:
-                        # No segments >= current available, use the minimum available
-                        # (This is the fallback, but at least we log it)
-                        target_segment = min(segments)
+                        # No segments > current available
+                        # This means we've processed all available segments - wait for new ones
                         logger.warning(format_structured_log(
-                            "[SpoolProcessor] ⚠ No forward segments available, using oldest",
+                            "[SpoolProcessor] ⚠ No forward segments available, reached end of spool",
                             missing_segment=self._current_segment,
-                            target_segment=target_segment
+                            available_segments=len(segments)
                         ))
+                        # Return None to signal spool is empty (will wait for new segments)
+                        return None
                     
                     self._frame_generator = self._reader.read_frames(start_segment=target_segment)
                     self._current_segment = target_segment
