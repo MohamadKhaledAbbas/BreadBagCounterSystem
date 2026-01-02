@@ -340,6 +340,163 @@ def test_encoding_type_handling():
     print("✓ test_encoding_type_handling passed")
 
 
+def test_get_current_segment_tracking():
+    """Test that SegmentReader.get_current_segment() tracks progress during read_frames()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create multiple segments with frames
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            
+            # Write 3 frames per segment
+            for i in range(3):
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        # Create reader and verify initial state
+        reader = SegmentReader(tmpdir)
+        assert reader.get_current_segment() == -1, "Initial current segment should be -1"
+        
+        # Read frames and verify segment tracking
+        segments_seen = []
+        for frame in reader.read_frames():
+            current_seg = reader.get_current_segment()
+            if current_seg not in segments_seen:
+                segments_seen.append(current_seg)
+        
+        # Should have tracked all 3 segments in order
+        assert segments_seen == [1, 2, 3], f"Expected [1, 2, 3], got {segments_seen}"
+        
+        # After reading all frames, current_segment should be the last segment
+        assert reader.get_current_segment() == 3, "Current segment should be 3 after reading all"
+        
+        print("✓ test_get_current_segment_tracking passed")
+
+
+def test_get_last_completed_segment():
+    """Test that SegmentReader.get_last_completed_segment() tracks completion correctly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create multiple segments with frames
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            
+            # Write 3 frames per segment
+            for i in range(3):
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        # Create reader and verify initial state
+        reader = SegmentReader(tmpdir)
+        assert reader.get_last_completed_segment() == -1, "Initial last completed should be -1"
+        
+        # Read frames and track when segments complete
+        generator = reader.read_frames()
+        
+        # Read first 3 frames (segment 1) - segment not complete yet until we try to read more
+        for _ in range(3):
+            next(generator)
+        # Note: _last_completed_segment is updated when the generator MOVES to the next segment
+        # So after reading 3 frames, we haven't moved to segment 2 yet
+        assert reader.get_last_completed_segment() == -1, "Segment 1 not complete yet (waiting for move to next)"
+        
+        # Read 4th frame (first of segment 2) - THIS triggers completion of segment 1
+        next(generator)
+        assert reader.get_last_completed_segment() == 1, "Segment 1 should be completed after 4th frame"
+        
+        # Read 5th and 6th frames (rest of segment 2)
+        next(generator)
+        next(generator)
+        assert reader.get_last_completed_segment() == 1, "Still segment 1 - segment 2 not complete yet"
+        
+        # Read 7th frame (first of segment 3) - THIS triggers completion of segment 2
+        next(generator)
+        assert reader.get_last_completed_segment() == 2, "Segment 2 should be completed after 7th frame"
+        
+        # Read remaining 2 frames (rest of segment 3)
+        next(generator)
+        next(generator)
+        assert reader.get_last_completed_segment() == 2, "Still segment 2 - segment 3 not complete yet"
+        
+        # Try to read more - StopIteration will be raised and segment 3 completed
+        try:
+            next(generator)
+        except StopIteration:
+            pass
+        
+        # After StopIteration, segment 3 should be completed
+        assert reader.get_last_completed_segment() == 3, "Last completed should be 3 after exhaustion"
+        
+        print("✓ test_get_last_completed_segment passed")
+
+
+def test_read_single_segment():
+    """
+    Test that read_single_segment() reads exactly one segment and raises StopIteration.
+    
+    V8.7: This tests the new per-segment generator that enables immediate deletion.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create 3 segments with known frame counts
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            for i in range(3):  # 3 frames per segment
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        reader = SegmentReader(tmpdir)
+        
+        # Read segment 1 only
+        gen1 = reader.read_single_segment(1)
+        frames1 = list(gen1)  # Should exhaust after 3 frames and raise StopIteration
+        assert len(frames1) == 3, f"Segment 1 should have 3 frames, got {len(frames1)}"
+        assert reader.get_last_completed_segment() == 1, "Segment 1 should be completed"
+        
+        # Read segment 2 only
+        gen2 = reader.read_single_segment(2)
+        frames2 = list(gen2)
+        assert len(frames2) == 3, f"Segment 2 should have 3 frames, got {len(frames2)}"
+        assert reader.get_last_completed_segment() == 2, "Segment 2 should be completed"
+        
+        # Read segment 3 only
+        gen3 = reader.read_single_segment(3)
+        frames3 = list(gen3)
+        assert len(frames3) == 3, f"Segment 3 should have 3 frames, got {len(frames3)}"
+        assert reader.get_last_completed_segment() == 3, "Segment 3 should be completed"
+        
+        # Verify total frames
+        total = len(frames1) + len(frames2) + len(frames3)
+        assert total == 9, f"Total frames should be 9, got {total}"
+        
+        print("✓ test_read_single_segment passed")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Segment I/O Roundtrip")
@@ -358,6 +515,9 @@ if __name__ == "__main__":
         test_frame_record_timestamps()
         test_large_frame_data()
         test_encoding_type_handling()
+        test_get_current_segment_tracking()
+        test_get_last_completed_segment()
+        test_read_single_segment()
         
         print()
         print("=" * 60)

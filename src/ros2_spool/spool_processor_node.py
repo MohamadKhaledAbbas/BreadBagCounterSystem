@@ -392,11 +392,13 @@ class SpoolProcessorNode(Node):
         Initialize the frame generator from oldest segment.
         
         V7: Supports seeking to last published frame + 1 for restart continuity.
+        V8.7: Uses read_single_segment() to enable per-segment completion tracking.
         """
         oldest = self._reader.get_oldest_segment()
         if oldest is not None:
             logger.info(f"[SpoolProcessor] Starting from segment {oldest}")
-            self._frame_generator = self._reader.read_frames(start_segment=oldest)
+            # V8.7: Use read_single_segment() for per-segment completion tracking
+            self._frame_generator = self._reader.read_single_segment(oldest)
             # Mark that we need SPS/PPS for the first frame of this segment
             self._segment_needs_sps_pps = True
             self._current_segment = oldest
@@ -477,6 +479,12 @@ class SpoolProcessorNode(Node):
         if self._frame_generator is None:
             self._init_frame_generator()
         
+        # V8.3: Sync _current_segment with reader's actual position
+        # This is critical to prevent stale segment tracking that causes rewinds
+        reader_segment = self._reader.get_current_segment()
+        if reader_segment >= 0:
+            self._current_segment = reader_segment
+        
         # V7: Retention guard - check if current segment was deleted
         if self._current_segment >= 0:
             segments = self._reader.list_segments()
@@ -537,25 +545,31 @@ class SpoolProcessorNode(Node):
             return frame
         except StopIteration:
             # Segment exhausted, try to move to next sequential segment
-            old_segment = self._current_segment
+            # V8.4: Use get_last_completed_segment() to get the ACTUALLY completed segment
+            # The _current_segment might point to the NEXT segment that was about to be read
+            completed_segment = self._reader.get_last_completed_segment()
+            if completed_segment < 0:
+                # Fallback to _current_segment if no segment was completed
+                completed_segment = self._current_segment
+            
             with self._stats_lock:
-                if self._current_segment >= 0:
+                if completed_segment >= 0:
                     self._segments_processed += 1
             
             # V8: Notify retention policy that segment is fully processed
             # This will trigger immediate segment deletion if enabled
-            if self._retention_policy is not None and old_segment >= 0:
-                self._retention_policy.set_last_processed_segment(old_segment)
+            if self._retention_policy is not None and completed_segment >= 0:
+                self._retention_policy.set_last_processed_segment(completed_segment)
                 logger.info(format_structured_log(
                     "[SpoolProcessor] 🗑️ Segment processed and queued for deletion",
-                    segment=old_segment
+                    segment=completed_segment
                 ))
             
             self._segment_needs_sps_pps = True  # New segment will need SPS/PPS
             
             # V7.2: Move to NEXT sequential segment, not oldest
             # This ensures proper sequential processing even when old segments are deleted
-            next_segment = old_segment + 1 if old_segment >= 0 else None
+            next_segment = completed_segment + 1 if completed_segment >= 0 else None
             
             # Check if next segment exists, or find the nearest available segment after current
             available_segments = self._reader.list_segments()
@@ -569,20 +583,21 @@ class SpoolProcessorNode(Node):
                 candidates = [s for s in available_segments if s >= next_segment] if next_segment is not None else available_segments
                 if candidates:
                     target_segment = min(candidates)
-                    if old_segment >= 0:
+                    if completed_segment >= 0:
                         skipped = target_segment - next_segment
                         if skipped > 0:
                             logger.warning(format_structured_log(
                                 "[SpoolProcessor] ⚠ Segments missing, skipping forward",
-                                old_segment=old_segment,
+                                old_segment=completed_segment,
                                 next_expected=next_segment,
                                 actual=target_segment,
                                 skipped=skipped
                             ))
             
             if target_segment is not None:
-                logger.info(f"[SpoolProcessor] Segment transition: {old_segment} → {target_segment}")
-                self._frame_generator = self._reader.read_frames(start_segment=target_segment)
+                logger.info(f"[SpoolProcessor] Segment transition: {completed_segment} → {target_segment}")
+                # V8.7: Use read_single_segment() for per-segment completion tracking
+                self._frame_generator = self._reader.read_single_segment(target_segment)
                 self._current_segment = target_segment
                 
                 # V7.4: Save state when transitioning segments for cross-process safety
@@ -619,9 +634,17 @@ class SpoolProcessorNode(Node):
                         min_interval=5.0
                     )
                     
-                    # Mark this segment as processed
+                    # Mark this segment as processed and trigger deletion
                     with self._stats_lock:
                         self._segments_processed += 1
+                    
+                    # V8.7: Trigger immediate deletion for empty segment
+                    if self._retention_policy is not None:
+                        self._retention_policy.set_last_processed_segment(target_segment)
+                        logger.info(format_structured_log(
+                            "[SpoolProcessor] Empty segment queued for deletion",
+                            segment=target_segment
+                        ))
                     
                     # Find next segment > target_segment
                     forward_candidates = [s for s in available_segments if s > target_segment]
@@ -632,7 +655,8 @@ class SpoolProcessorNode(Node):
                             empty_segment=target_segment,
                             next_segment=next_target
                         ))
-                        self._frame_generator = self._reader.read_frames(start_segment=next_target)
+                        # V8.7: Use read_single_segment() for per-segment completion tracking
+                        self._frame_generator = self._reader.read_single_segment(next_target)
                         self._current_segment = next_target
                         self._segment_needs_sps_pps = True
                         
