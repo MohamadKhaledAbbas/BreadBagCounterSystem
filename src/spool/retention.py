@@ -270,7 +270,8 @@ class RetentionPolicy:
                 self.bytes_recovered += size
                 self.segments_deleted += 1
                 self.segments_deleted_by_processing += 1
-                logger.debug(f"[Retention] Deleted processed segment {segment_num} ({size / 1024:.1f}KB)")
+                # V8.6: Use INFO level for immediate deletion so it's more visible
+                logger.info(f"[Retention] [IMMEDIATE] Deleted segment {segment_num} ({size / 1024:.1f}KB)")
             else:
                 logger.debug(f"[Retention] Segment {segment_num} already deleted (immediate cleanup)")
         except FileNotFoundError:
@@ -400,10 +401,8 @@ class RetentionPolicy:
                 if seg_num >= safe_segment_threshold:
                     if not force_size_cleanup:
                         logger.debug(
-                            f"[Retention] Protected segment {seg_num}: at or after processor position "
-                            f"(safe_threshold={safe_segment_threshold}, "
-                            f"last_processed_seg={last_processed_segment}, "
-                            f"processor_current_seg={processor_current_segment})"
+                            f"[Retention] [SCHEDULED] Protected segment {seg_num}: not yet processed "
+                            f"(processor_at={processor_current_segment}, threshold={safe_segment_threshold})"
                         )
                         self.segments_protected_by_progress += 1
                         protected_by_unprocessed += 1
@@ -413,7 +412,7 @@ class RetentionPolicy:
                         # to avoid deleting what processor is actively reading
                         if seg_num >= safe_segment_threshold:
                             logger.debug(
-                                f"[Retention] Size cleanup: still protecting current segment {seg_num} "
+                                f"[Retention] [SCHEDULED] Size cleanup: still protecting segment {seg_num} "
                                 f"(safe_threshold={safe_segment_threshold})"
                             )
                             self.segments_protected_by_progress += 1
