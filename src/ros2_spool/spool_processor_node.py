@@ -477,6 +477,12 @@ class SpoolProcessorNode(Node):
         if self._frame_generator is None:
             self._init_frame_generator()
         
+        # V8.3: Sync _current_segment with reader's actual position
+        # This is critical to prevent stale segment tracking that causes rewinds
+        reader_segment = self._reader.get_current_segment()
+        if reader_segment >= 0:
+            self._current_segment = reader_segment
+        
         # V7: Retention guard - check if current segment was deleted
         if self._current_segment >= 0:
             segments = self._reader.list_segments()

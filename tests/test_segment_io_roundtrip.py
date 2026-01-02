@@ -340,6 +340,48 @@ def test_encoding_type_handling():
     print("✓ test_encoding_type_handling passed")
 
 
+def test_get_current_segment_tracking():
+    """Test that SegmentReader.get_current_segment() tracks progress during read_frames()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create multiple segments with frames
+        for seg_num in [1, 2, 3]:
+            writer = SegmentWriter(tmpdir, segment_duration=999)
+            writer.start()
+            writer._current_segment = seg_num
+            
+            tmp_path = writer._get_segment_path(seg_num, tmp=True)
+            writer._current_file = open(tmp_path, 'wb')
+            writer._current_file.write(SEGMENT_MAGIC + bytes([SEGMENT_VERSION, 0]))
+            
+            # Write 3 frames per segment
+            for i in range(3):
+                frame = create_test_frame(seg_num * 100 + i)
+                writer._current_file.write(frame.to_bytes())
+            
+            writer._current_file.close()
+            final_path = writer._get_segment_path(seg_num, tmp=False)
+            tmp_path.rename(final_path)
+        
+        # Create reader and verify initial state
+        reader = SegmentReader(tmpdir)
+        assert reader.get_current_segment() == -1, "Initial current segment should be -1"
+        
+        # Read frames and verify segment tracking
+        segments_seen = []
+        for frame in reader.read_frames():
+            current_seg = reader.get_current_segment()
+            if current_seg not in segments_seen:
+                segments_seen.append(current_seg)
+        
+        # Should have tracked all 3 segments in order
+        assert segments_seen == [1, 2, 3], f"Expected [1, 2, 3], got {segments_seen}"
+        
+        # After reading all frames, current_segment should be the last segment
+        assert reader.get_current_segment() == 3, "Current segment should be 3 after reading all"
+        
+        print("✓ test_get_current_segment_tracking passed")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Segment I/O Roundtrip")
@@ -358,6 +400,7 @@ if __name__ == "__main__":
         test_frame_record_timestamps()
         test_large_frame_data()
         test_encoding_type_handling()
+        test_get_current_segment_tracking()
         
         print()
         print("=" * 60)

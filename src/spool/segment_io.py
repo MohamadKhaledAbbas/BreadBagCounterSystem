@@ -460,7 +460,8 @@ class SegmentReader:
         """
         self.spool_dir = Path(spool_dir)
         self._current_file: Optional[Any] = None
-        self._current_segment: int = 0
+        self._current_segment: int = -1  # Track the segment currently being read (-1 = none)
+        self._segment_lock = threading.Lock()  # Thread-safe access to _current_segment
 
         # Segment list caching to avoid repeated filesystem scans
         self._cache_refresh_interval = cache_refresh_interval
@@ -640,6 +641,10 @@ class SegmentReader:
 
         Yields:
             FrameRecord objects in chronological order
+        
+        Note:
+            Updates _current_segment as it iterates through segments, allowing
+            callers to track progress via get_current_segment().
         """
         segments = self.list_segments()
 
@@ -647,9 +652,24 @@ class SegmentReader:
             segments = [s for s in segments if s >= start_segment]
 
         for seg_num in segments:
+            # Update current segment BEFORE reading so callers can track progress
+            with self._segment_lock:
+                self._current_segment = seg_num
             logger.debug(f"[SegmentReader] Reading segment {seg_num}")
             yield from self.read_segment(seg_num)
-
+    
+    def get_current_segment(self) -> int:
+        """
+        Get the segment number currently being read.
+        
+        Returns:
+            The segment number being read, or -1 if no segment is active.
+            
+        This method is thread-safe and can be called from another thread
+        to check the reader's progress.
+        """
+        with self._segment_lock:
+            return self._current_segment
 
 def validate_segment_file(path: str) -> bool:
     """
