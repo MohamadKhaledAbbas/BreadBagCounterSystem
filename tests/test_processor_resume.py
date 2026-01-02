@@ -236,7 +236,9 @@ def test_resume_jumps_to_next_segment_after_last_published():
         assert resume_segment == 5, f"Should jump to segment 5, got {resume_segment}"
         
         # Verify we skipped segments 2, 3, 4 (which don't exist)
-        assert resume_segment - last_published_segment == 2, "Should skip 2 segments forward"
+        expected_skip = resume_segment - last_published_segment
+        assert expected_skip > 0, "Should skip segments forward"
+        assert expected_skip == 2, f"Expected to skip 2 segments, skipped {expected_skip}"
         
         print("✓ test_resume_jumps_to_next_segment_after_last_published passed")
 

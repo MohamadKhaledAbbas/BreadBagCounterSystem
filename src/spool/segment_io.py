@@ -509,10 +509,11 @@ class SegmentReader:
                     if not entry.name.startswith('seg_'):
                         continue
                     # Extract segment number using simple string slicing
-                    # Format: seg_NNNNNN.bin (6 digits)
+                    # Format: seg_NNNNNN.bin (typically 6 digits, but flexible)
                     try:
                         # Extract the numeric part between 'seg_' and '.bin'
-                        num_str = entry.name[4:10]  # Characters 4-9 (6 digits)
+                        # Using [4:-4] handles variable-length segment numbers
+                        num_str = entry.name[4:-4]  # Everything between 'seg_' and '.bin'
                         num = int(num_str)
                         segments.append(num)
                     except (ValueError, IndexError):
