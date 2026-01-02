@@ -69,6 +69,7 @@ DEFAULT_RETENTION_SECONDS = 180.0
 DEFAULT_QUEUE_SIZE = 100
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_DROP_LOG_THROTTLE = 5.0  # Seconds between drop warning logs
+DEFAULT_MAX_SPOOL_SIZE_BYTES = 2_147_483_648  # 2GB hard limit to prevent SD card fill
 
 
 @dataclass
@@ -82,6 +83,7 @@ class SpoolConfig:
     stats_interval: float = DEFAULT_STATS_INTERVAL
     drop_log_throttle: float = DEFAULT_DROP_LOG_THROTTLE
     enable_backpressure_hook: bool = False  # Future: enable backpressure on drops
+    max_spool_size_bytes: int = DEFAULT_MAX_SPOOL_SIZE_BYTES  # Maximum spool directory size
 
 
 def load_default_config() -> SpoolConfig:
@@ -179,9 +181,19 @@ class SpoolRecorderNode(Node):
             spool_dir=self.config.spool_dir_path,
             retention_seconds=self.config.retention_seconds,
             cleanup_interval=10.0,
-            min_segments_to_keep=2
+            min_segments_to_keep=2,
+            retention_safety_enabled=True,  # Enable processor state awareness
+            max_spool_size_bytes=self.config.max_spool_size_bytes,  # Enforce 2GB limit
+            delete_processed_segments=False  # Only delete by age/size, not immediate
         )
         self._retention.start()
+        
+        logger.info(format_structured_log(
+            "[SpoolRecorder] Retention policy configured",
+            retention_seconds=self.config.retention_seconds,
+            max_spool_size_mb=self.config.max_spool_size_bytes / 1024 / 1024,
+            min_segments_to_keep=2
+        ))
         
         # Start writer thread
         self._running = True

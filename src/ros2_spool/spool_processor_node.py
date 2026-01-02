@@ -252,12 +252,15 @@ class SpoolProcessorNode(Node):
                 cleanup_interval=30.0,  # Cleanup check interval
                 min_segments_to_keep=2,  # Always keep at least 2 segments
                 retention_safety_enabled=True,  # Protect unprocessed segments
+                max_spool_size_bytes=2_147_483_648,  # 2GB hard limit
                 delete_processed_segments=True  # Delete segments immediately after processing
             )
             logger.info(format_structured_log(
                 "[SpoolProcessor] Segment deletion enabled",
                 delete_after_processing=True,
-                min_segments_to_keep=2
+                min_segments_to_keep=2,
+                max_spool_size_mb=2048
+            ))
             ))
         else:
             self._retention_policy = None

@@ -572,6 +572,7 @@ class RetentionPolicy:
     def _get_oldest_processed_segments(self, exclude: List[Tuple[int, Path, int]]) -> List[Tuple[int, Path, int]]:
         """
         V7.1: Get oldest segments that have been processed (for size-based cleanup).
+        V8: Enhanced to use processor state file for cross-process awareness.
         
         Args:
             exclude: List of segments already marked for deletion
@@ -580,18 +581,42 @@ class RetentionPolicy:
             List of tuples (segment_num, path, size) for oldest processed segments
         """
         excluded_nums = {seg_num for seg_num, _, _ in exclude}
-        last_processed_seg = self._last_processed_segment
         
-        # Get all segments older than last processed
+        # V8: Get processor state from file (cross-process)
+        processor_current_segment = self._get_processor_current_segment()
+        
+        # Use the maximum of internal state and file state
+        last_processed_seg = max(self._last_processed_segment, processor_current_segment)
+        
+        # If no processor state available, we can't safely determine processed segments
+        # Return empty list to be conservative (don't delete potentially unprocessed data)
+        if last_processed_seg < 0:
+            logger.debug(
+                "[Retention] No processor state available - cannot determine processed segments "
+                "for size-based cleanup (being conservative)"
+            )
+            return []
+        
+        # Get all segments older than last processed (with safety margin of 1 segment)
         segments = self.list_segments()
         processed_segments = []
         
+        # Protect current segment and one ahead (being cautious about what processor might read next)
+        # So we can safely delete segments < last_processed_seg
+        safe_threshold = last_processed_seg
+        
         for seg_num, path, mtime, size in segments:
-            if seg_num < last_processed_seg and seg_num not in excluded_nums:
+            if seg_num < safe_threshold and seg_num not in excluded_nums:
                 processed_segments.append((seg_num, path, size))
         
-        # Sort by age (oldest first)
-        processed_segments.sort(key=lambda x: x[1].stat().st_mtime)
+        # Sort by age (oldest first) for efficient cleanup
+        if processed_segments:
+            processed_segments.sort(key=lambda x: x[1].stat().st_mtime if x[1].exists() else 0)
+        
+        logger.debug(
+            f"[Retention] Found {len(processed_segments)} old processed segments "
+            f"(last_processed_seg={last_processed_seg}, safe_threshold={safe_threshold})"
+        )
         
         return processed_segments
     
