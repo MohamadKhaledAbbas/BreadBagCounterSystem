@@ -107,15 +107,15 @@ DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
 ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 # V8: Segment deletion and pacing control
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
-DEFAULT_MIN_FRAME_INTERVAL_MS = 20.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
+DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
 
 # Add new constants at the top (around line 94-111)
-DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
-DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 15  # Between 5-15 = normal pace
+DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 10  # Less than this = healthy, relax
+DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 5-25 = normal pace
 # Above 15 = high lag, speed up
 
-DEFAULT_ADAPTIVE_FPS_RELAXED = 20.0  # Healthy state - save resources
-DEFAULT_ADAPTIVE_FPS_MAX = 50.0  # High lag state - catch up (15ms min interval)
+DEFAULT_ADAPTIVE_FPS_RELAXED = 15.0  # Healthy state - save resources
+DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (15ms min interval)
 
 @dataclass
 class ProcessorConfig:
@@ -136,6 +136,8 @@ class ProcessorConfig:
     # V8: Segment deletion and pacing control
     delete_processed_segments: bool = DEFAULT_DELETE_PROCESSED_SEGMENTS
     min_frame_interval_ms: float = DEFAULT_MIN_FRAME_INTERVAL_MS
+    # V8.2: Segment list caching for performance
+    segment_list_cache_interval: float = 1.0  # Refresh segment list cache every 1 second
 
 
 def load_default_config() -> ProcessorConfig:
@@ -193,7 +195,10 @@ class SpoolProcessorNode(Node):
         spool_dir = Path(self.config.spool_dir_path)
         spool_dir.mkdir(parents=True, exist_ok=True)
 
-        self._reader = SegmentReader(self.config.spool_dir_path)
+        self._reader = SegmentReader(
+            self.config.spool_dir_path,
+            cache_refresh_interval=self.config.segment_list_cache_interval
+        )
         self._frame_generator: Optional[Generator] = None
         self._current_frame: Optional[FrameRecord] = None
         self._current_frame_index: int = 0
@@ -1060,7 +1065,7 @@ class SpoolProcessorNode(Node):
         # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
-                # Compute spool lag
+                # Compute spool lag (uses cached segment list)
                 segments = self._reader.list_segments()
                 newest_segment = max(segments) if segments else None
                 spool_lag = 0
@@ -1072,6 +1077,9 @@ class SpoolProcessorNode(Node):
                 if self._retention_policy is not None:
                     segments_deleted = self._retention_policy.segments_deleted_by_processing
                 
+                # V8.2: Get cache statistics for performance monitoring
+                cache_stats = self._reader.get_cache_stats()
+
                 # Structured stats logging
                 stats_msg = format_structured_log(
                     "[SpoolProcessor] Stats",
@@ -1085,7 +1093,8 @@ class SpoolProcessorNode(Node):
                     segments_deleted=segments_deleted,
                     sps_pps_prepends=self._sps_pps_prepends,
                     sps_pps_missing=self._sps_pps_missing_critical,
-                    state=self._state.value
+                    state=self._state.value,
+                    cache_hit_rate=f"{cache_stats['hit_rate_pct']:.1f}%"
                 )
                 logger.info(stats_msg)
                 
@@ -1099,6 +1108,17 @@ class SpoolProcessorNode(Node):
                 )
                 logger.info(spool_msg)
                 
+                # V8.2: Log cache performance (only when cache misses occur to avoid spam)
+                if cache_stats['misses'] > 0:
+                    cache_msg = format_structured_log(
+                        "[SpoolProcessor] Cache stats",
+                        hits=cache_stats['hits'],
+                        misses=cache_stats['misses'],
+                        hit_rate=f"{cache_stats['hit_rate_pct']:.1f}%",
+                        refresh_interval=f"{cache_stats['refresh_interval_sec']:.1f}s"
+                    )
+                    logger.debug(cache_msg)
+
                 # Warn on spool lag thresholds
                 if spool_lag >= self.config.spool_lag_error_threshold:
                     lag_msg = format_structured_log(
