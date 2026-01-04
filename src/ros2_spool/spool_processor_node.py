@@ -109,13 +109,13 @@ ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
 DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
 
-# Add new constants at the top (around line 94-111)
+# V9: Pacing and adaptive thresholds
 DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 10  # Less than this = healthy, relax
-DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 5-25 = normal pace
-# Above 15 = high lag, speed up
-
+DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 10-25 = normal pace
 DEFAULT_ADAPTIVE_FPS_RELAXED = 15.0  # Healthy state - save resources
-DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (15ms min interval)
+DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (~28ms intervals)
+MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
+ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
 
 @dataclass
 class ProcessorConfig:
@@ -138,6 +138,9 @@ class ProcessorConfig:
     min_frame_interval_ms: float = DEFAULT_MIN_FRAME_INTERVAL_MS
     # V8.2: Segment list caching for performance
     segment_list_cache_interval: float = 1.0  # Refresh segment list cache every 1 second
+    # V9: Performance profiling
+    enable_perf_logging: bool = False  # Enable performance profiling
+    perf_log_interval_sec: float = 2.0  # Log performance metrics every 2 seconds
 
 
 def load_default_config() -> ProcessorConfig:
@@ -240,6 +243,14 @@ class SpoolProcessorNode(Node):
         self._current_target_fps: float = self.config.target_fps  # Adaptive pacing
         self._throttle_log_dict = {}  # For throttled logging
         
+        # V9: Performance profiling
+        self._perf_frame_count: int = 0
+        self._perf_time_list_segments: float = 0.0
+        self._perf_time_get_next_frame: float = 0.0
+        self._perf_time_publish_frame: float = 0.0
+        self._perf_time_total_loop: float = 0.0
+        self._last_perf_log_time: float = time.time()
+        
         # State file path
         self._state_file_path = os.path.join(self.config.spool_dir_path, self.config.state_file)
         self._allow_next_gap = False
@@ -289,6 +300,35 @@ class SpoolProcessorNode(Node):
         
         logger.info("[SpoolProcessor] Starting...")
         self._running = True
+        
+        # V9: Log startup configuration and constants for runtime observability
+        logger.info("=" * 80)
+        logger.info("[SpoolProcessor] 🚀 Startup Configuration")
+        logger.info(f"  Module: {__file__}")
+        logger.info(f"  Version: V9 (Production ACK-Free with Adaptive Pacing)")
+        logger.info(f"  Session ID: {self._session_id}")
+        logger.info(f"")
+        logger.info(f"  Target FPS Configuration:")
+        logger.info(f"    - Default Target FPS: {DEFAULT_TARGET_FPS}")
+        logger.info(f"    - Adaptive FPS Relaxed: {DEFAULT_ADAPTIVE_FPS_RELAXED} (healthy mode)")
+        logger.info(f"    - Adaptive FPS Max: {DEFAULT_ADAPTIVE_FPS_MAX} (high lag catchup)")
+        logger.info(f"    - Min Frame Interval: {self.config.min_frame_interval_ms}ms")
+        logger.info(f"")
+        logger.info(f"  Adaptive Pacing Thresholds:")
+        logger.info(f"    - Healthy Threshold: < {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD} segments")
+        logger.info(f"    - Normal Threshold: {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD}-{DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
+        logger.info(f"    - High Lag Threshold: > {DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
+        logger.info(f"    - Warn Threshold: {self.config.spool_lag_warn_threshold} segments")
+        logger.info(f"    - Error Threshold: {self.config.spool_lag_error_threshold} segments")
+        logger.info(f"")
+        logger.info(f"  Performance Settings:")
+        logger.info(f"    - Segment List Cache Interval: {self.config.segment_list_cache_interval}s")
+        logger.info(f"    - Delete Processed Segments: {self.config.delete_processed_segments}")
+        logger.info(f"    - Enable Adaptive Pacing: {self.config.enable_adaptive_pacing}")
+        logger.info(f"    - Enable Performance Logging: {self.config.enable_perf_logging}")
+        if self.config.enable_perf_logging:
+            logger.info(f"    - Perf Log Interval: {self.config.perf_log_interval_sec}s")
+        logger.info("=" * 80)
         
         # V7: Load persisted state for restart continuity
         loaded_state = load_processor_state(self._state_file_path)
@@ -840,7 +880,20 @@ class SpoolProcessorNode(Node):
             encoding_padded = list(encoding_bytes) + [0] * (12 - len(encoding_bytes))
             frame_msg.encoding = encoding_padded
             
-            frame_msg.data = list(frame_data)
+            # V9: Optimize frame data assignment - avoid expensive list() conversion
+            # Try to assign bytes directly, fallback to list if needed for compatibility
+            # Note: ROS2 message field 'data' should accept bytes or sequence types.
+            # If the H26XFrame.data field type is defined as 'sequence<uint8>', 
+            # it should accept bytes directly. The fallback ensures compatibility
+            # with any message definition that requires a list.
+            try:
+                # Attempt direct bytes assignment (most efficient)
+                frame_msg.data = frame_data
+            except TypeError:
+                # Fallback to list conversion if direct assignment fails due to type mismatch
+                # This is the old behavior for compatibility
+                frame_msg.data = list(frame_data)
+                logger.debug("[SpoolProcessor] Using list conversion fallback for frame data")
             
             self._frame_pub.publish(frame_msg)
             
@@ -909,18 +962,23 @@ class SpoolProcessorNode(Node):
     
     def _processor_loop_ack_free(self):
         """
-        V6/V7 ACK-Free Processing Loop (Production-Grade).
+        V6/V7/V9 ACK-Free Processing Loop (Production-Grade).
         
         This loop processes frames continuously without waiting for ACKs:
         1. Read frame from spool
         2. Publish immediately
-        3. Pace to target_fps (adaptive)
+        3. Pace to target_fps (adaptive) using tick-based scheduling
         4. Never block
         
         V7 Additions:
         - Spool lag computation and warnings
         - Watchdog for stalled publishing (using monotonic time)
         - Adaptive pacing on high lag (optional)
+        
+        V9 Improvements:
+        - Robust tick-based pacing with next_deadline
+        - Performance profiling (optional)
+        - Fixed pacing calculation to exclude sleep from processing time
         
         Benefits:
         - No deadlocks (impossible)
@@ -936,13 +994,16 @@ class SpoolProcessorNode(Node):
             target_fps=self.config.target_fps,
             adaptive_pacing=self.config.enable_adaptive_pacing,
             min_frame_interval_ms=self.config.min_frame_interval_ms,
-            delete_processed_segments=self.config.delete_processed_segments
+            delete_processed_segments=self.config.delete_processed_segments,
+            perf_logging=self.config.enable_perf_logging
         ))
         
         # Use monotonic time for pacing and watchdog
         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
-        last_publish_monotonic = time.monotonic()
         last_watchdog_check = time.monotonic()
+        
+        # V9: Tick-based pacing with next_deadline
+        next_deadline = time.monotonic() + frame_interval
         
         # V8: Pre-calculate minimum interval (avoid division in tight loop)
         min_interval_sec = self.config.min_frame_interval_ms / 1000.0
@@ -952,7 +1013,11 @@ class SpoolProcessorNode(Node):
         
         while self._running:
             try:
-                current_monotonic = time.monotonic()
+                loop_start = time.monotonic()
+                current_monotonic = loop_start
+                
+                # V9: Profiling - measure list_segments time
+                t_list_segments_start = time.monotonic()
                 
                 # V7: Compute spool lag
                 segments = self._reader.list_segments()
@@ -960,32 +1025,40 @@ class SpoolProcessorNode(Node):
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
+                
+                if self.config.enable_perf_logging:
+                    self._perf_time_list_segments += (time.monotonic() - t_list_segments_start) * 1000.0
 
                 # V7: Check lag thresholds and adaptive pacing (3-tier system)
                 if self.config.enable_adaptive_pacing:
+                    old_fps = self._current_target_fps
+                    old_interval = frame_interval
+                    
                     if spool_lag < DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD:
-                        # HEALTHY: < 5 segments - RELAX and save resources
-                        target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 20 FPS
+                        # HEALTHY: < 10 segments - RELAX and save resources
+                        target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 15 FPS
                         mode_emoji = "😌"
                         mode_text = "RELAXED - System healthy, conserving resources"
 
                     elif spool_lag <= DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD:
-                        # NORMAL: 5-15 segments - maintain default pace
+                        # NORMAL: 10-25 segments - maintain default pace
                         target_fps = DEFAULT_TARGET_FPS  # 30 FPS
                         mode_emoji = "✅"
                         mode_text = "NORMAL - Maintaining default pace"
 
                     else:
-                        # HIGH LAG: > 15 segments - SPEED UP to catch up
-                        target_fps = DEFAULT_ADAPTIVE_FPS_MAX  # 66 FPS (15ms intervals)
+                        # HIGH LAG: > 25 segments - SPEED UP to catch up
+                        target_fps = DEFAULT_ADAPTIVE_FPS_MAX  # 35 FPS (~28ms intervals)
                         mode_emoji = "🚀"
                         mode_text = "CATCHING UP - High lag detected"
 
                     # Only update if significant change
-                    if abs(self._current_target_fps - target_fps) > 0.1:
-                        old_fps = self._current_target_fps
+                    if abs(self._current_target_fps - target_fps) > ADAPTIVE_FPS_CHANGE_THRESHOLD:
                         self._current_target_fps = target_fps
                         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
+                        
+                        # V9: Reset next_deadline to avoid drift when changing FPS
+                        next_deadline = time.monotonic() + frame_interval
 
                         # Choose appropriate log level based on mode
                         log_func = logger.info if spool_lag < DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD else logger.warning
@@ -1018,8 +1091,14 @@ class SpoolProcessorNode(Node):
                             )
                     last_watchdog_check = current_monotonic
                 
+                # V9: Profiling - measure get_next_frame time
+                t_get_frame_start = time.monotonic()
+                
                 # Get next frame
                 frame = self._get_next_frame()
+                
+                if self.config.enable_perf_logging:
+                    self._perf_time_get_next_frame += (time.monotonic() - t_get_frame_start) * 1000.0
                 
                 if frame is None:
                     # Spool is empty, wait and retry
@@ -1029,20 +1108,24 @@ class SpoolProcessorNode(Node):
                     time.sleep(self.config.poll_interval)
                     with self._state_lock:
                         self._state = ProcessorRunState.PUBLISHING
+                    # V9: Reset deadline after long sleep
+                    next_deadline = time.monotonic() + frame_interval
                     continue
                 
                 self._current_frame = frame
                 self._current_frame_index = frame.index
                 
-                # V7.1: Adaptive frame rate pacing with robust interval guards
-                publish_start = time.monotonic()
+                # V9: Profiling - measure publish_frame time
+                t_publish_start = time.monotonic()
                 
                 # Publish frame (no ACK wait)
                 success = self._publish_frame(frame)
                 
-                # Calculate adaptive sleep based on actual processing time
+                if self.config.enable_perf_logging:
+                    self._perf_time_publish_frame += (time.monotonic() - t_publish_start) * 1000.0
+                
+                # V9: Tick-based pacing - calculate sleep time based on deadline
                 publish_end = time.monotonic()
-                processing_time = publish_end - last_publish_monotonic
                 
                 # Guard against negative or zero intervals
                 if frame_interval <= 0:
@@ -1052,16 +1135,34 @@ class SpoolProcessorNode(Node):
                     )
                     frame_interval = 0.025
                     self._current_target_fps = 40.0
+                    next_deadline = publish_end + frame_interval
                 
-                # V8: Ensure minimum frame interval to avoid CPU heat
-                # This guarantees at least min_frame_interval_ms between frames
-                # (min_interval_sec is pre-calculated outside the loop)
-                target_sleep = max(min_interval_sec, frame_interval - processing_time)
+                # V9: Calculate sleep time to hit next_deadline
+                time_until_deadline = next_deadline - publish_end
+                
+                # Determine target sleep time
+                # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
+                if time_until_deadline <= 0:
+                    # We're behind schedule - don't sleep at all to catch up
+                    target_sleep = 0
+                else:
+                    # We're ahead of schedule - sleep to hit deadline
+                    # Never sleep MORE than time_until_deadline (would miss deadline)
+                    # Prefer to sleep at least min_interval_sec (to prevent CPU spinning)
+                    # But if that would make us miss deadline, sleep less
+                    target_sleep = time_until_deadline
                 
                 if target_sleep > 0:
                     time.sleep(target_sleep)
                 
-                last_publish_monotonic = time.monotonic()
+                # V9: Update next_deadline for next frame (tick-based scheduling)
+                next_deadline += frame_interval
+                
+                # V9: If we're significantly behind schedule, reset deadline to current time
+                now = time.monotonic()
+                if now > next_deadline + frame_interval * MAX_FRAMES_BEHIND_BEFORE_RESET:
+                    # We're more than MAX_FRAMES_BEHIND_BEFORE_RESET frames behind - reset to avoid buildup
+                    next_deadline = now + frame_interval
                 
                 if success:
                     with self._stats_lock:
@@ -1071,6 +1172,16 @@ class SpoolProcessorNode(Node):
                         self._frames_skipped += 1
                     logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
                 
+                # V9: Performance profiling
+                if self.config.enable_perf_logging:
+                    loop_end = time.monotonic()
+                    self._perf_time_total_loop += (loop_end - loop_start) * 1000.0
+                    self._perf_frame_count += 1
+                    
+                    # Log performance metrics periodically
+                    if time.time() - self._last_perf_log_time >= self.config.perf_log_interval_sec:
+                        self._log_performance_metrics()
+                
                 # Log stats periodically
                 self._maybe_log_stats()
                 
@@ -1079,7 +1190,56 @@ class SpoolProcessorNode(Node):
                 import traceback
                 logger.debug(traceback.format_exc())
                 time.sleep(0.1)
+                # V9: Reset deadline after error
+                next_deadline = time.monotonic() + frame_interval
     
+
+
+    def _log_performance_metrics(self):
+        """
+        Log performance metrics for profiling (V9).
+        
+        Logs average timing for:
+        - list_segments
+        - get_next_frame
+        - publish_frame
+        - total_loop
+        
+        Also logs computed effective FPS and current adaptive target.
+        """
+        if self._perf_frame_count == 0:
+            return
+        
+        # Calculate averages
+        avg_list_segments = self._perf_time_list_segments / self._perf_frame_count
+        avg_get_next_frame = self._perf_time_get_next_frame / self._perf_frame_count
+        avg_publish_frame = self._perf_time_publish_frame / self._perf_frame_count
+        avg_total_loop = self._perf_time_total_loop / self._perf_frame_count
+        
+        # Calculate effective FPS based on actual time elapsed
+        time_elapsed = time.time() - self._last_perf_log_time
+        effective_fps = self._perf_frame_count / time_elapsed if time_elapsed > 0 else 0.0
+        
+        # Log performance metrics
+        logger.info(format_structured_log(
+            "[SpoolProcessor] 📊 Performance Metrics",
+            frames=self._perf_frame_count,
+            interval_sec=f"{time_elapsed:.2f}",
+            effective_fps=f"{effective_fps:.1f}",
+            target_fps=f"{self._current_target_fps:.1f}",
+            avg_list_segments_ms=f"{avg_list_segments:.2f}",
+            avg_get_next_frame_ms=f"{avg_get_next_frame:.2f}",
+            avg_publish_frame_ms=f"{avg_publish_frame:.2f}",
+            avg_total_loop_ms=f"{avg_total_loop:.2f}"
+        ))
+        
+        # Reset counters
+        self._perf_frame_count = 0
+        self._perf_time_list_segments = 0.0
+        self._perf_time_get_next_frame = 0.0
+        self._perf_time_publish_frame = 0.0
+        self._perf_time_total_loop = 0.0
+        self._last_perf_log_time = time.time()
 
 
     def _maybe_log_stats(self):
