@@ -31,7 +31,7 @@ def test_processor_config_has_perf_logging_fields():
     assert hasattr(config, 'perf_log_interval_sec'), "Config should have perf_log_interval_sec field"
     
     # Check defaults
-    assert config.enable_perf_logging == False, "Default enable_perf_logging should be False"
+    assert not config.enable_perf_logging, "Default enable_perf_logging should be False"
     assert config.perf_log_interval_sec == 2.0, "Default perf_log_interval_sec should be 2.0"
     
     print("✓ test_processor_config_has_perf_logging_fields passed")
@@ -46,7 +46,7 @@ def test_processor_config_perf_logging_can_be_enabled():
         perf_log_interval_sec=5.0
     )
     
-    assert config.enable_perf_logging == True, "enable_perf_logging should be True"
+    assert config.enable_perf_logging, "enable_perf_logging should be True"
     assert config.perf_log_interval_sec == 5.0, "perf_log_interval_sec should be 5.0"
     
     print("✓ test_processor_config_perf_logging_can_be_enabled passed")
