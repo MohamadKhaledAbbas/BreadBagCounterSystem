@@ -902,6 +902,108 @@ class TrackingConfig:
     """
     
     # --------------------------------------------------------------------------
+    # Kalman Filter for Centroid Prediction (V7 Enhancement)
+    # --------------------------------------------------------------------------
+    # Kalman Filter provides robust prediction during occlusion by estimating
+    # velocity and predicting position. This dramatically reduces overcounting
+    # caused by ID fragmentation during 3-10 frame occlusions.
+    
+    kalman_filter_enabled: bool = _parse_bool_env("KALMAN_FILTER_ENABLED", True)
+    """
+    Enable Kalman Filter for centroid prediction during association.
+    
+    When True: Uses Kalman Filter to predict centroid position based on velocity.
+    When False: Uses simple Euclidean distance with optional velocity scaling.
+    
+    Benefits:
+    - Survives 5+ frame occlusions by predicting bag location
+    - Reduces ghost ID creation from fragmentation
+    - Improves association accuracy during fast movements
+    - More robust than simple linear velocity extrapolation
+    
+    Environment: KALMAN_FILTER_ENABLED=true
+    
+    Default: True (V7 enhancement)
+    """
+    
+    kalman_process_noise: float = _parse_float_env("KALMAN_PROCESS_NOISE", 0.1)
+    """
+    Process noise covariance scalar for Kalman Filter.
+    
+    Higher values = filter adapts more quickly to changes in motion
+    Lower values = smoother predictions, slower adaptation
+    
+    Range: 0.01 - 1.0
+    - 0.01: Very smooth, slow to adapt (good for steady motion)
+    - 0.1: Balanced (recommended default)
+    - 0.5+: Very responsive, may be noisy
+    
+    Environment: KALMAN_PROCESS_NOISE=0.1
+    
+    Default: 0.1
+    """
+    
+    kalman_measurement_noise: float = _parse_float_env("KALMAN_MEASUREMENT_NOISE", 1.0)
+    """
+    Measurement noise covariance scalar for Kalman Filter.
+    
+    Higher values = trust predictions more than measurements
+    Lower values = trust measurements more than predictions
+    
+    Range: 0.1 - 10.0
+    - 0.5: Trust measurements heavily (good for accurate detections)
+    - 1.0: Balanced (recommended default)
+    - 5.0+: Trust predictions heavily (useful if detections are noisy)
+    
+    Environment: KALMAN_MEASUREMENT_NOISE=1.0
+    
+    Default: 1.0
+    """
+    
+    kalman_use_for_association: bool = _parse_bool_env("KALMAN_USE_FOR_ASSOCIATION", True)
+    """
+    Use Kalman Filter prediction for association distance calculation.
+    
+    When True: Association uses predicted centroid from Kalman Filter
+    When False: Association uses last observed centroid (Kalman only for velocity)
+    
+    Environment: KALMAN_USE_FOR_ASSOCIATION=true
+    
+    Default: True
+    """
+    
+    kalman_adaptive_threshold_enabled: bool = _parse_bool_env("KALMAN_ADAPTIVE_THRESHOLD_ENABLED", True)
+    """
+    Enable adaptive association threshold based on Kalman uncertainty.
+    
+    When True: Association distance threshold scales with prediction uncertainty
+    When False: Fixed association threshold used
+    
+    This allows larger association distances when the filter is less certain
+    (e.g., during long occlusions), improving recovery chances.
+    
+    Environment: KALMAN_ADAPTIVE_THRESHOLD_ENABLED=true
+    
+    Default: True
+    """
+    
+    kalman_uncertainty_scale_factor: float = _parse_float_env("KALMAN_UNCERTAINTY_SCALE_FACTOR", 2.0)
+    """
+    Scale factor for uncertainty-based threshold adjustment.
+    
+    effective_threshold = base_threshold + uncertainty * scale_factor
+    
+    Range: 1.0 - 5.0
+    - 1.0: Modest expansion based on uncertainty
+    - 2.0: Balanced (recommended)
+    - 3.0+: Aggressive expansion, may cause false associations
+    
+    Environment: KALMAN_UNCERTAINTY_SCALE_FACTOR=2.0
+    
+    Default: 2.0
+    """
+    
+    # --------------------------------------------------------------------------
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
     
@@ -2525,6 +2627,14 @@ def get_event_config():
         max_association_distance_px=tracking_config.max_association_distance_px,
         min_velocity_threshold=tracking_config.min_velocity_threshold,
         max_prediction_time_ms=tracking_config.max_prediction_time_ms,
+        
+        # Kalman Filter for centroid prediction (V7 Enhancement)
+        kalman_filter_enabled=tracking_config.kalman_filter_enabled,
+        kalman_process_noise=tracking_config.kalman_process_noise,
+        kalman_measurement_noise=tracking_config.kalman_measurement_noise,
+        kalman_use_for_association=tracking_config.kalman_use_for_association,
+        kalman_adaptive_threshold_enabled=tracking_config.kalman_adaptive_threshold_enabled,
+        kalman_uncertainty_scale_factor=tracking_config.kalman_uncertainty_scale_factor,
         
         # Hard constraints for preventing teleportation (Issue #1)
         max_jump_distance_px=tracking_config.max_jump_distance_px,

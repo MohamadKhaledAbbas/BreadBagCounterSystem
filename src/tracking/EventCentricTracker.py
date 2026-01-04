@@ -50,6 +50,244 @@ from src.config.tracking_config import tracking_config  # V4 Phase 3: For lazy_r
 
 
 # =============================================================================
+# Kalman Filter for Centroid Prediction (V7 Enhancement)
+# =============================================================================
+
+class KalmanFilter2D:
+    """
+    2D Kalman Filter for tracking centroid position with velocity estimation.
+    
+    State vector: [x, y, vx, vy] - position (x, y) and velocity (vx, vy)
+    Measurement vector: [x, y] - measured position
+    
+    The Kalman filter provides robust prediction during occlusion by:
+    1. Estimating velocity from past observations
+    2. Predicting position based on constant velocity model
+    3. Handling measurement noise to smooth trajectory
+    
+    Benefits for bread bag tracking:
+    - Survives 5+ frame occlusions by predicting bag location
+    - Reduces ghost ID creation from fragmentation
+    - Improves association accuracy during fast movements
+    
+    Usage:
+        kf = KalmanFilter2D(initial_x, initial_y, process_noise=0.1, measurement_noise=1.0)
+        kf.update(measured_x, measured_y, dt)  # Update with measurement
+        pred_x, pred_y = kf.predict(dt_ahead)  # Predict future position
+    """
+    
+    def __init__(
+        self,
+        initial_x: float,
+        initial_y: float,
+        process_noise: float = 0.1,
+        measurement_noise: float = 1.0,
+        initial_velocity_x: float = 0.0,
+        initial_velocity_y: float = 0.0,
+    ):
+        """
+        Initialize Kalman Filter with initial position.
+        
+        Args:
+            initial_x: Initial X position (pixels)
+            initial_y: Initial Y position (pixels)
+            process_noise: Process noise covariance scalar (Q scaling).
+                          Higher values = more responsive to changes, less smooth.
+                          Lower values = smoother predictions, slower to adapt.
+            measurement_noise: Measurement noise covariance scalar (R scaling).
+                              Higher values = trust predictions more than measurements.
+                              Lower values = trust measurements more.
+            initial_velocity_x: Initial X velocity estimate (pixels/ms)
+            initial_velocity_y: Initial Y velocity estimate (pixels/ms)
+        """
+        # State vector: [x, y, vx, vy]
+        self.state = np.array([
+            initial_x,
+            initial_y,
+            initial_velocity_x,
+            initial_velocity_y
+        ], dtype=np.float64)
+        
+        # State covariance matrix (initial uncertainty)
+        # Higher initial uncertainty for velocity since we don't know it
+        self.P = np.diag([1.0, 1.0, 10.0, 10.0])
+        
+        # Process noise covariance (Q) - scaled by time in predict step
+        self.process_noise = process_noise
+        
+        # Measurement noise covariance (R)
+        self.R = np.eye(2) * measurement_noise
+        
+        # Measurement matrix (H) - we only observe position
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float64)
+        
+        # Track last update time for dt calculation
+        self.last_update_time_ms: Optional[float] = None
+        
+        # Track whether filter has been updated at least once
+        self.initialized = False
+    
+    def _get_transition_matrix(self, dt: float) -> np.ndarray:
+        """
+        Get state transition matrix F for given time delta.
+        
+        Constant velocity model:
+        x' = x + vx * dt
+        y' = y + vy * dt
+        vx' = vx
+        vy' = vy
+        
+        Args:
+            dt: Time delta in milliseconds
+            
+        Returns:
+            4x4 state transition matrix
+        """
+        return np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float64)
+    
+    def _get_process_noise_matrix(self, dt: float) -> np.ndarray:
+        """
+        Get process noise covariance matrix Q for given time delta.
+        
+        Uses a simple model where process noise scales with dt^2 for position
+        and dt for velocity.
+        
+        Args:
+            dt: Time delta in milliseconds
+            
+        Returns:
+            4x4 process noise covariance matrix
+        """
+        q = self.process_noise
+        dt2 = dt * dt
+        dt3 = dt2 * dt / 2
+        dt4 = dt2 * dt2 / 4
+        
+        # Discrete noise model assuming constant acceleration noise
+        return np.array([
+            [dt4 * q, 0, dt3 * q, 0],
+            [0, dt4 * q, 0, dt3 * q],
+            [dt3 * q, 0, dt2 * q, 0],
+            [0, dt3 * q, 0, dt2 * q]
+        ], dtype=np.float64)
+    
+    def predict(self, dt: float) -> Tuple[float, float]:
+        """
+        Predict state ahead by dt milliseconds.
+        
+        This is a "peek" prediction that doesn't modify the internal state.
+        Use this to check where the filter predicts the object will be.
+        
+        Args:
+            dt: Time delta in milliseconds to predict ahead
+            
+        Returns:
+            Tuple of (predicted_x, predicted_y)
+        """
+        F = self._get_transition_matrix(dt)
+        predicted_state = F @ self.state
+        return (predicted_state[0], predicted_state[1])
+    
+    def update(
+        self, 
+        measured_x: float, 
+        measured_y: float, 
+        timestamp_ms: float
+    ) -> Tuple[float, float, float, float]:
+        """
+        Update filter with new measurement and advance state.
+        
+        Performs both prediction (to current time) and update (with measurement).
+        
+        Args:
+            measured_x: Measured X position (pixels)
+            measured_y: Measured Y position (pixels)
+            timestamp_ms: Current timestamp in milliseconds
+            
+        Returns:
+            Tuple of (estimated_x, estimated_y, estimated_vx, estimated_vy)
+        """
+        # Calculate dt from last update
+        if self.last_update_time_ms is not None:
+            dt = timestamp_ms - self.last_update_time_ms
+        else:
+            dt = 40.0  # Default ~25fps if first update
+        
+        # Clamp dt to reasonable range (avoid extreme values)
+        dt = max(1.0, min(dt, 1000.0))
+        
+        # Predict step
+        F = self._get_transition_matrix(dt)
+        Q = self._get_process_noise_matrix(dt)
+        
+        self.state = F @ self.state
+        self.P = F @ self.P @ F.T + Q
+        
+        # Update step
+        z = np.array([measured_x, measured_y])
+        y = z - self.H @ self.state  # Innovation
+        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
+        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        
+        self.last_update_time_ms = timestamp_ms
+        self.initialized = True
+        
+        return (self.state[0], self.state[1], self.state[2], self.state[3])
+    
+    def get_position(self) -> Tuple[float, float]:
+        """Get current estimated position."""
+        return (self.state[0], self.state[1])
+    
+    def get_velocity(self) -> Tuple[float, float]:
+        """Get current estimated velocity (pixels/ms)."""
+        return (self.state[2], self.state[3])
+    
+    def get_velocity_magnitude(self) -> float:
+        """Get magnitude of velocity (pixels/ms)."""
+        return math.sqrt(self.state[2]**2 + self.state[3]**2)
+    
+    def get_position_uncertainty(self) -> float:
+        """
+        Get position uncertainty (standard deviation).
+        
+        Returns the average of X and Y position standard deviations.
+        Useful for adaptive association thresholds.
+        """
+        return math.sqrt((self.P[0, 0] + self.P[1, 1]) / 2)
+    
+    def predict_with_uncertainty(self, dt: float) -> Tuple[float, float, float]:
+        """
+        Predict position with uncertainty estimate.
+        
+        Args:
+            dt: Time delta in milliseconds
+            
+        Returns:
+            Tuple of (predicted_x, predicted_y, position_uncertainty)
+        """
+        F = self._get_transition_matrix(dt)
+        Q = self._get_process_noise_matrix(dt)
+        
+        predicted_state = F @ self.state
+        predicted_P = F @ self.P @ F.T + Q
+        
+        uncertainty = math.sqrt((predicted_P[0, 0] + predicted_P[1, 1]) / 2)
+        
+        return (predicted_state[0], predicted_state[1], uncertainty)
+
+
+# =============================================================================
 # V4 Phase 3: Vectorized IoU Computation
 # =============================================================================
 
@@ -198,6 +436,89 @@ class EventConfig:
     max_association_distance_px: float = 180.0  # Absolute max association distance (reduced from 250.0)
     min_velocity_threshold: float = 0.01    # Min velocity (px/ms) to trigger scaling
     max_prediction_time_ms: float = 500.0   # Max time ahead to predict centroid
+    
+    # ==========================================================================
+    # Kalman Filter for Centroid Prediction (V7 Enhancement)
+    # ==========================================================================
+    # Kalman Filter provides robust prediction during occlusion by estimating
+    # velocity and predicting position. This dramatically reduces overcounting
+    # caused by ID fragmentation during 3-10 frame occlusions.
+    kalman_filter_enabled: bool = True
+    """Enable Kalman Filter for centroid prediction during association.
+    
+    When True: Uses Kalman Filter to predict centroid position based on velocity.
+    When False: Uses simple Euclidean distance with optional velocity scaling.
+    
+    Benefits:
+    - Survives 5+ frame occlusions by predicting bag location
+    - Reduces ghost ID creation from fragmentation
+    - Improves association accuracy during fast movements
+    - More robust than simple linear velocity extrapolation
+    
+    Default: True (V7 enhancement)
+    """
+    
+    kalman_process_noise: float = 0.1
+    """Process noise covariance scalar for Kalman Filter.
+    
+    Higher values = filter adapts more quickly to changes in motion
+    Lower values = smoother predictions, slower adaptation
+    
+    Range: 0.01 - 1.0
+    - 0.01: Very smooth, slow to adapt (good for steady motion)
+    - 0.1: Balanced (recommended default)
+    - 0.5+: Very responsive, may be noisy
+    
+    Default: 0.1
+    """
+    
+    kalman_measurement_noise: float = 1.0
+    """Measurement noise covariance scalar for Kalman Filter.
+    
+    Higher values = trust predictions more than measurements
+    Lower values = trust measurements more than predictions
+    
+    Range: 0.1 - 10.0
+    - 0.5: Trust measurements heavily (good for accurate detections)
+    - 1.0: Balanced (recommended default)
+    - 5.0+: Trust predictions heavily (useful if detections are noisy)
+    
+    Default: 1.0
+    """
+    
+    kalman_use_for_association: bool = True
+    """Use Kalman Filter prediction for association distance calculation.
+    
+    When True: Association uses predicted centroid from Kalman Filter
+    When False: Association uses last observed centroid (Kalman only for velocity)
+    
+    Default: True
+    """
+    
+    kalman_adaptive_threshold_enabled: bool = True
+    """Enable adaptive association threshold based on Kalman uncertainty.
+    
+    When True: Association distance threshold scales with prediction uncertainty
+    When False: Fixed association threshold used
+    
+    This allows larger association distances when the filter is less certain
+    (e.g., during long occlusions), improving recovery chances.
+    
+    Default: True
+    """
+    
+    kalman_uncertainty_scale_factor: float = 2.0
+    """Scale factor for uncertainty-based threshold adjustment.
+    
+    effective_threshold = base_threshold + uncertainty * scale_factor
+    
+    Range: 1.0 - 5.0
+    - 1.0: Modest expansion based on uncertainty
+    - 2.0: Balanced (recommended)
+    - 3.0+: Aggressive expansion, may cause false associations
+    
+    Default: 2.0
+    """
     
     # Hard constraints for preventing teleportation (Issue #1 fix)
     max_jump_distance_px: float = 200.0
@@ -738,6 +1059,20 @@ class BreadBagEvent:
         self.frames_out_of_zone = 0
         self.out_of_zone_since_ms: Optional[float] = None
         
+        # Kalman Filter for centroid prediction (V7 Enhancement)
+        self.kalman_filter: Optional[KalmanFilter2D] = None
+        if self.config.kalman_filter_enabled:
+            self.kalman_filter = KalmanFilter2D(
+                initial_x=initial_detection.centroid_x,
+                initial_y=initial_detection.centroid_y,
+                process_noise=self.config.kalman_process_noise,
+                measurement_noise=self.config.kalman_measurement_noise,
+            )
+        
+        # ROI count tracking (initialized here, updated in _try_collect_roi)
+        self.open_roi_count = 0
+        self.closed_roi_count = 0
+        
         # Log event creation
         structured_logger.event_created(
             event_id=self.id,
@@ -858,10 +1193,28 @@ class BreadBagEvent:
     
     def predict_centroid(self, target_time_ms: float) -> Tuple[float, float]:
         """
-        Predict centroid position at target_time using velocity.
+        Predict centroid position at target_time using Kalman Filter or velocity.
         
-        This helps with association during fast movements (flip/throw).
+        V7 Enhancement: Uses Kalman Filter for robust prediction when enabled.
+        Falls back to simple linear velocity extrapolation when disabled.
+        
+        This helps with association during fast movements (flip/throw) and
+        occlusion scenarios (hand covering bag for several frames).
+        
+        Args:
+            target_time_ms: Target timestamp in milliseconds
+            
+        Returns:
+            Tuple of (predicted_x, predicted_y)
         """
+        # V7: Use Kalman Filter for prediction when enabled
+        if self.config.kalman_filter_enabled and self.kalman_filter is not None:
+            dt = target_time_ms - self.last_detection_time_ms
+            # Clamp dt to reasonable range
+            dt = max(0.0, min(dt, self.config.max_prediction_time_ms))
+            return self.kalman_filter.predict(dt)
+        
+        # Fallback to simple linear velocity extrapolation
         if len(self.centroid_history) < 2:
             return self.last_centroid
         
@@ -875,6 +1228,33 @@ class BreadBagEvent:
         pred_y = self.last_centroid[1] + vy * dt
         
         return (pred_x, pred_y)
+    
+    def predict_centroid_with_uncertainty(self, target_time_ms: float) -> Tuple[float, float, float]:
+        """
+        V7: Predict centroid position with uncertainty estimate.
+        
+        Uses Kalman Filter to provide both position prediction and uncertainty.
+        Uncertainty is useful for adaptive association thresholds.
+        
+        Args:
+            target_time_ms: Target timestamp in milliseconds
+            
+        Returns:
+            Tuple of (predicted_x, predicted_y, uncertainty_px)
+            - uncertainty_px: Position uncertainty in pixels (std dev)
+        """
+        if self.config.kalman_filter_enabled and self.kalman_filter is not None:
+            dt = target_time_ms - self.last_detection_time_ms
+            dt = max(0.0, min(dt, self.config.max_prediction_time_ms))
+            return self.kalman_filter.predict_with_uncertainty(dt)
+        
+        # Fallback: use simple prediction with fixed uncertainty
+        pred_x, pred_y = self.predict_centroid(target_time_ms)
+        # Default uncertainty based on time since last detection
+        dt = target_time_ms - self.last_detection_time_ms
+        # Simple heuristic: uncertainty grows with time at ~0.1 pixels/ms
+        uncertainty = min(dt * 0.1, 50.0)  # Cap at 50 pixels
+        return (pred_x, pred_y, uncertainty)
     
     def _compute_iou(self, box1: Tuple[float, float, float, float], 
                      box2: Tuple[float, float, float, float]) -> float:
@@ -953,6 +1333,11 @@ class BreadBagEvent:
         3. Area ratio gate (cheap) 
         4. IOU computation (expensive - only if above pass)
         
+        V7 ENHANCEMENT: Kalman Filter prediction
+        - Uses Kalman Filter for centroid prediction when enabled
+        - Provides adaptive association threshold based on prediction uncertainty
+        - Significantly improves association during occlusion (5+ frames)
+        
         This approach provides:
         - Early rejection of most candidates (cheap checks first)
         - IOU only computed on viable candidates
@@ -989,12 +1374,13 @@ class BreadBagEvent:
             return False, 0.0, reason, 0.0
         
         # ==========================================================================
-        # STAGE 2: Centroid distance gate (cheap)
+        # STAGE 2: Centroid distance gate (cheap) - V7: With Kalman Filter enhancement
         # ==========================================================================
         # Calculate base association distance threshold
         base_distance_threshold = self.config.association_distance_px
         scaled_threshold = base_distance_threshold
         velocity_mag = 0.0
+        kalman_uncertainty = 0.0
         
         # Velocity-based scaling: increase threshold for fast-moving bags
         if self.config.velocity_scaling_enabled:
@@ -1016,8 +1402,33 @@ class BreadBagEvent:
         distance_to_last = math.sqrt(dx*dx + dy*dy)
         distance = distance_to_last
         
-        # Also try distance to predicted position (for fast movements)
-        if self.config.velocity_scaling_enabled and len(self.centroid_history) >= 2:
+        # V7: Use Kalman Filter prediction for association
+        if self.config.kalman_filter_enabled and self.config.kalman_use_for_association:
+            # Get Kalman prediction with uncertainty
+            pred_x, pred_y, kalman_uncertainty = self.predict_centroid_with_uncertainty(
+                detection.timestamp_ms
+            )
+            
+            # Calculate distance to Kalman predicted position
+            dx_kalman = det_centroid[0] - pred_x
+            dy_kalman = det_centroid[1] - pred_y
+            distance_to_kalman = math.sqrt(dx_kalman*dx_kalman + dy_kalman*dy_kalman)
+            
+            # Use smaller of distances (Kalman prediction or last centroid)
+            distance = min(distance_to_last, distance_to_kalman)
+            
+            # V7: Apply adaptive threshold based on Kalman uncertainty
+            if self.config.kalman_adaptive_threshold_enabled and kalman_uncertainty > 0:
+                # Expand threshold based on uncertainty
+                uncertainty_expansion = kalman_uncertainty * self.config.kalman_uncertainty_scale_factor
+                # Don't expand beyond max_association_distance_px
+                adaptive_threshold = min(
+                    scaled_threshold + uncertainty_expansion,
+                    self.config.max_association_distance_px
+                )
+                scaled_threshold = adaptive_threshold
+        elif self.config.velocity_scaling_enabled and len(self.centroid_history) >= 2:
+            # Fallback to simple velocity-based prediction
             pred_centroid = self.predict_centroid(detection.timestamp_ms)
             dx_pred = det_centroid[0] - pred_centroid[0]
             dy_pred = det_centroid[1] - pred_centroid[1]
@@ -1221,6 +1632,14 @@ class BreadBagEvent:
                 # Keep velocity history bounded
                 if len(self.velocity_history) > 10:
                     self.velocity_history = self.velocity_history[-10:]
+        
+        # V7: Update Kalman Filter with new measurement
+        if self.config.kalman_filter_enabled and self.kalman_filter is not None:
+            self.kalman_filter.update(
+                measured_x=detection.centroid_x,
+                measured_y=detection.centroid_y,
+                timestamp_ms=detection.timestamp_ms
+            )
         
         # Update spatial tracking
         self.last_centroid = (detection.centroid_x, detection.centroid_y)
