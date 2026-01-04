@@ -109,13 +109,13 @@ ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
 DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
 
-# Add new constants at the top (around line 94-111)
+# V9: Pacing and adaptive thresholds
 DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 10  # Less than this = healthy, relax
-DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 5-25 = normal pace
-# Above 15 = high lag, speed up
-
+DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 10-25 = normal pace
 DEFAULT_ADAPTIVE_FPS_RELAXED = 15.0  # Healthy state - save resources
-DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (15ms min interval)
+DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (~28ms intervals)
+MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
+ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
 
 @dataclass
 class ProcessorConfig:
@@ -883,6 +883,10 @@ class SpoolProcessorNode(Node):
             
             # V9: Optimize frame data assignment - avoid expensive list() conversion
             # Try to assign bytes directly, fallback to list if needed for compatibility
+            # Note: ROS2 message field 'data' should accept bytes or sequence types.
+            # If the H26XFrame.data field type is defined as 'sequence<uint8>', 
+            # it should accept bytes directly. The fallback ensures compatibility
+            # with any message definition that requires a list.
             try:
                 # Attempt direct bytes assignment (most efficient)
                 frame_msg.data = frame_data
@@ -1050,7 +1054,7 @@ class SpoolProcessorNode(Node):
                         mode_text = "CATCHING UP - High lag detected"
 
                     # Only update if significant change
-                    if abs(self._current_target_fps - target_fps) > 0.1:
+                    if abs(self._current_target_fps - target_fps) > ADAPTIVE_FPS_CHANGE_THRESHOLD:
                         self._current_target_fps = target_fps
                         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
                         
@@ -1147,8 +1151,8 @@ class SpoolProcessorNode(Node):
                 
                 # V9: If we're significantly behind schedule, reset deadline to current time
                 now = time.monotonic()
-                if now > next_deadline + frame_interval * 2:
-                    # We're more than 2 frames behind - reset to avoid buildup
+                if now > next_deadline + frame_interval * MAX_FRAMES_BEHIND_BEFORE_RESET:
+                    # We're more than MAX_FRAMES_BEHIND_BEFORE_RESET frames behind - reset to avoid buildup
                     next_deadline = now + frame_interval
                 
                 if success:
