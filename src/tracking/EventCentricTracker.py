@@ -53,6 +53,10 @@ from src.config.tracking_config import tracking_config  # V4 Phase 3: For lazy_r
 # Kalman Filter for Centroid Prediction (V7 Enhancement)
 # =============================================================================
 
+# Default frame interval for Kalman Filter (25fps = 40ms)
+DEFAULT_FRAME_INTERVAL_MS = 40.0
+
+
 class KalmanFilter2D:
     """
     2D Kalman Filter for tracking centroid position with velocity estimation.
@@ -219,7 +223,7 @@ class KalmanFilter2D:
         if self.last_update_time_ms is not None:
             dt = timestamp_ms - self.last_update_time_ms
         else:
-            dt = 40.0  # Default ~25fps if first update
+            dt = DEFAULT_FRAME_INTERVAL_MS  # Default ~25fps if first update
         
         # Clamp dt to reasonable range (avoid extreme values)
         dt = max(1.0, min(dt, 1000.0))
@@ -235,10 +239,13 @@ class KalmanFilter2D:
         z = np.array([measured_x, measured_y])
         y = z - self.H @ self.state  # Innovation
         S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        # Use np.linalg.solve for better numerical stability than np.linalg.inv
+        K = np.linalg.solve(S.T, (self.P @ self.H.T).T).T  # Kalman gain
         
         self.state = self.state + K @ y
-        self.P = (np.eye(4) - K @ self.H) @ self.P
+        # Joseph form for covariance update (numerically stable)
+        IKH = np.eye(4) - K @ self.H
+        self.P = IKH @ self.P @ IKH.T + K @ self.R @ K.T
         
         self.last_update_time_ms = timestamp_ms
         self.initialized = True
