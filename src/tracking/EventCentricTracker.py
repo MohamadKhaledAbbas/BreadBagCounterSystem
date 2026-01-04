@@ -530,7 +530,10 @@ class EventConfig:
     # Hard constraints for preventing teleportation (Issue #1 fix)
     max_jump_distance_px: float = 200.0
     """Hard cap on centroid jump distance, even if IoU/expanded IoU passes.
-    Prevents events from teleporting to distant detections during crowded scenes."""
+    Prevents events from teleporting to distant detections during crowded scenes.
+    
+    Note: This is the BASE value. For fast-moving bags, this is scaled up
+    based on velocity when velocity_adaptive_jump_enabled=True."""
     
     require_centroid_proximity_for_expanded_iou: bool = True
     """When True, expanded IoU associations still require reasonable centroid distance.
@@ -538,6 +541,86 @@ class EventConfig:
     
     max_centroid_distance_for_expanded_iou: float = 250.0
     """Maximum centroid distance allowed for expanded IoU associations (px)."""
+    
+    # ==========================================================================
+    # Velocity-Adaptive Jump Distance (V7.1 - Fast Throw Handling)
+    # ==========================================================================
+    # These parameters enable adaptive jump distance for fast-moving bags.
+    # When a bag is thrown, the jump distance limit scales with velocity
+    # to allow tracking while still preventing teleportation to nearby bags.
+    
+    velocity_adaptive_jump_enabled: bool = True
+    """Enable velocity-adaptive maximum jump distance.
+    
+    When True: max_jump = base_max_jump + velocity * time_gap * scale_factor
+    When False: Fixed max_jump_distance_px used
+    
+    This allows fast-thrown bags to be tracked while preventing false
+    associations to nearby stationary bags.
+    
+    Default: True
+    """
+    
+    velocity_adaptive_jump_scale: float = 1.5
+    """Scale factor for velocity-based jump distance expansion.
+    
+    effective_max_jump = max_jump_distance_px + velocity_magnitude * time_gap * scale
+    
+    Range: 1.0 - 3.0
+    - 1.0: Conservative expansion (prevents some false associations)
+    - 1.5: Balanced (recommended)
+    - 2.0+: Aggressive, may cause false associations to nearby bags
+    
+    Default: 1.5
+    """
+    
+    velocity_adaptive_jump_max: float = 400.0
+    """Absolute maximum jump distance regardless of velocity (pixels).
+    
+    This is a hard ceiling to prevent unreasonable jump distances
+    even for very fast-thrown bags.
+    
+    Range: 300 - 600
+    Default: 400.0
+    """
+    
+    motion_direction_validation_enabled: bool = True
+    """Enable motion direction validation for associations.
+    
+    When True: For fast-moving bags, validates that the detection is 
+    roughly in the direction of motion (within a cone around the
+    velocity vector). This prevents tracking from jumping to a 
+    different nearby bag when a thrown bag leaves the scene.
+    
+    Default: True
+    """
+    
+    motion_direction_cone_angle_deg: float = 90.0
+    """Maximum angle (degrees) between velocity vector and detection direction.
+    
+    A detection must be within this angle of the predicted motion direction
+    to be considered a valid association for fast-moving objects.
+    
+    Range: 45 - 120
+    - 45: Strict, only accepts detections closely aligned with motion
+    - 90: Balanced (accepts detections in a hemisphere around motion direction)
+    - 120: Lenient, allows significant deviation from motion direction
+    
+    Default: 90.0 (hemisphere)
+    """
+    
+    motion_direction_min_velocity: float = 0.3
+    """Minimum velocity (pixels/ms) to apply motion direction validation.
+    
+    Direction validation only applies when the object is moving faster
+    than this threshold. Below this, the object is considered stationary
+    and direction is not checked.
+    
+    0.3 px/ms = 300 px/s = significant deliberate movement
+    
+    Range: 0.1 - 0.5
+    Default: 0.3
+    """
     
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
@@ -1491,12 +1574,67 @@ class BreadBagEvent:
             # Note: Detailed IoU calculation debug removed to reduce log flooding
             # IoU values are logged in the hybrid_association_attempt call below
         
-        # ISSUE #1 FIX: Hard cap on centroid jump distance
+        # V7.1: Calculate velocity-adaptive max jump distance for fast-thrown bags
+        effective_max_jump = self.config.max_jump_distance_px
+        if self.config.velocity_adaptive_jump_enabled and velocity_mag > self.config.min_velocity_threshold:
+            # Scale max jump based on velocity and time gap
+            velocity_jump_expansion = velocity_mag * time_gap_ms * self.config.velocity_adaptive_jump_scale
+            effective_max_jump = min(
+                self.config.max_jump_distance_px + velocity_jump_expansion,
+                self.config.velocity_adaptive_jump_max
+            )
+        
+        # V7.1: Motion direction validation for fast-moving bags
+        # This prevents association with nearby bags when the tracked bag moves away
+        direction_valid = True
+        if (self.config.motion_direction_validation_enabled and 
+            velocity_mag >= self.config.motion_direction_min_velocity and
+            distance_to_last > self.config.association_distance_px):
+            # For fast-moving bags with large jumps, validate motion direction
+            # Get velocity direction from Kalman filter or centroid history
+            vx, vy = self.get_velocity()
+            if abs(vx) > 0.001 or abs(vy) > 0.001:  # Velocity is significant
+                # Calculate angle between velocity vector and detection direction
+                # Reuse velocity_mag calculated earlier instead of recalculating
+                dx_det = det_centroid[0] - self.last_centroid[0]
+                dy_det = det_centroid[1] - self.last_centroid[1]
+                
+                # Normalize vectors
+                if distance_to_last > 0.001 and velocity_mag > 0.001:
+                    # Dot product to find angle between velocity and detection direction
+                    dot_product = (vx * dx_det + vy * dy_det) / (velocity_mag * distance_to_last)
+                    # Clamp to avoid numerical issues with acos
+                    dot_product = max(-1.0, min(1.0, dot_product))
+                    angle_rad = math.acos(dot_product)
+                    angle_deg = math.degrees(angle_rad)
+                    
+                    # Check if detection is within the motion cone
+                    if angle_deg > self.config.motion_direction_cone_angle_deg:
+                        direction_valid = False
+                        # Log direction validation failure for debugging
+                        logger.debug(
+                            f"[Event:{self.id}] Direction validation failed: "
+                            f"angle={angle_deg:.1f}° > max={self.config.motion_direction_cone_angle_deg}°"
+                        )
+        
+        # ISSUE #1 FIX: Hard cap on centroid jump distance (now velocity-adaptive)
         # This prevents teleportation even if IoU/expanded IoU allows it
-        if distance_to_last > self.config.max_jump_distance_px:
+        if distance_to_last > effective_max_jump:
             match_type = "jump_distance_exceeded"
             metrics_detail = (
-                f"dist={distance_to_last:.1f}px > max_jump={self.config.max_jump_distance_px}px"
+                f"dist={distance_to_last:.1f}px > max_jump={effective_max_jump:.1f}px "
+                f"(base={self.config.max_jump_distance_px}px, vel={velocity_mag:.3f}px/ms)"
+            )
+            reason = f"{match_type} ({metrics_detail})"
+            return False, distance_to_last, reason, iou_value
+        
+        # V7.1: Reject if motion direction validation fails
+        if not direction_valid:
+            match_type = "direction_validation_failed"
+            vx, vy = self.get_velocity()
+            metrics_detail = (
+                f"dist={distance_to_last:.1f}px, velocity=({vx:.3f}, {vy:.3f})px/ms, "
+                f"detection not in motion cone"
             )
             reason = f"{match_type} ({metrics_detail})"
             return False, distance_to_last, reason, iou_value

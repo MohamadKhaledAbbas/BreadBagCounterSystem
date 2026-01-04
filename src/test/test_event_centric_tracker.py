@@ -2846,3 +2846,129 @@ class TestKalmanFilterOcclusionRecovery:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# =============================================================================
+# Velocity-Adaptive Jump and Motion Direction Tests (V7.1)
+# =============================================================================
+
+class TestVelocityAdaptiveJump:
+    """Tests for velocity-adaptive jump distance (V7.1 - Fast throw handling)."""
+    
+    @pytest.fixture
+    def fast_throw_config(self):
+        """Create EventConfig for testing fast throw handling."""
+        return EventConfig(
+            association_distance_px=80.0,
+            association_time_ms=400.0,
+            max_association_distance_px=180.0,
+            kalman_filter_enabled=True,
+            kalman_process_noise=0.1,
+            kalman_measurement_noise=1.0,
+            max_jump_distance_px=200.0,
+            velocity_adaptive_jump_enabled=True,
+            velocity_adaptive_jump_scale=1.5,
+            velocity_adaptive_jump_max=400.0,
+            motion_direction_validation_enabled=True,
+            motion_direction_cone_angle_deg=90.0,
+            motion_direction_min_velocity=0.3,
+            ghost_timeout_ms=1000.0,
+            velocity_scaling_enabled=True,
+            min_velocity_threshold=0.01,
+        )
+    
+    def test_velocity_adaptive_jump_allows_fast_movement(self, fast_throw_config):
+        """Fast-moving bags should not be rejected by jump distance check when velocity is high."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, fast_throw_config, open_class_id=1, closed_class_id=0)
+        
+        # Establish high velocity (moving fast to the right)
+        event.add_detection(create_evidence(40.0, 180, 100, is_open=True, frame_index=1))  
+        event.add_detection(create_evidence(80.0, 260, 100, is_open=True, frame_index=2))
+        
+        # Detection at ~250px from last position (beyond base max_jump=200)
+        # But velocity is high, so adaptive jump should allow it
+        # This should NOT be rejected by jump_distance_exceeded
+        far_detection = create_evidence(120.0, 500, 100, is_open=True, frame_index=3)
+        
+        can_assoc, distance, reason, _ = event.can_associate(far_detection)
+        
+        # The key test: it should NOT fail due to "jump_distance_exceeded"
+        # With velocity_adaptive_jump_enabled, the max jump scales with velocity
+        # Velocity ~2 px/ms, time_gap=40ms, scale=1.5 -> expansion = 2*40*1.5 = 120px
+        # effective_max_jump = 200 + 120 = 320px
+        # distance=240px < 320px -> passes jump check
+        # It may fail for other reasons (centroid/IoU threshold) but NOT jump distance
+        assert "jump_distance_exceeded" not in reason
+    
+    def test_motion_direction_blocks_wrong_direction(self, fast_throw_config):
+        """Detection in wrong direction should be rejected for fast movement."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, fast_throw_config, open_class_id=1, closed_class_id=0)
+        
+        # Establish velocity: moving right (+X direction)
+        event.add_detection(create_evidence(40.0, 200, 100, is_open=True, frame_index=1))
+        event.add_detection(create_evidence(80.0, 300, 100, is_open=True, frame_index=2))
+        
+        # Detection in OPPOSITE direction (left of last position)
+        # This could be a different nearby bag - should be rejected
+        wrong_direction_detection = create_evidence(120.0, 200, 100, is_open=True, frame_index=3)
+        
+        can_assoc, distance, reason, _ = event.can_associate(wrong_direction_detection)
+        
+        # Should be rejected due to direction validation (detection is in opposite direction)
+        # The bag was moving right, but detection is to the left
+        assert can_assoc is False or "direction" in reason.lower()
+    
+    def test_motion_direction_allows_correct_direction(self, fast_throw_config):
+        """Detection in correct direction should be accepted for fast movement."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, fast_throw_config, open_class_id=1, closed_class_id=0)
+        
+        # Establish velocity: moving right (+X direction)
+        event.add_detection(create_evidence(40.0, 150, 100, is_open=True, frame_index=1))
+        event.add_detection(create_evidence(80.0, 200, 100, is_open=True, frame_index=2))
+        
+        # Detection further right (same direction as motion)
+        correct_direction_detection = create_evidence(120.0, 250, 100, is_open=True, frame_index=3)
+        
+        can_assoc, distance, reason, _ = event.can_associate(correct_direction_detection)
+        
+        # Should be accepted - detection is in the direction of motion
+        assert can_assoc is True
+    
+    def test_slow_movement_ignores_direction_validation(self, fast_throw_config):
+        """Slow movements should not trigger direction validation."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, fast_throw_config, open_class_id=1, closed_class_id=0)
+        
+        # Slow movement (5px in 40ms = 0.125 px/ms < 0.3 px/ms threshold)
+        event.add_detection(create_evidence(40.0, 105, 100, is_open=True, frame_index=1))
+        event.add_detection(create_evidence(80.0, 110, 100, is_open=True, frame_index=2))
+        
+        # Detection in any direction should be allowed for slow movement
+        detection = create_evidence(120.0, 105, 100, is_open=True, frame_index=3)
+        
+        can_assoc, distance, reason, _ = event.can_associate(detection)
+        
+        # Should be accepted - slow movement doesn't trigger direction check
+        assert can_assoc is True
+    
+    def test_adaptive_jump_respects_absolute_maximum(self, fast_throw_config):
+        """Velocity-adaptive jump should not exceed absolute maximum."""
+        evidence = create_evidence(0.0, 100, 100, is_open=True)
+        event = BreadBagEvent(evidence, fast_throw_config, open_class_id=1, closed_class_id=0)
+        
+        # Extremely fast movement (would exceed absolute max if not capped)
+        event.add_detection(create_evidence(20.0, 400, 100, is_open=True, frame_index=1))
+        event.add_detection(create_evidence(40.0, 700, 100, is_open=True, frame_index=2))
+        
+        # Detection way beyond even adaptive max
+        too_far_detection = create_evidence(60.0, 1200, 100, is_open=True, frame_index=3)
+        
+        can_assoc, distance, reason, _ = event.can_associate(too_far_detection)
+        
+        # Should be rejected - 500px distance > 400px absolute max
+        assert can_assoc is False
+        assert "jump_distance_exceeded" in reason
+

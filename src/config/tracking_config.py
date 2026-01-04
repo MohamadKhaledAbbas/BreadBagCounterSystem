@@ -839,6 +839,9 @@ class TrackingConfig:
     centroid moves more than this distance. This prevents events from
     teleporting to distant detections during crowded scenes with multiple bags.
     
+    Note: This is the BASE value. For fast-moving bags, this is scaled up
+    based on velocity when velocity_adaptive_jump_enabled=True.
+    
     Range: 150 - 300 pixels
     - Lower values: Stricter, may lose track during very fast movements
     - Higher values: More lenient, may allow teleportation
@@ -878,6 +881,106 @@ class TrackingConfig:
     allow unreasonable jumps.
     
     Default: 250.0
+    """
+    
+    # --------------------------------------------------------------------------
+    # Velocity-Adaptive Jump Distance (V7.1 - Fast Throw Handling)
+    # --------------------------------------------------------------------------
+    # These parameters enable adaptive jump distance for fast-moving bags.
+    # When a bag is thrown, the jump distance limit scales with velocity
+    # to allow tracking while still preventing teleportation to nearby bags.
+    
+    velocity_adaptive_jump_enabled: bool = _parse_bool_env("VELOCITY_ADAPTIVE_JUMP_ENABLED", True)
+    """
+    Enable velocity-adaptive maximum jump distance.
+    
+    When True: max_jump = base_max_jump + velocity * time_gap * scale_factor
+    When False: Fixed max_jump_distance_px used
+    
+    This allows fast-thrown bags to be tracked while preventing false
+    associations to nearby stationary bags.
+    
+    Environment: VELOCITY_ADAPTIVE_JUMP_ENABLED=true
+    
+    Default: True
+    """
+    
+    velocity_adaptive_jump_scale: float = _parse_float_env("VELOCITY_ADAPTIVE_JUMP_SCALE", 1.5)
+    """
+    Scale factor for velocity-based jump distance expansion.
+    
+    effective_max_jump = max_jump_distance_px + velocity_magnitude * time_gap * scale
+    
+    Range: 1.0 - 3.0
+    - 1.0: Conservative expansion (prevents some false associations)
+    - 1.5: Balanced (recommended)
+    - 2.0+: Aggressive, may cause false associations to nearby bags
+    
+    Environment: VELOCITY_ADAPTIVE_JUMP_SCALE=1.5
+    
+    Default: 1.5
+    """
+    
+    velocity_adaptive_jump_max: float = _parse_float_env("VELOCITY_ADAPTIVE_JUMP_MAX", 400.0)
+    """
+    Absolute maximum jump distance regardless of velocity (pixels).
+    
+    This is a hard ceiling to prevent unreasonable jump distances
+    even for very fast-thrown bags.
+    
+    Range: 300 - 600
+    
+    Environment: VELOCITY_ADAPTIVE_JUMP_MAX=400.0
+    
+    Default: 400.0
+    """
+    
+    motion_direction_validation_enabled: bool = _parse_bool_env("MOTION_DIRECTION_VALIDATION_ENABLED", True)
+    """
+    Enable motion direction validation for associations.
+    
+    When True: For fast-moving bags, validates that the detection is 
+    roughly in the direction of motion (within a cone around the
+    velocity vector). This prevents tracking from jumping to a 
+    different nearby bag when a thrown bag leaves the scene.
+    
+    Environment: MOTION_DIRECTION_VALIDATION_ENABLED=true
+    
+    Default: True
+    """
+    
+    motion_direction_cone_angle_deg: float = _parse_float_env("MOTION_DIRECTION_CONE_ANGLE_DEG", 90.0)
+    """
+    Maximum angle (degrees) between velocity vector and detection direction.
+    
+    A detection must be within this angle of the predicted motion direction
+    to be considered a valid association for fast-moving objects.
+    
+    Range: 45 - 120
+    - 45: Strict, only accepts detections closely aligned with motion
+    - 90: Balanced (accepts detections in a hemisphere around motion direction)
+    - 120: Lenient, allows significant deviation from motion direction
+    
+    Environment: MOTION_DIRECTION_CONE_ANGLE_DEG=90.0
+    
+    Default: 90.0 (hemisphere)
+    """
+    
+    motion_direction_min_velocity: float = _parse_float_env("MOTION_DIRECTION_MIN_VELOCITY", 0.3)
+    """
+    Minimum velocity (pixels/ms) to apply motion direction validation.
+    
+    Direction validation only applies when the object is moving faster
+    than this threshold. Below this, the object is considered stationary
+    and direction is not checked.
+    
+    0.3 px/ms = 300 px/s = significant deliberate movement
+    
+    Range: 0.1 - 0.5
+    
+    Environment: MOTION_DIRECTION_MIN_VELOCITY=0.3
+    
+    Default: 0.3
     """
     
     min_velocity_threshold: float = 0.01
@@ -2640,6 +2743,14 @@ def get_event_config():
         max_jump_distance_px=tracking_config.max_jump_distance_px,
         require_centroid_proximity_for_expanded_iou=tracking_config.require_centroid_proximity_for_expanded_iou,
         max_centroid_distance_for_expanded_iou=tracking_config.max_centroid_distance_for_expanded_iou,
+        
+        # Velocity-adaptive jump distance (V7.1 - Fast throw handling)
+        velocity_adaptive_jump_enabled=tracking_config.velocity_adaptive_jump_enabled,
+        velocity_adaptive_jump_scale=tracking_config.velocity_adaptive_jump_scale,
+        velocity_adaptive_jump_max=tracking_config.velocity_adaptive_jump_max,
+        motion_direction_validation_enabled=tracking_config.motion_direction_validation_enabled,
+        motion_direction_cone_angle_deg=tracking_config.motion_direction_cone_angle_deg,
+        motion_direction_min_velocity=tracking_config.motion_direction_min_velocity,
         
         # Ghost (G) - frame-based with ms migration
         ghost_timeout_ms=tracking_config.ghost_timeout_ms,
