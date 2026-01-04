@@ -310,9 +310,8 @@ class SpoolProcessorNode(Node):
         logger.info(f"")
         logger.info(f"  Target FPS Configuration:")
         logger.info(f"    - Default Target FPS: {DEFAULT_TARGET_FPS}")
-        logger.info(f"    - Adaptive FPS Relaxed: {DEFAULT_ADAPTIVE_FPS_RELAXED}")
-        logger.info(f"    - Adaptive FPS Max: {DEFAULT_ADAPTIVE_FPS_MAX}")
-        logger.info(f"    - Adaptive FPS Min: {DEFAULT_ADAPTIVE_FPS_MIN}")
+        logger.info(f"    - Adaptive FPS Relaxed: {DEFAULT_ADAPTIVE_FPS_RELAXED} (healthy mode)")
+        logger.info(f"    - Adaptive FPS Max: {DEFAULT_ADAPTIVE_FPS_MAX} (high lag catchup)")
         logger.info(f"    - Min Frame Interval: {self.config.min_frame_interval_ms}ms")
         logger.info(f"")
         logger.info(f"  Adaptive Pacing Thresholds:")
@@ -890,8 +889,8 @@ class SpoolProcessorNode(Node):
             try:
                 # Attempt direct bytes assignment (most efficient)
                 frame_msg.data = frame_data
-            except (TypeError, AttributeError):
-                # Fallback to list conversion if direct assignment fails
+            except TypeError:
+                # Fallback to list conversion if direct assignment fails due to type mismatch
                 # This is the old behavior for compatibility
                 frame_msg.data = list(frame_data)
                 logger.debug("[SpoolProcessor] Using list conversion fallback for frame data")
