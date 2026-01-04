@@ -1138,9 +1138,19 @@ class SpoolProcessorNode(Node):
                     next_deadline = publish_end + frame_interval
                 
                 # V9: Calculate sleep time to hit next_deadline
-                # Ensure minimum frame interval to avoid CPU heat
                 time_until_deadline = next_deadline - publish_end
-                target_sleep = max(0.0, max(min_interval_sec, time_until_deadline))
+                
+                # Determine target sleep time
+                # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
+                if time_until_deadline <= 0:
+                    # We're behind schedule - don't sleep at all to catch up
+                    target_sleep = 0
+                else:
+                    # We're ahead of schedule - sleep to hit deadline
+                    # Never sleep MORE than time_until_deadline (would miss deadline)
+                    # Prefer to sleep at least min_interval_sec (to prevent CPU spinning)
+                    # But if that would make us miss deadline, sleep less
+                    target_sleep = time_until_deadline
                 
                 if target_sleep > 0:
                     time.sleep(target_sleep)

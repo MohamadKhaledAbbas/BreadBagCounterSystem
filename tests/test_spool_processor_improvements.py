@@ -207,26 +207,32 @@ def test_performance_metrics_calculation():
 
 
 def test_min_frame_interval_guard():
-    """Test that minimum frame interval is always respected."""
-    min_interval_sec = 0.025  # 25ms
+    """Test that sleep logic prioritizes hitting target FPS deadline."""
+    min_interval_sec = 0.025  # 25ms (informational, not enforced anymore)
     
-    # Test case 1: Normal operation
+    # Test case 1: Normal operation - sleep until deadline
     frame_interval = 1.0 / 30.0  # ~33.33ms
-    time_until_deadline = 0.030  # 30ms
-    target_sleep = max(0.0, max(min_interval_sec, time_until_deadline))
-    assert target_sleep == 0.030, "Should use time_until_deadline when > min_interval"
+    time_until_deadline = 0.030  # 30ms ahead
+    target_sleep = time_until_deadline if time_until_deadline > 0 else 0
+    assert abs(target_sleep - 0.030) < 0.001, f"Should sleep {0.030}, got {target_sleep}"
     
-    # Test case 2: Fast processing
-    time_until_deadline = 0.010  # 10ms
-    target_sleep = max(0.0, max(min_interval_sec, time_until_deadline))
-    assert target_sleep == min_interval_sec, \
-        f"Should enforce min_interval_sec when time_until_deadline < min_interval"
+    # Test case 2: Fast target FPS with short sleep remaining
+    frame_interval = 1.0 / 35.0  # ~28.57ms
+    time_until_deadline = 0.010  # 10ms ahead
+    # Should sleep 10ms to hit deadline (even though it's less than min_interval)
+    target_sleep = time_until_deadline if time_until_deadline > 0 else 0
+    assert abs(target_sleep - 0.010) < 0.001, f"Should sleep to hit deadline, got {target_sleep}"
     
-    # Test case 3: Negative deadline (behind schedule)
+    # Test case 3: Behind schedule - no sleep
     time_until_deadline = -0.005  # 5ms behind
-    target_sleep = max(0.0, max(min_interval_sec, time_until_deadline))
-    assert target_sleep == min_interval_sec, \
-        "Should enforce min_interval_sec even when behind schedule"
+    target_sleep = time_until_deadline if time_until_deadline > 0 else 0
+    assert target_sleep == 0, f"Should not sleep when behind schedule, got {target_sleep}"
+    
+    # Test case 4: Very short sleep remaining
+    time_until_deadline = 0.001  # 1ms ahead
+    # Should still sleep 1ms to hit deadline precisely
+    target_sleep = time_until_deadline if time_until_deadline > 0 else 0
+    assert abs(target_sleep - 0.001) < 0.0001, f"Should sleep precisely to deadline, got {target_sleep}"
     
     print("✓ test_min_frame_interval_guard passed")
 
