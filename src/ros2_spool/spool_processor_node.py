@@ -96,7 +96,6 @@ DEFAULT_SPOOL_DIR = "/home/sunrise/BreadCounting/data/spool"
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STATS_INTERVAL = 10.0
 DEFAULT_SPS_PPS_PREPEND = True  # Prepend cached SPS/PPS to first frame of segment
-DEFAULT_TARGET_FPS = 30.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
 DEFAULT_STATE_FILE = "processor_state.json"  # Relative to spool_dir
 DEFAULT_SPOOL_LAG_WARN_THRESHOLD = 5  # Segments
 DEFAULT_SPOOL_LAG_ERROR_THRESHOLD = 10  # Segments
@@ -113,7 +112,8 @@ DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms w
 DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 10  # Less than this = healthy, relax
 DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 25  # Between 10-25 = normal pace
 DEFAULT_ADAPTIVE_FPS_RELAXED = 15.0  # Healthy state - save resources
-DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (~28ms intervals)
+DEFAULT_TARGET_FPS = 20.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
+DEFAULT_ADAPTIVE_FPS_MAX = 30.0  # High lag state - catch up (~28ms intervals)
 MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
 ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
 

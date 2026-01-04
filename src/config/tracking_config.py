@@ -1577,7 +1577,7 @@ class TrackingConfig:
     Default: 'Brown_Orange_Family'
     """
     
-    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 22100.0)
+    disambiguation_small_threshold: float = _parse_float_env("DISAMBIGUATION_SMALL_THRESHOLD", 15200.0)
     """
     Raw area threshold (pixels²) below which a detection is classified as "small".
     
@@ -1599,7 +1599,7 @@ class TrackingConfig:
     Default: 9000.0 (pixels²) - UPDATED from 7000.0 based on production logs
     """
     
-    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 26800.0)
+    disambiguation_regular_threshold: float = _parse_float_env("DISAMBIGUATION_REGULAR_THRESHOLD", 18600.0)
     """
     Raw area threshold (pixels²) above which a detection is classified as "regular/overlay".
     
