@@ -2046,6 +2046,130 @@ class TrackingConfig:
     
     Default: 2
     """
+    
+    # ============================================================================
+    # Velocity Stability Gate for ROI Collection
+    # ============================================================================
+    # These parameters implement a "Time-To-Live" (TTL) gate that ensures bags
+    # have truly settled before collecting ROIs. This prevents blurry ROIs from
+    # bags that are still vibrating or moving.
+    
+    velocity_stability_gate_enabled: bool = _parse_bool_env("VELOCITY_STABILITY_GATE_ENABLED", True)
+    """
+    Enable velocity stability gating for ROI collection.
+    
+    When True: ROIs are only collected after the bag has been stable
+               (velocity below threshold) for a minimum duration.
+    When False: ROIs are collected immediately regardless of velocity.
+    
+    Default: True
+    """
+    
+    velocity_stability_threshold: float = _parse_float_env("VELOCITY_STABILITY_THRESHOLD", 0.15)
+    """
+    Maximum velocity (pixels per millisecond) to consider position "stable".
+    
+    If velocity > threshold, stability timer resets.
+    If velocity < threshold, stability timer accumulates.
+    
+    Range: 0.05 - 0.5 px/ms
+    - 0.05 px/ms = 50 px/s (very strict, bag nearly stationary)
+    - 0.15 px/ms = 150 px/s (moderate, bag settling)
+    - 0.5 px/ms = 500 px/s (lenient, bag moving slowly)
+    
+    Default: 0.15 (150 pixels per second)
+    """
+    
+    velocity_stability_min_duration_ms: float = _parse_float_env("VELOCITY_STABILITY_MIN_DURATION_MS", 150.0)
+    """
+    Minimum time (milliseconds) the bag must remain stable before collecting ROIs.
+    
+    This ensures the bag has truly settled, not just paused for one frame.
+    
+    Range: 50 - 300 ms
+    - 50ms: Less strict, catches brief pauses
+    - 150ms: Moderate, ensures genuine stability
+    - 300ms: Very strict, may miss some ROIs
+    
+    Default: 150.0 (150 milliseconds)
+    """
+    
+    # ============================================================================
+    # Bidirectional Context-Aware Classification Smoothing
+    # ============================================================================
+    # These parameters implement a buffered validation queue that uses both
+    # previous and future context to correct low-confidence classifications.
+    # This exploits the batch nature of production lines where bags of the
+    # same type are processed sequentially.
+    
+    bidirectional_smoothing_enabled: bool = _parse_bool_env("BIDIRECTIONAL_SMOOTHING_ENABLED", True)
+    """
+    Enable bidirectional context-aware classification smoothing.
+    
+    When True: Classifications are buffered and validated using both
+               previous and next items before final commit.
+    When False: Classifications are committed immediately (legacy behavior).
+    
+    Default: True
+    """
+    
+    bidirectional_buffer_size: int = _parse_int_env("BIDIRECTIONAL_BUFFER_SIZE", 7)
+    """
+    Size of the validation buffer for bidirectional smoothing.
+    
+    The center item (buffer_size // 2) is validated using context from
+    both sides. Buffer must be odd for symmetric context.
+    
+    Range: 5 - 11 (odd numbers recommended)
+    - 5: Context of 2 before + 2 after (faster commit, less context)
+    - 7: Context of 3 before + 3 after (balanced)
+    - 11: Context of 5 before + 5 after (more context, slower commit)
+    
+    Default: 7 (3 items before + center + 3 items after)
+    """
+    
+    bidirectional_confidence_threshold: float = _parse_float_env("BIDIRECTIONAL_CONFIDENCE_THRESHOLD", 0.90)
+    """
+    Confidence threshold above which classifications bypass context checking.
+    
+    High-confidence classifications (>= threshold) are trusted and not
+    overridden by context, even if context disagrees.
+    
+    Range: 0.80 - 0.95
+    - 0.80: More items bypass context check (trust classifier more)
+    - 0.90: Balanced (default)
+    - 0.95: Most items use context check (trust context more)
+    
+    Default: 0.90
+    """
+    
+    bidirectional_context_agreement_ratio: float = _parse_float_env("BIDIRECTIONAL_CONTEXT_AGREEMENT_RATIO", 0.8)
+    """
+    Minimum ratio of context items that must agree to override center item.
+    
+    For a buffer of 7 (3+1+3), with this set to 0.8:
+    - Check prev_3 and next_3 (6 context items)
+    - At least 5 of 6 (80%) must agree to override center
+    
+    Range: 0.6 - 1.0
+    - 0.6: 60% agreement needed (more aggressive smoothing)
+    - 0.8: 80% agreement needed (balanced)
+    - 1.0: 100% agreement needed (only unanimous context overrides)
+    
+    Default: 0.8
+    """
+    
+    bidirectional_batch_transition_protection: bool = _parse_bool_env("BIDIRECTIONAL_BATCH_TRANSITION_PROTECTION", True)
+    """
+    Protect batch transitions from being incorrectly smoothed.
+    
+    When True: If prev_context disagrees with next_context, this indicates
+               a batch transition (e.g., Brown -> White). In this case,
+               do NOT override the center item; trust the classifier.
+    When False: Always apply smoothing if context ratio is met.
+    
+    Default: True
+    """
 
     use_frame_timestamps: bool = IS_WINDOWS
 
@@ -2648,4 +2772,9 @@ def get_event_config():
         
         # Retention Safety
         retention_safety_enabled=tracking_config.retention_safety_enabled,
+        
+        # Velocity Stability Gate for ROI Collection
+        velocity_stability_gate_enabled=tracking_config.velocity_stability_gate_enabled,
+        velocity_stability_threshold=tracking_config.velocity_stability_threshold,
+        velocity_stability_min_duration_ms=tracking_config.velocity_stability_min_duration_ms,
     )

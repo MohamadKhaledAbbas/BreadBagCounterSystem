@@ -28,6 +28,7 @@ from collections import deque
 from src.counting.Visualizer import Visualizer
 from src.classifier.ClassifierService import ClassifierService
 from src.classifier.BaseClassifier import BaseClassifier
+from src.classifier.bidirectional_smoother import BidirectionalSmoother
 from src.counting.BagStateMonitor import BagStateMonitor
 from src.detection.BaseDetection import BaseDetector
 from src.logging.Database import DatabaseManager
@@ -280,6 +281,17 @@ class BagCounterApp:
         
         self.classifier_service.register_callback(self.on_classification_result)
         self.ui_counts = {}
+        
+        # V8: Bidirectional Context-Aware Smoothing
+        self.bidirectional_smoother = BidirectionalSmoother()
+        if tracking_config.bidirectional_smoothing_enabled:
+            logger.info(
+                f"[BagCounterApp] V8 Bidirectional Smoothing: ENABLED "
+                f"(buffer_size={tracking_config.bidirectional_buffer_size}, "
+                f"confidence_threshold={tracking_config.bidirectional_confidence_threshold:.2f})"
+            )
+        else:
+            logger.info("[BagCounterApp] V8 Bidirectional Smoothing: DISABLED")
 
         self.is_publishing = db.get_config_value(constants.show_ui_screen_key) == "1"
         logger.info(f"[BagCounterApp] IPC Publishing: {'ENABLED' if self.is_publishing else 'DISABLED'}")
@@ -771,6 +783,13 @@ class BagCounterApp:
     
 
     def on_classification_result(self, track_id: int, data: Dict[str, Any]):
+        """
+        Handle classification result from ClassifierService.
+        
+        V8: Integrates bidirectional context-aware smoothing to validate
+        low-confidence classifications using context from both previous
+        and upcoming events.
+        """
         label = data["label"]
         phash = data["phash"]
         image_path = data["image_path"]
@@ -780,13 +799,60 @@ class BagCounterApp:
         metadata = data.get("metadata", {})
 
         # V7.2: Determine confidence tier
-        # Priority:
-        # 1. Use track_confidence_tier from metadata if available (from disambiguation/evidence accumulator)
-        # 2. Fall back to threshold-based determination
         confidence_tier = metadata.get('track_confidence_tier')
         if not confidence_tier:
-            # Legacy fallback: use confidence threshold
             confidence_tier = 'high' if conf >= tracking_config.high_confidence_threshold else 'low'
+        
+        # V8: Build event data for bidirectional smoothing
+        event_data = {
+            'event_id': track_id,
+            'bag_type': label,
+            'confidence': conf,
+            'phash': phash,
+            'image_path': image_path,
+            'candidates_count': candidates_count,
+            'context': context,
+            'metadata': metadata,
+            'confidence_tier': confidence_tier,
+        }
+        
+        # V8: Pass through bidirectional smoother
+        validated_event = self.bidirectional_smoother.add_event(event_data)
+        
+        # If smoother returns None, event is buffered - don't commit yet
+        if validated_event is None:
+            return
+        
+        # Commit the validated event
+        self._commit_classification_event(validated_event)
+    
+    def _commit_classification_event(self, event_data: Dict[str, Any]):
+        """
+        Commit a validated classification event to the database.
+        
+        V8: Called after bidirectional smoothing validation.
+        
+        Args:
+            event_data: Validated event data dictionary
+        """
+        track_id = event_data.get('event_id', 0)
+        label = event_data.get('bag_type', 'Unknown')
+        phash = event_data.get('phash')
+        image_path = event_data.get('image_path')
+        conf = event_data.get('confidence', 1.0)
+        candidates_count = event_data.get('candidates_count', 1)
+        context = event_data.get('context')
+        metadata = event_data.get('metadata', {})
+        confidence_tier = event_data.get('confidence_tier', 'low')
+        
+        # Check if smoothing was applied
+        smoothing_info = event_data.get('bidirectional_smoothing', {})
+        if smoothing_info.get('applied', False):
+            logger.info(
+                f"[BidirectionalSmoothing] Track {track_id}: "
+                f"Smoothed {smoothing_info.get('original_label')} -> {label} "
+                f"(reason: {smoothing_info.get('reason')})"
+            )
         
         bag_type_id = self.db.get_or_create_bag_type(label, phash, image_path)
         self.db.log_event(bag_type_id, track_id, conf, confidence_tier)
@@ -1907,6 +1973,28 @@ class BagCounterApp:
         logger.info(f"[BagCounterApp] Shutting down...")
         self.is_running = False
         THREAD_SHUTDOWN_TIMEOUT = 3.0
+        
+        # V8: Flush remaining events from bidirectional smoother
+        if hasattr(self, 'bidirectional_smoother') and self.bidirectional_smoother:
+            remaining_events = self.bidirectional_smoother.flush()
+            if remaining_events:
+                logger.info(
+                    f"[BagCounterApp] V8: Flushing {len(remaining_events)} buffered events "
+                    f"from bidirectional smoother"
+                )
+                for event_data in remaining_events:
+                    try:
+                        self._commit_classification_event(event_data)
+                    except Exception as e:
+                        logger.error(f"[BagCounterApp] Error committing flushed event: {e}")
+            
+            # Log smoother statistics
+            stats = self.bidirectional_smoother.get_stats()
+            logger.info(
+                f"[BidirectionalSmoother] Final stats: "
+                f"total={stats['total_events']}, validated={stats['validated_events']}, "
+                f"smoothed={stats['smoothed_events']}, smoothing_rate={stats['smoothing_rate']:.2%}"
+            )
         
         # Phase 2: Shutdown all classification worker threads
         self._classification_running = False

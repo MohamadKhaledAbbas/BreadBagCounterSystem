@@ -1009,5 +1009,268 @@ class TestEvidenceAccumulationIntegration:
         assert result.label in ('ClassA', 'ClassB', 'Uncertain')
 
 
+# =============================================================================
+# V8: Velocity Stability Gate Tests
+# =============================================================================
+
+class TestVelocityStabilityGate:
+    """Tests for V8 velocity stability gating of ROI collection."""
+    
+    def test_initial_state_is_stable(self):
+        """New events should start as stable (no movement yet)."""
+        from src.tracking.EventCentricTracker import BreadBagEvent, EventConfig, DetectionEvidence
+        
+        config = EventConfig(
+            velocity_stability_gate_enabled=True,
+            velocity_stability_threshold=0.15,
+            velocity_stability_min_duration_ms=150.0,
+        )
+        
+        evidence = DetectionEvidence(
+            timestamp_ms=0.0, centroid_x=640, centroid_y=360,
+            box=(590, 310, 690, 410), is_open=True, is_closed=False,
+            confidence=0.8, frame_index=0,
+        )
+        
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Initial state should be stable (no movement detected yet)
+        assert event.is_velocity_stable is True
+        assert event.is_stable_for_roi_collection() is True
+    
+    def test_slow_movement_accumulates_stability(self):
+        """Slow movement should accumulate stability time."""
+        from src.tracking.EventCentricTracker import BreadBagEvent, EventConfig, DetectionEvidence
+        
+        config = EventConfig(
+            velocity_stability_gate_enabled=True,
+            velocity_stability_threshold=0.15,
+            velocity_stability_min_duration_ms=150.0,
+        )
+        
+        evidence = DetectionEvidence(
+            timestamp_ms=0.0, centroid_x=640, centroid_y=360,
+            box=(590, 310, 690, 410), is_open=True, is_closed=False,
+            confidence=0.8, frame_index=0,
+        )
+        
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Add several slow movements to accumulate stability
+        # Move 2px per 40ms = 0.05 px/ms < 0.15 threshold
+        for i in range(6):
+            slow_evidence = DetectionEvidence(
+                timestamp_ms=40.0 + i * 40.0, 
+                centroid_x=640 + i * 2, 
+                centroid_y=360,
+                box=(590 + i*2, 310, 690 + i*2, 410),
+                is_open=True, is_closed=False,
+                confidence=0.8, frame_index=1 + i,
+            )
+            event.add_detection(slow_evidence)
+        
+        # After 200ms+ of slow movement, should be stable
+        assert event.stability_duration_ms >= config.velocity_stability_min_duration_ms
+        assert event.is_velocity_stable is True
+        assert event.is_stable_for_roi_collection() is True
+    
+    def test_stability_gate_disabled_always_stable(self):
+        """When gate is disabled, should always be stable for ROI collection."""
+        from src.tracking.EventCentricTracker import BreadBagEvent, EventConfig, DetectionEvidence
+        
+        config = EventConfig(
+            velocity_stability_gate_enabled=False,
+        )
+        
+        evidence = DetectionEvidence(
+            timestamp_ms=0.0, centroid_x=640, centroid_y=360,
+            box=(590, 310, 690, 410), is_open=True, is_closed=False,
+            confidence=0.8, frame_index=0,
+        )
+        
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Add fast movement
+        fast_evidence = DetectionEvidence(
+            timestamp_ms=40.0, centroid_x=800, centroid_y=360,
+            box=(750, 310, 850, 410), is_open=True, is_closed=False,
+            confidence=0.8, frame_index=1,
+        )
+        event.add_detection(fast_evidence)
+        
+        # Even with fast movement, should be stable when gate is disabled
+        assert event.is_stable_for_roi_collection() is True
+
+
+# =============================================================================
+# V8: Bidirectional Smoother Tests
+# =============================================================================
+
+class TestBidirectionalSmoother:
+    """Tests for V8 bidirectional context-aware classification smoothing."""
+    
+    def test_high_confidence_bypasses_context(self):
+        """High confidence classifications should bypass context checking."""
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(
+            buffer_size=5,
+            confidence_threshold=0.90,
+            context_agreement_ratio=0.6,
+            batch_transition_protection=True,
+            enabled=True,
+        )
+        
+        # Fill buffer with high confidence events
+        results = []
+        for i in range(7):
+            result = smoother.add_event({
+                'event_id': i + 1,
+                'bag_type': 'Brown',
+                'confidence': 0.95,  # Above threshold
+            })
+            if result:
+                results.append(result)
+        
+        # Check first validated event
+        assert len(results) >= 1
+        smoothing = results[0].get('bidirectional_smoothing', {})
+        assert smoothing.get('applied') is False
+    
+    def test_low_confidence_with_unanimous_context_smoothed(self):
+        """Low confidence item surrounded by unanimous context should be smoothed."""
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(
+            buffer_size=5,
+            confidence_threshold=0.90,
+            context_agreement_ratio=0.6,
+            batch_transition_protection=True,
+            enabled=True,
+        )
+        
+        # Sequence: Brown, Brown, WHITE(low), Brown, Brown
+        events = [
+            {'event_id': 1, 'bag_type': 'Brown', 'confidence': 0.95},
+            {'event_id': 2, 'bag_type': 'Brown', 'confidence': 0.92},
+            {'event_id': 3, 'bag_type': 'White', 'confidence': 0.60},  # Should be smoothed
+            {'event_id': 4, 'bag_type': 'Brown', 'confidence': 0.94},
+            {'event_id': 5, 'bag_type': 'Brown', 'confidence': 0.91},
+            {'event_id': 6, 'bag_type': 'Brown', 'confidence': 0.93},
+            {'event_id': 7, 'bag_type': 'Brown', 'confidence': 0.92},
+        ]
+        
+        results = []
+        for event in events:
+            result = smoother.add_event(event)
+            if result:
+                results.append(result)
+        
+        # Flush remaining
+        results.extend(smoother.flush())
+        
+        # Find event 3 (the low confidence White)
+        event_3 = next(r for r in results if r['event_id'] == 3)
+        
+        # Should have been smoothed to Brown
+        assert event_3['bag_type'] == 'Brown'
+        smoothing = event_3.get('bidirectional_smoothing', {})
+        assert smoothing.get('applied') is True
+        assert smoothing.get('original_label') == 'White'
+    
+    def test_batch_transition_protected(self):
+        """Valid batch transitions should not be smoothed."""
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(
+            buffer_size=5,
+            confidence_threshold=0.90,
+            context_agreement_ratio=0.6,
+            batch_transition_protection=True,
+            enabled=True,
+        )
+        
+        # Sequence: Brown, Brown, WHITE(low), White, White
+        events = [
+            {'event_id': 1, 'bag_type': 'Brown', 'confidence': 0.95},
+            {'event_id': 2, 'bag_type': 'Brown', 'confidence': 0.92},
+            {'event_id': 3, 'bag_type': 'White', 'confidence': 0.65},  # At transition
+            {'event_id': 4, 'bag_type': 'White', 'confidence': 0.94},
+            {'event_id': 5, 'bag_type': 'White', 'confidence': 0.91},
+            {'event_id': 6, 'bag_type': 'White', 'confidence': 0.93},
+            {'event_id': 7, 'bag_type': 'White', 'confidence': 0.92},
+        ]
+        
+        results = []
+        for event in events:
+            result = smoother.add_event(event)
+            if result:
+                results.append(result)
+        
+        # Flush remaining
+        results.extend(smoother.flush())
+        
+        # Find event 3 (the transition point)
+        event_3 = next(r for r in results if r['event_id'] == 3)
+        
+        # Should NOT have been smoothed (batch transition protected)
+        assert event_3['bag_type'] == 'White'
+        smoothing = event_3.get('bidirectional_smoothing', {})
+        assert smoothing.get('applied') is False
+        
+        # Check stats
+        stats = smoother.get_stats()
+        assert stats['batch_transitions_protected'] >= 1
+    
+    def test_smoother_disabled_passthrough(self):
+        """When disabled, smoother should pass events through immediately."""
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(enabled=False)
+        
+        event = {
+            'event_id': 1,
+            'bag_type': 'Brown',
+            'confidence': 0.50,
+        }
+        
+        result = smoother.add_event(event)
+        
+        # Should return immediately
+        assert result is not None
+        assert result['event_id'] == 1
+        assert result['bag_type'] == 'Brown'
+    
+    def test_flush_returns_all_remaining(self):
+        """Flush should return all remaining buffered events."""
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(
+            buffer_size=5,
+            confidence_threshold=0.90,
+            context_agreement_ratio=0.6,
+            batch_transition_protection=True,
+            enabled=True,
+        )
+        
+        # Add partial buffer
+        for i in range(3):
+            smoother.add_event({
+                'event_id': i + 1,
+                'bag_type': 'Brown',
+                'confidence': 0.95,
+            })
+        
+        # Flush
+        remaining = smoother.flush()
+        
+        # Should get all 3 events back
+        assert len(remaining) == 3
+        event_ids = [r['event_id'] for r in remaining]
+        assert 1 in event_ids
+        assert 2 in event_ids
+        assert 3 in event_ids
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -479,6 +479,18 @@ class EventConfig:
     retention_safety_enabled: bool = True
     """Enable retention safety rule."""
     
+    # ==========================================================================
+    # Velocity Stability Gate for ROI Collection
+    # ==========================================================================
+    velocity_stability_gate_enabled: bool = True
+    """Enable velocity stability gating for ROI collection."""
+    
+    velocity_stability_threshold: float = 0.15
+    """Maximum velocity (pixels per millisecond) to consider position stable."""
+    
+    velocity_stability_min_duration_ms: float = 150.0
+    """Minimum time (ms) the bag must remain stable before collecting ROIs."""
+    
     def __post_init__(self):
         """
         Post-initialization to handle migration compatibility.
@@ -738,6 +750,12 @@ class BreadBagEvent:
         self.frames_out_of_zone = 0
         self.out_of_zone_since_ms: Optional[float] = None
         
+        # Velocity Stability Gate tracking
+        # Tracks how long the bag has been "stable" (velocity below threshold)
+        self.stability_duration_ms: float = 0.0  # Time spent below velocity threshold
+        self.last_stability_check_time_ms: float = initial_detection.timestamp_ms
+        self.is_velocity_stable: bool = True  # Start as stable (no movement yet)
+        
         # Log event creation
         structured_logger.event_created(
             event_id=self.id,
@@ -817,6 +835,50 @@ class BreadBagEvent:
         """Get velocity magnitude in pixels per millisecond."""
         vx, vy = self.get_velocity()
         return math.sqrt(vx*vx + vy*vy)
+    
+    def _update_velocity_stability(self, current_time_ms: float) -> None:
+        """
+        Update velocity stability tracking.
+        
+        This implements the "Time-To-Live" (TTL) gate for ROI collection:
+        - If velocity > threshold, reset stability_duration_ms to 0
+        - If velocity < threshold, increment stability_duration_ms by time_delta
+        
+        Only ROIs collected when stability_duration_ms > min_duration_ms.
+        """
+        if not self.config.velocity_stability_gate_enabled:
+            return
+        
+        velocity_mag = self.get_velocity_magnitude()
+        time_delta = current_time_ms - self.last_stability_check_time_ms
+        
+        if velocity_mag > self.config.velocity_stability_threshold:
+            # Velocity exceeds threshold - reset stability tracking
+            self.stability_duration_ms = 0.0
+            self.is_velocity_stable = False
+        else:
+            # Velocity below threshold - accumulate stability time
+            self.stability_duration_ms += max(0, time_delta)
+            # Check if we've been stable long enough
+            if self.stability_duration_ms >= self.config.velocity_stability_min_duration_ms:
+                self.is_velocity_stable = True
+        
+        self.last_stability_check_time_ms = current_time_ms
+    
+    def is_stable_for_roi_collection(self) -> bool:
+        """
+        Check if the event is stable enough for ROI collection.
+        
+        Returns True if:
+        - Velocity stability gate is disabled, OR
+        - Velocity has been below threshold for >= min_duration_ms
+        
+        This ensures bags have truly settled before collecting ROIs,
+        preventing blurry images from vibrating or moving bags.
+        """
+        if not self.config.velocity_stability_gate_enabled:
+            return True
+        return self.is_velocity_stable
     
     def get_adaptive_ghost_timeout_frames(self) -> int:
         """
@@ -1221,6 +1283,9 @@ class BreadBagEvent:
                 # Keep velocity history bounded
                 if len(self.velocity_history) > 10:
                     self.velocity_history = self.velocity_history[-10:]
+                
+                # Update velocity stability tracking
+                self._update_velocity_stability(detection.timestamp_ms)
         
         # Update spatial tracking
         self.last_centroid = (detection.centroid_x, detection.centroid_y)
@@ -1406,6 +1471,7 @@ class BreadBagEvent:
         """
         V4 Phase 3: Supports lazy ROI cropping for memory and CPU efficiency.
         V7.3: Enhanced validation for invalid crops, aspect ratios, and glare detection.
+        V8: Velocity stability gate - only collect ROIs when bag has settled.
         
         When lazy_roi_cropping_enabled=True:
         - ROI is not cropped immediately
@@ -1424,7 +1490,17 @@ class BreadBagEvent:
         - Glare/overexposure detection
         - Empty crop detection
         - Frame reference validation in lazy mode
+        
+        V8 Velocity Stability Gate:
+        - Only collect ROIs when bag has been stable for >= min_duration_ms
+        - Prevents blurry ROIs from vibrating or moving bags
         """
+        # V8: Velocity Stability Gate - check if bag has settled before collecting ROI
+        if not self.is_stable_for_roi_collection():
+            # Bag is still moving/vibrating - skip ROI collection
+            pipeline_metrics.record_roi_quality(False, 0.0, "velocity_unstable")
+            return
+        
         # Determine class-specific caps (fallback to legacy max_roi_samples)
         max_open_cap = getattr(self.config, "max_open_roi_samples", self.config.max_roi_samples)
         max_closed_cap = getattr(self.config, "max_closed_roi_samples", self.config.max_roi_samples)
