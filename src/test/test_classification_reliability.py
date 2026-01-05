@@ -1100,6 +1100,53 @@ class TestVelocityStabilityGate:
         
         # Even with fast movement, should be stable when gate is disabled
         assert event.is_stable_for_roi_collection() is True
+    
+    def test_spin_detection_blocks_roi_collection(self):
+        """Spinning (high aspect ratio variance) should block ROI collection."""
+        from src.tracking.EventCentricTracker import BreadBagEvent, EventConfig, DetectionEvidence
+        
+        config = EventConfig(
+            velocity_stability_gate_enabled=True,
+            velocity_stability_threshold=0.25,
+            velocity_stability_min_duration_ms=150.0,
+            spin_detection_min_boxes=5,
+            spin_detection_ar_variance_threshold=0.02,
+        )
+        
+        # Start with a wide box (bag viewed from front)
+        evidence = DetectionEvidence(
+            timestamp_ms=0.0, centroid_x=640, centroid_y=360,
+            box=(540, 310, 740, 410), is_open=True, is_closed=False,  # Width=200, Height=100, AR=2.0
+            confidence=0.8, frame_index=0,
+        )
+        
+        event = BreadBagEvent(evidence, config, open_class_id=1, closed_class_id=0)
+        
+        # Simulate spinning by alternating aspect ratios
+        # As bag rotates: wide (front) -> narrow (side) -> wide -> narrow
+        aspect_ratios = [
+            (540, 310, 740, 410),  # AR=2.0 (wide)
+            (600, 280, 680, 440),  # AR=0.5 (narrow - rotated 90 degrees)
+            (540, 310, 740, 410),  # AR=2.0 (wide)
+            (600, 280, 680, 440),  # AR=0.5 (narrow)
+            (540, 310, 740, 410),  # AR=2.0 (wide)
+        ]
+        
+        for i, box in enumerate(aspect_ratios):
+            spin_evidence = DetectionEvidence(
+                timestamp_ms=40.0 + i * 40.0, 
+                centroid_x=640,  # Centroid stays still
+                centroid_y=360,
+                box=box,
+                is_open=True, is_closed=False,
+                confidence=0.8, frame_index=1 + i,
+            )
+            event.add_detection(spin_evidence)
+        
+        # Should detect spinning due to high AR variance
+        assert event.is_spinning is True
+        # Even though velocity is low, should NOT be stable due to spinning
+        assert event.is_stable_for_roi_collection() is False
 
 
 # =============================================================================

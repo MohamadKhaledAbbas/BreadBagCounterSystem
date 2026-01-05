@@ -2094,6 +2094,53 @@ class TrackingConfig:
     Default: 150.0 (150 milliseconds)
     """
     
+    spin_detection_min_boxes: int = _parse_int_env("SPIN_DETECTION_MIN_BOXES", 5)
+    """
+    Minimum number of bounding boxes needed to detect spinning.
+    
+    Spinning is detected by analyzing the variance in bounding box aspect ratios
+    over recent history. When a bag spins, its aspect ratio changes significantly
+    as it rotates (e.g., narrow when viewed from side, wider from front).
+    
+    Range: 3 - 10
+    - 3: Very quick detection, but may have false positives
+    - 5: Balanced detection
+    - 10: More confident detection, but delayed
+    
+    Default: 5
+    """
+    
+    spin_detection_ar_variance_threshold: float = _parse_float_env("SPIN_DETECTION_AR_VARIANCE_THRESHOLD", 0.02)
+    """
+    Aspect ratio variance threshold to detect spinning.
+    
+    When the variance of aspect ratios over recent bounding boxes exceeds
+    this threshold, the bag is considered to be spinning. Lower values are
+    more sensitive to rotation.
+    
+    Range: 0.01 - 0.1
+    - 0.01: Very sensitive, detects slight rotations
+    - 0.02: Moderate sensitivity (default)
+    - 0.1: Only detects significant spinning
+    
+    Default: 0.02
+    """
+    
+    spin_detection_box_history_size: int = _parse_int_env("SPIN_DETECTION_BOX_HISTORY_SIZE", 15)
+    """
+    Maximum number of bounding boxes to keep in history for spin detection.
+    
+    Larger values allow detection of slower spinning but use more memory.
+    Smaller values detect only rapid spinning.
+    
+    Range: 10 - 30
+    - 10: Only recent history, detects rapid spinning
+    - 15: Balanced (default)
+    - 30: Longer history, detects slower spinning
+    
+    Default: 15
+    """
+    
     # ============================================================================
     # Bidirectional Context-Aware Classification Smoothing
     # ============================================================================
@@ -2793,4 +2840,9 @@ def get_event_config():
         velocity_stability_gate_enabled=tracking_config.velocity_stability_gate_enabled,
         velocity_stability_threshold=tracking_config.velocity_stability_threshold,
         velocity_stability_min_duration_ms=tracking_config.velocity_stability_min_duration_ms,
+        
+        # Spin Detection for ROI Collection
+        spin_detection_min_boxes=tracking_config.spin_detection_min_boxes,
+        spin_detection_ar_variance_threshold=tracking_config.spin_detection_ar_variance_threshold,
+        spin_detection_box_history_size=tracking_config.spin_detection_box_history_size,
     )

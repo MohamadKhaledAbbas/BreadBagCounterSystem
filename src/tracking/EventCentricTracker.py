@@ -491,6 +491,18 @@ class EventConfig:
     velocity_stability_min_duration_ms: float = 150.0
     """Minimum time (ms) the bag must remain stable before collecting ROIs."""
     
+    # ==========================================================================
+    # Spin Detection for ROI Collection
+    # ==========================================================================
+    spin_detection_min_boxes: int = 5
+    """Minimum number of bounding boxes needed to detect spinning."""
+    
+    spin_detection_ar_variance_threshold: float = 0.02
+    """Aspect ratio variance threshold to detect spinning."""
+    
+    spin_detection_box_history_size: int = 15
+    """Maximum number of bounding boxes to keep in history for spin detection."""
+    
     def __post_init__(self):
         """
         Post-initialization to handle migration compatibility.
@@ -758,6 +770,13 @@ class BreadBagEvent:
         self.last_stability_check_time_ms: float = initial_detection.timestamp_ms
         self.is_velocity_stable: bool = True  # Start as stable (no movement yet)
         
+        # Spin Detection tracking
+        # Track bounding box history for aspect ratio analysis to detect spinning
+        self.box_history: List[Tuple[Tuple[float, float, float, float], float]] = [
+            (initial_detection.box, initial_detection.timestamp_ms)
+        ]  # List of (box, timestamp_ms)
+        self.is_spinning: bool = False  # True if aspect ratio variance indicates spinning
+        
         # Log event creation
         structured_logger.event_created(
             event_id=self.id,
@@ -884,14 +903,67 @@ class BreadBagEvent:
         
         Returns True if:
         - Velocity stability gate is disabled, OR
-        - Velocity has been below threshold for >= min_duration_ms
+        - Velocity has been below threshold for >= min_duration_ms AND
+        - Bag is not currently spinning (aspect ratio is stable)
         
         This ensures bags have truly settled before collecting ROIs,
         preventing blurry images from vibrating or moving bags.
         """
         if not self.config.velocity_stability_gate_enabled:
             return True
-        return self.is_velocity_stable
+        
+        # Both velocity must be stable AND bag must not be spinning
+        return self.is_velocity_stable and not self.is_spinning
+    
+    def _update_spin_detection(self) -> None:
+        """
+        Detect spinning by analyzing aspect ratio variance in recent bounding boxes.
+        
+        When a bag spins in place, its centroid doesn't move much, but its bounding
+        box aspect ratio changes significantly as it rotates. A bread bag viewed
+        from the side is much narrower than viewed from the front.
+        
+        This method computes the variance of aspect ratios over recent history.
+        High variance indicates the bag is spinning.
+        """
+        if not self.config.velocity_stability_gate_enabled:
+            self.is_spinning = False
+            return
+        
+        # Need at least a few boxes to detect spinning
+        min_boxes = self.config.spin_detection_min_boxes
+        if len(self.box_history) < min_boxes:
+            self.is_spinning = False
+            return
+        
+        # Get aspect ratios from recent box history
+        recent_boxes = self.box_history[-min_boxes:]
+        aspect_ratios = []
+        
+        for box, _ in recent_boxes:
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+            if height > 0:
+                aspect_ratio = width / height
+                aspect_ratios.append(aspect_ratio)
+        
+        if len(aspect_ratios) < 2:
+            self.is_spinning = False
+            return
+        
+        # Calculate variance of aspect ratios
+        mean_ar = sum(aspect_ratios) / len(aspect_ratios)
+        variance = sum((ar - mean_ar) ** 2 for ar in aspect_ratios) / len(aspect_ratios)
+        
+        # High variance = spinning
+        ar_variance_threshold = self.config.spin_detection_ar_variance_threshold
+        self.is_spinning = variance > ar_variance_threshold
+        
+        if self.is_spinning:
+            logger.debug(
+                f"[Event:{self.id}] Spin detected: aspect_ratio_variance={variance:.4f} > threshold={ar_variance_threshold}"
+            )
     
     def get_adaptive_ghost_timeout_frames(self) -> int:
         """
@@ -1306,6 +1378,16 @@ class BreadBagEvent:
             (detection.centroid_x, detection.centroid_y, detection.timestamp_ms)
         )
         self.last_box = detection.box
+        
+        # Track box history for spin detection
+        self.box_history.append((detection.box, detection.timestamp_ms))
+        # Keep box history bounded
+        box_history_size = self.config.spin_detection_box_history_size
+        if len(self.box_history) > box_history_size:
+            self.box_history = self.box_history[-box_history_size:]
+        
+        # Update spin detection
+        self._update_spin_detection()
         
         # Keep centroid history bounded
         if len(self.centroid_history) > 30:
