@@ -722,6 +722,8 @@ class BreadBagEvent:
         
         # ROI collection (during OPEN or CLOSED state)
         self.roi_candidates: List[ROICandidate] = []
+        self.open_roi_count: int = 0    # Count of open state ROIs collected
+        self.closed_roi_count: int = 0  # Count of closed state ROIs collected
         
         # State transition history for debugging
         self.state_transitions: List[Dict[str, Any]] = [{
@@ -852,13 +854,24 @@ class BreadBagEvent:
         velocity_mag = self.get_velocity_magnitude()
         time_delta = current_time_ms - self.last_stability_check_time_ms
         
+        # Guard against clock regression or timestamp ordering issues
+        # In production, timestamps should always increase, but defensive coding
+        # handles edge cases like frame reprocessing or testing scenarios
+        if time_delta < 0:
+            logger.debug(
+                f"[VelocityStability] Negative time_delta detected "
+                f"(current={current_time_ms:.1f}ms, last={self.last_stability_check_time_ms:.1f}ms), "
+                f"skipping update"
+            )
+            return
+        
         if velocity_mag > self.config.velocity_stability_threshold:
             # Velocity exceeds threshold - reset stability tracking
             self.stability_duration_ms = 0.0
             self.is_velocity_stable = False
         else:
             # Velocity below threshold - accumulate stability time
-            self.stability_duration_ms += max(0, time_delta)
+            self.stability_duration_ms += time_delta
             # Check if we've been stable long enough
             if self.stability_duration_ms >= self.config.velocity_stability_min_duration_ms:
                 self.is_velocity_stable = True

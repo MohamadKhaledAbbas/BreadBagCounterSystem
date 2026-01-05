@@ -27,8 +27,8 @@ Usage:
 """
 
 import logging
-from collections import deque
-from typing import Dict, Any, Optional, List, Tuple
+from collections import deque, Counter
+from typing import Dict, Any, Optional, List, Tuple, Deque
 from dataclasses import dataclass, field
 
 from src.config.tracking_config import tracking_config
@@ -125,8 +125,8 @@ class BidirectionalSmoother:
         # Center index is the item being validated
         self.center_index = self.buffer_size // 2
         
-        # The validation buffer
-        self._buffer: deque[BufferedEvent] = deque(maxlen=self.buffer_size)
+        # The validation buffer (using Deque for compatibility with Python 3.8+)
+        self._buffer: Deque[BufferedEvent] = deque(maxlen=self.buffer_size)
         
         # Statistics for monitoring
         self._stats = {
@@ -302,8 +302,7 @@ class BidirectionalSmoother:
         next_labels = [e.label for e in next_context]
         all_context_labels = prev_labels + next_labels
         
-        # Count label occurrences
-        from collections import Counter
+        # Count label occurrences (Counter imported at top of module)
         prev_counter = Counter(prev_labels)
         next_counter = Counter(next_labels)
         all_counter = Counter(all_context_labels)
