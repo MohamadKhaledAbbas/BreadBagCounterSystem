@@ -1756,6 +1756,13 @@ class BagCounterApp:
                         # Log pipeline metrics periodically
                         pipeline_metrics.maybe_log_summary()
                         
+                        # V8: Check bidirectional smoother inactivity timeout
+                        # This ensures buffered events are committed even when no new bags arrive
+                        if hasattr(self, 'bidirectional_smoother') and self.bidirectional_smoother:
+                            timed_out_events = self.bidirectional_smoother.check_inactivity_timeout()
+                            for event_data in timed_out_events:
+                                self._commit_classification_event(event_data)
+                        
                         # Log system status periodically (every 15 minutes)
                         current_time = time.perf_counter()
                         if current_time - self._last_system_status_log >= self.SYSTEM_STATUS_LOG_INTERVAL:

@@ -27,6 +27,7 @@ Usage:
 """
 
 import logging
+import time
 from collections import deque, Counter
 from typing import Dict, Any, Optional, List, Tuple, Deque
 from dataclasses import dataclass, field
@@ -97,6 +98,7 @@ class BidirectionalSmoother:
         context_agreement_ratio: float = None,
         batch_transition_protection: bool = None,
         enabled: bool = None,
+        inactivity_timeout_ms: float = None,
     ):
         """
         Initialize the bidirectional smoother.
@@ -107,6 +109,7 @@ class BidirectionalSmoother:
             context_agreement_ratio: Fraction of context items that must agree
             batch_transition_protection: If True, protect batch transitions
             enabled: If False, smoother is disabled (pass-through mode)
+            inactivity_timeout_ms: Time after which buffer is flushed if no new events
         """
         # Load defaults from config
         self.enabled = enabled if enabled is not None else tracking_config.bidirectional_smoothing_enabled
@@ -114,6 +117,7 @@ class BidirectionalSmoother:
         self.confidence_threshold = confidence_threshold if confidence_threshold is not None else tracking_config.bidirectional_confidence_threshold
         self.context_agreement_ratio = context_agreement_ratio if context_agreement_ratio is not None else tracking_config.bidirectional_context_agreement_ratio
         self.batch_transition_protection = batch_transition_protection if batch_transition_protection is not None else tracking_config.bidirectional_batch_transition_protection
+        self.inactivity_timeout_ms = inactivity_timeout_ms if inactivity_timeout_ms is not None else tracking_config.bidirectional_inactivity_timeout_ms
         
         # Ensure buffer size is odd for symmetric context
         if self.buffer_size % 2 == 0:
@@ -128,6 +132,9 @@ class BidirectionalSmoother:
         # The validation buffer (using Deque for compatibility with Python 3.8+)
         self._buffer: Deque[BufferedEvent] = deque(maxlen=self.buffer_size)
         
+        # Track last event time for inactivity timeout
+        self._last_event_time_ms: float = 0.0
+        
         # Statistics for monitoring
         self._stats = {
             'total_events': 0,
@@ -137,13 +144,15 @@ class BidirectionalSmoother:
             'context_overrides': 0,
             'batch_transitions_protected': 0,
             'no_context_available': 0,
+            'inactivity_flushes': 0,
         }
         
         logger.info(
             f"[BidirectionalSmoother] Initialized: enabled={self.enabled}, "
             f"buffer_size={self.buffer_size}, confidence_threshold={self.confidence_threshold:.2f}, "
             f"context_agreement_ratio={self.context_agreement_ratio:.2f}, "
-            f"batch_transition_protection={self.batch_transition_protection}"
+            f"batch_transition_protection={self.batch_transition_protection}, "
+            f"inactivity_timeout_ms={self.inactivity_timeout_ms:.0f}"
         )
     
     def add_event(self, event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -168,6 +177,9 @@ class BidirectionalSmoother:
         
         self._stats['total_events'] += 1
         
+        # Track last event time for inactivity timeout
+        self._last_event_time_ms = time.time() * 1000.0
+        
         # Extract classification info
         event_id = event_data.get('event_id', 0)
         label = event_data.get('bag_type', 'Unknown')
@@ -191,6 +203,33 @@ class BidirectionalSmoother:
             return self._validate_center()
         
         return None
+    
+    def check_inactivity_timeout(self) -> List[Dict[str, Any]]:
+        """
+        Check if the buffer should be flushed due to inactivity.
+        
+        Call this periodically to ensure buffered events are committed
+        even when no new events arrive for a while.
+        
+        Returns:
+            List of validated events if timeout exceeded and buffer has items,
+            empty list otherwise
+        """
+        if not self.enabled or len(self._buffer) == 0:
+            return []
+        
+        current_time_ms = time.time() * 1000.0
+        time_since_last_event = current_time_ms - self._last_event_time_ms
+        
+        if time_since_last_event >= self.inactivity_timeout_ms:
+            logger.info(
+                f"[BidirectionalSmoother] Inactivity timeout ({time_since_last_event:.0f}ms >= "
+                f"{self.inactivity_timeout_ms:.0f}ms), flushing {len(self._buffer)} buffered events"
+            )
+            self._stats['inactivity_flushes'] += 1
+            return self.flush()
+        
+        return []
     
     def flush(self) -> List[Dict[str, Any]]:
         """

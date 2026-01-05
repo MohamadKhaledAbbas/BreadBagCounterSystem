@@ -2065,7 +2065,7 @@ class TrackingConfig:
     Default: True
     """
     
-    velocity_stability_threshold: float = _parse_float_env("VELOCITY_STABILITY_THRESHOLD", 0.15)
+    velocity_stability_threshold: float = _parse_float_env("VELOCITY_STABILITY_THRESHOLD", 0.25)
     """
     Maximum velocity (pixels per millisecond) to consider position "stable".
     
@@ -2074,10 +2074,10 @@ class TrackingConfig:
     
     Range: 0.05 - 0.5 px/ms
     - 0.05 px/ms = 50 px/s (very strict, bag nearly stationary)
-    - 0.15 px/ms = 150 px/s (moderate, bag settling)
+    - 0.25 px/ms = 250 px/s (moderate, catches settling and slow rotation)
     - 0.5 px/ms = 500 px/s (lenient, bag moving slowly)
     
-    Default: 0.15 (150 pixels per second)
+    Default: 0.25 (250 pixels per second) - increased from 0.15 to better catch spinning bags
     """
     
     velocity_stability_min_duration_ms: float = _parse_float_env("VELOCITY_STABILITY_MIN_DURATION_MS", 150.0)
@@ -2169,6 +2169,22 @@ class TrackingConfig:
     When False: Always apply smoothing if context ratio is met.
     
     Default: True
+    """
+    
+    bidirectional_inactivity_timeout_ms: float = _parse_float_env("BIDIRECTIONAL_INACTIVITY_TIMEOUT_MS", 5000.0)
+    """
+    Time in milliseconds after which buffered events are committed if no new events arrive.
+    
+    This ensures that events in the bidirectional buffer are committed even during
+    periods of inactivity (no new bread bags detected), rather than waiting indefinitely
+    for more events to fill the buffer.
+    
+    Range: 1000 - 30000 ms
+    - 1000ms: Quick flush, less context available
+    - 5000ms: Balanced, waits 5 seconds for more bags
+    - 30000ms: Very patient, waits up to 30 seconds
+    
+    Default: 5000.0 (5 seconds)
     """
 
     use_frame_timestamps: bool = IS_WINDOWS

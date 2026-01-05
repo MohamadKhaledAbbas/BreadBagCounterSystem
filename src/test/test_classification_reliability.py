@@ -1270,6 +1270,43 @@ class TestBidirectionalSmoother:
         assert 1 in event_ids
         assert 2 in event_ids
         assert 3 in event_ids
+    
+    def test_inactivity_timeout_flushes_buffer(self):
+        """Inactivity timeout should flush buffered events."""
+        import time
+        from src.classifier.bidirectional_smoother import BidirectionalSmoother
+        
+        smoother = BidirectionalSmoother(
+            buffer_size=5,
+            confidence_threshold=0.90,
+            context_agreement_ratio=0.6,
+            batch_transition_protection=True,
+            enabled=True,
+            inactivity_timeout_ms=100,  # Very short timeout for testing
+        )
+        
+        # Add partial buffer
+        for i in range(3):
+            smoother.add_event({
+                'event_id': i + 1,
+                'bag_type': 'Brown',
+                'confidence': 0.95,
+            })
+        
+        # Immediate check should return empty (no timeout yet)
+        immediate_result = smoother.check_inactivity_timeout()
+        assert len(immediate_result) == 0
+        
+        # Wait for timeout
+        time.sleep(0.15)  # Wait 150ms (longer than 100ms timeout)
+        
+        # Check should now return buffered events
+        timed_out_events = smoother.check_inactivity_timeout()
+        assert len(timed_out_events) == 3
+        event_ids = [r['event_id'] for r in timed_out_events]
+        assert 1 in event_ids
+        assert 2 in event_ids
+        assert 3 in event_ids
 
 
 if __name__ == '__main__':
