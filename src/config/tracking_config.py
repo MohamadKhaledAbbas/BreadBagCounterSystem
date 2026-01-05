@@ -92,7 +92,7 @@ class TrackingConfig:
     # State Transition Thresholds
     # ============================================================================
     
-    min_open_frames: int = 5  # V3: Reduced from 5 for faster state transitions
+    min_open_frames: int = 3  # V3: Reduced from 5 for faster state transitions
     """
     Minimum consecutive frames a bag must be detected as "open" before allowing 
     transition to "closed" state.
@@ -104,7 +104,7 @@ class TrackingConfig:
     Default: 4 (V3: reduced from 5)
     """
     
-    min_closed_frames: int = 3  # V3: Reduced from 3 for faster counting
+    min_closed_frames: int = 5  # V3: Reduced from 3 for faster counting
     """
     Minimum consecutive frames a bag must be detected as "closed" to trigger 
     classification and counting.
