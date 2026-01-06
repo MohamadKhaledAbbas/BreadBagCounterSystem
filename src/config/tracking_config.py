@@ -347,6 +347,27 @@ class TrackingConfig:
     Default: 0.6
     """
     
+    classifier_reject_labels: tuple = ('Rejected',)
+    """
+    List of classifier labels to reject/skip during voting and aggregation.
+    
+    Predictions with these labels are excluded from evidence accumulation and
+    do not contribute to the final classification decision. This is useful for
+    handling low-quality frames or ambiguous predictions that the classifier
+    explicitly marks as unreliable.
+    
+    Behavior:
+    - ROIs with reject labels are skipped during evidence accumulation
+    - They do not count toward the minimum candidates threshold
+    - They do not contribute to winner/runner-up scoring
+    - If ALL predictions are rejected, track is classified as "Unknown"
+    
+    Default: ('Rejected',)
+    
+    Example:
+        classifier_reject_labels = ('Rejected', 'Uncertain', 'LowQuality')
+    """
+    
     # ============================================================================
     # Classification Stability Heuristics (Production-Grade)
     # ============================================================================
