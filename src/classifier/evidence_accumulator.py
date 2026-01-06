@@ -185,21 +185,32 @@ class EvidenceAccumulator:
             trust: Trust score for this ROI (0-1)
             state: 'open' or 'closed' state of the ROI
         """
+        # Filter out reject labels from probabilities before processing
+        # This ensures reject labels don't contribute ANY evidence
+        filtered_probs = {
+            class_name: prob
+            for class_name, prob in probs.items()
+            if class_name not in self._reject_labels
+        }
+        
+        # Count rejected classes (always count, even if all are rejected)
+        num_rejected = len(probs) - len(filtered_probs)
+        if num_rejected > 0:
+            self._rejected_count += num_rejected
+        
+        # Always increment roi_count and track trust (even if all classes rejected)
         self._roi_count += 1
         self._trust_values.append(trust)
         
         if trust >= self._trust_min:
             self._trusted_count += 1
         
-        # Update evidence for each class, skipping reject labels
-        for class_name, prob in probs.items():
-            # Skip reject labels (e.g., 'Rejected', 'Unknown', 'Uncertain')
-            # These indicate classifier uncertainty or low quality and should not
-            # contribute to evidence accumulation
-            if class_name in self._reject_labels:
-                self._rejected_count += 1
-                continue
-            
+        # If all classes were rejected, no evidence to accumulate, but counts are still updated
+        if not filtered_probs:
+            return
+        
+        # Update evidence for each non-rejected class
+        for class_name, prob in filtered_probs.items():
             # Compute weighted log evidence
             log_prob = math.log(prob + self._epsilon)
             weighted_contribution = trust * log_prob
@@ -278,10 +289,10 @@ class EvidenceAccumulator:
                 margin=0.0,
                 gate_passed=False,
                 gate_failure_reason="no_evidence",
-                rois_used=0,
-                rois_trusted=0,
+                rois_used=self._roi_count,
+                rois_trusted=self._trusted_count,
                 rois_rejected=self._rejected_count,
-                trust_stats={'min': 0.0, 'max': 0.0, 'mean': 0.0},
+                trust_stats=self._compute_trust_stats(),
                 evidence_per_class={},
                 class_switch_penalty_applied=False
             )
