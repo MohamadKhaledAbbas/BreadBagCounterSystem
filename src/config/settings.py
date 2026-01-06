@@ -124,7 +124,8 @@ class AppConfig:
                 2: 'Brown_Orange_Family',
                 3: 'Green_Yellow',
                 4: 'Red_Yellow',
-                5: 'Wheatberry'
+                5: 'Rejected',
+                6: 'Wheatberry'
             }
         if self.detector_classes is None:
             self.detector_classes = {
