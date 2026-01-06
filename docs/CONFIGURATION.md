@@ -92,6 +92,23 @@ evidence_ratio_threshold: float = 1.5
 - Range: 1.1 - 3.0
 - **Recommendation**: 1.5 balances accuracy vs Unknown rate
 
+```python
+classifier_reject_labels: tuple = ('Rejected',)
+```
+- Labels to skip/reject during voting and aggregation
+- Predictions with these labels are excluded from evidence accumulation
+- They don't count toward minimum candidates threshold
+- If ALL predictions are rejected, track is classified as "Unknown"
+- **Default**: ('Rejected',)
+- **Example**: Add more labels like ('Rejected', 'LowQuality', 'Ambiguous')
+- **Recommendation**: Use this to filter out low-quality or uncertain classifier predictions
+
+**Behavior Details:**
+- ROIs with reject labels are completely skipped during evidence accumulation
+- Rejection count is tracked and reported in statistics
+- Other classes in the same probability vector are still used (only the reject label itself is skipped)
+- This improves classification quality by ignoring frames the classifier marked as unreliable
+
 ## Database Schema Changes
 
 ### Confidence Tier Column

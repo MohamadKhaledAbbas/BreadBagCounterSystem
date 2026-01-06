@@ -51,6 +51,7 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 
 ## Documentation
 
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)**: Complete configuration guide including reject labels
 - **[SMART_SKIP_QUICKSTART.md](docs/SMART_SKIP_QUICKSTART.md)**: Quick start guide for smart frame skipping
 - **[SMART_FRAME_SKIPPING.md](docs/SMART_FRAME_SKIPPING.md)**: Complete smart frame skipping documentation
 - **[AUDIT_REPORT.md](docs/AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
@@ -77,9 +78,10 @@ See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
 - `src/classifier/ClassifierService.py`: Multi-candidate classification with evidence accumulation
 - `src/classifier/disambiguation_v2.py`: Production-grade size-based disambiguation (V2)
 - `src/classifier/probability_adjustments.py`: Probability mass transfer for disambiguation
-- `src/classifier/evidence_accumulator.py`: Trust-weighted log-evidence accumulation
+- `src/classifier/evidence_accumulator.py`: Trust-weighted log-evidence accumulation with reject label filtering
 - `src/classifier/roi_trust.py`: ROI quality scoring for evidence weighting
 - Evidence-based decision making with rejection thresholds and stability gates
+- **Configurable reject labels**: Filter out low-quality predictions (e.g., 'Rejected', 'LowQuality') from voting
 
 ### Logging & Analysis
 - `src/utils/AppLogging.py`: Structured JSON logging
