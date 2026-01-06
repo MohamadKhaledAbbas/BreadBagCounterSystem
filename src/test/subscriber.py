@@ -27,8 +27,8 @@ class FrameSubscriber(Node):
         img_data = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
         nv12_img = img_data.reshape((msg.height * 3 // 2, msg.width))
         bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
-        resized_bgr = cv2.resize(bgr, (640, 640))
-        cv2.imshow("NV12", resized_bgr)
+        resized_bgr = cv2.resize(bgr, (1024, 1025))
+        cv2.imshow(self.winname, resized_bgr)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             import rclpy

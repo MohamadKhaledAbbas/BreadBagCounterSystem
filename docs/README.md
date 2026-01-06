@@ -47,24 +47,24 @@ python tools/log_analyzer.py --log-dir ./data/logs --day 2025-12-16
 python tools/log_analyzer.py --log-dir ./data/logs --from 2025-12-16T08:00:00Z --to 2025-12-16T16:00:00Z
 ```
 
-See [docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md) for detailed documentation.
+See [docs/LOG_ANALYZER.md](LOG_ANALYZER.md) for detailed documentation.
 
 ## Documentation
 
 - **[CONFIGURATION.md](docs/CONFIGURATION.md)**: Complete configuration guide including reject labels
-- **[SMART_SKIP_QUICKSTART.md](docs/SMART_SKIP_QUICKSTART.md)**: Quick start guide for smart frame skipping
-- **[SMART_FRAME_SKIPPING.md](docs/SMART_FRAME_SKIPPING.md)**: Complete smart frame skipping documentation
-- **[AUDIT_REPORT.md](docs/AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
-- **[LOGGING_REFACTOR_SUMMARY.md](docs/LOGGING_REFACTOR_SUMMARY.md)**: Logging architecture overview
-- **[LOGGING_SAMPLES.md](docs/LOGGING_SAMPLES.md)**: Log format reference and debugging guide
-- **[EVENT_CENTRIC_TRACKING_ARCHITECTURE.md](docs/EVENT_CENTRIC_TRACKING_ARCHITECTURE.md)**: Event tracking design
-- **[PLATFORM_COMPATIBILITY.md](docs/PLATFORM_COMPATIBILITY.md)**: Platform support information
-- **[docs/LOG_ANALYZER.md](docs/LOG_ANALYZER.md)**: Log analyzer tool documentation
-- **[docs/STRUCTURED_LOGGING_SCHEMA.md](docs/STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
-- **[docs/PROBABILITY_ADJUSTMENTS.md](docs/PROBABILITY_ADJUSTMENTS.md)**: Probability mass transfer and disambiguation integration
-- **[docs/DISAMBIGUATION_V2_GUIDE.md](docs/DISAMBIGUATION_V2_GUIDE.md)**: Production guide for enhanced disambiguation V2 module
-- **[docs/ROI_FILTERING_AND_THRESHOLDS.md](docs/ROI_FILTERING_AND_THRESHOLDS.md)**: ROI quality filtering and threshold selection
-- **[IMPLEMENTATION_SUMMARY.md](docs/IMPLEMENTATION_SUMMARY.md)**: Production-grade classification improvements summary
+- **[SMART_SKIP_QUICKSTART.md](SMART_SKIP_QUICKSTART.md)**: Quick start guide for smart frame skipping
+- **[SMART_FRAME_SKIPPING.md](SMART_FRAME_SKIPPING.md)**: Complete smart frame skipping documentation
+- **[AUDIT_REPORT.md](AUDIT_REPORT.md)**: Comprehensive system audit and accuracy roadmap
+- **[LOGGING_REFACTOR_SUMMARY.md](LOGGING_REFACTOR_SUMMARY.md)**: Logging architecture overview
+- **[LOGGING_SAMPLES.md](LOGGING_SAMPLES.md)**: Log format reference and debugging guide
+- **[EVENT_CENTRIC_TRACKING_ARCHITECTURE.md](EVENT_CENTRIC_TRACKING_ARCHITECTURE.md)**: Event tracking design
+- **[PLATFORM_COMPATIBILITY.md](PLATFORM_COMPATIBILITY.md)**: Platform support information
+- **[docs/LOG_ANALYZER.md](LOG_ANALYZER.md)**: Log analyzer tool documentation
+- **[docs/STRUCTURED_LOGGING_SCHEMA.md](STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
+- **[docs/PROBABILITY_ADJUSTMENTS.md](PROBABILITY_ADJUSTMENTS.md)**: Probability mass transfer and disambiguation integration
+- **[docs/DISAMBIGUATION_V2_GUIDE.md](DISAMBIGUATION_V2_GUIDE.md)**: Production guide for enhanced disambiguation V2 module
+- **[docs/ROI_FILTERING_AND_THRESHOLDS.md](ROI_FILTERING_AND_THRESHOLDS.md)**: ROI quality filtering and threshold selection
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Production-grade classification improvements summary
 
 ## Key Components
 
@@ -178,7 +178,7 @@ When running on slower hardware (e.g., Windows PCs), the system automatically sc
 - **No frame dropping**: All frames processed regardless of speed
 - **Equivalent behavior**: Event lifecycles match production timing
 
-See [docs/TESTING_TIME_SCALING.md](docs/TESTING_TIME_SCALING.md) for detailed configuration guide.
+See [docs/TESTING_TIME_SCALING.md](TESTING_TIME_SCALING.md) for detailed configuration guide.
 
 ### Unknown Bag Handling
 

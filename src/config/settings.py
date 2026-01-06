@@ -71,9 +71,9 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2026-01-05-v2.6.0"
+    APP_VERSION: str = "2026-01-06-v2.7.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\20251129050005_20251129050202.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\20251129060005_20251129065911.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
@@ -84,8 +84,8 @@ class AppConfig:
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
-        "data/model/classify_yolo_small_v9_bayese_224x224_nv12.bin" if IS_RDK
-        else "data/model/classify_yolo_small_v9.pt"
+        "data/model/classify_yolo_small_v10_bayese_224x224_nv12.bin" if IS_RDK
+        else "data/model/classify_yolo_small_v10.pt"
     )
 
     if IS_RDK:
