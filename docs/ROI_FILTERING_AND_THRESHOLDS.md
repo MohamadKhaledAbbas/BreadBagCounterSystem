@@ -1,5 +1,26 @@
 # ROI Filtering and Threshold Selection Best Practices
 
+## V8 Classification Reliability Updates (2026-01)
+
+This version includes critical production-ready fixes to improve classification reliability and reduce "Uncertain" classifications:
+
+### Key Changes
+1. **Stratified Top-K Selection**: Ensures minimum 3 closed ROIs in top-K (prevents disambiguation failures)
+2. **Equal Trust Caps**: Both open/closed ROIs can reach trust=1.0 (quality metrics determine trust)
+3. **Relaxed Margin Threshold**: 0.3 instead of 0.5 (reduces excessive uncertain classifications)
+4. **Increased Min Trusted ROIs**: 3 instead of 2 (ensures sufficient high-quality evidence)
+5. **Probability Validation**: Prevents crashes from malformed classifier outputs
+6. **Enhanced Diagnostics**: Detailed failure reasons for debugging
+
+### Impact
+- ✅ Reduced "Uncertain" classification rate (target: <10%)
+- ✅ All closed-only disambiguation cases have closed ROIs available
+- ✅ Balanced evidence accumulation with 10 open + 10 closed ROIs
+- ✅ No crashes from malformed probability vectors
+- ✅ Clear diagnostic logs for uncertain classifications
+
+---
+
 ## Overview
 
 This document describes the production-grade ROI filtering and threshold selection strategy for the Brown_Orange_Family (Brown_Orange_Overlay vs Brown_Orange_Small) classification system.
@@ -203,10 +224,12 @@ trust = base_trust * (1 - size_penalty) * (1 - blur_penalty)
 base_trust = min(sharpness_normalized, state_cap)
 ```
 
-#### State Cap
-- **Open ROIs**: Max trust = 1.0 (full trust)
-- **Closed ROIs**: Max trust = 0.7 (capped trust)
-- **Rationale**: Open bags provide clearer view of features; Closed bags may have deformation
+#### State Cap (V8: Equal Trust Design)
+- **Open ROIs**: Max trust = 1.0
+- **Closed ROIs**: Max trust = 1.0 (changed from 0.7)
+- **Rationale**: Quality metrics (sharpness, brightness) should determine trust, not state
+- **Design Philosophy**: Let the quality of the ROI speak for itself. If a closed ROI is sharp and well-lit, it should be trusted equally. The previous cap of 0.7 for closed ROIs artificially biased evidence toward open ROIs.
+- **Impact**: Closed ROIs now have equal opportunity to contribute high-quality evidence for size-based disambiguation
 
 #### Size Stability Penalty
 - **Metric**: Deviation from median ROI size across track
@@ -224,16 +247,30 @@ base_trust = min(sharpness_normalized, state_cap)
 - **Purpose**: ROIs below threshold don't count toward stability gate
 - **Rationale**: Only sufficiently reliable ROIs should influence decision
 
-### Top-K Selection
+### Top-K Selection (V8: Stratified Selection)
 
-**Strategy**: Select top K=7 ROIs by trust score for classification
+**Strategy**: Stratified selection ensuring minimum closed ROI representation
+
+**Parameters**:
+- `top_k_candidates = 10` (increased from 5/7)
+- `min_closed_rois_in_top_k = 3` (new parameter)
+- `evidence_top_k_rois = 10` (increased from 7)
+
+**Algorithm**:
+1. Guarantee at least 3 closed ROIs in top-K (if available)
+2. Fill remaining slots with best ROIs by trust from both states
+3. Prevents all top-K being open ROIs when they have slightly higher sharpness
 
 **Rationale**:
-- Quality over quantity: 7 high-trust ROIs better than 20 mixed-quality
-- Reduces computational cost (7 classifier calls instead of 20)
-- Focuses evidence on most reliable samples
+- **Problem**: Simple trust-based selection may select all open ROIs (higher sharpness), leaving zero closed ROIs for size-based disambiguation
+- **Solution**: Stratified selection ensures closed ROIs are always represented
+- **Impact**: Closed-only disambiguation cases now always have closed ROIs available
+- **Quality Preservation**: Within guaranteed closed and remaining pool, still selects by trust
 
-**Configuration**: `evidence_top_k_rois = 7` in tracking_config.py
+**Example**:
+- 10 open ROIs (trust 0.8-0.9) + 5 closed ROIs (trust 0.6-0.75)
+- Without stratification: All top-7 would be open (higher trust)
+- With stratification: 3 closed (guaranteed) + 7 best remaining = balanced mix
 
 ## Temporal Evidence Accumulation
 
@@ -250,21 +287,31 @@ evidence[class] = Σᵢ trust_i × log(prob_i[class] + ε)
 - Requires consistent evidence across multiple ROIs
 - Handles zero/near-zero probabilities gracefully with epsilon
 
-### Stability Gate
+### Stability Gate (V8: Relaxed Thresholds)
 
 Before accepting a classification, the system checks:
 
-1. **Margin Threshold**: Winner score - Runner-up score ≥ 0.5
+1. **Margin Threshold**: Winner score - Runner-up score ≥ 0.3 (reduced from 0.5)
    - Ensures clear separation between top two classes
    - Rejects close races as "Uncertain"
+   - **V8 Tuning**: Lowered from 0.5 to 0.3 because log-evidence scores are negative (e.g., -3.5 vs -4.2), making margins naturally small
+   - **Impact**: Reduces excessive "Uncertain" classifications while still catching ambiguous cases
 
-2. **Minimum Trusted ROIs**: At least 2 ROIs with trust ≥ 0.4
+2. **Minimum Trusted ROIs**: At least 3 ROIs with trust ≥ 0.4 (increased from 2)
    - Ensures sufficient high-quality evidence
    - Rejects tracks with only low-trust samples
+   - **V8 Tuning**: Increased to 3 to ensure better reliability with balanced ROI collection
+
+**Enhanced Failure Reasoning (V8)**:
+- Gate failures now include detailed context for debugging:
+  - Winner/runner-up scores and labels
+  - Actual margin vs threshold
+  - Trust values of ROIs used
+  - Total ROI counts
 
 **Result**:
 - Pass both gates → Accept winner class
-- Fail either gate → Return "Uncertain"
+- Fail either gate → Return "Uncertain" with detailed reason
 
 ### Class-Switch Penalty
 
@@ -337,9 +384,9 @@ disambiguation_regular_threshold = 11000.0     # UPDATED for production
 disambiguation_gray_zone_behavior = 'keep_original'
 disambiguation_debug_logging = True            # Enable for tuning
 
-# Trust Scoring (Part 2)
+# Trust Scoring (Part 2) - V8 Updates
 trust_open_max = 1.0
-trust_closed_max = 0.7
+trust_closed_max = 1.0  # V8: Increased from 0.7 for equal trust design
 trust_sharpness_min = 100.0
 trust_sharpness_max = 800.0
 trust_blur_penalty = 0.3
