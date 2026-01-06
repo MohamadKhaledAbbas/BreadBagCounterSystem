@@ -297,43 +297,60 @@ def apply_batch_adjustments(
 
 def validate_probability_vector(
     probs: Dict[str, float],
-    epsilon: float = 1e-6
-) -> Tuple[bool, Optional[str]]:
+    epsilon: float = 0.01
+) -> Tuple[bool, str]:
     """
-    Validate that a probability vector is well-formed.
+    Validate classifier probability vector for correctness.
     
     Checks:
-    1. All values are non-negative
-    2. Sum is approximately 1.0 (within epsilon)
-    3. No NaN or Inf values
+    - Non-empty
+    - No NaN/Inf values
+    - All values in [0, 1]
+    - Sum ≈ 1.0 (within epsilon)
+    - Not too ambiguous (max prob > 0.25)
+    
+    This prevents malformed classifier outputs from crashing the evidence
+    accumulation system or producing invalid results.
     
     Args:
-        probs: Probability vector to validate
-        epsilon: Tolerance for sum check
+        probs: Probability vector {class_name: probability}
+        epsilon: Tolerance for sum check (default: 0.01 = 1%)
         
     Returns:
-        Tuple of (is_valid, error_message)
+        Tuple of (is_valid, reason):
+        - is_valid: True if all checks pass
+        - reason: "valid" if valid, otherwise description of failure
+        
+    Example:
+        is_valid, reason = validate_probability_vector(
+            {"ClassA": 0.6, "ClassB": 0.3, "ClassC": 0.1}
+        )
+        if not is_valid:
+            logger.error(f"Invalid probabilities: {reason}")
+            return None
     """
+    # Check 1: Non-empty
     if not probs:
-        return False, "empty_probability_vector"
+        return False, "empty_probs"
     
-    # Check for non-numeric values
+    # Check 2: No NaN/Inf values, all in [0, 1]
     for class_name, prob in probs.items():
-        if not isinstance(prob, (int, float)):
-            return False, f"non_numeric_probability ({class_name}: {type(prob)})"
-        
-        if math.isnan(prob):
-            return False, f"nan_probability ({class_name})"
-        
-        if math.isinf(prob):
-            return False, f"inf_probability ({class_name})"
-        
-        if prob < 0:
-            return False, f"negative_probability ({class_name}: {prob})"
+        if math.isnan(prob) or math.isinf(prob):
+            return False, f"invalid_value_{class_name}"
+        if prob < 0 or prob > 1:
+            return False, f"out_of_range_{class_name}_{prob:.3f}"
     
-    # Check sum
+    # Check 3: Sum ≈ 1.0 (within epsilon)
     total = sum(probs.values())
-    if abs(total - 1.0) > epsilon:
-        return False, f"sum_not_one (sum={total:.6f})"
+    if not (1.0 - epsilon <= total <= 1.0 + epsilon):
+        return False, f"invalid_sum_{total:.3f}"
     
-    return True, None
+    # Check 4: Not too ambiguous (max prob > 0.25)
+    # This catches degenerate cases where classifier is completely uncertain
+    # (e.g., all classes at 0.2 each for 5 classes)
+    max_prob = max(probs.values())
+    if max_prob < 0.25:
+        return False, "too_ambiguous"
+    
+    return True, "valid"
+
