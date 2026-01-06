@@ -92,6 +92,9 @@ class ClassifierService:
         self.sharpness_scale = tracking_config.sharpness_weight_scale
         self.temporal_scale = tracking_config.temporal_weight_scale
         self.max_single_weight = tracking_config.max_single_roi_weight
+        
+        # Reject labels configuration
+        self.reject_labels = set(tracking_config.classifier_reject_labels)
 
         self.callbacks: List[ResultCallback] = []
         self.running = True
@@ -101,6 +104,7 @@ class ClassifierService:
         self._unknown_structural = 0
         self._unknown_low_evidence = 0
         self._unknown_ambiguous = 0
+        self._rejected_predictions = 0  # Track rejected prediction count
         
         # V5: Classification smoothing with history (for sequential bags of same type)
         self.history_size = 5  # Last N bag classifications to maintain
@@ -153,7 +157,8 @@ class ClassifierService:
             f"[ClassifierService] Initialized V4 (Evidence-Based) with V5 Classification Smoothing: "
             f"top_k={self.top_k}, min_evidence={self.min_total_evidence}, "
             f"ratio_threshold={self.ratio_threshold}, min_candidates={self.min_candidates}, "
-            f"history_size={self.history_size}, history_vote_threshold={self.history_vote_threshold}"
+            f"history_size={self.history_size}, history_vote_threshold={self.history_vote_threshold}, "
+            f"reject_labels={list(self.reject_labels)}"
         )
         logger.info(f"[ClassifierService] V7 Reliability: {v7_str}")
 
@@ -804,12 +809,25 @@ class ClassifierService:
             relative_time = clf['relative_time']
             roi = clf['roi']
             
-            # Skip Unknown predictions - they don't contribute evidence
-            # Note: If ALL predictions are Unknown, the track will be classified as Unknown
+            # Skip reject labels (e.g., 'Rejected', 'Unknown') - they don't contribute evidence
+            # Note: If ALL predictions are rejected, the track will be classified as Unknown
             # with reason "no_valid_classifications" in _finalize_classification().
-            # This is intentional: Unknown predictions indicate classifier uncertainty,
+            # This is intentional: Reject labels indicate classifier uncertainty or low quality,
             # so they should not influence the evidence accumulation.
-            if label == "Unknown":
+            if label in self.reject_labels or label == "Unknown":
+                if label in self.reject_labels:
+                    self._rejected_predictions += 1
+                    structured_logger.classification_candidate(
+                        track_id=-1,  # Not tracked here, logged per-candidate
+                        candidate_idx=-1,
+                        label=label,
+                        confidence=confidence,
+                        sharpness=sharpness,
+                        relative_time=relative_time,
+                        contribution=0.0,
+                        frame_index=clf.get('frame_index', 0),
+                        bbox=None,
+                    )
                 continue
             
             # Compute weights
@@ -1152,6 +1170,7 @@ class ClassifierService:
                 metadata = {
                     "evidence_per_label": {k: round(v, 4) for k, v in accumulator_result.evidence_per_class.items()},
                     "total_candidates_classified": accumulator_result.rois_used,
+                    "rejected_predictions": accumulator_result.rois_rejected,
                     "winner_score": round(accumulator_result.winner_score, 4),
                     "runner_up": {
                         "label": accumulator_result.runner_up_label,
@@ -1165,6 +1184,9 @@ class ClassifierService:
                     "class_switch_penalty_applied": accumulator_result.class_switch_penalty_applied,
                     "evidence_accumulation_used": True
                 }
+                
+                # Update global rejection counter
+                self._rejected_predictions += accumulator_result.rois_rejected
                 
                 # Removed old per-ROI disambiguation stats - now using track-level disambiguation
                 # Track-level disambiguation metadata is added in the track_disambiguation section above
@@ -1556,6 +1578,7 @@ class ClassifierService:
             "unknown_structural": self._unknown_structural,
             "unknown_low_evidence": self._unknown_low_evidence,
             "unknown_ambiguous": self._unknown_ambiguous,
+            "rejected_predictions": self._rejected_predictions,
             "successful": self._total_classified - (
                 self._unknown_structural + self._unknown_low_evidence + self._unknown_ambiguous
             ),
@@ -1583,5 +1606,10 @@ class ClassifierService:
                 "confidence_penalty_applied": self._disambiguation_v2_stats['confidence_penalty_applied'],
                 "by_size_bin": dict(self._disambiguation_v2_stats['by_size_bin']),
                 "by_reason": dict(self._disambiguation_v2_stats['by_reason']),
+            },
+            # Rejection configuration
+            "rejection": {
+                "reject_labels": list(self.reject_labels),
+                "total_rejected": self._rejected_predictions,
             },
         }

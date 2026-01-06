@@ -80,6 +80,7 @@ class FinalClassificationResult:
     # Diagnostic info
     rois_used: int  # Number of ROIs used
     rois_trusted: int  # Number of trusted ROIs
+    rois_rejected: int  # Number of rejected ROIs (with reject labels)
     trust_stats: Dict[str, float]  # min/max/mean trust
     evidence_per_class: Dict[str, float]  # Log-evidence for each class
     class_switch_penalty_applied: bool  # Was inertia/penalty applied?
@@ -98,6 +99,7 @@ class FinalClassificationResult:
             'gate_failure_reason': self.gate_failure_reason,
             'rois_used': self.rois_used,
             'rois_trusted': self.rois_trusted,
+            'rois_rejected': self.rois_rejected,
             'trust_stats': self.trust_stats,
             'evidence_per_class': self.evidence_per_class,
             'class_switch_penalty_applied': self.class_switch_penalty_applied
@@ -148,6 +150,9 @@ class EvidenceAccumulator:
         self._trust_values: List[float] = []
         self._trusted_count: int = 0
         
+        # Rejection tracking
+        self._rejected_count: int = 0
+        
         # Configuration
         self._epsilon = getattr(config, 'evidence_epsilon', 1e-6)
         self._inertia_enabled = getattr(config, 'temporal_inertia_enabled', True)
@@ -157,6 +162,12 @@ class EvidenceAccumulator:
         self._margin_threshold = getattr(config, 'stability_margin_threshold', 0.5)
         self._min_trusted = getattr(config, 'stability_min_trusted_rois', 2)
         self._trust_min = getattr(config, 'trust_min_for_support', 0.4)
+        
+        # Reject labels configuration
+        reject_labels_tuple = getattr(config, 'classifier_reject_labels', ('Rejected',))
+        self._reject_labels = set(reject_labels_tuple) if reject_labels_tuple else set()
+        # Always include 'Unknown' and 'Uncertain' in reject list
+        self._reject_labels.update(['Unknown', 'Uncertain'])
     
     def update(
         self,
@@ -174,14 +185,32 @@ class EvidenceAccumulator:
             trust: Trust score for this ROI (0-1)
             state: 'open' or 'closed' state of the ROI
         """
+        # Filter out reject labels from probabilities before processing
+        # This ensures reject labels don't contribute ANY evidence
+        filtered_probs = {
+            class_name: prob
+            for class_name, prob in probs.items()
+            if class_name not in self._reject_labels
+        }
+        
+        # Count rejected classes (always count, even if all are rejected)
+        num_rejected = len(probs) - len(filtered_probs)
+        if num_rejected > 0:
+            self._rejected_count += num_rejected
+        
+        # Always increment roi_count and track trust (even if all classes rejected)
         self._roi_count += 1
         self._trust_values.append(trust)
         
         if trust >= self._trust_min:
             self._trusted_count += 1
         
-        # Update evidence for each class
-        for class_name, prob in probs.items():
+        # If all classes were rejected, no evidence to accumulate, but counts are still updated
+        if not filtered_probs:
+            return
+        
+        # Update evidence for each non-rejected class
+        for class_name, prob in filtered_probs.items():
             # Compute weighted log evidence
             log_prob = math.log(prob + self._epsilon)
             weighted_contribution = trust * log_prob
@@ -260,9 +289,10 @@ class EvidenceAccumulator:
                 margin=0.0,
                 gate_passed=False,
                 gate_failure_reason="no_evidence",
-                rois_used=0,
-                rois_trusted=0,
-                trust_stats={'min': 0.0, 'max': 0.0, 'mean': 0.0},
+                rois_used=self._roi_count,
+                rois_trusted=self._trusted_count,
+                rois_rejected=self._rejected_count,
+                trust_stats=self._compute_trust_stats(),
                 evidence_per_class={},
                 class_switch_penalty_applied=False
             )
@@ -345,6 +375,7 @@ class EvidenceAccumulator:
             gate_failure_reason=gate_failure_reason,
             rois_used=self._roi_count,
             rois_trusted=self._trusted_count,
+            rois_rejected=self._rejected_count,
             trust_stats=trust_stats,
             evidence_per_class=evidence_per_class,
             class_switch_penalty_applied=penalty_applied
