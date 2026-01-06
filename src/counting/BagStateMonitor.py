@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 from src.utils.AppLogging import logger, structured_logger
 from src.config.tracking_config import tracking_config
 from src.utils.PipelineMetrics import pipeline_metrics
+from src.classifier.roi_trust import select_stratified_top_k
 
 
 class BagEvent:
@@ -386,6 +387,8 @@ class BagEvent:
         """
         V4: Return all collected ROIs with full metadata for evidence-based classification.
         
+        V8: Uses stratified top-K selection to ensure minimum closed ROI representation.
+        
         Returns:
             List of candidate dictionaries, each containing:
             - roi: The ROI image
@@ -395,9 +398,19 @@ class BagEvent:
             - confidence: Detection confidence
             - relative_time: Position in track lifecycle (0.0 = start, 1.0 = end)
             - bbox: Bounding box (x1, y1, x2, y2) for disambiguation
+            - state: 'open' or 'closed' state for stratified selection
+            - is_open: Boolean indicating open state (for compatibility)
         """
-        # Combine both buffers
-        all_rois = self.open_rois + self.closed_rois
+        # Combine both buffers but keep track of state
+        all_rois = []
+        
+        # Add open ROIs with state marker
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox in self.open_rois:
+            all_rois.append((sharpness, roi, frame_index, bbox_area, confidence, bbox, 'open'))
+        
+        # Add closed ROIs with state marker
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox in self.closed_rois:
+            all_rois.append((sharpness, roi, frame_index, bbox_area, confidence, bbox, 'closed'))
         
         if not all_rois:
             return []
@@ -405,9 +418,9 @@ class BagEvent:
         # V4: Calculate relative time for each ROI
         track_duration = max(1, self.current_frame_index - self.start_frame_index)
         
-        # Convert to list of dictionaries with full metadata
+        # Convert to list of dictionaries with full metadata including state
         candidates = []
-        for sharpness, roi, frame_index, bbox_area, confidence, bbox in all_rois:
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox, state in all_rois:
             # Ensure no division by zero with additional safety check
             relative_time = (frame_index - self.start_frame_index) / track_duration if track_duration > 0 else 0.5
             candidates.append({
@@ -418,14 +431,22 @@ class BagEvent:
                 'confidence': confidence,
                 'relative_time': relative_time,
                 'bbox': bbox,  # Include bbox for disambiguation
+                'state': state,  # NEW: Include state for stratified selection
+                'is_open': state == 'open',  # NEW: Boolean flag for compatibility
             })
         
-        # Sort by sharpness (highest first), then by frame_index (later first) for ties
-        candidates.sort(key=lambda x: (x['sharpness'], x['frame_index']), reverse=True)
-        
-        # Select top-K candidates
+        # V8: Stratified Top-K Selection using centralized function
+        # Use the roi_trust module's stratified selection to ensure minimum closed representation
         top_k = tracking_config.top_k_candidates
-        selected_candidates = candidates[:top_k]
+        min_closed = getattr(tracking_config, 'min_closed_rois_in_top_k', 3)
+        
+        selected_candidates = select_stratified_top_k(
+            candidates,
+            top_k=top_k,
+            min_closed=min_closed,
+            config=tracking_config
+        )
+        
         return selected_candidates
 
     def get_stats(self) -> dict:

@@ -436,3 +436,130 @@ def count_trusted_rois(
             count += 1
     
     return count
+
+
+def select_stratified_top_k(
+    roi_candidates: List[Dict[str, Any]],
+    top_k: int = 10,
+    min_closed: int = 3,
+    config: Any = None
+) -> List[Dict[str, Any]]:
+    """
+    Select top K ROIs ensuring minimum closed representation.
+    
+    Strategy:
+    1. Guarantee at least min_closed closed ROIs (if available)
+    2. Fill remaining slots with best ROIs from both states by trust
+    3. Prevents disambiguation failure from lack of closed ROIs
+    
+    This addresses the critical issue where top-K selection by trust alone
+    may select only open ROIs if they have slightly higher sharpness, leaving
+    zero closed ROIs for size-based disambiguation.
+    
+    Example:
+        Given 10 open ROIs (trust 0.8-0.9) and 5 closed ROIs (trust 0.6-0.75):
+        - Without stratification: All 10 selected would be open (higher trust)
+        - With stratification: At least 3 closed + 7 best remaining = good mix
+    
+    Args:
+        roi_candidates: List of ROI candidate dicts with 'trust' and 'state'/'is_open'
+        top_k: Total number of ROIs to select
+        min_closed: Minimum number of closed ROIs to guarantee (if available)
+        config: TrackingConfig object (unused, kept for API compatibility)
+        
+    Returns:
+        Top-K candidates with stratified selection ensuring min closed representation
+        
+    Raises:
+        ValueError: If min_closed > top_k
+    """
+    if min_closed > top_k:
+        raise ValueError(f"min_closed ({min_closed}) cannot exceed top_k ({top_k})")
+    
+    if not roi_candidates:
+        return []
+    
+    # Ensure all candidates have trust scores
+    candidates_with_trust = []
+    for candidate in roi_candidates:
+        if 'trust' not in candidate:
+            # Compute trust if missing
+            if config:
+                sharpness = candidate.get('sharpness', 0.0)
+                is_open = candidate.get('is_open', True) or candidate.get('state') == 'open'
+                roi_size = candidate.get('size', (100, 100))
+                
+                trust_result = compute_roi_trust(
+                    sharpness=sharpness,
+                    is_open=is_open,
+                    roi_size=roi_size,
+                    median_size=None,
+                    config=config
+                )
+                candidate = {**candidate, 'trust': trust_result.trust}
+            else:
+                # No config, default to 0.5
+                candidate = {**candidate, 'trust': 0.5}
+        
+        candidates_with_trust.append(candidate)
+    
+    # Separate by state
+    open_rois = []
+    closed_rois = []
+    
+    for roi in candidates_with_trust:
+        # Determine state from 'is_open' or 'state' field
+        is_open = roi.get('is_open', None)
+        state = roi.get('state', None)
+        
+        if is_open is not None:
+            if is_open:
+                open_rois.append(roi)
+            else:
+                closed_rois.append(roi)
+        elif state is not None:
+            if state == 'open':
+                open_rois.append(roi)
+            elif state == 'closed':
+                closed_rois.append(roi)
+            else:
+                # Unknown state, treat as open by default
+                open_rois.append(roi)
+        else:
+            # No state information, treat as open by default
+            open_rois.append(roi)
+    
+    # Sort by trust descending
+    open_sorted = sorted(open_rois, key=lambda x: x.get('trust', 0.0), reverse=True)
+    closed_sorted = sorted(closed_rois, key=lambda x: x.get('trust', 0.0), reverse=True)
+    
+    # STEP 1: Ensure minimum closed representation
+    # Take up to min_closed closed ROIs (or all if fewer available)
+    selected_closed = closed_sorted[:min(min_closed, len(closed_sorted))]
+    remaining_slots = top_k - len(selected_closed)
+    
+    # STEP 2: Fill remaining slots with best from both states
+    # Combine remaining closed (after min_closed) with all open
+    remaining_closed = closed_sorted[len(selected_closed):]
+    remaining_pool = open_sorted + remaining_closed
+    
+    # Sort combined pool by trust
+    remaining_sorted = sorted(remaining_pool, key=lambda x: x.get('trust', 0.0), reverse=True)
+    
+    # Select top remaining_slots from combined pool
+    selected_remaining = remaining_sorted[:remaining_slots]
+    
+    # STEP 3: Combine and return
+    final_selection = selected_closed + selected_remaining
+    
+    # Log stratification stats if we have logger
+    if len(closed_sorted) > 0:
+        actual_closed_selected = len([r for r in final_selection if not r.get('is_open', True) or r.get('state') == 'closed'])
+        logger.debug(
+            f"Stratified top-K selection: {len(final_selection)} total "
+            f"({actual_closed_selected} closed, {len(final_selection) - actual_closed_selected} open) "
+            f"from {len(candidates_with_trust)} candidates "
+            f"({len(closed_sorted)} closed, {len(open_sorted)} open available)"
+        )
+    
+    return final_selection

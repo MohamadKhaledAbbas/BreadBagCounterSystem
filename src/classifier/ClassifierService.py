@@ -39,7 +39,12 @@ from src.utils.PipelineMetrics import pipeline_metrics
 # V7: Import new reliability modules
 from src.classifier.disambiguation import disambiguate_by_size, DisambiguationResult
 from src.classifier.disambiguation_v2 import disambiguate_v2, DisambiguationV2Result
-from src.classifier.roi_trust import compute_roi_trust, select_top_k_by_trust, count_trusted_rois
+from src.classifier.roi_trust import (
+    compute_roi_trust, 
+    select_top_k_by_trust, 
+    select_stratified_top_k,
+    count_trusted_rois
+)
 from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 from src.classifier.probability_adjustments import apply_probability_adjustment, validate_probability_vector
 
@@ -206,7 +211,35 @@ class ClassifierService:
         """
         try:
             label, conf, probs = self.classifier.predict_probs(roi_image)
+            
+            # CRITICAL: Validate probability vector before using
+            is_valid, reason = validate_probability_vector(probs, epsilon=0.01)
+            if not is_valid:
+                # Log validation failure with structured logging
+                structured_logger.pipeline_error(
+                    component="ClassifierService",
+                    operation="probability_validation",
+                    error_type="invalid_probability_vector",
+                    error_message=f"Validation failed: {reason}",
+                    affected_ids=[idx],
+                    context={
+                        "candidate_idx": idx,
+                        "reason": reason,
+                        "label": label,
+                        "confidence": conf,
+                        "probs": str(probs)[:200]  # Truncate for logging
+                    }
+                )
+                logger.error(
+                    f"[ClassifierService] Invalid probability vector for ROI {idx}: {reason}. "
+                    f"Label={label}, conf={conf:.3f}"
+                )
+                
+                # Return safe fallback: Unknown with uniform probabilities
+                return "Unknown", 0.0, {"Unknown": 1.0}
+            
             return label, float(conf), probs
+            
         except Exception as e:
             structured_logger.pipeline_error(
                 component="ClassifierService",

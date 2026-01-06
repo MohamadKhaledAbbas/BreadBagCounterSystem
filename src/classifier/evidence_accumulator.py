@@ -25,6 +25,20 @@ Log-evidence provides mathematical containment:
 - Suppresses noisy ambiguous frames
 - Contains overconfident misclassifications
 
+DECISION LOGIC (Margin-Based):
+    The final classification uses MARGIN-BASED decision, not absolute threshold:
+    
+    1. Find winner: class with highest log-evidence score
+    2. Find runner-up: class with second-highest score
+    3. Compute margin = winner_score - runner_up_score
+    4. Accept if: margin >= stability_margin_threshold AND
+                  trusted_rois >= stability_min_trusted_rois
+    5. Otherwise: Return "Uncertain"
+    
+    The min_total_evidence_score parameter is DEPRECATED and unused because
+    log-evidence scores are negative (e.g., -3.5, -4.2), making a positive
+    threshold meaningless. The margin-based approach is more robust.
+
 Usage:
     from src.classifier.evidence_accumulator import EvidenceAccumulator
     
@@ -348,12 +362,26 @@ class EvidenceAccumulator:
             # Check margin threshold
             if margin < self._margin_threshold:
                 gate_passed = False
-                gate_failure_reason = f"margin_too_small ({margin:.3f} < {self._margin_threshold})"
+                # Enhanced context-aware reasoning
+                gate_failure_reason = (
+                    f"margin_too_small: winner={winner_name} ({winner_score:.3f}) "
+                    f"vs runner_up={runner_up_name} ({runner_up_score:.3f}), "
+                    f"margin={margin:.3f} < threshold={self._margin_threshold} "
+                    f"[rois_used={self._roi_count}, trusted={self._trusted_count}]"
+                )
             
             # Check trusted ROI count
             elif self._trusted_count < self._min_trusted:
                 gate_passed = False
-                gate_failure_reason = f"too_few_trusted_rois ({self._trusted_count} < {self._min_trusted})"
+                # Enhanced context-aware reasoning
+                trust_list = [f"{t:.2f}" for t in self._trust_values[:5]]  # First 5 for brevity
+                gate_failure_reason = (
+                    f"too_few_trusted_rois: trusted={self._trusted_count}/{self._roi_count} "
+                    f"(min={self._min_trusted}, trust_threshold={self._trust_min}), "
+                    f"trust_values=[{', '.join(trust_list)}{' ...' if len(self._trust_values) > 5 else ''}], "
+                    f"winner={winner_name} (score={winner_score:.3f})"
+                )
+
         
         # Determine final label
         if gate_passed:

@@ -69,7 +69,7 @@ class MockConfig:
     temporal_inertia_strength: float = 0.15
     temporal_inertia_decay: float = 0.8
     stability_gate_enabled: bool = True
-    stability_margin_threshold: float = 0.5
+    stability_margin_threshold: float = 0.3
     stability_min_trusted_rois: int = 2
 
 
@@ -1354,6 +1354,339 @@ class TestBidirectionalSmoother:
         assert 1 in event_ids
         assert 2 in event_ids
         assert 3 in event_ids
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
+
+
+# =============================================================================
+# V8: Stratified Top-K Selection Tests
+# =============================================================================
+
+class TestStratifiedTopKSelection:
+    """Tests for stratified top-K ROI selection ensuring minimum closed representation."""
+    
+    def test_stratified_selection_ensures_min_closed(self, default_config):
+        """Stratified selection should guarantee minimum closed ROIs even when open have higher trust."""
+        from src.classifier.roi_trust import select_stratified_top_k
+        
+        # Create candidates: 10 open with high trust, 5 closed with lower trust
+        candidates = []
+        
+        # Open ROIs with high trust (0.8-0.9)
+        for i in range(10):
+            candidates.append({
+                'roi_id': f'open_{i}',
+                'trust': 0.8 + (i * 0.01),
+                'sharpness': 700 + (i * 10),
+                'state': 'open',
+                'is_open': True
+            })
+        
+        # Closed ROIs with lower trust (0.6-0.75)
+        for i in range(5):
+            candidates.append({
+                'roi_id': f'closed_{i}',
+                'trust': 0.6 + (i * 0.03),
+                'sharpness': 500 + (i * 10),
+                'state': 'closed',
+                'is_open': False
+            })
+        
+        # Without stratification, all top-7 would be open (higher trust)
+        # With stratification (min_closed=3), at least 3 should be closed
+        selected = select_stratified_top_k(candidates, top_k=7, min_closed=3, config=default_config)
+        
+        closed_count = len([c for c in selected if c['state'] == 'closed'])
+        open_count = len([c for c in selected if c['state'] == 'open'])
+        
+        assert len(selected) == 7
+        assert closed_count >= 3, f"Expected at least 3 closed ROIs, got {closed_count}"
+        assert open_count == 4, f"Expected 4 open ROIs, got {open_count}"
+    
+    def test_stratified_selection_with_insufficient_closed(self, default_config):
+        """When fewer closed ROIs available than min_closed, use all available."""
+        from src.classifier.roi_trust import select_stratified_top_k
+        
+        candidates = []
+        
+        # 8 open ROIs
+        for i in range(8):
+            candidates.append({
+                'roi_id': f'open_{i}',
+                'trust': 0.8,
+                'state': 'open',
+                'is_open': True
+            })
+        
+        # Only 2 closed ROIs (min_closed=3 but only 2 available)
+        for i in range(2):
+            candidates.append({
+                'roi_id': f'closed_{i}',
+                'trust': 0.7,
+                'state': 'closed',
+                'is_open': False
+            })
+        
+        selected = select_stratified_top_k(candidates, top_k=7, min_closed=3, config=default_config)
+        
+        closed_count = len([c for c in selected if c['state'] == 'closed'])
+        open_count = len([c for c in selected if c['state'] == 'open'])
+        
+        assert len(selected) == 7
+        assert closed_count == 2, f"Should use all 2 available closed ROIs, got {closed_count}"
+        assert open_count == 5, f"Should fill remaining with open ROIs, got {open_count}"
+    
+    def test_stratified_selection_all_same_state(self, default_config):
+        """When all ROIs are same state, should select by trust."""
+        from src.classifier.roi_trust import select_stratified_top_k
+        
+        # All open ROIs
+        candidates = []
+        for i in range(10):
+            candidates.append({
+                'roi_id': f'open_{i}',
+                'trust': 0.5 + (i * 0.05),
+                'state': 'open',
+                'is_open': True
+            })
+        
+        selected = select_stratified_top_k(candidates, top_k=7, min_closed=3, config=default_config)
+        
+        assert len(selected) == 7
+        closed_count = len([c for c in selected if c['state'] == 'closed'])
+        assert closed_count == 0, "No closed ROIs available, should be 0"
+        
+        # Should select top 7 by trust
+        trust_values = [c['trust'] for c in selected]
+        assert min(trust_values) >= 0.65, "Should select highest trust ROIs"
+    
+    def test_stratified_selection_respects_trust_within_state(self, default_config):
+        """Within guaranteed closed and remaining pool, should select by trust."""
+        from src.classifier.roi_trust import select_stratified_top_k
+        
+        candidates = []
+        
+        # 5 closed with varying trust
+        for i in range(5):
+            candidates.append({
+                'roi_id': f'closed_{i}',
+                'trust': 0.4 + (i * 0.1),  # 0.4, 0.5, 0.6, 0.7, 0.8
+                'state': 'closed',
+                'is_open': False
+            })
+        
+        # 5 open with varying trust
+        for i in range(5):
+            candidates.append({
+                'roi_id': f'open_{i}',
+                'trust': 0.5 + (i * 0.1),  # 0.5, 0.6, 0.7, 0.8, 0.9
+                'state': 'open',
+                'is_open': True
+            })
+        
+        selected = select_stratified_top_k(candidates, top_k=7, min_closed=3, config=default_config)
+        
+        # Should get top 3 closed (0.8, 0.7, 0.6) guaranteed
+        # Then top 4 from remaining (0.9 open, 0.8 open, 0.7 open, 0.6 open)
+        closed_selected = [c for c in selected if c['state'] == 'closed']
+        closed_trusts = sorted([c['trust'] for c in closed_selected], reverse=True)
+        
+        assert closed_trusts == [0.8, 0.7, 0.6], f"Should select top 3 closed by trust, got {closed_trusts}"
+
+
+# =============================================================================
+# V8: Probability Vector Validation Tests
+# =============================================================================
+
+class TestProbabilityVectorValidation:
+    """Tests for probability vector validation."""
+    
+    def test_validate_valid_vector(self):
+        """Valid probability vector should pass validation."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        probs = {
+            'ClassA': 0.6,
+            'ClassB': 0.3,
+            'ClassC': 0.1
+        }
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is True
+        assert reason == "valid"
+    
+    def test_validate_empty_vector(self):
+        """Empty probability vector should fail."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        probs = {}
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is False
+        assert reason == "empty_probs"
+    
+    def test_validate_nan_value(self):
+        """NaN values should fail validation."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        import math
+        
+        probs = {
+            'ClassA': 0.6,
+            'ClassB': math.nan,
+            'ClassC': 0.4
+        }
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is False
+        assert "invalid_value_ClassB" in reason
+    
+    def test_validate_inf_value(self):
+        """Inf values should fail validation."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        import math
+        
+        probs = {
+            'ClassA': 0.6,
+            'ClassB': math.inf,
+            'ClassC': 0.4
+        }
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is False
+        assert "invalid_value_ClassB" in reason
+    
+    def test_validate_out_of_range(self):
+        """Values outside [0, 1] should fail."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        probs = {
+            'ClassA': 0.6,
+            'ClassB': 1.5,  # Invalid: > 1.0
+            'ClassC': 0.1
+        }
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is False
+        assert "out_of_range_ClassB" in reason
+        
+        probs_negative = {
+            'ClassA': 0.6,
+            'ClassB': -0.2,  # Invalid: < 0
+            'ClassC': 0.6
+        }
+        
+        is_valid, reason = validate_probability_vector(probs_negative)
+        assert is_valid is False
+        assert "out_of_range_ClassB" in reason
+    
+    def test_validate_invalid_sum(self):
+        """Sum not equal to 1.0 (within epsilon) should fail."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        probs = {
+            'ClassA': 0.6,
+            'ClassB': 0.3,
+            'ClassC': 0.05  # Sum = 0.95, not 1.0
+        }
+        
+        is_valid, reason = validate_probability_vector(probs, epsilon=0.01)
+        assert is_valid is False
+        assert "invalid_sum" in reason
+    
+    def test_validate_too_ambiguous(self):
+        """All low probabilities (max < 0.25) should fail."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        probs = {
+            'ClassA': 0.2,
+            'ClassB': 0.2,
+            'ClassC': 0.2,
+            'ClassD': 0.2,
+            'ClassE': 0.2  # All equal, max = 0.2 < 0.25
+        }
+        
+        is_valid, reason = validate_probability_vector(probs)
+        assert is_valid is False
+        assert reason == "too_ambiguous"
+    
+    def test_validate_with_epsilon_tolerance(self):
+        """Should allow sum within epsilon tolerance."""
+        from src.classifier.probability_adjustments import validate_probability_vector
+        
+        # Sum = 1.005, within default epsilon of 0.01
+        probs = {
+            'ClassA': 0.605,
+            'ClassB': 0.3,
+            'ClassC': 0.1
+        }
+        
+        is_valid, reason = validate_probability_vector(probs, epsilon=0.01)
+        assert is_valid is True
+        assert reason == "valid"
+
+
+# =============================================================================
+# V8: Enhanced Gate Failure Reasoning Tests
+# =============================================================================
+
+class TestEnhancedUncertainReasoning:
+    """Tests for enhanced gate_failure_reason in evidence accumulator."""
+    
+    def test_margin_too_small_reason_includes_context(self, default_config):
+        """Margin failure reason should include detailed context."""
+        from src.classifier.evidence_accumulator import EvidenceAccumulator
+        
+        accumulator = EvidenceAccumulator(default_config)
+        
+        # Add ROIs with truly ambiguous evidence (very close scores)
+        # Need to create margin < 0.3 (the new threshold)
+        for i in range(5):
+            accumulator.update(
+                roi_id=i,
+                probs={'ClassA': 0.35, 'ClassB': 0.34, 'ClassC': 0.31},
+                trust=0.7,
+                state='open'
+            )
+        
+        result = accumulator.finalize()
+        
+        assert not result.is_certain
+        assert result.gate_failure_reason is not None
+        assert "margin_too_small" in result.gate_failure_reason
+        assert "winner=" in result.gate_failure_reason
+        assert "runner_up=" in result.gate_failure_reason
+        assert "margin=" in result.gate_failure_reason
+        assert "threshold=" in result.gate_failure_reason
+    
+    def test_too_few_trusted_reason_includes_trust_values(self, default_config):
+        """Too few trusted ROIs reason should include trust values."""
+        # Create config with high min_trusted requirement
+        test_config = MockConfig()
+        test_config.stability_min_trusted_rois = 5
+        
+        from src.classifier.evidence_accumulator import EvidenceAccumulator
+        
+        accumulator = EvidenceAccumulator(test_config)
+        
+        # Add only 2 ROIs with low trust
+        for i in range(2):
+            accumulator.update(
+                roi_id=i,
+                probs={'ClassA': 0.7, 'ClassB': 0.2, 'ClassC': 0.1},
+                trust=0.3,  # Below min_for_support of 0.4
+                state='open'
+            )
+        
+        result = accumulator.finalize()
+        
+        assert not result.is_certain
+        assert result.gate_failure_reason is not None
+        assert "too_few_trusted_rois" in result.gate_failure_reason
+        assert "trusted=" in result.gate_failure_reason
+        assert "min=" in result.gate_failure_reason
+        assert "trust_values=" in result.gate_failure_reason
 
 
 if __name__ == '__main__':

@@ -185,24 +185,31 @@ class TrackingConfig:
     # ROI Collection Parameters (BagEvent)
     # ============================================================================
     
-    max_open_samples: int = 10  # V3: Reduced from 6 for memory efficiency
+    max_open_samples: int = 10
     """
     Maximum number of ROI samples to collect during the 'open' phase.
     
     Range: 4 - 15
     More samples provide better classification but use more memory.
     
-    Default: 5 (V3: reduced from 6)
+    BALANCED COLLECTION: Set to 10 to match max_closed_samples for balanced
+    evidence accumulation. Previously was 15, creating imbalance.
+    
+    Default: 10 (balanced with closed samples)
     """
     
-    max_closed_samples: int = 10  # V3: Reduced from 4 for memory efficiency
+    max_closed_samples: int = 10
     """
     Maximum number of ROI samples to collect during the 'closed' phase.
     
     Range: 2 - 10
     More samples provide better classification but use more memory.
     
-    Default: 3 (V3: reduced from 4)
+    BALANCED COLLECTION: Set to 10 to match max_open_samples. Closed ROIs are
+    essential for size-based disambiguation, so equal collection is critical.
+    Previously was 5, which was insufficient.
+    
+    Default: 10 (balanced with open samples)
     """
     
     # ============================================================================
@@ -253,14 +260,32 @@ class TrackingConfig:
     # Classification Parameters (V4: Evidence-Based Classification)
     # ============================================================================
     
-    top_k_candidates: int = 5
+    top_k_candidates: int = 10
     """
     Number of top ROI candidates to select for classification at track end.
     
-    Range: 3 - 7
-    These are selected by sharpness (primary) and frame recency (secondary).
+    Range: 5 - 10
+    These are selected using stratified sampling to ensure minimum closed ROI
+    representation (see min_closed_rois_in_top_k).
     
-    Default: 5
+    Increased from 7 to 10 to ensure sufficient evidence with stratified selection.
+    
+    Default: 10
+    """
+    
+    min_closed_rois_in_top_k: int = 3
+    """
+    Minimum number of closed ROIs to guarantee in top-K selection.
+    
+    Range: 2 - 5
+    Ensures that size-based disambiguation has sufficient closed ROIs available.
+    Top-K selection uses stratified sampling: guarantees min_closed closed ROIs
+    if available, then fills remaining slots with best ROIs by trust.
+    
+    This prevents scenarios where all top-K ROIs are open (due to higher trust/
+    sharpness) leaving zero closed ROIs for disambiguation.
+    
+    Default: 3
     """
     
     high_confidence_threshold: float = 0.5
@@ -279,12 +304,17 @@ class TrackingConfig:
     
     min_total_evidence_score: float = 0.3
     """
-    Minimum total evidence score required to accept a classification.
+    DEPRECATED: This parameter is unused in the current implementation.
     
-    Range: 0.1 - 1.0
-    Below this threshold, the track is classified as "Unknown".
+    Evidence accumulation uses margin-based decision (winner vs runner-up margin)
+    rather than absolute evidence score threshold. Log-evidence scores are negative,
+    making this positive threshold meaningless.
     
-    Default: 0.3
+    See stability_margin_threshold for the actual decision threshold used.
+    
+    Kept for backward compatibility. Will be removed in future version.
+    
+    Default: 0.3 (unused)
     """
     
     evidence_ratio_threshold: float = 1.5
@@ -372,19 +402,25 @@ class TrackingConfig:
     # Classification Stability Heuristics (Production-Grade)
     # ============================================================================
     
-    enable_label_reuse: bool = _parse_bool_env("ENABLE_LABEL_REUSE", True)
+    enable_label_reuse: bool = _parse_bool_env("ENABLE_LABEL_REUSE", False)
     """
     Enable previous-label reuse when confidence is low but evidence is strong.
+    
+    DEPRECATED: This feature adds complexity and may not be needed with improved
+    evidence accumulation. Disabled by default.
     
     When True: Allows reusing previous track classification if current confidence
                is below LOW_CONF_THRESHOLD but there's strong historical evidence
                (streak length >= STREAK_MIN, burst dominance, etc.)
-    When False: Always use current classification (default safe behavior)
+    When False: Always use current classification (recommended behavior)
     
     Feature-flagged for safe rollout. Can also be controlled via environment:
         ENABLE_LABEL_REUSE=true
     
-    Default: False (disabled for safety, opt-in only)
+    Consider removing this feature in a future release after validating that
+    improved evidence accumulation provides sufficient reliability.
+    
+    Default: False (disabled, consider removing feature)
     """
     
     low_conf_threshold: float = _parse_float_env("LOW_CONF_THRESHOLD", 0.7)
@@ -1917,14 +1953,22 @@ class TrackingConfig:
     Default: 1.0
     """
     
-    trust_closed_max: float = _parse_float_env("TRUST_CLOSED_MAX", 0.7)
+    trust_closed_max: float = _parse_float_env("TRUST_CLOSED_MAX", 1.0)
     """
-    Maximum trust score for Closed ROIs (capped).
+    Maximum trust score for Closed ROIs.
     
-    Closed ROIs may have caps/deformation but still provide regularization.
-    Range: 0.5 - 0.8
+    EQUAL TRUST DESIGN: Set to 1.0 (same as open) to let quality metrics determine
+    trust, not the state. Previous value of 0.7 artificially biased evidence toward
+    open ROIs. Closed ROIs are essential for disambiguation and should be weighted
+    equally based on sharpness, brightness, and other quality factors.
     
-    Default: 0.7
+    If closed ROIs have lower quality, they will naturally get lower trust through
+    sharpness penalties, blur penalties, etc. The state itself should not impose
+    a blanket cap.
+    
+    Range: 0.8 - 1.0
+    
+    Default: 1.0 (equal to open, changed from 0.7)
     """
     
     trust_sharpness_min: float = _parse_float_env("TRUST_SHARPNESS_MIN", 100.0)
@@ -1990,14 +2034,19 @@ class TrackingConfig:
     Default: 1e-6
     """
     
-    evidence_top_k_rois: int = _parse_int_env("EVIDENCE_TOP_K_ROIS", 7)
+    evidence_top_k_rois: int = _parse_int_env("EVIDENCE_TOP_K_ROIS", 10)
     """
     Number of top ROIs (by trust) to use for evidence accumulation.
     
     Quality-first selection: pick best K ROIs regardless of total count.
-    Range: 3 - 10
+    Uses stratified sampling to ensure minimum closed ROI representation.
     
-    Default: 7
+    Increased from 7 to 10 to provide more evidence while maintaining quality
+    through trust-based weighting.
+    
+    Range: 5 - 10
+    
+    Default: 10 (increased from 7)
     """
     
     # --------------------------------------------------------------------------
@@ -2048,24 +2097,38 @@ class TrackingConfig:
     Default: True
     """
     
-    stability_margin_threshold: float = _parse_float_env("STABILITY_MARGIN_THRESHOLD", 0.5)
+    stability_margin_threshold: float = _parse_float_env("STABILITY_MARGIN_THRESHOLD", 0.3)
     """
     Minimum log-evidence margin between winner and runner-up.
     
     If margin < threshold, result is marked as "Uncertain".
     Range: 0.2 - 1.0
     
-    Default: 0.5
+    TUNED FOR LOG-EVIDENCE: Log-evidence scores are negative (e.g., -3.5 vs -4.2),
+    so margins are relatively small. A threshold of 0.3 provides good discrimination
+    while avoiding excessive "Uncertain" classifications. Previous value of 0.5 was
+    too strict, causing too many uncertain results.
+    
+    Typical margins:
+    - Clear winner: margin > 0.5 (e.g., -2.0 vs -2.8)
+    - Moderate confidence: margin 0.3-0.5 (e.g., -3.5 vs -4.0)
+    - Ambiguous: margin < 0.3 (e.g., -4.0 vs -4.2) → Uncertain
+    
+    Default: 0.3 (reduced from 0.5)
     """
     
-    stability_min_trusted_rois: int = _parse_int_env("STABILITY_MIN_TRUSTED_ROIS", 2)
+    stability_min_trusted_rois: int = _parse_int_env("STABILITY_MIN_TRUSTED_ROIS", 3)
     """
     Minimum number of trusted ROIs (trust >= trust_min_for_support) required.
     
     If fewer trusted ROIs, result is marked as "Uncertain".
     Range: 1 - 5
     
-    Default: 2
+    Increased from 2 to 3 to ensure sufficient high-quality evidence before
+    accepting a classification. With balanced ROI collection (10+10) and top-K
+    of 10, requiring 3 trusted ROIs is achievable and provides better reliability.
+    
+    Default: 3 (increased from 2)
     """
     
     # ============================================================================
