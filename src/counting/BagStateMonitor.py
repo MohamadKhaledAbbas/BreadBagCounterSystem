@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 from src.utils.AppLogging import logger, structured_logger
 from src.config.tracking_config import tracking_config
 from src.utils.PipelineMetrics import pipeline_metrics
+from src.classifier.roi_trust import select_stratified_top_k
 
 
 class BagEvent:
@@ -434,43 +435,16 @@ class BagEvent:
                 'is_open': state == 'open',  # NEW: Boolean flag for compatibility
             })
         
-        # V8: Stratified Top-K Selection
-        # Instead of simple sorting by sharpness, use stratified selection to ensure
-        # minimum closed ROI representation. This prevents all top-K being open ROIs
-        # when they have slightly higher sharpness, which would leave zero closed ROIs
-        # for size-based disambiguation.
+        # V8: Stratified Top-K Selection using centralized function
+        # Use the roi_trust module's stratified selection to ensure minimum closed representation
         top_k = tracking_config.top_k_candidates
         min_closed = getattr(tracking_config, 'min_closed_rois_in_top_k', 3)
         
-        # Separate by state
-        open_candidates = [c for c in candidates if c['state'] == 'open']
-        closed_candidates = [c for c in candidates if c['state'] == 'closed']
-        
-        # Sort each group by sharpness
-        open_sorted = sorted(open_candidates, key=lambda x: x['sharpness'], reverse=True)
-        closed_sorted = sorted(closed_candidates, key=lambda x: x['sharpness'], reverse=True)
-        
-        # Stratified selection: guarantee min_closed closed ROIs if available
-        selected_closed = closed_sorted[:min(min_closed, len(closed_sorted))]
-        remaining_slots = top_k - len(selected_closed)
-        
-        # Fill remaining slots with best from both states by sharpness
-        remaining_open = open_sorted
-        remaining_closed = closed_sorted[len(selected_closed):]
-        remaining_pool = remaining_open + remaining_closed
-        remaining_sorted = sorted(remaining_pool, key=lambda x: x['sharpness'], reverse=True)
-        selected_remaining = remaining_sorted[:remaining_slots]
-        
-        # Combine guaranteed closed + best remaining
-        selected_candidates = selected_closed + selected_remaining
-        
-        # Log stratification stats for debugging
-        logger.debug(
-            f"[BagEvent {self.id}] Stratified selection: {len(selected_candidates)} total "
-            f"({len([c for c in selected_candidates if c['state'] == 'closed'])} closed, "
-            f"{len([c for c in selected_candidates if c['state'] == 'open'])} open) "
-            f"from {len(candidates)} candidates "
-            f"({len(closed_candidates)} closed, {len(open_candidates)} open available)"
+        selected_candidates = select_stratified_top_k(
+            candidates,
+            top_k=top_k,
+            min_closed=min_closed,
+            config=tracking_config
         )
         
         return selected_candidates
