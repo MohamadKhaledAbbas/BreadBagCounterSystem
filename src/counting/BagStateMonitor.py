@@ -386,6 +386,8 @@ class BagEvent:
         """
         V4: Return all collected ROIs with full metadata for evidence-based classification.
         
+        V8: Uses stratified top-K selection to ensure minimum closed ROI representation.
+        
         Returns:
             List of candidate dictionaries, each containing:
             - roi: The ROI image
@@ -395,9 +397,19 @@ class BagEvent:
             - confidence: Detection confidence
             - relative_time: Position in track lifecycle (0.0 = start, 1.0 = end)
             - bbox: Bounding box (x1, y1, x2, y2) for disambiguation
+            - state: 'open' or 'closed' state for stratified selection
+            - is_open: Boolean indicating open state (for compatibility)
         """
-        # Combine both buffers
-        all_rois = self.open_rois + self.closed_rois
+        # Combine both buffers but keep track of state
+        all_rois = []
+        
+        # Add open ROIs with state marker
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox in self.open_rois:
+            all_rois.append((sharpness, roi, frame_index, bbox_area, confidence, bbox, 'open'))
+        
+        # Add closed ROIs with state marker
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox in self.closed_rois:
+            all_rois.append((sharpness, roi, frame_index, bbox_area, confidence, bbox, 'closed'))
         
         if not all_rois:
             return []
@@ -405,9 +417,9 @@ class BagEvent:
         # V4: Calculate relative time for each ROI
         track_duration = max(1, self.current_frame_index - self.start_frame_index)
         
-        # Convert to list of dictionaries with full metadata
+        # Convert to list of dictionaries with full metadata including state
         candidates = []
-        for sharpness, roi, frame_index, bbox_area, confidence, bbox in all_rois:
+        for sharpness, roi, frame_index, bbox_area, confidence, bbox, state in all_rois:
             # Ensure no division by zero with additional safety check
             relative_time = (frame_index - self.start_frame_index) / track_duration if track_duration > 0 else 0.5
             candidates.append({
@@ -418,14 +430,49 @@ class BagEvent:
                 'confidence': confidence,
                 'relative_time': relative_time,
                 'bbox': bbox,  # Include bbox for disambiguation
+                'state': state,  # NEW: Include state for stratified selection
+                'is_open': state == 'open',  # NEW: Boolean flag for compatibility
             })
         
-        # Sort by sharpness (highest first), then by frame_index (later first) for ties
-        candidates.sort(key=lambda x: (x['sharpness'], x['frame_index']), reverse=True)
-        
-        # Select top-K candidates
+        # V8: Stratified Top-K Selection
+        # Instead of simple sorting by sharpness, use stratified selection to ensure
+        # minimum closed ROI representation. This prevents all top-K being open ROIs
+        # when they have slightly higher sharpness, which would leave zero closed ROIs
+        # for size-based disambiguation.
         top_k = tracking_config.top_k_candidates
-        selected_candidates = candidates[:top_k]
+        min_closed = getattr(tracking_config, 'min_closed_rois_in_top_k', 3)
+        
+        # Separate by state
+        open_candidates = [c for c in candidates if c['state'] == 'open']
+        closed_candidates = [c for c in candidates if c['state'] == 'closed']
+        
+        # Sort each group by sharpness
+        open_sorted = sorted(open_candidates, key=lambda x: x['sharpness'], reverse=True)
+        closed_sorted = sorted(closed_candidates, key=lambda x: x['sharpness'], reverse=True)
+        
+        # Stratified selection: guarantee min_closed closed ROIs if available
+        selected_closed = closed_sorted[:min(min_closed, len(closed_sorted))]
+        remaining_slots = top_k - len(selected_closed)
+        
+        # Fill remaining slots with best from both states by sharpness
+        remaining_open = open_sorted
+        remaining_closed = closed_sorted[len(selected_closed):]
+        remaining_pool = remaining_open + remaining_closed
+        remaining_sorted = sorted(remaining_pool, key=lambda x: x['sharpness'], reverse=True)
+        selected_remaining = remaining_sorted[:remaining_slots]
+        
+        # Combine guaranteed closed + best remaining
+        selected_candidates = selected_closed + selected_remaining
+        
+        # Log stratification stats for debugging
+        logger.debug(
+            f"[BagEvent {self.id}] Stratified selection: {len(selected_candidates)} total "
+            f"({len([c for c in selected_candidates if c['state'] == 'closed'])} closed, "
+            f"{len([c for c in selected_candidates if c['state'] == 'open'])} open) "
+            f"from {len(candidates)} candidates "
+            f"({len(closed_candidates)} closed, {len(open_candidates)} open available)"
+        )
+        
         return selected_candidates
 
     def get_stats(self) -> dict:
