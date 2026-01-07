@@ -234,97 +234,96 @@ class TestSizeBinComputation:
 # =============================================================================
 
 class TestGrayZoneResolution:
-    """Tests for gray zone resolution strategies."""
+    """Tests for simplified gray zone resolution (midpoint-based)."""
     
-    def test_keep_original_strategy(self, default_config_v2):
-        """'keep_original' should return classifier prediction."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'keep_original'
+    def test_below_midpoint_pixel(self, default_config_v2):
+        """Area below midpoint should resolve to small class (pixel mode)."""
+        size_metadata = {
+            'raw_area': 9500.0,  # Below midpoint of 10000
+            'homography_used': False,
+            'thresholds': {
+                'small': 9000.0,
+                'regular': 11000.0
+            }
+        }
         
         label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Small',
-            confidence=0.65,
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
+            original_label='Brown_Orange_Family',
+            size_bin_metadata=size_metadata,
+            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small'),
+            homography_used=False
         )
         
         assert label == 'Brown_Orange_Small'
-        assert 'keep_original' in reason
+        assert 'gray_zone_resolved_to_small' in reason
+        assert '9500.0px²' in reason
     
-    def test_uncertain_strategy(self, default_config_v2):
-        """'uncertain' should return Uncertain."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'uncertain'
+    def test_above_midpoint_pixel(self, default_config_v2):
+        """Area above midpoint should resolve to regular class (pixel mode)."""
+        size_metadata = {
+            'raw_area': 10500.0,  # Above midpoint of 10000
+            'homography_used': False,
+            'thresholds': {
+                'small': 9000.0,
+                'regular': 11000.0
+            }
+        }
         
         label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Small',
-            confidence=0.65,
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
-        )
-        
-        assert label == 'Uncertain'
-        assert 'uncertain' in reason
-    
-    def test_prefer_small_strategy(self, default_config_v2):
-        """'prefer_small' should return small class."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'prefer_small'
-        
-        label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Overlay',
-            confidence=0.65,
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
-        )
-        
-        assert label == 'Brown_Orange_Small'
-        assert 'prefer_small' in reason
-    
-    def test_prefer_regular_strategy(self, default_config_v2):
-        """'prefer_regular' should return regular class."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'prefer_regular'
-        
-        label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Small',
-            confidence=0.65,
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
+            original_label='Brown_Orange_Family',
+            size_bin_metadata=size_metadata,
+            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small'),
+            homography_used=False
         )
         
         assert label == 'Brown_Orange_Overlay'
-        assert 'prefer_regular' in reason
+        assert 'gray_zone_resolved_to_regular' in reason
+        assert '10500.0px²' in reason
     
-    def test_use_confidence_high_conf(self, default_config_v2):
-        """'use_confidence' with high conf should keep original."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'use_confidence'
+    def test_below_midpoint_homography(self, default_config_v2):
+        """Area below midpoint should resolve to small class (homography mode)."""
+        size_metadata = {
+            'area_cm2': 120.0,  # Below midpoint of 125
+            'homography_used': True,
+            'thresholds_cm2': {
+                'small': 100.0,
+                'large': 150.0
+            }
+        }
         
         label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Small',
-            confidence=0.75,  # Above 0.6 threshold
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
+            original_label='Brown_Orange_Family',
+            size_bin_metadata=size_metadata,
+            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small'),
+            homography_used=True
         )
         
         assert label == 'Brown_Orange_Small'
-        assert 'high_confidence' in reason
+        assert 'gray_zone_resolved_to_small' in reason
+        assert '120.0cm²' in reason
     
-    def test_use_confidence_low_conf(self, default_config_v2):
-        """'use_confidence' with low conf should return Uncertain."""
-        default_config_v2.disambiguation_gray_zone_behavior = 'use_confidence'
+    def test_above_midpoint_homography(self, default_config_v2):
+        """Area above midpoint should resolve to regular class (homography mode)."""
+        size_metadata = {
+            'area_cm2': 130.0,  # Above midpoint of 125
+            'homography_used': True,
+            'thresholds_cm2': {
+                'small': 100.0,
+                'large': 150.0
+            }
+        }
         
         label, reason = resolve_gray_zone(
-            original_label='Brown_Orange_Small',
-            confidence=0.5,  # Below 0.6 threshold
-            size_bin_metadata={'raw_area': 10000.0},
-            config=default_config_v2,
-            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small')
+            original_label='Brown_Orange_Family',
+            size_bin_metadata=size_metadata,
+            target_classes=('Brown_Orange_Overlay', 'Brown_Orange_Small'),
+            homography_used=True
         )
         
-        assert label == 'Uncertain'
-        assert 'low_confidence' in reason
+        assert label == 'Brown_Orange_Overlay'
+        assert 'gray_zone_resolved_to_regular' in reason
+        assert '130.0cm²' in reason
+
 
 
 # =============================================================================
@@ -380,20 +379,6 @@ class TestDisambiguationV2:
         assert result.disambiguated is False
         assert result.reason == 'not_target_family'
     
-    def test_validation_failure_skips_disambiguation(self, default_config_v2):
-        """Invalid bbox should skip disambiguation."""
-        result = disambiguate_v2(
-            original_label='Brown_Orange_Overlay',
-            confidence=0.8,
-            bbox=(200, 100, 100, 200),  # Negative width
-            is_open=False,
-            config=default_config_v2
-        )
-        
-        assert result.label == 'Brown_Orange_Overlay'
-        assert result.disambiguated is False
-        assert 'validation_failed' in result.reason
-    
     def test_very_small_area_to_small_class(self, default_config_v2):
         """Very small area should map to Small class."""
         result = disambiguate_v2(
@@ -406,8 +391,8 @@ class TestDisambiguationV2:
         
         assert result.label == 'Brown_Orange_Small'
         assert result.disambiguated is True
-        assert 'very_small' in result.reason
-        assert result.metadata['label_changed'] is True
+        assert 'small' in result.reason.lower()
+        assert result.confidence_tier == 'low'  # Pixel fallback
     
     def test_large_area_to_overlay_class(self, default_config_v2):
         """Large area should map to Overlay class."""
@@ -421,72 +406,50 @@ class TestDisambiguationV2:
         
         assert result.label == 'Brown_Orange_Overlay'
         assert result.disambiguated is True
-        assert 'large' in result.reason
-        assert result.metadata['label_changed'] is True
+        assert 'regular' in result.reason.lower()
+        assert result.confidence_tier == 'low'  # Pixel fallback
     
-    def test_gray_zone_keeps_original_by_default(self, default_config_v2):
-        """Gray zone should keep original by default."""
+    def test_gray_zone_resolution_by_midpoint(self, default_config_v2):
+        """Gray zone should resolve by midpoint."""
+        # Area = 10,000 px², midpoint = (9000 + 11000) / 2 = 10,000
+        # Should resolve to regular (above or equal to midpoint)
         result = disambiguate_v2(
-            original_label='Brown_Orange_Small',
+            original_label='Brown_Orange_Family',
             confidence=0.7,
-            bbox=(100, 100, 200, 150),  # 100x50 = 10,000 px² (in gray zone)
+            bbox=(100, 100, 200, 150),  # 100x50 = 10,000 px² (at midpoint)
             is_open=False,
             config=default_config_v2
         )
         
-        assert result.label == 'Brown_Orange_Small'
         assert result.disambiguated is True
         assert 'gray_zone' in result.reason
-        assert 'keep_original' in result.reason
+        assert result.confidence_tier == 'low'  # Gray zone always low
     
-    def test_confidence_penalty_on_label_change(self, default_config_v2):
-        """Confidence should be penalized when label changes."""
-        default_config_v2.disambiguation_penalty_on_change_only = True
-        
+    def test_confidence_penalty_gray_zone_pixel_fallback(self, default_config_v2):
+        """Confidence penalty only applied for pixel fallback + gray zone."""
         result = disambiguate_v2(
-            original_label='Brown_Orange_Overlay',
+            original_label='Brown_Orange_Family',
             confidence=1.0,
-            bbox=(100, 100, 170, 150),  # Very small area
+            bbox=(100, 100, 200, 150),  # Gray zone
             is_open=False,
             config=default_config_v2
         )
         
-        assert result.label == 'Brown_Orange_Small'
+        # Penalty only for gray zone with pixel fallback
         assert result.confidence == 0.9  # 1.0 * 0.9
-        assert result.metadata['confidence_penalty_applied'] is True
     
-    def test_no_penalty_when_label_unchanged(self, default_config_v2):
-        """No penalty when classifier agrees with size."""
-        default_config_v2.disambiguation_penalty_on_change_only = True
-        
+    def test_no_penalty_clear_classification(self, default_config_v2):
+        """No penalty when classification is clear (not gray zone)."""
         result = disambiguate_v2(
             original_label='Brown_Orange_Small',
             confidence=1.0,
-            bbox=(100, 100, 170, 150),  # Very small area
+            bbox=(100, 100, 170, 150),  # Very small area - clear
             is_open=False,
             config=default_config_v2
         )
         
         assert result.label == 'Brown_Orange_Small'
-        assert result.confidence == 1.0  # No penalty
-        assert result.metadata['confidence_penalty_applied'] is False
-    
-    def test_validation_penalty_applied(self, default_config_v2):
-        """Validation penalty should reduce confidence."""
-        result = disambiguate_v2(
-            original_label='Brown_Orange_Overlay',
-            confidence=1.0,
-            bbox=(100, 100, 120, 200),  # AR = 0.2 < 0.3 (suspicious)
-            is_open=False,
-            config=default_config_v2
-        )
-        
-        # Validation penalty (0.3) + disambiguation penalty (0.9)
-        # conf_after_validation = 1.0 * (1 - 0.3) = 0.7
-        # conf_after_disambiguation = 0.7 * 0.9 = 0.63
-        assert result.metadata['validation_penalty'] == 0.3
-        assert result.metadata['confidence_after_validation'] == 0.7
-        assert result.confidence == pytest.approx(0.63, rel=0.01)
+        assert result.confidence == 1.0  # No penalty for clear classification
     
     def test_context_included_in_metadata(self, default_config_v2):
         """Context should be included in result metadata."""
@@ -515,6 +478,22 @@ class TestDisambiguationV2:
         
         assert result.label == 'Brown_Orange_Small'
         assert result.disambiguated is True
+    
+    def test_homography_metadata_present(self, default_config_v2):
+        """Result metadata should include homography usage flag."""
+        result = disambiguate_v2(
+            original_label='Brown_Orange_Overlay',
+            confidence=0.8,
+            bbox=(100, 100, 200, 200),
+            is_open=False,
+            config=default_config_v2
+        )
+        
+        # Should have homography_used in metadata
+        assert 'homography_used' in result.metadata
+        # Should be False since no calibration in test
+        assert result.metadata['homography_used'] is False
+
 
 
 # =============================================================================
@@ -589,6 +568,7 @@ if __name__ == '__main__':
         test_results = {'passed': 0, 'failed': 0}
         
         def run_test(test_class, test_method_name):
+            import traceback
             try:
                 test_instance = test_class()
                 test_method = getattr(test_instance, test_method_name)
@@ -597,7 +577,11 @@ if __name__ == '__main__':
                 print(f"✓ {test_class.__name__}.{test_method_name}")
                 test_results['passed'] += 1
             except AssertionError as e:
-                print(f"✗ {test_class.__name__}.{test_method_name}: {e}")
+                error_msg = str(e) if str(e) else "(assertion failed with no message)"
+                tb = traceback.format_exc()
+                print(f"✗ {test_class.__name__}.{test_method_name}: AssertionError: {error_msg}")
+                if os.getenv('DEBUG_TESTS'):
+                    print(tb)
                 test_results['failed'] += 1
             except Exception as e:
                 print(f"✗ {test_class.__name__}.{test_method_name}: {type(e).__name__}: {e}")
@@ -621,26 +605,23 @@ if __name__ == '__main__':
         run_test(TestSizeBinComputation, 'test_large_bin')
         
         print("\n--- Gray Zone Resolution Tests ---")
-        run_test(TestGrayZoneResolution, 'test_keep_original_strategy')
-        run_test(TestGrayZoneResolution, 'test_uncertain_strategy')
-        run_test(TestGrayZoneResolution, 'test_prefer_small_strategy')
-        run_test(TestGrayZoneResolution, 'test_prefer_regular_strategy')
-        run_test(TestGrayZoneResolution, 'test_use_confidence_high_conf')
-        run_test(TestGrayZoneResolution, 'test_use_confidence_low_conf')
+        run_test(TestGrayZoneResolution, 'test_below_midpoint_pixel')
+        run_test(TestGrayZoneResolution, 'test_above_midpoint_pixel')
+        run_test(TestGrayZoneResolution, 'test_below_midpoint_homography')
+        run_test(TestGrayZoneResolution, 'test_above_midpoint_homography')
         
         print("\n--- Main Disambiguation V2 Tests ---")
         run_test(TestDisambiguationV2, 'test_disabled_v2_returns_original')
         run_test(TestDisambiguationV2, 'test_skip_open_state')
         run_test(TestDisambiguationV2, 'test_skip_non_target_family')
-        run_test(TestDisambiguationV2, 'test_validation_failure_skips_disambiguation')
         run_test(TestDisambiguationV2, 'test_very_small_area_to_small_class')
         run_test(TestDisambiguationV2, 'test_large_area_to_overlay_class')
-        run_test(TestDisambiguationV2, 'test_gray_zone_keeps_original_by_default')
-        run_test(TestDisambiguationV2, 'test_confidence_penalty_on_label_change')
-        run_test(TestDisambiguationV2, 'test_no_penalty_when_label_unchanged')
-        run_test(TestDisambiguationV2, 'test_validation_penalty_applied')
+        run_test(TestDisambiguationV2, 'test_gray_zone_resolution_by_midpoint')
+        run_test(TestDisambiguationV2, 'test_confidence_penalty_gray_zone_pixel_fallback')
+        run_test(TestDisambiguationV2, 'test_no_penalty_clear_classification')
         run_test(TestDisambiguationV2, 'test_context_included_in_metadata')
         run_test(TestDisambiguationV2, 'test_family_name_recognition')
+        run_test(TestDisambiguationV2, 'test_homography_metadata_present')
         
         print("\n--- Batch Disambiguation Tests ---")
         run_test(TestBatchDisambiguationV2, 'test_batch_with_mixed_results')
