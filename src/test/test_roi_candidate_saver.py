@@ -22,7 +22,7 @@ class TestROICandidateSaverConfig:
         config = ROICandidateSaverConfig()
         
         # Should be disabled by default
-        assert config.enabled == False
+        assert not config.enabled
     
     def test_config_from_env_vars(self):
         """Test that config reads from environment variables."""
@@ -41,7 +41,7 @@ class TestROICandidateSaverConfig:
             
             config = ROICandidateSaverConfig()
             
-            assert config.enabled == True
+            assert config.enabled
             assert config.output_dir == '/tmp/test_rois'
             
         finally:
@@ -90,14 +90,14 @@ class TestROICandidateSaver:
         saver = ROICandidateSaver(config)
         
         # Should save normal classifications
-        assert saver._should_save_track('Brown_Orange_Small') == True
+        assert saver._should_save_track('Brown_Orange_Small')
         
         # Should not save rejected when disabled
-        assert saver._should_save_track('Rejected') == False
+        assert not saver._should_save_track('Rejected')
         
         # Should not save uncertain when disabled
-        assert saver._should_save_track('Uncertain') == False
-        assert saver._should_save_track('Unknown') == False
+        assert not saver._should_save_track('Uncertain')
+        assert not saver._should_save_track('Unknown')
     
     def test_get_class_directory_creates_dir(self):
         """Test that _get_class_directory creates the directory."""
@@ -249,7 +249,7 @@ class TestROICandidateSaver:
             
             stats = saver.get_stats()
             
-            assert stats['enabled'] == True
+            assert stats['enabled']
             assert stats['total_tracks'] == 3
             assert stats['total_rois'] == 3
             assert 'ClassA' in stats['classes']

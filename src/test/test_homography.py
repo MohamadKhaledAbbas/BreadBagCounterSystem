@@ -138,8 +138,8 @@ class TestHomographyTransform:
         
         info = h.get_calibration_info()
         
-        assert info['enabled'] == True
-        assert info['calibrated'] == True
+        assert info['enabled']
+        assert info['calibrated']
         assert info['table_corners_px'] == table_corners_px
         assert info['table_size_cm'] == table_size_cm
         assert info['px_per_cm'] is not None
