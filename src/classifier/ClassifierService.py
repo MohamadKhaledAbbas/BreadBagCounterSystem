@@ -48,6 +48,12 @@ from src.classifier.roi_trust import (
 from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 from src.classifier.probability_adjustments import apply_probability_adjustment, validate_probability_vector
 
+# V8: Import ROI candidate saver for debug/analysis
+from src.classifier.roi_candidate_saver import save_track_roi_candidates
+
+# V8: Import homography module for size-based classification
+from src.classifier.homography import get_homography_transform
+
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
@@ -509,7 +515,11 @@ class ClassifierService:
     
     def _apply_classification_smoothing(self, label: str, confidence: float) -> Tuple[str, float, Optional[str]]:
         """
-        Apply classification smoothing using recent bag classification history.
+        DEPRECATED: Apply classification smoothing using recent bag classification history.
+        
+        This method is deprecated in favor of BidirectionalSmoother which provides
+        superior bidirectional context-aware smoothing at the event level in BagCounterApp.
+        Kept for backward compatibility but no longer called in the process() pipeline.
         
         Exploits the fact that bags are often provided in sequences of the same type.
         
@@ -601,7 +611,16 @@ class ClassifierService:
             allow_unknown: bool = True,
     ) -> Tuple[str, float, Optional[str]]:
         """
-        Robust label reuse logic for both known and unknown labels.
+        DEPRECATED: Robust label reuse logic for both known and unknown labels.
+        
+        This method is deprecated in favor of BidirectionalSmoother which provides
+        superior bidirectional context-aware smoothing at the event level in BagCounterApp.
+        Kept for backward compatibility but no longer called in the process() pipeline.
+        
+        The BidirectionalSmoother handles:
+        - Bidirectional context (previous + future events)
+        - Batch transition protection
+        - Event-level smoothing after track aggregation
         - For known classes: reuse only on low confidence and strong streak.
         - For unknowns: reuse only if streak exists for a known label, burst dominance supports it, and no better candidate exists.
 
@@ -1318,48 +1337,11 @@ class ClassifierService:
                         f"{original_family_label} -> {final_label} (conf={final_conf:.3f}, tier={resolved_tier})"
                     )
             
-            # Step 3.5: Apply classification smoothing (V5)
-            # Only smooth non-Unknown and non-Uncertain classifications
-            if final_label not in ("Unknown", "Uncertain"):
-                smoothed_label, smoothed_conf, smooth_reason = self._apply_classification_smoothing(
-                    final_label, final_conf
-                )
-                
-                # Update if smoothing changed the result
-                if smoothed_label != final_label or abs(smoothed_conf - final_conf) > 0.01:
-                    metadata["smoothing_applied"] = True
-                    metadata["original_label"] = final_label
-                    metadata["original_confidence"] = final_conf
-                    metadata["smoothing_reason"] = smooth_reason
-                    
-                    final_label = smoothed_label
-                    final_conf = smoothed_conf
-                    
-                    logger.info(
-                        f"[ClassifierService] Track {track_id}: Smoothing changed result: "
-                        f"{metadata['original_label']}({metadata['original_confidence']:.2f}) -> "
-                        f"{final_label}({final_conf:.2f}), reason={smooth_reason}"
-                    )
-
-            # Step 3.6: Apply label reuse smoothing ALWAYS
-            # Note: For evidence accumulation path, we use metadata as evidence dict substitute
-            evidence_for_reuse = evidence if not self.evidence_accumulation_enabled else metadata.get('evidence_per_label', {})
-            reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
-                track_id, final_label, final_conf, evidence_for_reuse
-            )
-            if reuse_label != final_label:
-                metadata["label_reuse_applied"] = True
-                metadata["pre_reuse_label"] = final_label
-                metadata["pre_reuse_confidence"] = final_conf
-                metadata["reuse_reason"] = reuse_reason
-                final_label = reuse_label
-                final_conf = reuse_conf
-                logger.info(
-                    f"[ClassifierService] Track {track_id}: Label reuse changed result: "
-                    f"{metadata['pre_reuse_label']}({metadata['pre_reuse_confidence']:.2f}) -> "
-                    f"{final_label}({final_conf:.2f}), reason={reuse_reason}"
-                )
-
+            # REMOVED: Legacy classification smoothing and label reuse (V8)
+            # These are now handled by BidirectionalSmoother in BagCounterApp at the event level,
+            # which provides superior bidirectional context-aware smoothing after track aggregation.
+            # The smoother uses both previous and future context to validate classifications,
+            # protects batch transitions, and operates on committed events rather than raw classifications.
             
             # Step 3.7: Track label history for volatility analysis (V6)
             self._track_label_history[track_id].append((final_label, final_conf))
@@ -1411,10 +1393,19 @@ class ClassifierService:
                         unknown_kind = "structural"
                     metadata["unknown_kind"] = unknown_kind
             
+            # V8: Prepare ROI candidates for saving (debug/analysis)
+            # Use classifications_with_probs if available, otherwise classifications
+            roi_candidates_for_save = None
+            if self.evidence_accumulation_enabled:
+                roi_candidates_for_save = classifications_with_probs if 'classifications_with_probs' in locals() else None
+            else:
+                roi_candidates_for_save = classifications if 'classifications' in locals() else None
+            
             # Save ROI and invoke callbacks
             self._save_and_callback(
                 track_id, best_roi, final_label, final_conf, 
-                len(candidates), metadata, context
+                len(candidates), metadata, context,
+                roi_candidates=roi_candidates_for_save
             )
 
         except Exception as e:
@@ -1518,8 +1509,12 @@ class ClassifierService:
 
     def _save_and_callback(self, track_id: int, best_roi: Any, label: str, 
                            confidence: float, candidates_count: int,
-                           metadata: Dict, context: Optional[Dict]):
-        """Save ROI image and invoke registered callbacks."""
+                           metadata: Dict, context: Optional[Dict],
+                           roi_candidates: Optional[List[Dict]] = None):
+        """Save ROI image and invoke registered callbacks.
+        
+        V8: Also saves all ROI candidates for debug/analysis if enabled.
+        """
         if best_roi is None:
             logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
             return
@@ -1555,6 +1550,27 @@ class ClassifierService:
             image_path = save_path
         elif existing_files:
             image_path = os.path.join(target_dir, existing_files[0])
+        
+        # V8: Save all ROI candidates for debug/analysis if enabled
+        if tracking_config.save_roi_candidates and roi_candidates:
+            try:
+                # Build homography info if available
+                homography_info = None
+                homography = get_homography_transform()
+                if homography.is_calibrated():
+                    homography_info = homography.get_calibration_info()
+                
+                # Save ROI candidates
+                save_track_roi_candidates(
+                    track_id=track_id,
+                    classification=label,
+                    confidence=confidence,
+                    roi_candidates=roi_candidates,
+                    homography_info=homography_info,
+                    additional_metadata=metadata
+                )
+            except Exception as e:
+                logger.warning(f"[ClassifierService] Failed to save ROI candidates: {e}")
         
         # Prepare result data
         result_data = {

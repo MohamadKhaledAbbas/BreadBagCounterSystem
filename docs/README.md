@@ -63,6 +63,7 @@ See [docs/LOG_ANALYZER.md](LOG_ANALYZER.md) for detailed documentation.
 - **[docs/STRUCTURED_LOGGING_SCHEMA.md](STRUCTURED_LOGGING_SCHEMA.md)**: Structured logging schema reference
 - **[docs/PROBABILITY_ADJUSTMENTS.md](PROBABILITY_ADJUSTMENTS.md)**: Probability mass transfer and disambiguation integration
 - **[docs/DISAMBIGUATION_V2_GUIDE.md](DISAMBIGUATION_V2_GUIDE.md)**: Production guide for enhanced disambiguation V2 module
+- **[docs/HOMOGRAPHY_CALIBRATION_GUIDE.md](HOMOGRAPHY_CALIBRATION_GUIDE.md)**: Complete guide for homography-based size calibration
 - **[docs/ROI_FILTERING_AND_THRESHOLDS.md](ROI_FILTERING_AND_THRESHOLDS.md)**: ROI quality filtering and threshold selection
 - **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Production-grade classification improvements summary
 
@@ -76,12 +77,34 @@ See [docs/LOG_ANALYZER.md](LOG_ANALYZER.md) for detailed documentation.
 
 ### Classification
 - `src/classifier/ClassifierService.py`: Multi-candidate classification with evidence accumulation
-- `src/classifier/disambiguation_v2.py`: Production-grade size-based disambiguation (V2)
+- `src/classifier/disambiguation_v2.py`: Homography-first size-based disambiguation (V2)
+- `src/classifier/homography.py`: Perspective-invariant size measurement using work table calibration
 - `src/classifier/probability_adjustments.py`: Probability mass transfer for disambiguation
 - `src/classifier/evidence_accumulator.py`: Trust-weighted log-evidence accumulation with reject label filtering
 - `src/classifier/roi_trust.py`: ROI quality scoring for evidence weighting
 - Evidence-based decision making with rejection thresholds and stability gates
 - **Configurable reject labels**: Filter out low-quality predictions (e.g., 'Rejected', 'LowQuality') from voting
+
+### Homography-Based Size Classification
+
+The system now supports **homography-based size classification** for accurate, perspective-invariant bread bag size measurement:
+
+**Benefits:**
+- ✅ **Physically accurate**: Measures actual bread size in cm², not perception-based pixels
+- ✅ **Perspective-invariant**: Works consistently at any camera angle or distance
+- ✅ **Debuggable**: Real-world measurements (120 cm²) vs arbitrary pixel thresholds (10,000 px²)
+- ✅ **Lightweight**: ~1ms overhead, no ML model needed
+
+**Quick Start:**
+```bash
+# Run interactive calibration
+python scripts/calibrate_homography.py --image path/to/frame.jpg
+
+# Test existing calibration
+python scripts/calibrate_homography.py --dry-run
+```
+
+**See:** [HOMOGRAPHY_CALIBRATION_GUIDE.md](HOMOGRAPHY_CALIBRATION_GUIDE.md) for complete setup instructions
 
 ### Logging & Analysis
 - `src/utils/AppLogging.py`: Structured JSON logging
