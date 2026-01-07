@@ -16,6 +16,7 @@ Run with: python -m pytest src/test/test_disambiguation_v2.py -v
 
 import sys
 import os
+import traceback
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -568,7 +569,6 @@ if __name__ == '__main__':
         test_results = {'passed': 0, 'failed': 0}
         
         def run_test(test_class, test_method_name):
-            import traceback
             try:
                 test_instance = test_class()
                 test_method = getattr(test_instance, test_method_name)
@@ -577,7 +577,7 @@ if __name__ == '__main__':
                 print(f"✓ {test_class.__name__}.{test_method_name}")
                 test_results['passed'] += 1
             except AssertionError as e:
-                error_msg = str(e) if str(e) else "(assertion failed with no message)"
+                error_msg = str(e) or "(assertion failed with no message)"
                 tb = traceback.format_exc()
                 print(f"✗ {test_class.__name__}.{test_method_name}: AssertionError: {error_msg}")
                 if os.getenv('DEBUG_TESTS'):

@@ -336,7 +336,7 @@ def resolve_gray_zone(
         area = size_bin_metadata.get('raw_area', 0)
         thresholds = size_bin_metadata.get('thresholds', {})
         small_threshold = thresholds.get('small', 9000.0)
-        large_threshold = thresholds.get('regular', 11000.0)
+        large_threshold = thresholds.get('regular', 11000.0)  # Note: 'regular' not 'large' for pixel mode
         unit = 'px²'
     
     # Simple midpoint-based resolution
