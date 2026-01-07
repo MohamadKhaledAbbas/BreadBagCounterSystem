@@ -2143,15 +2143,30 @@ class TrackingConfig:
     # have truly settled before collecting ROIs. This prevents blurry ROIs from
     # bags that are still vibrating or moving.
     
-    velocity_stability_gate_enabled: bool = _parse_bool_env("VELOCITY_STABILITY_GATE_ENABLED", True)
+    velocity_stability_gate_enabled: bool = _parse_bool_env("VELOCITY_STABILITY_GATE_ENABLED", False)
     """
     Enable velocity stability gating for ROI collection.
     
     When True: ROIs are only collected after the bag has been stable
                (velocity below threshold) for a minimum duration.
     When False: ROIs are collected immediately regardless of velocity.
+               Relies on classifier's "Rejected" class to filter unusable ROIs.
     
-    Default: True
+    V8 CHANGE: Default changed from True to False.
+    
+    Rationale: Strict velocity gates caused too few ROIs to be collected (2-3 per track
+    instead of 8-15), leading to "Uncertain" classifications. By disabling velocity
+    gates, we rely on:
+    1. Essential quality checks (min size, aspect ratio, brightness, sharpness)
+    2. Classifier's "Rejected" class to identify unusable ROIs
+    3. Quality-based selection (keep best N ROIs by composite quality score)
+    
+    This approach collects more ROI candidates, giving the classifier sufficient
+    evidence for confident decisions while letting it handle marginal cases.
+    
+    Set VELOCITY_STABILITY_GATE_ENABLED=true to restore strict behavior.
+    
+    Default: False (V8: relaxed from True for better ROI collection)
     """
     
     velocity_stability_threshold: float = _parse_float_env("VELOCITY_STABILITY_THRESHOLD", 0.25)
