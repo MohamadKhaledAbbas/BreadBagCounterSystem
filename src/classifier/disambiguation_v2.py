@@ -63,6 +63,13 @@ import math
 
 from src.utils.AppLogging import logger
 
+# V8: Import homography for real-world size measurement
+try:
+    from src.classifier.homography import get_homography_transform, classify_size_by_area_cm2
+    HOMOGRAPHY_AVAILABLE = True
+except ImportError:
+    HOMOGRAPHY_AVAILABLE = False
+
 
 @dataclass
 class DisambiguationV2Result:
@@ -187,13 +194,15 @@ def validate_bbox(
         metadata=metadata
     )
 
-
 def compute_size_bin(
     raw_area: float,
-    config: Any
+    config: Any,
+    bbox: Optional[Tuple[float, float, float, float]] = None
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Compute size bin for the given raw area using multi-threshold logic.
+    
+    V8: Supports homography-based real-world measurements when calibrated.
     
     Bins:
     - 'very_small': area < very_small_threshold
@@ -205,11 +214,72 @@ def compute_size_bin(
     Args:
         raw_area: Raw bounding box area in pixels²
         config: Configuration object with threshold values
+        bbox: Optional bounding box for homography transformation
         
     Returns:
         Tuple of (bin_name, metadata_dict)
     """
-    # Get thresholds from config
+    # V8: Check if homography is enabled and calibrated
+    use_homography = getattr(config, 'homography_enabled', False) and HOMOGRAPHY_AVAILABLE
+    area_cm2 = None
+    size_cm = None
+    
+    if use_homography and bbox is not None:
+        try:
+            homography = get_homography_transform()
+            if homography.is_calibrated():
+                size_cm = homography.get_bbox_size_cm(bbox)
+                area_cm2 = size_cm[0] * size_cm[1]
+                
+                # Use homography-based thresholds
+                small_threshold_cm2 = getattr(config, 'homography_small_threshold_cm2', 100.0)
+                large_threshold_cm2 = getattr(config, 'homography_large_threshold_cm2', 150.0)
+                
+                # Use cm² thresholds to determine bin
+                metadata = {
+                    'raw_area_px': raw_area,
+                    'area_cm2': area_cm2,
+                    'size_cm': size_cm,
+                    'homography_used': True,
+                    'thresholds_cm2': {
+                        'small': small_threshold_cm2,
+                        'large': large_threshold_cm2
+                    }
+                }
+                
+                # Classify using cm² thresholds
+                size_class, size_bin = classify_size_by_area_cm2(
+                    area_cm2, 
+                    small_threshold_cm2,
+                    large_threshold_cm2
+                )
+                
+                # Map size_class to bin names
+                if size_bin == 'very_small':
+                    bin_name = 'very_small'
+                elif size_bin == 'small':
+                    bin_name = 'small'
+                elif size_bin == 'medium':
+                    bin_name = 'gray_zone'  # Medium = gray zone
+                elif size_bin == 'large':
+                    bin_name = 'regular'  # Large in cm = regular bag
+                else:
+                    bin_name = 'gray_zone'
+                
+                metadata['bin'] = bin_name
+                metadata['size_class'] = size_class
+                
+                logger.debug(
+                    f"[Disambiguation V2] Homography: area={area_cm2:.1f}cm², "
+                    f"size={size_cm[0]:.1f}x{size_cm[1]:.1f}cm, bin={bin_name}"
+                )
+                
+                return bin_name, metadata
+                
+        except Exception as e:
+            logger.debug(f"[Disambiguation V2] Homography failed, using pixel area: {e}")
+    
+    # Fallback: Use pixel-based thresholds
     very_small_threshold = getattr(config, 'disambiguation_v2_very_small_threshold', 5000.0)
     small_threshold = getattr(config, 'disambiguation_small_threshold', 9000.0)
     regular_threshold = getattr(config, 'disambiguation_regular_threshold', 11000.0)
@@ -217,6 +287,7 @@ def compute_size_bin(
     
     metadata = {
         'raw_area': raw_area,
+        'homography_used': False,
         'thresholds': {
             'very_small': very_small_threshold,
             'small': small_threshold,
@@ -429,13 +500,13 @@ def disambiguate_v2(
     # Apply validation penalty if any
     current_confidence = confidence
     
-    # Step 2: Compute size bin
+    # Step 2: Compute size bin (V8: supports homography if enabled)
     x1, y1, x2, y2 = bbox
     width = x2 - x1
     height = y2 - y1
     raw_area = width * height
     
-    size_bin, size_metadata = compute_size_bin(raw_area, config)
+    size_bin, size_metadata = compute_size_bin(raw_area, config, bbox=bbox)
     metadata['size_bin'] = size_bin
     metadata['size_metadata'] = size_metadata
     

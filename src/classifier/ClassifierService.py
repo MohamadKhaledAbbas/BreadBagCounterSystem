@@ -48,6 +48,12 @@ from src.classifier.roi_trust import (
 from src.classifier.evidence_accumulator import EvidenceAccumulator, FinalClassificationResult, accumulate_track_evidence
 from src.classifier.probability_adjustments import apply_probability_adjustment, validate_probability_vector
 
+# V8: Import ROI candidate saver for debug/analysis
+from src.classifier.roi_candidate_saver import save_track_roi_candidates
+
+# V8: Import homography module for size-based classification
+from src.classifier.homography import get_homography_transform
+
 ResultCallback = Callable[[int, Dict[str, Any]], None]
 
 
@@ -1411,10 +1417,19 @@ class ClassifierService:
                         unknown_kind = "structural"
                     metadata["unknown_kind"] = unknown_kind
             
+            # V8: Prepare ROI candidates for saving (debug/analysis)
+            # Use classifications_with_probs if available, otherwise classifications
+            roi_candidates_for_save = None
+            if self.evidence_accumulation_enabled:
+                roi_candidates_for_save = classifications_with_probs if 'classifications_with_probs' in locals() else None
+            else:
+                roi_candidates_for_save = classifications if 'classifications' in locals() else None
+            
             # Save ROI and invoke callbacks
             self._save_and_callback(
                 track_id, best_roi, final_label, final_conf, 
-                len(candidates), metadata, context
+                len(candidates), metadata, context,
+                roi_candidates=roi_candidates_for_save
             )
 
         except Exception as e:
@@ -1518,8 +1533,12 @@ class ClassifierService:
 
     def _save_and_callback(self, track_id: int, best_roi: Any, label: str, 
                            confidence: float, candidates_count: int,
-                           metadata: Dict, context: Optional[Dict]):
-        """Save ROI image and invoke registered callbacks."""
+                           metadata: Dict, context: Optional[Dict],
+                           roi_candidates: Optional[List[Dict]] = None):
+        """Save ROI image and invoke registered callbacks.
+        
+        V8: Also saves all ROI candidates for debug/analysis if enabled.
+        """
         if best_roi is None:
             logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
             return
@@ -1555,6 +1574,27 @@ class ClassifierService:
             image_path = save_path
         elif existing_files:
             image_path = os.path.join(target_dir, existing_files[0])
+        
+        # V8: Save all ROI candidates for debug/analysis if enabled
+        if tracking_config.save_roi_candidates and roi_candidates:
+            try:
+                # Build homography info if available
+                homography_info = None
+                homography = get_homography_transform()
+                if homography.is_calibrated():
+                    homography_info = homography.get_calibration_info()
+                
+                # Save ROI candidates
+                save_track_roi_candidates(
+                    track_id=track_id,
+                    classification=label,
+                    confidence=confidence,
+                    roi_candidates=roi_candidates,
+                    homography_info=homography_info,
+                    additional_metadata=metadata
+                )
+            except Exception as e:
+                logger.warning(f"[ClassifierService] Failed to save ROI candidates: {e}")
         
         # Prepare result data
         result_data = {

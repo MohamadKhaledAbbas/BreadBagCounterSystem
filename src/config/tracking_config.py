@@ -53,6 +53,11 @@ def _parse_int_env(env_var: str, default: int) -> int:
         return default
 
 
+def _parse_str_env(env_var: str, default: str) -> str:
+    """Parse string from environment variable."""
+    return os.getenv(env_var, default)
+
+
 @dataclass
 class TrackingConfig:
     """
@@ -2752,6 +2757,155 @@ class TrackingConfig:
     Only used when classification_batch_enabled=True.
     
     Default: 4
+    """
+    
+    # ============================================================================
+    # Homography-Based Size Classification
+    # ============================================================================
+    # These parameters enable accurate size-based classification using the work
+    # table as a reference plane for perspective transformation.
+    
+    homography_enabled: bool = _parse_bool_env("HOMOGRAPHY_ENABLED", False)
+    """
+    Enable homography-based size estimation for physically accurate measurements.
+    
+    When True: Use homography transformation to convert pixel measurements to
+               real-world centimeter measurements using the table as reference.
+    When False: Use raw pixel area for size estimation (current behavior).
+    
+    Benefits:
+    - Perspective-invariant: Works at any camera distance/angle
+    - Physically accurate: Measures actual bread size in cm², not pixels
+    - Debuggable: Real measurements vs arbitrary pixels
+    
+    Requires: homography_table_corners and homography_table_size_cm to be set.
+    
+    Default: False (requires calibration)
+    """
+    
+    homography_table_corners: str = _parse_str_env(
+        "HOMOGRAPHY_TABLE_CORNERS", 
+        ""  # Empty means not calibrated
+    )
+    """
+    Table corner positions in pixel coordinates for homography calibration.
+    
+    Format: JSON array of 4 corners in clockwise order starting from top-left.
+    Example: "[[150,100],[950,120],[980,650],[120,680]]"
+    
+    The corners define the work table boundaries in the camera view.
+    Used to compute the perspective transformation matrix.
+    
+    Default: "" (not calibrated)
+    """
+    
+    homography_table_width_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_WIDTH_CM", 80.0)
+    """
+    Physical width of the work table in centimeters.
+    
+    Range: 40.0 - 200.0 (typical work tables)
+    
+    Default: 80.0 cm
+    """
+    
+    homography_table_height_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_HEIGHT_CM", 60.0)
+    """
+    Physical height (depth) of the work table in centimeters.
+    
+    Range: 30.0 - 150.0 (typical work tables)
+    
+    Default: 60.0 cm
+    """
+    
+    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 100.0)
+    """
+    Area threshold (cm²) below which a bag is classified as "Small".
+    
+    When homography is enabled, this threshold is used instead of pixel-based
+    disambiguation_small_threshold.
+    
+    Range: 50.0 - 200.0 cm²
+    Tuning: Measure actual Small bag dimensions and compute area.
+    
+    Default: 100.0 cm² (approximately 10cm x 10cm)
+    """
+    
+    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 150.0)
+    """
+    Area threshold (cm²) above which a bag is classified as "Large/Regular".
+    
+    When homography is enabled, this threshold is used instead of pixel-based
+    disambiguation_regular_threshold.
+    
+    Range: 100.0 - 300.0 cm²
+    Tuning: Measure actual Large bag dimensions and compute area.
+    
+    Default: 150.0 cm² (approximately 12cm x 12cm)
+    """
+    
+    # ============================================================================
+    # ROI Candidate Saving (Debug/Analysis)
+    # ============================================================================
+    # These parameters control saving all ROI candidates with metadata for
+    # post-analysis, model improvement, and debugging.
+    
+    save_roi_candidates: bool = _parse_bool_env("SAVE_ROI_CANDIDATES", False)
+    """
+    Enable/disable saving all ROI candidates with metadata.
+    
+    When True: Save all ROI candidates per track with quality metrics and metadata
+    When False: Do not save ROI candidates (production behavior)
+    
+    Useful for:
+    - Debugging "Uncertain" or "Rejected" classifications
+    - Analyzing ROI quality metrics
+    - Collecting real production data for model retraining
+    - Quality verification and monitoring
+    
+    Default: False (enable for debug/analysis)
+    """
+    
+    roi_candidates_dir: str = _parse_str_env("ROI_CANDIDATES_DIR", "data/roi_candidates")
+    """
+    Directory for saved ROI candidates.
+    
+    ROIs are organized by classification:
+        {roi_candidates_dir}/
+        ├── Brown_Orange_Small/
+        │   ├── track_12345_roi_0_quality_0.85.jpg
+        │   └── track_12345_metadata.json
+        ├── Rejected/
+        └── Uncertain/
+    
+    Default: "data/roi_candidates"
+    """
+    
+    save_rejected_tracks: bool = _parse_bool_env("SAVE_REJECTED_TRACKS", True)
+    """
+    Save ROI candidates for tracks classified as "Rejected".
+    
+    Useful for analyzing why the classifier rejects certain inputs.
+    
+    Default: True (save for analysis)
+    """
+    
+    save_uncertain_tracks: bool = _parse_bool_env("SAVE_UNCERTAIN_TRACKS", True)
+    """
+    Save ROI candidates for tracks classified as "Uncertain" or "Unknown".
+    
+    Useful for understanding classification failures and edge cases.
+    
+    Default: True (save for analysis)
+    """
+    
+    max_rois_per_track_save: int = _parse_int_env("MAX_ROIS_PER_TRACK_SAVE", 20)
+    """
+    Maximum number of ROI candidates to save per track.
+    
+    Limits disk usage while still capturing sufficient data for analysis.
+    
+    Range: 5 - 50
+    Default: 20
     """
 
 
