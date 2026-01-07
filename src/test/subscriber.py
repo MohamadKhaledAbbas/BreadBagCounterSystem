@@ -6,7 +6,7 @@ from rclpy.qos import qos_profile_sensor_data
 from hbm_img_msgs.msg import HbmMsg1080P
 
 class FrameSubscriber(Node):
-    def __init__(self, topic_name="/nv12_images"):
+    def __init__(self, topic_name="/nv12_images", save_video=False, video_filename="output.mp4", fps=30):
         super().__init__('frame_subscriber_node')
         self.subscription = self.create_subscription(
             HbmMsg1080P,
@@ -19,19 +19,43 @@ class FrameSubscriber(Node):
         self.winname = "ROS2 FrameSubscriber"
         cv2.namedWindow(self.winname, cv2.WINDOW_NORMAL)
         self.get_logger().info(f"Subscribed to topic '{topic_name}' as HbmMsg1080P.")
+        # Saving options
+        self.save_video = save_video
+        self.video_filename = video_filename
+        self.fps = fps
+        self.video_writer = None
+        self.video_size = None
 
     def listener_callback(self, msg):
         h = msg.height
         w = msg.width
-        frame_len = int(h * w * 1.5)
+        # Convert NV12 data to BGR
         img_data = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
-        nv12_img = img_data.reshape((msg.height * 3 // 2, msg.width))
+        nv12_img = img_data.reshape((h * 3 // 2, w))
         bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
-        resized_bgr = cv2.resize(bgr, (1024, 1025))
+
+        # Resize for display, keep original for saving
+        resized_bgr = cv2.resize(bgr, (1024, 1024))
         cv2.imshow(self.winname, resized_bgr)
 
+        # Optional: Save frame to video
+        if self.save_video:
+            # Lazy initialization of VideoWriter
+            if self.video_writer is None:
+                self.video_size = (bgr.shape[1], bgr.shape[0])
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.video_writer = cv2.VideoWriter(
+                    self.video_filename, fourcc, self.fps, self.video_size
+                )
+                self.get_logger().info(f"Saving video to {self.video_filename} at {self.fps} FPS, size={self.video_size}")
+            self.video_writer.write(bgr)
+
+        self.frame_counter += 1
+        # Optionally save latest frame as image (add flag if desired)
+        # if self.save_frames:
+        #     cv2.imwrite(f"frame_{self.frame_counter:04d}.png", bgr)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            import rclpy
             rclpy.shutdown()
             cv2.destroyAllWindows()
 
@@ -41,11 +65,16 @@ class FrameSubscriber(Node):
         return self.latest_frame.copy()
 
     def close_node(self):
+        # Release video writer if in use
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.get_logger().info(f"Video saved to {self.video_filename}")
         self.destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = FrameSubscriber("/nv12_images")
+    # Set save_video=True to enable MP4 saving
+    node = FrameSubscriber(topic_name="/nv12_images", save_video=False, video_filename="/home/sunrise/BreadCounting/data/nv12_output.mp4", fps=20)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

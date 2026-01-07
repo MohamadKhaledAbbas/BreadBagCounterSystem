@@ -198,7 +198,7 @@ class TrackingConfig:
     More samples provide better classification but use more memory.
     
     BALANCED COLLECTION: Set to 10 to match max_closed_samples for balanced
-    evidence accumulation. Previously was 15, creating imbalance.
+    evidence accumulation.Previously was 15, creating imbalance.
     
     Default: 10 (balanced with closed samples)
     """
@@ -210,7 +210,7 @@ class TrackingConfig:
     Range: 2 - 10
     More samples provide better classification but use more memory.
     
-    BALANCED COLLECTION: Set to 10 to match max_open_samples. Closed ROIs are
+    BALANCED COLLECTION: Set to 10 to match max_open_samples.Closed ROIs are
     essential for size-based disambiguation, so equal collection is critical.
     Previously was 5, which was insufficient.
     
@@ -231,7 +231,7 @@ class TrackingConfig:
     Default: 100 (V3: reduced from 300 - this was blocking the entire pipeline!)
     
     IMPORTANT: The log showed ROIs of ~160x175 pixels were being rejected due to
-    min_size=300. This was preventing classification from ever running.
+    min_size=300.This was preventing classification from ever running.
     """
     
     min_roi_sharpness: float = 500  # V3: Reduced from 400 for more accepted samples
@@ -312,7 +312,7 @@ class TrackingConfig:
     DEPRECATED: This parameter is unused in the current implementation.
     
     Evidence accumulation uses margin-based decision (winner vs runner-up margin)
-    rather than absolute evidence score threshold. Log-evidence scores are negative,
+    rather than absolute evidence score threshold.Log-evidence scores are negative,
     making this positive threshold meaningless.
     
     See stability_margin_threshold for the actual decision threshold used.
@@ -2780,7 +2780,7 @@ class TrackingConfig:
     # These parameters enable accurate size-based classification using the work
     # table as a reference plane for perspective transformation.
     
-    homography_enabled: bool = _parse_bool_env("HOMOGRAPHY_ENABLED", False)
+    homography_enabled: bool = _parse_bool_env("HOMOGRAPHY_ENABLED", True)
     """
     Enable homography-based size estimation for physically accurate measurements.
     
@@ -2800,7 +2800,7 @@ class TrackingConfig:
     
     homography_table_corners: str = _parse_str_env(
         "HOMOGRAPHY_TABLE_CORNERS", 
-        ""  # Empty means not calibrated
+        "[[904.0, 287.0], [1070.0, 538.0], [358.0, 587.0], [413.0, 290.0]]"  # Empty means not calibrated
     )
     """
     Table corner positions in pixel coordinates for homography calibration.
@@ -2814,7 +2814,7 @@ class TrackingConfig:
     Default: "" (not calibrated)
     """
     
-    homography_table_width_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_WIDTH_CM", 80.0)
+    homography_table_width_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_WIDTH_CM", 140.0)
     """
     Physical width of the work table in centimeters.
     
@@ -2823,7 +2823,7 @@ class TrackingConfig:
     Default: 80.0 cm
     """
     
-    homography_table_height_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_HEIGHT_CM", 60.0)
+    homography_table_height_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_HEIGHT_CM", 80.0)
     """
     Physical height (depth) of the work table in centimeters.
     
@@ -2832,7 +2832,7 @@ class TrackingConfig:
     Default: 60.0 cm
     """
     
-    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 100.0)
+    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 1600.0)
     """
     Area threshold (cm²) below which a bag is classified as "Small".
     
@@ -2845,7 +2845,7 @@ class TrackingConfig:
     Default: 100.0 cm² (approximately 10cm x 10cm)
     """
     
-    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 150.0)
+    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 2000.0)
     """
     Area threshold (cm²) above which a bag is classified as "Large/Regular".
     
@@ -2864,7 +2864,7 @@ class TrackingConfig:
     # These parameters control saving all ROI candidates with metadata for
     # post-analysis, model improvement, and debugging.
     
-    save_roi_candidates: bool = _parse_bool_env("SAVE_ROI_CANDIDATES", False)
+    save_roi_candidates: bool = _parse_bool_env("SAVE_ROI_CANDIDATES", True)
     """
     Enable/disable saving all ROI candidates with metadata.
     

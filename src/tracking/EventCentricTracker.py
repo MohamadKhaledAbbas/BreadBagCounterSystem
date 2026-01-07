@@ -1864,8 +1864,8 @@ class BreadBagEvent:
         Returns:
             True if ROI should be rejected as duplicate, False otherwise
         """
-        DUPLICATE_IOU_THRESHOLD = 0.7
-        QUALITY_GAIN_EPSILON = 0.05
+        DUPLICATE_IOU_THRESHOLD = 0.85
+        QUALITY_GAIN_EPSILON = 0.03
         
         for existing in self.roi_candidates:
             if existing.bbox is None:

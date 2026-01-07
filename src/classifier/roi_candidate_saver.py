@@ -47,6 +47,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 
+from src.config.tracking_config import tracking_config
+
 try:
     import cv2
     CV2_AVAILABLE = True
@@ -358,7 +360,13 @@ def get_roi_candidate_saver() -> ROICandidateSaver:
     global _saver_instance
     
     if _saver_instance is None:
-        _saver_instance = ROICandidateSaver()
+        config = ROICandidateSaverConfig()
+        config.enabled = tracking_config.save_roi_candidates
+        config.output_dir = tracking_config.roi_candidates_dir
+        config.save_rejected_tracks = tracking_config.save_rejected_tracks
+        config.save_uncertain_tracks = tracking_config.save_uncertain_tracks
+        config.max_rois_per_track = tracking_config.max_rois_per_track_save
+        _saver_instance = ROICandidateSaver(config=config)
     
     return _saver_instance
 

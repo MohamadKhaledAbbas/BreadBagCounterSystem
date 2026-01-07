@@ -26,7 +26,7 @@ class FrameServer(Node, FrameSource):
     to be added to an external SingleThreadedExecutor.
     """
 
-    def __init__(self, topic='/nv12_images', target_fps=30.0):
+    def __init__(self, topic='/nv12_images', target_fps=20.0):
         # IMPORTANT: rclpy.init() must be called externally before this class is instantiated.
         super().__init__('frame_server')
         

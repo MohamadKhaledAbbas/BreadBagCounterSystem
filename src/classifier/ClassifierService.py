@@ -1402,8 +1402,8 @@ class ClassifierService:
                 roi_candidates_for_save = classifications if 'classifications' in locals() else None
             
             # Save ROI and invoke callbacks
-            self._save_and_callback(
-                track_id, best_roi, final_label, final_conf, 
+            self._callback_and_maybe_save(
+                track_id, final_label, final_conf,
                 len(candidates), metadata, context,
                 roi_candidates=roi_candidates_for_save
             )
@@ -1507,50 +1507,15 @@ class ClassifierService:
         save_path = os.path.join(target_dir, filename)
         cv2.imwrite(save_path, roi)
 
-    def _save_and_callback(self, track_id: int, best_roi: Any, label: str, 
-                           confidence: float, candidates_count: int,
-                           metadata: Dict, context: Optional[Dict],
-                           roi_candidates: Optional[List[Dict]] = None):
+    def _callback_and_maybe_save(self, track_id: int, label: str,
+                                 confidence: float, candidates_count: int,
+                                 metadata: Dict, context: Optional[Dict],
+                                 roi_candidates: Optional[List[Dict]] = None):
         """Save ROI image and invoke registered callbacks.
         
         V8: Also saves all ROI candidates for debug/analysis if enabled.
         """
-        if best_roi is None:
-            logger.error(f"[ClassifierService] Track {track_id}: No valid ROI!")
-            return
-        
-        # Compute phash (only for non-Unknown or when we have actual ROI data)
-        phash_obj = compute_phash(best_roi)
-        phash_str = str(phash_obj) if phash_obj else None
-        
-        # Determine save path
-        if label == "Unknown":
-            # For Unknown, use a single directory instead of per-phash directories
-            target_dir = os.path.join(self.data_root, "saved_rois", "unknown")
-        else:
-            target_dir = os.path.join(self.data_root, "saved_rois", "classes", label)
-        
-        os.makedirs(target_dir, exist_ok=True)
-        
-        # Save logic
-        should_save = False
-        existing_files = os.listdir(target_dir)
-        
-        if self.save_all_rois:
-            should_save = True
-        elif not existing_files:
-            should_save = True
-        
-        image_path = None
-        if should_save:
-            timestamp = int(time.time())
-            filename = f"{timestamp}_{track_id}.jpg"
-            save_path = os.path.join(target_dir, filename)
-            cv2.imwrite(save_path, best_roi)
-            image_path = save_path
-        elif existing_files:
-            image_path = os.path.join(target_dir, existing_files[0])
-        
+
         # V8: Save all ROI candidates for debug/analysis if enabled
         if tracking_config.save_roi_candidates and roi_candidates:
             try:
@@ -1575,8 +1540,6 @@ class ClassifierService:
         # Prepare result data
         result_data = {
             "label": label,
-            "phash": phash_str,
-            "image_path": image_path,
             "confidence": confidence,
             "candidates_evaluated": candidates_count,
             "context": context,

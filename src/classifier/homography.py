@@ -317,9 +317,30 @@ def get_homography_transform() -> HomographyTransform:
     
     Environment Variables:
         HOMOGRAPHY_ENABLED: Enable/disable homography (default: false)
-        HOMOGRAPHY_TABLE_CORNERS: JSON array of 4 corners, e.g., "[[150,100],[950,120],[980,650],[120,680]]"
-        HOMOGRAPHY_TABLE_WIDTH_CM: Table width in cm (default: 80)
-        HOMOGRAPHY_TABLE_HEIGHT_CM: Table height in cm (default: 60)
+
+        # Homography Configuration
+        # Add these lines to your .env file
+        HOMOGRAPHY_ENABLED=true
+        HOMOGRAPHY_TABLE_CORNERS='[[916.0, 184.0], [1159.0, 440.0], [388.0, 604.0], [390.0, 255.0]]'
+        HOMOGRAPHY_TABLE_WIDTH_CM=140.0
+        HOMOGRAPHY_TABLE_HEIGHT_CM=80.0
+        HOMOGRAPHY_SMALL_THRESHOLD_CM2=100.0
+        HOMOGRAPHY_LARGE_THRESHOLD_CM2=150.0
+
+        \u2705 Saved calibration image:  data/calibration/calibration_image.jpg
+        \u2705 Saved calibration data: data/calibration/calibration_data.json
+        \u2705 Saved environment config: data/calibration/calibration. env
+
+        ======================================================================
+        \u2705 CALIBRATION COMPLETE!
+        ======================================================================
+
+        Next steps:
+          1. Copy the environment variables above to your .env file
+          2. Restart your application
+          3. Verify homography is working with: python scripts/calibrate_homography.py --dry-run
+        ======================================================================
+
     
     Returns:
         HomographyTransform instance
@@ -329,18 +350,18 @@ def get_homography_transform() -> HomographyTransform:
     if _homography_instance is None:
         import json
         
-        enabled = os.getenv('HOMOGRAPHY_ENABLED', 'false').lower() in ('true', '1', 'yes')
+        enabled = os.getenv('HOMOGRAPHY_ENABLED', 'true').lower() in ('true', '1', 'yes')
         
         table_corners_px = None
-        corners_str = os.getenv('HOMOGRAPHY_TABLE_CORNERS')
+        corners_str = os.getenv('HOMOGRAPHY_TABLE_CORNERS', '[[904.0, 287.0], [1070.0, 538.0], [358.0, 587.0], [413.0, 290.0]]')
         if corners_str:
             try:
                 table_corners_px = json.loads(corners_str)
             except json.JSONDecodeError as e:
                 logger.error(f"[Homography] Failed to parse HOMOGRAPHY_TABLE_CORNERS: {e}")
         
-        table_width_cm = float(os.getenv('HOMOGRAPHY_TABLE_WIDTH_CM', '80'))
-        table_height_cm = float(os.getenv('HOMOGRAPHY_TABLE_HEIGHT_CM', '60'))
+        table_width_cm = float(os.getenv('HOMOGRAPHY_TABLE_WIDTH_CM', '140'))
+        table_height_cm = float(os.getenv('HOMOGRAPHY_TABLE_HEIGHT_CM', '80'))
         table_size_cm = (table_width_cm, table_height_cm)
         
         _homography_instance = HomographyTransform(
@@ -360,8 +381,8 @@ def get_homography_transform() -> HomographyTransform:
 
 def classify_size_by_area_cm2(
     area_cm2: float,
-    small_threshold_cm2: float = 100.0,
-    large_threshold_cm2: float = 150.0
+    small_threshold_cm2: float = 760.0,
+    large_threshold_cm2: float = 915.0
 ) -> Tuple[str, str]:
     """
     Classify size based on real-world area in square centimeters.

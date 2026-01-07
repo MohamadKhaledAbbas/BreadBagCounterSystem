@@ -791,8 +791,6 @@ class BagCounterApp:
         and upcoming events.
         """
         label = data["label"]
-        phash = data["phash"]
-        image_path = data["image_path"]
         conf = data.get("confidence", 1.0)
         candidates_count = data.get("candidates_evaluated", 1)
         context = data.get("context")
@@ -808,8 +806,6 @@ class BagCounterApp:
             'event_id': track_id,
             'bag_type': label,
             'confidence': conf,
-            'phash': phash,
-            'image_path': image_path,
             'candidates_count': candidates_count,
             'context': context,
             'metadata': metadata,

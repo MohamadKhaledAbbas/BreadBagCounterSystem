@@ -222,8 +222,8 @@ def compute_size_bin(
                 area_cm2 = size_cm[0] * size_cm[1]
                 
                 # Use homography-based thresholds
-                small_threshold_cm2 = getattr(config, 'homography_small_threshold_cm2', 100.0)
-                large_threshold_cm2 = getattr(config, 'homography_large_threshold_cm2', 150.0)
+                small_threshold_cm2 = getattr(config, 'homography_small_threshold_cm2', 1600.0)
+                large_threshold_cm2 = getattr(config, 'homography_large_threshold_cm2', 2000.0)
                 
                 # Use cm² thresholds to determine bin
                 metadata = {

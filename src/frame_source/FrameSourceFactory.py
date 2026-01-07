@@ -39,7 +39,7 @@ class FrameSourceFactory:
             # Import ROS2 frame server only when needed (RDK platform)
             from src.frame_source.Ros2FrameServer import FrameServer
             topic = kwargs.get('topic', '/nv12_images')
-            target_fps = kwargs.get('target_fps', 30.0)
+            target_fps = kwargs.get('target_fps', 20.0)
 
             node = FrameServer(topic=topic, target_fps=target_fps)
             return node
