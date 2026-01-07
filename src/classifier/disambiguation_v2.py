@@ -1,38 +1,29 @@
 """
-Production-Grade Size-Based Disambiguation Module V2.
+Simplified Production-Grade Size-Based Disambiguation Module V2.
 
-This module implements enhanced family-based disambiguation for visually similar
-bread bag classes (e.g., Brown_Orange_Overlay vs Brown_Orange_Small) using
-production-tuned thresholds and robust fallback logic.
+This module implements homography-first size-based disambiguation for visually similar
+bread bag classes (e.g., Brown_Orange_Overlay vs Brown_Orange_Small).
 
-## Key Improvements Over V1:
+## V8 Improvements: Homography-First Approach
 
-1. **Multi-threshold logic with adjustable bins**:
-   - Multiple size bins for more granular classification
-   - Configurable thresholds for each bin
-   - Gray zone handling with multiple strategies
+1. **Homography-based classification (preferred)**:
+   - Uses real-world measurements (cm²) when calibrated
+   - Perspective-invariant and physically accurate
+   - High confidence results
 
-2. **Aspect ratio and area validation**:
-   - Validates ROI geometry for suspicious bboxes
-   - Penalizes confidence for invalid aspect ratios
-   - Detects and handles degenerate bboxes
+2. **Simple pixel fallback**:
+   - Used when homography is not calibrated
+   - Lower confidence tier to indicate less reliable measurement
+   - Minimal penalty for gray zone cases
 
-3. **Gray zone handling strategies**:
-   - 'keep_original': Trust classifier in ambiguous cases (default)
-   - 'prefer_small': Bias toward small class
-   - 'prefer_regular': Bias toward regular class
-   - 'use_confidence': Use classifier confidence to break ties
+3. **Simplified gray zone handling**:
+   - No complex strategies needed with homography
+   - Simple midpoint-based resolution
+   - Always flags as low confidence
 
-4. **Detailed diagnostic logging**:
-   - Before/after labels and confidence
-   - Area, aspect ratio, size bin information
-   - Resolution reason with full context
-   - Confidence change tracking
-
-5. **Configurable confidence penalty**:
-   - Penalty when disambiguation changes the class
-   - Minimal impact when classifier agrees with size
-   - Separate penalty for validation failures
+4. **Streamlined confidence tiers**:
+   - High: Homography-based clear classification
+   - Low: Pixel fallback, or any gray zone case
 
 ## Usage
 
@@ -47,14 +38,13 @@ production-tuned thresholds and robust fallback logic.
         context={'track_id': 123, 'frame_index': 45}
     )
     
-    # Result includes detailed metadata
+    # Result includes homography status
     print(f"Label: {result.label}")
     print(f"Confidence: {result.confidence}")
-    print(f"Changed: {result.disambiguated}")
-    print(f"Reason: {result.reason}")
-    print(f"Metadata: {result.metadata}")
+    print(f"Tier: {result.confidence_tier}")
+    print(f"Homography used: {result.metadata['homography_used']}")
 
-All parameters are centralized in tracking_config.py for easy tuning.
+Parameters are centralized in tracking_config.py and environment variables.
 """
 
 from typing import Dict, Any, Optional, Tuple
@@ -314,85 +304,48 @@ def compute_size_bin(
 
 def resolve_gray_zone(
     original_label: str,
-    confidence: float,
     size_bin_metadata: Dict[str, Any],
-    config: Any,
     target_classes: Tuple[str, str],
-    family_name: str = 'Brown_Orange_Family'
+    homography_used: bool = False
 ) -> Tuple[str, str]:
     """
-    Resolve classification in gray zone using configured strategy.
+    Resolve classification in gray zone with simplified logic.
     
-    CRITICAL: Always returns a specific class, never a generic family label.
-    Note: Confidence tier flagging is handled by the caller (disambiguate_v2).
-    
-    Strategies:
-    - 'keep_original': Trust classifier's prediction, but use best match if it's a family label
-    - 'prefer_small': Bias toward small class
-    - 'prefer_regular': Bias toward regular class
-    - 'use_confidence': Use confidence to break ties; pick best match for low confidence
+    SIMPLIFIED: With homography, gray zones are rare and we just pick by midpoint.
+    Without homography (pixel fallback), we use the same simple midpoint logic.
     
     Args:
         original_label: Original classifier prediction
-        confidence: Prediction confidence
         size_bin_metadata: Metadata from size bin computation
-        config: Configuration object
         target_classes: Tuple of (regular_class, small_class)
-        family_name: Generic family name to avoid in output
+        homography_used: Whether homography was used for measurement
         
     Returns:
-        Tuple of (resolved_label, reason) - resolved_label is always a specific class
+        Tuple of (resolved_label, reason)
     """
-    gray_zone_behavior = getattr(config, 'disambiguation_gray_zone_behavior', 'keep_original')
     regular_class, small_class = target_classes
-    raw_area = size_bin_metadata.get('raw_area', 0)
     
-    # Helper: pick best match based on area relative to midpoint
-    def pick_best_match_by_area():
-        small_threshold = size_bin_metadata.get('thresholds', {}).get('small', 9000.0)
-        regular_threshold = size_bin_metadata.get('thresholds', {}).get('regular', 11000.0)
-        midpoint = (small_threshold + regular_threshold) / 2
-        # Below midpoint → small class, above midpoint → regular class
-        if raw_area < midpoint:
-            return small_class
-        else:
-            return regular_class
+    # Get area (either cm² or px²)
+    if homography_used:
+        area = size_bin_metadata.get('area_cm2', 0)
+        thresholds = size_bin_metadata.get('thresholds_cm2', {})
+        small_threshold = thresholds.get('small', 100.0)
+        large_threshold = thresholds.get('large', 150.0)
+        unit = 'cm²'
+    else:
+        area = size_bin_metadata.get('raw_area', 0)
+        thresholds = size_bin_metadata.get('thresholds', {})
+        small_threshold = thresholds.get('small', 9000.0)
+        large_threshold = thresholds.get('regular', 11000.0)  # Note: 'regular' not 'large' for pixel mode
+        unit = 'px²'
     
-    if gray_zone_behavior == 'uncertain':
-        # CHANGED: Instead of returning "Uncertain", pick best match by area
-        best_match = pick_best_match_by_area()
-        return best_match, f"gray_zone_uncertain_resolved (area={raw_area:.0f}, picked={best_match})"
+    # Simple midpoint-based resolution
+    midpoint = (small_threshold + large_threshold) / 2
     
-    elif gray_zone_behavior == 'prefer_small':
-        return small_class, f"gray_zone_prefer_small (area={raw_area:.0f})"
-    
-    elif gray_zone_behavior == 'prefer_regular':
-        return regular_class, f"gray_zone_prefer_regular (area={raw_area:.0f})"
-    
-    elif gray_zone_behavior == 'use_confidence':
-        # Use confidence threshold to decide
-        confidence_threshold = getattr(config, 'disambiguation_v2_gray_zone_confidence_threshold', 0.6)
-        if confidence >= confidence_threshold:
-            # High confidence: trust classifier if it's a specific class, else pick best match
-            if original_label in target_classes:
-                return original_label, f"gray_zone_high_confidence (area={raw_area:.0f}, conf={confidence:.3f})"
-            else:
-                # Family label or other - pick best match
-                best_match = pick_best_match_by_area()
-                return best_match, f"gray_zone_high_confidence_resolved (area={raw_area:.0f}, conf={confidence:.3f}, picked={best_match})"
-        else:
-            # Low confidence: pick best match by area
-            best_match = pick_best_match_by_area()
-            return best_match, f"gray_zone_low_confidence_resolved (area={raw_area:.0f}, conf={confidence:.3f}, picked={best_match})"
-    
-    else:  # 'keep_original' or unknown strategy
-        # If original is a specific target class, use it; else pick best match
-        if original_label in target_classes:
-            return original_label, f"gray_zone_keep_original (area={raw_area:.0f})"
-        else:
-            # Family label or other - pick best match
-            best_match = pick_best_match_by_area()
-            return best_match, f"gray_zone_keep_original_resolved (area={raw_area:.0f}, picked={best_match})"
+    if area < midpoint:
+        return small_class, f"gray_zone_resolved_to_small (area={area:.1f}{unit}, midpoint={midpoint:.1f})"
+    else:
+        return regular_class, f"gray_zone_resolved_to_regular (area={area:.1f}{unit}, midpoint={midpoint:.1f})"
 
 
 def disambiguate_v2(
@@ -404,14 +357,15 @@ def disambiguate_v2(
     context: Optional[Dict[str, Any]] = None
 ) -> DisambiguationV2Result:
     """
-    Enhanced size-based disambiguation with robust validation and detailed diagnostics.
+    Simplified homography-first size-based disambiguation.
     
-    This function implements production-grade disambiguation with:
-    - Multi-threshold size bins
-    - Aspect ratio and area validation
-    - Gray zone handling with multiple strategies
-    - Detailed logging with before/after metadata
-    - Configurable confidence penalties
+    SIMPLIFIED APPROACH:
+    1. Check if enabled and not open state
+    2. Check if target family member
+    3. Use homography if calibrated (preferred), otherwise pixel fallback
+    4. Classify based on thresholds
+    5. Set confidence tier (low if pixel fallback or gray zone)
+    6. Return result
     
     Args:
         original_label: Label predicted by classifier
@@ -422,7 +376,7 @@ def disambiguate_v2(
         context: Optional context dict with track_id, frame_index, etc. for logging
         
     Returns:
-        DisambiguationV2Result with final label and comprehensive diagnostics
+        DisambiguationV2Result with final label and diagnostics
     """
     # Initialize metadata
     metadata = {
@@ -433,9 +387,8 @@ def disambiguate_v2(
         'context': context or {}
     }
     
-    # Check if disambiguation is enabled
+    # Step 1: Check if disambiguation is enabled
     if not getattr(config, 'disambiguation_v2_enabled', False):
-        # Fall back to V1 if V2 is disabled
         return DisambiguationV2Result(
             label=original_label,
             confidence=confidence,
@@ -444,7 +397,7 @@ def disambiguate_v2(
             metadata=metadata
         )
     
-    # CRITICAL: Skip disambiguation for open state ROIs
+    # Step 2: Skip disambiguation for open state ROIs
     if is_open:
         metadata['skip_reason'] = 'open_state'
         return DisambiguationV2Result(
@@ -455,13 +408,12 @@ def disambiguate_v2(
             metadata=metadata
         )
     
-    # Get target classes (family members)
+    # Step 3: Check if original label is in target family
     target_classes = getattr(config, 'disambiguation_classes', 
                              ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
     regular_class, small_class = target_classes
     family_name = getattr(config, 'disambiguation_family_name', 'Brown_Orange_Family')
     
-    # Check if original label is in target family
     is_family_member = (original_label in target_classes or original_label == family_name)
     
     if not is_family_member:
@@ -476,31 +428,7 @@ def disambiguate_v2(
     
     # === FAMILY MEMBER DETECTED IN CLOSED STATE ===
     
-    # Step 1: Validate bounding box
-    validation_result = validate_bbox(bbox, config, context)
-    metadata['validation'] = validation_result.metadata
-    metadata['validation_valid'] = validation_result.valid
-    metadata['validation_reason'] = validation_result.reason
-    
-    if not validation_result.valid:
-        # Bbox is degenerate, skip disambiguation
-        metadata['skip_reason'] = 'validation_failed'
-        logger.warning(
-            f"[Disambiguation V2] {context} Validation failed: {validation_result.reason}, "
-            f"skipping disambiguation"
-        )
-        return DisambiguationV2Result(
-            label=original_label,
-            confidence=confidence,
-            disambiguated=False,
-            reason=f"validation_failed: {validation_result.reason}",
-            metadata=metadata
-        )
-
-    # Apply validation penalty if any
-    current_confidence = confidence
-    
-    # Step 2: Compute size bin (V8: supports homography if enabled)
+    # Step 4: Compute size using homography (if available) or pixel fallback
     x1, y1, x2, y2 = bbox
     width = x2 - x1
     height = y2 - y1
@@ -510,93 +438,69 @@ def disambiguate_v2(
     metadata['size_bin'] = size_bin
     metadata['size_metadata'] = size_metadata
     
-    # Get thresholds for decision logic
-    small_threshold = getattr(config, 'disambiguation_small_threshold', 9000.0)
-    regular_threshold = getattr(config, 'disambiguation_regular_threshold', 11000.0)
+    homography_used = size_metadata.get('homography_used', False)
     
-    # Step 3: Make size-based decision
+    # Step 5: Classify based on size bin
     final_label = original_label
     reason = ""
+    confidence_tier = 'high'  # Default to high confidence
     
     if size_bin == 'very_small' or size_bin == 'small':
         # Clearly small
         final_label = small_class
-        reason = f"family_size_{size_bin} (area={raw_area:.0f} < {small_threshold:.0f})"
+        if homography_used:
+            area_cm2 = size_metadata.get('area_cm2', 0)
+            reason = f"homography_small (area={area_cm2:.1f}cm²)"
+        else:
+            reason = f"pixel_small (area={raw_area:.0f}px²)"
+        confidence_tier = 'high' if homography_used else 'low'
     
     elif size_bin == 'regular' or size_bin == 'large':
         # Clearly regular/large
         final_label = regular_class
-        reason = f"family_size_{size_bin} (area={raw_area:.0f} > {regular_threshold:.0f})"
+        if homography_used:
+            area_cm2 = size_metadata.get('area_cm2', 0)
+            reason = f"homography_regular (area={area_cm2:.1f}cm²)"
+        else:
+            reason = f"pixel_regular (area={raw_area:.0f}px²)"
+        confidence_tier = 'high' if homography_used else 'low'
     
     elif size_bin == 'gray_zone':
-        # Ambiguous size, use gray zone strategy
+        # Ambiguous size - resolve using simple midpoint logic
         final_label, reason = resolve_gray_zone(
-            original_label, current_confidence, size_metadata, config, target_classes
+            original_label, size_metadata, target_classes, homography_used
         )
+        confidence_tier = 'low'  # Gray zone is always low confidence
     
-    # Step 4: Apply confidence penalty if label changed
-    label_changed = (final_label != original_label)
-    metadata['label_changed'] = label_changed
-    
-    confidence_penalty = getattr(config, 'disambiguation_confidence_penalty', 0.9)
-
-    # Step 4.5: Determine confidence tier
-    # Mark as 'low' confidence for:
-    # - Gray zone results (ambiguous size)
-    # - Validation penalties applied
-    # - Label changed from original (disambiguation had to intervene)
-    # - Generic family label was originally detected (had to be resolved)
-    confidence_tier = 'high'  # Default
-
-    # Step 4: Decide if penalty should be applied
+    # Step 6: Apply minimal confidence penalty only for pixel fallback + gray zone
     final_confidence = confidence
-    confidence_tier = 'high'  # default
-    metadata['confidence_penalty_applied'] = False
-    metadata['confidence_tier_reason'] = 'clear_classification'
-
-    # ROI validation: penalty if needed
-    if validation_result.penalty_applied > 0:
-        final_confidence *= (1.0 - validation_result.penalty_applied)
-        confidence_tier = 'low'
-        metadata['confidence_penalty_applied'] = True
-        metadata['confidence_tier_reason'] = 'validation_penalty'
-        metadata['validation_penalty'] = validation_result.penalty_applied
-        metadata['confidence_after_validation'] = final_confidence
-
-    # Gray zone: confidence penalty applies ON TOP of any previous penalty
-    if size_bin == 'gray_zone':
-        final_confidence *= confidence_penalty
-        confidence_tier = 'low'
-        metadata['confidence_penalty_applied'] = True
-        metadata['confidence_tier_reason'] = 'gray_zone_ambiguous'
-
+    if not homography_used and size_bin == 'gray_zone':
+        # Only apply penalty when using pixel fallback in gray zone
+        penalty_factor = getattr(config, 'disambiguation_confidence_penalty', 0.9)
+        final_confidence = confidence * penalty_factor
     
-    metadata['confidence_tier'] = confidence_tier
     metadata['final_label'] = final_label
     metadata['final_confidence'] = final_confidence
-
-    # Step 5: Debug logging if enabled
-    debug_logging = getattr(config, 'disambiguation_v2_debug_logging', False)
+    metadata['confidence_tier'] = confidence_tier
+    metadata['homography_used'] = homography_used
     
+    # Debug logging if enabled
+    debug_logging = getattr(config, 'disambiguation_v2_debug_logging', False)
     if debug_logging:
         context_str = ""
         if context:
             track_id = context.get('track_id', 'N/A')
             frame_index = context.get('frame_index', 'N/A')
-            roi_index = context.get('roi_index', 'N/A')
-            context_str = f"Track {track_id} Frame {frame_index} ROI {roi_index}: "
+            context_str = f"Track {track_id} Frame {frame_index}: "
         
         logger.info(
             f"[Disambiguation V2] {context_str}"
-            f"family={family_name}, "
             f"original={original_label}(conf={confidence:.3f}), "
             f"final={final_label}(conf={final_confidence:.3f}), "
-            f"bbox={bbox}, area={raw_area:.0f}, size_bin={size_bin}, "
-            f"validation={validation_result.valid}, "
-            f"reason={reason}"
+            f"size_bin={size_bin}, homography={homography_used}, "
+            f"tier={confidence_tier}, reason={reason}"
         )
     
-    # Always mark as disambiguated for family members in closed state
     return DisambiguationV2Result(
         label=final_label,
         confidence=final_confidence,

@@ -515,7 +515,11 @@ class ClassifierService:
     
     def _apply_classification_smoothing(self, label: str, confidence: float) -> Tuple[str, float, Optional[str]]:
         """
-        Apply classification smoothing using recent bag classification history.
+        DEPRECATED: Apply classification smoothing using recent bag classification history.
+        
+        This method is deprecated in favor of BidirectionalSmoother which provides
+        superior bidirectional context-aware smoothing at the event level in BagCounterApp.
+        Kept for backward compatibility but no longer called in the process() pipeline.
         
         Exploits the fact that bags are often provided in sequences of the same type.
         
@@ -607,7 +611,16 @@ class ClassifierService:
             allow_unknown: bool = True,
     ) -> Tuple[str, float, Optional[str]]:
         """
-        Robust label reuse logic for both known and unknown labels.
+        DEPRECATED: Robust label reuse logic for both known and unknown labels.
+        
+        This method is deprecated in favor of BidirectionalSmoother which provides
+        superior bidirectional context-aware smoothing at the event level in BagCounterApp.
+        Kept for backward compatibility but no longer called in the process() pipeline.
+        
+        The BidirectionalSmoother handles:
+        - Bidirectional context (previous + future events)
+        - Batch transition protection
+        - Event-level smoothing after track aggregation
         - For known classes: reuse only on low confidence and strong streak.
         - For unknowns: reuse only if streak exists for a known label, burst dominance supports it, and no better candidate exists.
 
@@ -1324,48 +1337,11 @@ class ClassifierService:
                         f"{original_family_label} -> {final_label} (conf={final_conf:.3f}, tier={resolved_tier})"
                     )
             
-            # Step 3.5: Apply classification smoothing (V5)
-            # Only smooth non-Unknown and non-Uncertain classifications
-            if final_label not in ("Unknown", "Uncertain"):
-                smoothed_label, smoothed_conf, smooth_reason = self._apply_classification_smoothing(
-                    final_label, final_conf
-                )
-                
-                # Update if smoothing changed the result
-                if smoothed_label != final_label or abs(smoothed_conf - final_conf) > 0.01:
-                    metadata["smoothing_applied"] = True
-                    metadata["original_label"] = final_label
-                    metadata["original_confidence"] = final_conf
-                    metadata["smoothing_reason"] = smooth_reason
-                    
-                    final_label = smoothed_label
-                    final_conf = smoothed_conf
-                    
-                    logger.info(
-                        f"[ClassifierService] Track {track_id}: Smoothing changed result: "
-                        f"{metadata['original_label']}({metadata['original_confidence']:.2f}) -> "
-                        f"{final_label}({final_conf:.2f}), reason={smooth_reason}"
-                    )
-
-            # Step 3.6: Apply label reuse smoothing ALWAYS
-            # Note: For evidence accumulation path, we use metadata as evidence dict substitute
-            evidence_for_reuse = evidence if not self.evidence_accumulation_enabled else metadata.get('evidence_per_label', {})
-            reuse_label, reuse_conf, reuse_reason = self._check_label_reuse(
-                track_id, final_label, final_conf, evidence_for_reuse
-            )
-            if reuse_label != final_label:
-                metadata["label_reuse_applied"] = True
-                metadata["pre_reuse_label"] = final_label
-                metadata["pre_reuse_confidence"] = final_conf
-                metadata["reuse_reason"] = reuse_reason
-                final_label = reuse_label
-                final_conf = reuse_conf
-                logger.info(
-                    f"[ClassifierService] Track {track_id}: Label reuse changed result: "
-                    f"{metadata['pre_reuse_label']}({metadata['pre_reuse_confidence']:.2f}) -> "
-                    f"{final_label}({final_conf:.2f}), reason={reuse_reason}"
-                )
-
+            # REMOVED: Legacy classification smoothing and label reuse (V8)
+            # These are now handled by BidirectionalSmoother in BagCounterApp at the event level,
+            # which provides superior bidirectional context-aware smoothing after track aggregation.
+            # The smoother uses both previous and future context to validate classifications,
+            # protects batch transitions, and operates on committed events rather than raw classifications.
             
             # Step 3.7: Track label history for volatility analysis (V6)
             self._track_label_history[track_id].append((final_label, final_conf))
