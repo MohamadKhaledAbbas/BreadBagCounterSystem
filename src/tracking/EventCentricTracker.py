@@ -307,8 +307,8 @@ class EventConfig:
     min_roi_sharpness: float = 300.0    # Min Laplacian variance
     min_brightness: int = 80
     max_brightness: int = 220
-    max_open_roi_samples: int = 15        # Max ROIs to collect while open
-    max_closed_roi_samples: int = 5       # Max ROIs to collect while closed
+    max_open_roi_samples: int = 10        # Max ROIs to collect while open
+    max_closed_roi_samples: int = 10       # Max ROIs to collect while closed
 
     # ==========================================================================
     # Disambiguate Parameters
@@ -1864,8 +1864,8 @@ class BreadBagEvent:
         Returns:
             True if ROI should be rejected as duplicate, False otherwise
         """
-        DUPLICATE_IOU_THRESHOLD = 0.85
-        QUALITY_GAIN_EPSILON = 0.03
+        DUPLICATE_IOU_THRESHOLD = 0.95
+        QUALITY_GAIN_EPSILON = 0.01
         
         for existing in self.roi_candidates:
             if existing.bbox is None:

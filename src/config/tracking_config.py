@@ -779,7 +779,7 @@ class TrackingConfig:
     Default: True
     """
     
-    iou_association_threshold: float = 0.45
+    iou_association_threshold: float = 0.50
     """
     Minimum IoU value to associate a detection with an event.
     
@@ -879,7 +879,7 @@ class TrackingConfig:
     Default: 2.5
     """
     
-    max_association_distance_px: float = 180.0
+    max_association_distance_px: float = 150.0
     """
     Absolute maximum association distance regardless of velocity.
     
@@ -893,7 +893,7 @@ class TrackingConfig:
     # Hard Constraints for Preventing Teleportation (ISSUE #1 FIX)
     # --------------------------------------------------------------------------
     
-    max_jump_distance_px: float = 160.0
+    max_jump_distance_px: float = 140.0
     """
     ISSUE #1 FIX: Hard cap on centroid jump distance per association.
     
@@ -976,7 +976,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    ghost_timeout_frames: int = 40
+    ghost_timeout_frames: int = 50
     """
     G: Frames to keep event alive without detections (frame-based threshold).
     
@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 18
+    commit_idle_frames: int = 25
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -1078,7 +1078,7 @@ class TrackingConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     
-    suppression_distance_px: float = 100.0
+    suppression_distance_px: float = 150.0
     """
     Distance (pixels) within which new events are suppressed near recent commits.
     
@@ -1101,7 +1101,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    suppression_duration_frames: int = 10
+    suppression_duration_frames: int = 25
     """
     Frames to suppress new events after a commit (frame-based threshold).
     
@@ -1141,7 +1141,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_iou_threshold: float = 0.10
+    suppression_iou_threshold: float = 0.15
     """
     ISSUE #3 FIX: Minimum IoU with last committed box to trigger suppression.
     
@@ -1178,7 +1178,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 12
+    temporal_cooldown_frames: int = 18
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
@@ -1196,7 +1196,7 @@ class TrackingConfig:
     Default: 10 frames @ 25fps = 400ms
     """
     
-    temporal_cooldown_distance_px: float = 120.0
+    temporal_cooldown_distance_px: float = 150.0
     """
     Spatial distance (pixels) within which temporal cooldown applies.
     
@@ -1216,7 +1216,7 @@ class TrackingConfig:
     # Active Event Spatial Exclusion
     # --------------------------------------------------------------------------
     
-    active_event_exclusion_distance_px: float = 60.0
+    active_event_exclusion_distance_px: float = 80.0
     """
     Distance (pixels) within which new events are blocked if an active event exists.
     
@@ -1236,7 +1236,7 @@ class TrackingConfig:
     Default: 60.0
     """
     
-    active_event_exclusion_iou: float = 0.25
+    active_event_exclusion_iou: float = 0.30
     """
     IoU threshold for active event spatial exclusion.
     
@@ -1257,7 +1257,7 @@ class TrackingConfig:
     # Detection Clustering Parameters
     # --------------------------------------------------------------------------
     
-    detection_cluster_distance_px: float = 80.0
+    detection_cluster_distance_px: float = 100.0
     """
     Distance threshold for clustering nearby unassociated detections.
     
@@ -2016,7 +2016,7 @@ class TrackingConfig:
     Default: 0.3
     """
     
-    trust_min_for_support: float = _parse_float_env("TRUST_MIN_FOR_SUPPORT", 0.4)
+    trust_min_for_support: float = _parse_float_env("TRUST_MIN_FOR_SUPPORT", 0.35)
     """
     Minimum trust score for an ROI to count as "supporting" evidence.
     
@@ -2102,7 +2102,7 @@ class TrackingConfig:
     Default: True
     """
     
-    stability_margin_threshold: float = _parse_float_env("STABILITY_MARGIN_THRESHOLD", 0.3)
+    stability_margin_threshold: float = _parse_float_env("STABILITY_MARGIN_THRESHOLD", 0.25)
     """
     Minimum log-evidence margin between winner and runner-up.
     
@@ -2122,7 +2122,7 @@ class TrackingConfig:
     Default: 0.3 (reduced from 0.5)
     """
     
-    stability_min_trusted_rois: int = _parse_int_env("STABILITY_MIN_TRUSTED_ROIS", 3)
+    stability_min_trusted_rois: int = _parse_int_env("STABILITY_MIN_TRUSTED_ROIS", 2)
     """
     Minimum number of trusted ROIs (trust >= trust_min_for_support) required.
     
