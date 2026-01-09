@@ -329,7 +329,7 @@ def get_homography_transform() -> HomographyTransform:
 
         \u2705 Saved calibration image:  data/calibration/calibration_image.jpg
         \u2705 Saved calibration data: data/calibration/calibration_data.json
-        \u2705 Saved environment config: data/calibration/calibration. env
+        \u2705 Saved environment config: data/calibration/calibration.env
 
         ======================================================================
         \u2705 CALIBRATION COMPLETE!
@@ -353,15 +353,15 @@ def get_homography_transform() -> HomographyTransform:
         enabled = os.getenv('HOMOGRAPHY_ENABLED', 'true').lower() in ('true', '1', 'yes')
         
         table_corners_px = None
-        corners_str = os.getenv('HOMOGRAPHY_TABLE_CORNERS', '[[904.0, 287.0], [1070.0, 538.0], [358.0, 587.0], [413.0, 290.0]]')
+        corners_str = os.getenv('HOMOGRAPHY_TABLE_CORNERS', '[[417.0, 289.0], [906.0, 286.0], [1068.0, 536.0], [363.0, 585.0]]')
         if corners_str:
             try:
                 table_corners_px = json.loads(corners_str)
             except json.JSONDecodeError as e:
                 logger.error(f"[Homography] Failed to parse HOMOGRAPHY_TABLE_CORNERS: {e}")
         
-        table_width_cm = float(os.getenv('HOMOGRAPHY_TABLE_WIDTH_CM', '140'))
-        table_height_cm = float(os.getenv('HOMOGRAPHY_TABLE_HEIGHT_CM', '80'))
+        table_width_cm = float(os.getenv('HOMOGRAPHY_TABLE_WIDTH_CM', '200'))
+        table_height_cm = float(os.getenv('HOMOGRAPHY_TABLE_HEIGHT_CM', '100'))
         table_size_cm = (table_width_cm, table_height_cm)
         
         _homography_instance = HomographyTransform(

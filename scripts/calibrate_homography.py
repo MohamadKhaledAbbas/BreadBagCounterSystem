@@ -179,92 +179,6 @@ class CalibrationTool:
                 print(f"✅ Captured frame:  {frame.shape}")
                 return True
 
-    def load_image_from_ros2_topic(self, topic_name: str, timeout_sec: float = 10.0) -> bool:
-        """Capture a frame from a ROS2 NV12 topic."""
-        if not ROS2_AVAILABLE:
-            print("❌ Error: ROS2 libraries not available")
-            return False
-
-        print(f"📡 Connecting to ROS2 topic: {topic_name}")
-        print(f"   Waiting for frame (timeout: {timeout_sec}s)...")
-        print("   Press SPACE to capture current frame, ESC to cancel...")
-
-        # Initialize ROS2
-        rclpy.init()
-
-        try:
-            # Create capture node
-            capture_node = ROS2FrameCapture(topic_name)
-
-            # Create preview window
-            preview_window = "ROS2 Frame Preview"
-            cv2.namedWindow(preview_window, cv2.WINDOW_NORMAL)
-
-            # Spin until we get a frame or timeout
-            import time
-            start_time = time.time()
-            captured = False
-
-            while rclpy.ok():
-                # Process ROS2 callbacks
-                rclpy.spin_once(capture_node, timeout_sec=0.01)
-
-                # Get current frame
-                current_frame = capture_node.get_frame()
-
-                if current_frame is not None:
-                    # Display live preview
-                    preview = current_frame.copy()
-                    print(f"frame size = {preview.shape}")
-                    cv2.putText(preview, f"Frame {capture_node.frame_count} - Press SPACE to capture, ESC to cancel",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-                    # Resize for display if too large
-                    display_height = 720
-                    if preview.shape[0] > display_height:
-                        scale = display_height / preview.shape[0]
-                        display_width = int(preview.shape[1] * scale)
-                        preview_resized = cv2.resize(preview, (display_width, display_height))
-                    else:
-                        preview_resized = preview
-
-                    cv2.imshow(preview_window, preview_resized)
-
-                    # Check for key press
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 27:  # ESC
-                        print("❌ Capture cancelled")
-                        break
-                    elif key == 32:  # SPACE
-                        # Capture the current frame (use original, not resized)
-                        self.image = current_frame.copy()
-                        self.display_image = current_frame.copy()
-                        captured = True
-                        print(f"✅ Captured frame from ROS2 topic: {current_frame.shape}")
-                        break
-                else:
-                    # No frame yet, show waiting message
-                    if time.time() - start_time > timeout_sec:
-                        print(f"❌ Error:  Timeout waiting for frame from topic '{topic_name}'")
-                        break
-
-                    cv2.waitKey(10)
-
-            # Cleanup
-            cv2.destroyWindow(preview_window)
-            capture_node.destroy_node()
-            rclpy.shutdown()
-
-            return captured
-
-        except Exception as e:
-            print(f"❌ Error capturing from ROS2 topic: {e}")
-            try:
-                rclpy.shutdown()
-            except:
-                pass
-            return False
-
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse clicks for corner selection."""
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -911,8 +825,6 @@ Examples:
                         help='Frame number to extract from video (default: 0)')
     parser.add_argument('--output', type=str, default='data/calibration',
                         help='Output directory for calibration files (default: data/calibration)')
-    parser.add_argument('--ros2-timeout', type=float, default=10.0,
-                        help='Timeout for ROS2 frame capture in seconds (default: 10.0)')
 
     args = parser.parse_args()
 
@@ -945,9 +857,6 @@ Examples:
             sys.exit(1)
     elif args.camera is not None:
         if not tool.load_image_from_camera(args.camera):
-            sys.exit(1)
-    elif args.ros2_topic:
-        if not tool.load_image_from_ros2_topic(args.ros2_topic, args.ros2_timeout):
             sys.exit(1)
 
     # Interactive corner selection
@@ -999,7 +908,7 @@ Examples:
 
     # Save calibration data
     if tool.save_calibration(args.output, table_size_cm, small_threshold, large_threshold):
-        env_file_path = os.path.join(args.output, "calibration. env")
+        env_file_path = os.path.join(args.output, "calibration.env")
         with open(env_file_path, 'w') as f:
             f.write(env_config)
         print(f"✅ Saved environment config: {env_file_path}")
