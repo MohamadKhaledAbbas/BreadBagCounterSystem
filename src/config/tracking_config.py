@@ -2337,6 +2337,39 @@ class TrackingConfig:
     
     Default: 5000.0 (5 seconds)
     """
+    
+    bidirectional_uncertain_override_ratio: float = _parse_float_env("BIDIRECTIONAL_UNCERTAIN_OVERRIDE_RATIO", 0.5)
+    """
+    Context agreement ratio for overriding Uncertain/Unknown labels (relaxed threshold).
+    
+    This parameter applies specifically to "Uncertain" and "Unknown" classifications,
+    which are treated more aggressively than regular labels. Unlike regular labels that
+    require 80% agreement (bidirectional_context_agreement_ratio), Uncertain/Unknown
+    labels only require majority vote (50% by default) to be overridden by context.
+    
+    Rationale:
+    - Uncertain/Unknown labels indicate classifier uncertainty, making them good
+      candidates for context-based inference
+    - Lower threshold allows override even with partial agreement
+    - 50% (majority vote) means if more context items agree on a label than disagree,
+      that label wins
+    
+    Special Handling for Uncertain/Unknown:
+    - Always check context (skip high-confidence bypass)
+    - Filter Uncertain/Unknown from context when computing agreement
+    - Skip batch transition protection (allow override at transitions)
+    - Mark overridden labels with confidence_tier='low' and uncertain_override=True
+    
+    Range: 0.4 - 0.8
+    - 0.4: Very aggressive override (40% agreement needed)
+    - 0.5: Majority vote (balanced, default)
+    - 0.6: 60% agreement needed
+    - 0.8: Same as regular threshold (conservative)
+    
+    Environment: BIDIRECTIONAL_UNCERTAIN_OVERRIDE_RATIO=0.5
+    
+    Default: 0.5 (majority vote)
+    """
 
     use_frame_timestamps: bool = IS_WINDOWS
 
