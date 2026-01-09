@@ -723,7 +723,7 @@ class TrackingConfig:
     # Association Parameters (D, T from requirements)
     # --------------------------------------------------------------------------
     
-    association_distance_px: float = 40.0
+    association_distance_px: float = 60.0
     """
     D: Maximum centroid distance (pixels) to associate a detection with an event.
     
@@ -779,7 +779,7 @@ class TrackingConfig:
     Default: True
     """
     
-    iou_association_threshold: float = 0.50
+    iou_association_threshold: float = 0.45
     """
     Minimum IoU value to associate a detection with an event.
     
@@ -879,7 +879,7 @@ class TrackingConfig:
     Default: 2.5
     """
     
-    max_association_distance_px: float = 150.0
+    max_association_distance_px: float = 160.0
     """
     Absolute maximum association distance regardless of velocity.
     
@@ -976,7 +976,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    ghost_timeout_frames: int = 50
+    ghost_timeout_frames: int = 40
     """
     G: Frames to keep event alive without detections (frame-based threshold).
     
@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 25
+    commit_idle_frames: int = 20
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -1178,7 +1178,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 18
+    temporal_cooldown_frames: int = 14
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
@@ -1196,7 +1196,7 @@ class TrackingConfig:
     Default: 10 frames @ 25fps = 400ms
     """
     
-    temporal_cooldown_distance_px: float = 150.0
+    temporal_cooldown_distance_px: float = 120.0
     """
     Spatial distance (pixels) within which temporal cooldown applies.
     
@@ -1216,7 +1216,7 @@ class TrackingConfig:
     # Active Event Spatial Exclusion
     # --------------------------------------------------------------------------
     
-    active_event_exclusion_distance_px: float = 80.0
+    active_event_exclusion_distance_px: float = 70.0
     """
     Distance (pixels) within which new events are blocked if an active event exists.
     
@@ -1236,7 +1236,7 @@ class TrackingConfig:
     Default: 60.0
     """
     
-    active_event_exclusion_iou: float = 0.30
+    active_event_exclusion_iou: float = 0.25
     """
     IoU threshold for active event spatial exclusion.
     
@@ -1257,7 +1257,7 @@ class TrackingConfig:
     # Detection Clustering Parameters
     # --------------------------------------------------------------------------
     
-    detection_cluster_distance_px: float = 100.0
+    detection_cluster_distance_px: float = 80.0
     """
     Distance threshold for clustering nearby unassociated detections.
     
