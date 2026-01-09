@@ -96,6 +96,7 @@ class BidirectionalSmoother:
         buffer_size: int = None,
         confidence_threshold: float = None,
         context_agreement_ratio: float = None,
+        uncertain_override_ratio: float = None,
         batch_transition_protection: bool = None,
         enabled: bool = None,
         inactivity_timeout_ms: float = None,
@@ -107,6 +108,7 @@ class BidirectionalSmoother:
             buffer_size: Size of the validation buffer (should be odd)
             confidence_threshold: Above this, classifications bypass context check
             context_agreement_ratio: Fraction of context items that must agree
+            uncertain_override_ratio: Fraction for Uncertain/Unknown override (relaxed)
             batch_transition_protection: If True, protect batch transitions
             enabled: If False, smoother is disabled (pass-through mode)
             inactivity_timeout_ms: Time after which buffer is flushed if no new events
@@ -116,6 +118,7 @@ class BidirectionalSmoother:
         self.buffer_size = buffer_size if buffer_size is not None else tracking_config.bidirectional_buffer_size
         self.confidence_threshold = confidence_threshold if confidence_threshold is not None else tracking_config.bidirectional_confidence_threshold
         self.context_agreement_ratio = context_agreement_ratio if context_agreement_ratio is not None else tracking_config.bidirectional_context_agreement_ratio
+        self.uncertain_override_ratio = uncertain_override_ratio if uncertain_override_ratio is not None else tracking_config.bidirectional_uncertain_override_ratio
         self.batch_transition_protection = batch_transition_protection if batch_transition_protection is not None else tracking_config.bidirectional_batch_transition_protection
         self.inactivity_timeout_ms = inactivity_timeout_ms if inactivity_timeout_ms is not None else tracking_config.bidirectional_inactivity_timeout_ms
         
@@ -145,12 +148,15 @@ class BidirectionalSmoother:
             'batch_transitions_protected': 0,
             'no_context_available': 0,
             'inactivity_flushes': 0,
+            'uncertain_overrides': 0,
+            'uncertain_kept': 0,
         }
         
         logger.info(
             f"[BidirectionalSmoother] Initialized: enabled={self.enabled}, "
             f"buffer_size={self.buffer_size}, confidence_threshold={self.confidence_threshold:.2f}, "
             f"context_agreement_ratio={self.context_agreement_ratio:.2f}, "
+            f"uncertain_override_ratio={self.uncertain_override_ratio:.2f}, "
             f"batch_transition_protection={self.batch_transition_protection}, "
             f"inactivity_timeout_ms={self.inactivity_timeout_ms:.0f}"
         )
@@ -277,8 +283,11 @@ class BidirectionalSmoother:
         
         center_event = self._buffer[self.center_index]
         
-        # High confidence - bypass context check
-        if center_event.confidence >= self.confidence_threshold:
+        # Check if this is an Uncertain or Unknown label (needs special handling)
+        is_uncertain = self._is_uncertain_label(center_event.label)
+        
+        # High confidence - bypass context check (EXCEPT for Uncertain/Unknown)
+        if center_event.confidence >= self.confidence_threshold and not is_uncertain:
             center_event.validated = True
             center_event.smoothing_reason = "high_confidence_trusted"
             self._stats['validated_events'] += 1
@@ -292,9 +301,9 @@ class BidirectionalSmoother:
         prev_context = [self._buffer[i] for i in range(self.center_index)]
         next_context = [self._buffer[i] for i in range(self.center_index + 1, len(self._buffer))]
         
-        # Analyze context
+        # Analyze context (with special handling for Uncertain/Unknown)
         smoothed_label, smoothing_reason = self._analyze_context(
-            center_event, prev_context, next_context
+            center_event, prev_context, next_context, force_override_uncertain=is_uncertain
         )
         
         if smoothed_label and smoothed_label != center_event.label:
@@ -306,8 +315,34 @@ class BidirectionalSmoother:
             center_event.event_data['smoothed'] = True
             center_event.event_data['original_bag_type'] = center_event.original_label
             center_event.event_data['smoothing_reason'] = smoothing_reason
+            
+            # Mark uncertain overrides with low tier and special flag
+            if is_uncertain:
+                center_event.event_data['confidence_tier'] = 'low'
+                center_event.event_data['uncertain_override'] = True
+                self._stats['uncertain_overrides'] += 1
+                logger.debug(
+                    f"[BidirectionalSmoother] Uncertain override: {center_event.original_label} -> "
+                    f"{smoothed_label}, reason={smoothing_reason}"
+                )
+            
             self._stats['smoothed_events'] += 1
             self._stats['context_overrides'] += 1
+        elif is_uncertain and smoothed_label is None:
+            # Uncertain label kept as-is (no consensus)
+            # Set smoothing reason even though we're not smoothing
+            center_event.smoothing_reason = smoothing_reason
+            center_event.event_data['smoothing_reason'] = smoothing_reason
+            self._stats['uncertain_kept'] += 1
+            logger.debug(
+                f"[BidirectionalSmoother] Uncertain kept: {center_event.label}, "
+                f"reason={smoothing_reason}"
+            )
+        else:
+            # Not smoothed, set reason if we have one
+            if smoothing_reason:
+                center_event.smoothing_reason = smoothing_reason
+                center_event.event_data['smoothing_reason'] = smoothing_reason
         
         center_event.validated = True
         self._stats['validated_events'] += 1
@@ -320,15 +355,22 @@ class BidirectionalSmoother:
         self, 
         center_event: BufferedEvent,
         prev_context: List[BufferedEvent],
-        next_context: List[BufferedEvent]
+        next_context: List[BufferedEvent],
+        force_override_uncertain: bool = False
     ) -> Tuple[Optional[str], str]:
         """
         Analyze bidirectional context to determine if smoothing should occur.
+        
+        Enhanced to handle Uncertain/Unknown labels more aggressively:
+        - Filters Uncertain/Unknown from context when computing agreement
+        - Uses relaxed threshold (uncertain_override_ratio) for Uncertain/Unknown
+        - Skips batch transition protection for Uncertain/Unknown
         
         Args:
             center_event: The event being validated
             prev_context: Events before the center
             next_context: Events after the center
+            force_override_uncertain: If True, use enhanced logic for Uncertain/Unknown
             
         Returns:
             Tuple of (smoothed_label or None, reason string)
@@ -341,17 +383,30 @@ class BidirectionalSmoother:
         next_labels = [e.label for e in next_context]
         all_context_labels = prev_labels + next_labels
         
+        # Filter out Uncertain/Unknown from context if we're doing enhanced override
+        if force_override_uncertain:
+            # Remove Uncertain/Unknown labels from context for agreement calculation
+            filtered_prev = [label for label in prev_labels if not self._is_uncertain_label(label)]
+            filtered_next = [label for label in next_labels if not self._is_uncertain_label(label)]
+            all_context_labels = filtered_prev + filtered_next
+            
+            logger.debug(
+                f"[BidirectionalSmoother] Context filtering: "
+                f"prev={len(prev_labels)}->{len(filtered_prev)}, "
+                f"next={len(next_labels)}->{len(filtered_next)}"
+            )
+        
         # Count label occurrences (Counter imported at top of module)
-        prev_counter = Counter(prev_labels)
-        next_counter = Counter(next_labels)
+        prev_counter = Counter(filtered_prev if force_override_uncertain else prev_labels)
+        next_counter = Counter(filtered_next if force_override_uncertain else next_labels)
         all_counter = Counter(all_context_labels)
         
         # Get dominant labels
         prev_dominant = prev_counter.most_common(1)[0] if prev_counter else (None, 0)
         next_dominant = next_counter.most_common(1)[0] if next_counter else (None, 0)
         
-        # Check for batch transition
-        if self.batch_transition_protection:
+        # Check for batch transition (SKIP this check for Uncertain/Unknown)
+        if self.batch_transition_protection and not force_override_uncertain:
             if prev_dominant[0] != next_dominant[0] and prev_dominant[0] is not None and next_dominant[0] is not None:
                 # Different dominant labels on each side = batch transition
                 self._stats['batch_transitions_protected'] += 1
@@ -360,17 +415,26 @@ class BidirectionalSmoother:
         # Check context agreement
         total_context = len(all_context_labels)
         if total_context == 0:
+            if force_override_uncertain:
+                return None, "uncertain_no_consensus (no_valid_context)"
             return None, "no_context"
         
         # Find the most common label in context
         most_common_label, count = all_counter.most_common(1)[0]
         agreement_ratio = count / total_context
         
-        if agreement_ratio >= self.context_agreement_ratio:
+        # Use relaxed threshold for Uncertain/Unknown, regular threshold otherwise
+        threshold = self.uncertain_override_ratio if force_override_uncertain else self.context_agreement_ratio
+        
+        if agreement_ratio > threshold:
             if most_common_label != center_event.label:
                 # Context strongly agrees on a different label
-                return most_common_label, f"context_override (agreement={agreement_ratio:.2f}, label={most_common_label})"
+                reason_prefix = "uncertain_override" if force_override_uncertain else "context_override"
+                return most_common_label, f"{reason_prefix} (agreement={agreement_ratio:.2f}, label={most_common_label})"
         
+        # Not enough agreement to override
+        if force_override_uncertain:
+            return None, f"uncertain_no_consensus (best_agreement={agreement_ratio:.2f})"
         return None, f"context_disagrees (best_agreement={agreement_ratio:.2f})"
     
     def _finalize_event(self, event: BufferedEvent) -> Dict[str, Any]:
@@ -396,6 +460,21 @@ class BidirectionalSmoother:
         
         return result
     
+    def _is_uncertain_label(self, label: str) -> bool:
+        """
+        Check if a label is Uncertain or Unknown.
+        
+        These labels indicate classifier uncertainty and should be treated
+        more aggressively by the context-based smoother.
+        
+        Args:
+            label: Classification label to check
+            
+        Returns:
+            True if label is Uncertain or Unknown, False otherwise
+        """
+        return label in ('Uncertain', 'Unknown')
+    
     def get_stats(self) -> Dict[str, Any]:
         """Get smoother statistics for monitoring."""
         stats = self._stats.copy()
@@ -403,6 +482,12 @@ class BidirectionalSmoother:
         stats['smoothing_rate'] = (
             self._stats['smoothed_events'] / self._stats['validated_events']
             if self._stats['validated_events'] > 0 else 0.0
+        )
+        # Calculate uncertain override rate
+        total_uncertain = self._stats['uncertain_overrides'] + self._stats['uncertain_kept']
+        stats['uncertain_override_rate'] = (
+            self._stats['uncertain_overrides'] / total_uncertain
+            if total_uncertain > 0 else 0.0
         )
         return stats
     
