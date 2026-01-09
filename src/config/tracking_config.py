@@ -1078,7 +1078,7 @@ class TrackingConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     
-    suppression_distance_px: float = 150.0
+    suppression_distance_px: float = 120.0
     """
     Distance (pixels) within which new events are suppressed near recent commits.
     
@@ -1101,7 +1101,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    suppression_duration_frames: int = 25
+    suppression_duration_frames: int = 20
     """
     Frames to suppress new events after a commit (frame-based threshold).
     
@@ -1141,7 +1141,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_iou_threshold: float = 0.15
+    suppression_iou_threshold: float = 0.20
     """
     ISSUE #3 FIX: Minimum IoU with last committed box to trigger suppression.
     

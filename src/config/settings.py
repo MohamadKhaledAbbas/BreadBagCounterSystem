@@ -71,7 +71,7 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2026-01-09-v2.8.2"
+    APP_VERSION: str = "2026-01-09-v2.9.0"
 
     video_path: str = os.getenv("VIDEO_PATH", "D:\\Recordings\\New_Recordings\\20251129080005_20251129090005.mp4")
 
@@ -84,8 +84,8 @@ class AppConfig:
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
-        "data/model/classify_yolo_small_v10_bayese_224x224_nv12.bin" if IS_RDK
-        else "data/model/classify_yolo_small_v10.pt"
+        "data/model/classify_yolo_small_v11_bayese_224x224_nv12.bin" if IS_RDK
+        else "data/model/classify_yolo_small_v11.pt"
     )
 
     if IS_RDK:
