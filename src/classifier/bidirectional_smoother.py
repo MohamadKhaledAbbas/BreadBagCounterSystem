@@ -397,8 +397,8 @@ class BidirectionalSmoother:
             )
         
         # Count label occurrences (Counter imported at top of module)
-        prev_counter = Counter([label for label in (filtered_prev if force_override_uncertain else prev_labels)])
-        next_counter = Counter([label for label in (filtered_next if force_override_uncertain else next_labels)])
+        prev_counter = Counter(filtered_prev if force_override_uncertain else prev_labels)
+        next_counter = Counter(filtered_next if force_override_uncertain else next_labels)
         all_counter = Counter(all_context_labels)
         
         # Get dominant labels
