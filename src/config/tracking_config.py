@@ -2900,7 +2900,7 @@ class TrackingConfig:
     
     homography_table_corners: str = _parse_str_env(
         "HOMOGRAPHY_TABLE_CORNERS", 
-        "[[904.0, 287.0], [1070.0, 538.0], [358.0, 587.0], [413.0, 290.0]]"  # Empty means not calibrated
+        "[[401.0, 292.0], [913.0, 297.0], [1062.0, 564.0], [354.0, 578.0]]"  # Empty means not calibrated
     )
     """
     Table corner positions in pixel coordinates for homography calibration.
@@ -2914,7 +2914,7 @@ class TrackingConfig:
     Default: "" (not calibrated)
     """
     
-    homography_table_width_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_WIDTH_CM", 140.0)
+    homography_table_width_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_WIDTH_CM", 200.0)
     """
     Physical width of the work table in centimeters.
     
@@ -2923,7 +2923,7 @@ class TrackingConfig:
     Default: 80.0 cm
     """
     
-    homography_table_height_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_HEIGHT_CM", 80.0)
+    homography_table_height_cm: float = _parse_float_env("HOMOGRAPHY_TABLE_HEIGHT_CM", 100.0)
     """
     Physical height (depth) of the work table in centimeters.
     
@@ -2932,7 +2932,7 @@ class TrackingConfig:
     Default: 60.0 cm
     """
     
-    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 1600.0)
+    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 5500.0)
     """
     Area threshold (cm²) below which a bag is classified as "Small".
     
@@ -2945,7 +2945,7 @@ class TrackingConfig:
     Default: 100.0 cm² (approximately 10cm x 10cm)
     """
     
-    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 2000.0)
+    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 6500.0)
     """
     Area threshold (cm²) above which a bag is classified as "Large/Regular".
     
