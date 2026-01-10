@@ -1124,7 +1124,7 @@ class TrackingConfig:
     ISSUE #3 FIX: Require box overlap with last committed box for suppression.
     
     When True: Suppression requires BOTH:
-      1. Centroid proximity (within suppression_distance_px)
+      1. Centroid proximity (within suppression_distance_px or adaptive distance)
       2. Box overlap with last committed box (IoU >= suppression_iou_threshold)
     
     When False: Only centroid proximity is required (legacy behavior)
@@ -1163,6 +1163,73 @@ class TrackingConfig:
     overlap with a bag that may have moved slightly before commitment.
     
     Default: 0.10 (reduced from 0.15 for more aggressive suppression)
+    """
+    
+    # --------------------------------------------------------------------------
+    # Size-Adaptive Suppression (ISSUE #4 FIX)
+    # --------------------------------------------------------------------------
+    # Problem: Large bags overcount (+8-13%), small bags undercount (-12%)
+    # Root cause: Fixed suppression distance doesn't account for bag size variance
+    # Solution: Make suppression distance proportional to bag diagonal
+    
+    suppression_use_adaptive_distance: bool = _parse_bool_env("SUPPRESSION_USE_ADAPTIVE_DISTANCE", True)
+    """
+    ISSUE #4 FIX: Enable size-adaptive suppression distance.
+    
+    When True: Suppression distance = bag_diagonal * suppression_diagonal_multiplier
+               This ensures larger bags have larger suppression zones and smaller
+               bags have smaller suppression zones.
+    When False: Use fixed suppression_distance_px for all bags (legacy behavior)
+    
+    Benefits:
+    - Large bags: Larger suppression zone prevents overcounting
+    - Small bags: Smaller suppression zone prevents undercounting
+    - More accurate counting across all bag sizes
+    
+    Environment: SUPPRESSION_USE_ADAPTIVE_DISTANCE=true
+    Default: True
+    """
+    
+    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.5)
+    """
+    Multiplier for bag diagonal when calculating adaptive suppression distance.
+    
+    Formula: effective_suppression_distance = bag_diagonal * multiplier
+    
+    Range: 1.0 - 2.5
+    - 1.0: Suppression zone equals bag diagonal (tight)
+    - 1.5: Suppression zone 50% larger than diagonal (recommended)
+    - 2.0: Suppression zone twice the diagonal (aggressive)
+    
+    Tuning guidelines:
+    - If large bags still overcount: Increase multiplier (1.75, 2.0)
+    - If small bags still undercount: Decrease multiplier (1.25, 1.0)
+    - Start with 1.5 and adjust based on production results
+    
+    Environment: SUPPRESSION_DIAGONAL_MULTIPLIER=1.5
+    Default: 1.5
+    """
+    
+    suppression_min_distance_px: float = _parse_float_env("SUPPRESSION_MIN_DISTANCE_PX", 60.0)
+    """
+    Minimum suppression distance (floor for adaptive calculation).
+    
+    Ensures very small bags still have a reasonable suppression zone.
+    The adaptive distance will never go below this value.
+    
+    Range: 40 - 100 pixels
+    Default: 60.0 pixels
+    """
+    
+    suppression_max_distance_px: float = _parse_float_env("SUPPRESSION_MAX_DISTANCE_PX", 250.0)
+    """
+    Maximum suppression distance (ceiling for adaptive calculation).
+    
+    Prevents very large bags from having unreasonably large suppression zones
+    that might block legitimate new bag detections.
+    
+    Range: 150 - 400 pixels
+    Default: 250.0 pixels
     """
     
     # --------------------------------------------------------------------------
@@ -3025,6 +3092,11 @@ def get_event_config():
         suppression_duration_frames=tracking_config.suppression_duration_frames,
         suppression_require_box_overlap=tracking_config.suppression_require_box_overlap,
         suppression_iou_threshold=tracking_config.suppression_iou_threshold,
+        # Size-adaptive suppression (Issue #4 fix)
+        suppression_use_adaptive_distance=tracking_config.suppression_use_adaptive_distance,
+        suppression_diagonal_multiplier=tracking_config.suppression_diagonal_multiplier,
+        suppression_min_distance_px=tracking_config.suppression_min_distance_px,
+        suppression_max_distance_px=tracking_config.suppression_max_distance_px,
         
         # Temporal cooldown for new event creation - frame-based with ms migration
         min_event_creation_interval_ms=tracking_config.min_event_creation_interval_ms,
