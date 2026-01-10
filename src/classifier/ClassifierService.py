@@ -383,8 +383,12 @@ class ClassifierService:
         Disambiguate a family label at track level using closed ROIs.
         
         This function is called AFTER track aggregation/voting determines a winner label
-        that is a family/generic type. It selects the best closed ROI and runs
-        disambiguate_v2 once to resolve to a specific subclass.
+        that is a family/generic type. It uses the AVERAGE SIZE of all closed ROIs
+        to resolve to a specific subclass (small vs regular).
+        
+        V8 Enhancement: Uses average bbox size across all closed ROIs instead of
+        just the best one. This makes the size decision more robust by not relying
+        on a single potentially noisy measurement.
         
         Args:
             final_label: The winning label from aggregation (should be a family label)
@@ -417,54 +421,92 @@ class ClassifierService:
                 'fallback_used': True
             }
         
-        # Select best closed ROI by trust/confidence
-        # Prioritize: 1) trust score, 2) confidence, 3) sharpness
-        best_closed_roi = max(
-            closed_candidates,
-            key=lambda c: (c.get('trust', 0), c.get('confidence', 0), c.get('sharpness', 0))
-        )
+        # V8 Enhancement: Compute average bbox from all closed ROIs with valid bboxes
+        # This makes the size decision more robust by not relying on a single measurement
+        closed_bboxes = []
+        for c in closed_candidates:
+            bbox = c.get('bbox')
+            if bbox is not None and len(bbox) == 4:
+                # Validate bbox has positive dimensions
+                x1, y1, x2, y2 = bbox
+                if x2 > x1 and y2 > y1:
+                    closed_bboxes.append(bbox)
         
-        # Run disambiguation on best closed ROI
-        bbox = best_closed_roi.get('bbox')
-        if bbox is None:
-            # No bbox available - fallback
+        if not closed_bboxes:
+            # No valid bboxes available - fallback
             target_classes = getattr(tracking_config, 'disambiguation_classes', 
                                      ('Brown_Orange_Overlay', 'Brown_Orange_Small'))
             fallback_label = target_classes[0]
             
             logger.warning(
-                f"[ClassifierService] Track {track_id}: Best closed ROI has no bbox for family label '{final_label}', "
+                f"[ClassifierService] Track {track_id}: No valid bboxes in closed ROIs for family label '{final_label}', "
                 f"falling back to default subclass '{fallback_label}' with low confidence tier"
             )
             
             return fallback_label, final_confidence, 'low', {
                 'disambiguation_applied': True,
-                'disambiguation_reason': 'no_bbox_fallback',
+                'disambiguation_reason': 'no_valid_bbox_fallback',
                 'original_family_label': final_label,
-                'fallback_used': True
+                'fallback_used': True,
+                'total_closed_rois': len(closed_candidates),
+                'valid_bbox_count': 0
             }
+        
+        # Compute average bbox dimensions from all closed ROIs
+        avg_width = sum((b[2] - b[0]) for b in closed_bboxes) / len(closed_bboxes)
+        avg_height = sum((b[3] - b[1]) for b in closed_bboxes) / len(closed_bboxes)
+        
+        # Create a representative "average" bbox for disambiguation
+        # Use the centroid of the first bbox but with average dimensions
+        first_bbox = closed_bboxes[0]
+        center_x = (first_bbox[0] + first_bbox[2]) / 2
+        center_y = (first_bbox[1] + first_bbox[3]) / 2
+        
+        avg_bbox = (
+            center_x - avg_width / 2,
+            center_y - avg_height / 2,
+            center_x + avg_width / 2,
+            center_y + avg_height / 2
+        )
+        
+        # Also get best ROI for reference metadata
+        best_closed_roi = max(
+            closed_candidates,
+            key=lambda c: (c.get('trust', 0), c.get('confidence', 0), c.get('sharpness', 0))
+        )
+        
+        logger.debug(
+            f"[ClassifierService] Track {track_id}: Using average bbox from {len(closed_bboxes)} closed ROIs: "
+            f"avg_size=({avg_width:.1f}x{avg_height:.1f}), avg_area={avg_width * avg_height:.0f}px²"
+        )
         
         # Create context for disambiguation
         disamb_context = {
             'track_id': track_id,
             'frame_index': best_closed_roi.get('frame_index', 0),
             'roi_index': -1,  # Track-level disambiguation
-            'track_level': True
+            'track_level': True,
+            'used_average_bbox': True,
+            'closed_roi_count': len(closed_bboxes)
         }
         
-        # Run disambiguation
+        # Run disambiguation using the average bbox
         resolved_label, resolved_conf, disambiguated, reason, confidence_tier, metadata = self._apply_disambiguation(
             label=final_label,
             confidence=final_confidence,
-            bbox=bbox,
-            is_open=False,  # Using closed ROI
+            bbox=avg_bbox,
+            is_open=False,  # Using closed ROI data
             context=disamb_context
         )
         
         logger.info(
             f"[ClassifierService] Track {track_id}: Disambiguated family label '{final_label}' -> '{resolved_label}' "
-            f"(conf={resolved_conf:.3f}, tier={confidence_tier}, reason={reason})"
+            f"using average of {len(closed_bboxes)} closed ROIs "
+            f"(avg_area={avg_width * avg_height:.0f}px², conf={resolved_conf:.3f}, tier={confidence_tier}, reason={reason})"
         )
+        
+        # Collect individual bbox areas for metadata
+        individual_areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in closed_bboxes]
         
         # Build metadata
         track_disambiguation_metadata = {
@@ -477,6 +519,12 @@ class ClassifierService:
             'best_closed_roi_trust': best_closed_roi.get('trust', 0),
             'best_closed_roi_confidence': best_closed_roi.get('confidence', 0),
             'total_closed_rois': len(closed_candidates),
+            'valid_bbox_count': len(closed_bboxes),
+            'used_average_bbox': True,
+            'average_bbox': avg_bbox,
+            'average_bbox_area': avg_width * avg_height,
+            'average_bbox_size': (avg_width, avg_height),
+            'individual_bbox_areas': individual_areas,
             'disambiguation_metadata': metadata
         }
         
