@@ -293,6 +293,9 @@ class BidirectionalSmoother:
             self._stats['validated_events'] += 1
             self._stats['high_confidence_bypassed'] += 1
             
+            # Track per-class diagnostic for high-confidence bypass
+            self._track_high_confidence_bypass(center_event.label, center_event.confidence)
+            
             # Pop the front item and return it
             front_event = self._buffer.popleft()
             return self._finalize_event(front_event)
@@ -302,11 +305,13 @@ class BidirectionalSmoother:
         next_context = [self._buffer[i] for i in range(self.center_index + 1, len(self._buffer))]
         
         # Analyze context (with special handling for Uncertain/Unknown)
-        smoothed_label, smoothing_reason = self._analyze_context(
+        smoothed_label, smoothing_reason, agreement_ratio = self._analyze_context(
             center_event, prev_context, next_context, force_override_uncertain=is_uncertain
         )
         
-        if smoothed_label and smoothed_label != center_event.label:
+        was_smoothed = smoothed_label and smoothed_label != center_event.label
+        
+        if was_smoothed:
             center_event.label = smoothed_label
             center_event.smoothed = True
             center_event.smoothing_reason = smoothing_reason
@@ -344,6 +349,15 @@ class BidirectionalSmoother:
                 center_event.smoothing_reason = smoothing_reason
                 center_event.event_data['smoothing_reason'] = smoothing_reason
         
+        # Track per-class diagnostic for smoothing decision
+        final_label = smoothed_label if was_smoothed else center_event.original_label
+        self._track_per_class_smoothing(
+            center_event.original_label, 
+            final_label,
+            agreement_ratio,
+            was_smoothed
+        )
+        
         center_event.validated = True
         self._stats['validated_events'] += 1
         
@@ -357,7 +371,7 @@ class BidirectionalSmoother:
         prev_context: List[BufferedEvent],
         next_context: List[BufferedEvent],
         force_override_uncertain: bool = False
-    ) -> Tuple[Optional[str], str]:
+    ) -> Tuple[Optional[str], str, float]:
         """
         Analyze bidirectional context to determine if smoothing should occur.
         
@@ -373,10 +387,10 @@ class BidirectionalSmoother:
             force_override_uncertain: If True, use enhanced logic for Uncertain/Unknown
             
         Returns:
-            Tuple of (smoothed_label or None, reason string)
+            Tuple of (smoothed_label or None, reason string, agreement_ratio)
         """
         if not prev_context or not next_context:
-            return None, "insufficient_context"
+            return None, "insufficient_context", 0.0
         
         # Get labels from context
         prev_labels = [e.label for e in prev_context]
@@ -410,14 +424,14 @@ class BidirectionalSmoother:
             if prev_dominant[0] != next_dominant[0] and prev_dominant[0] is not None and next_dominant[0] is not None:
                 # Different dominant labels on each side = batch transition
                 self._stats['batch_transitions_protected'] += 1
-                return None, f"batch_transition_protected (prev={prev_dominant[0]}, next={next_dominant[0]})"
+                return None, f"batch_transition_protected (prev={prev_dominant[0]}, next={next_dominant[0]})", 0.0
         
         # Check context agreement
         total_context = len(all_context_labels)
         if total_context == 0:
             if force_override_uncertain:
-                return None, "uncertain_no_consensus (no_valid_context)"
-            return None, "no_context"
+                return None, "uncertain_no_consensus (no_valid_context)", 0.0
+            return None, "no_context", 0.0
         
         # Find the most common label in context
         most_common_label, count = all_counter.most_common(1)[0]
@@ -430,12 +444,12 @@ class BidirectionalSmoother:
             if most_common_label != center_event.label:
                 # Context strongly agrees on a different label
                 reason_prefix = "uncertain_override" if force_override_uncertain else "context_override"
-                return most_common_label, f"{reason_prefix} (agreement={agreement_ratio:.2f}, label={most_common_label})"
+                return most_common_label, f"{reason_prefix} (agreement={agreement_ratio:.2f}, label={most_common_label})", agreement_ratio
         
         # Not enough agreement to override
         if force_override_uncertain:
-            return None, f"uncertain_no_consensus (best_agreement={agreement_ratio:.2f})"
-        return None, f"context_disagrees (best_agreement={agreement_ratio:.2f})"
+            return None, f"uncertain_no_consensus (best_agreement={agreement_ratio:.2f})", agreement_ratio
+        return None, f"context_disagrees (best_agreement={agreement_ratio:.2f})", agreement_ratio
     
     def _finalize_event(self, event: BufferedEvent) -> Dict[str, Any]:
         """
@@ -489,12 +503,246 @@ class BidirectionalSmoother:
             self._stats['uncertain_overrides'] / total_uncertain
             if total_uncertain > 0 else 0.0
         )
+        
+        # Include per-class diagnostics if available
+        if hasattr(self, '_per_class_stats') and self._per_class_stats:
+            stats['per_class_diagnostics'] = self.get_per_class_diagnostics()
+        
         return stats
     
     def reset_stats(self):
         """Reset statistics counters."""
         for key in self._stats:
             self._stats[key] = 0
+        # Also reset per-class stats if they exist
+        if hasattr(self, '_per_class_stats'):
+            self._per_class_stats.clear()
+    
+    # ==========================================================================
+    # Per-Class Diagnostic Tracking (Issue #4: Detect bias toward high-frequency classes)
+    # ==========================================================================
+    
+    def _track_per_class_smoothing(self, original_label: str, smoothed_label: str, 
+                                   agreement_ratio: float, was_smoothed: bool):
+        """
+        Track per-class smoothing statistics for bias detection.
+        
+        This method tracks:
+        - How often each class is smoothed FROM (original_label → different label)
+        - How often each class is smoothed TO (different label → smoothed_label)
+        - Agreement ratios when smoothing occurs per class
+        - High-confidence bypass rates per class
+        
+        These metrics help detect if the smoother systematically biases toward
+        high-frequency classes, which could explain anomalous overcounting/undercounting.
+        
+        Args:
+            original_label: Original classification label
+            smoothed_label: Final label (same as original if no smoothing)
+            agreement_ratio: Context agreement ratio for this smoothing decision
+            was_smoothed: True if the label was changed
+        """
+        if not hasattr(self, '_per_class_stats'):
+            self._per_class_stats: Dict[str, Dict[str, Any]] = {}
+        
+        # Initialize per-class stats if needed
+        for label in [original_label, smoothed_label]:
+            if label not in self._per_class_stats:
+                self._per_class_stats[label] = {
+                    'total_events': 0,
+                    'smoothed_from': 0,  # Times this class was changed TO something else
+                    'smoothed_to': 0,    # Times something was changed TO this class
+                    'high_conf_bypassed': 0,  # Times high-confidence bypass occurred
+                    'agreement_ratios': [],  # Agreement ratios when this class was involved
+                    'original_confidences': [],  # Original confidences when smoothed
+                    'transitions': Counter(),  # Counter of (from_label, to_label) transitions
+                }
+        
+        # Track event for original label
+        self._per_class_stats[original_label]['total_events'] += 1
+        
+        if was_smoothed:
+            # Track smoothing direction
+            self._per_class_stats[original_label]['smoothed_from'] += 1
+            self._per_class_stats[smoothed_label]['smoothed_to'] += 1
+            
+            # Track agreement ratio
+            self._per_class_stats[original_label]['agreement_ratios'].append(agreement_ratio)
+            
+            # Track transition
+            transition_key = f"{original_label}->{smoothed_label}"
+            self._per_class_stats[original_label]['transitions'][transition_key] += 1
+    
+    def _track_high_confidence_bypass(self, label: str, confidence: float):
+        """Track when high-confidence events bypass context checking."""
+        if not hasattr(self, '_per_class_stats'):
+            self._per_class_stats: Dict[str, Dict[str, Any]] = {}
+        
+        if label not in self._per_class_stats:
+            self._per_class_stats[label] = {
+                'total_events': 0,
+                'smoothed_from': 0,
+                'smoothed_to': 0,
+                'high_conf_bypassed': 0,
+                'agreement_ratios': [],
+                'original_confidences': [],
+                'transitions': Counter(),
+            }
+        
+        self._per_class_stats[label]['high_conf_bypassed'] += 1
+        self._per_class_stats[label]['total_events'] += 1
+    
+    def get_per_class_diagnostics(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get per-class diagnostic statistics.
+        
+        Returns a dictionary with per-class metrics including:
+        - smoothed_from_rate: Rate at which this class is changed to something else
+        - smoothed_to_rate: Rate at which other classes are changed to this class
+        - net_gain: smoothed_to - smoothed_from (positive = gains events, negative = loses)
+        - avg_agreement_ratio: Average context agreement when this class was involved
+        - high_conf_bypass_rate: Rate at which events bypass context checking
+        - top_transitions: Most common smoothing transitions
+        
+        High positive net_gain + high smoothed_to_rate indicates potential bias
+        toward this class (high-frequency class attracting smoothed events).
+        
+        Returns:
+            Dictionary of per-class diagnostic statistics
+        """
+        if not hasattr(self, '_per_class_stats') or not self._per_class_stats:
+            return {}
+        
+        diagnostics = {}
+        
+        for label, stats in self._per_class_stats.items():
+            total = stats['total_events']
+            if total == 0:
+                continue
+            
+            smoothed_from_rate = stats['smoothed_from'] / total if total > 0 else 0.0
+            
+            # smoothed_to_rate is relative to total events in dataset
+            total_events = sum(s['total_events'] for s in self._per_class_stats.values())
+            smoothed_to_rate = stats['smoothed_to'] / total_events if total_events > 0 else 0.0
+            
+            net_gain = stats['smoothed_to'] - stats['smoothed_from']
+            
+            avg_agreement = (
+                sum(stats['agreement_ratios']) / len(stats['agreement_ratios'])
+                if stats['agreement_ratios'] else 0.0
+            )
+            
+            high_conf_rate = stats['high_conf_bypassed'] / total if total > 0 else 0.0
+            
+            # Get top transitions
+            top_transitions = stats['transitions'].most_common(5)
+            
+            diagnostics[label] = {
+                'total_events': total,
+                'smoothed_from': stats['smoothed_from'],
+                'smoothed_from_rate': smoothed_from_rate,
+                'smoothed_to': stats['smoothed_to'],
+                'smoothed_to_rate': smoothed_to_rate,
+                'net_gain': net_gain,
+                'net_gain_rate': net_gain / total if total > 0 else 0.0,
+                'avg_agreement_ratio': avg_agreement,
+                'high_conf_bypass_rate': high_conf_rate,
+                'top_transitions': dict(top_transitions),
+            }
+        
+        return diagnostics
+    
+    def get_bias_analysis(self) -> Dict[str, Any]:
+        """
+        Analyze smoother behavior for potential class bias.
+        
+        This method analyzes per-class statistics to identify:
+        1. Classes that systematically gain events (potential overcounting bias)
+        2. Classes that systematically lose events (potential undercounting bias)
+        3. Suspicious transition patterns (one class attracting many transitions)
+        
+        Returns analysis with:
+        - gainers: Classes with significant positive net gain
+        - losers: Classes with significant negative net gain
+        - suspicious_transitions: Transitions that occur more than expected
+        - recommendations: Suggested threshold adjustments
+        
+        Returns:
+            Dictionary containing bias analysis results
+        """
+        diagnostics = self.get_per_class_diagnostics()
+        
+        if not diagnostics:
+            return {
+                'gainers': [],
+                'losers': [],
+                'suspicious_transitions': [],
+                'recommendations': [],
+                'analysis_status': 'insufficient_data'
+            }
+        
+        gainers = []
+        losers = []
+        
+        for label, stats in diagnostics.items():
+            if stats['net_gain'] > 0 and stats['net_gain_rate'] > 0.05:
+                # More than 5% net gain - potential overcounting bias
+                gainers.append({
+                    'label': label,
+                    'net_gain': stats['net_gain'],
+                    'net_gain_rate': stats['net_gain_rate'],
+                    'smoothed_to': stats['smoothed_to'],
+                })
+            elif stats['net_gain'] < 0 and abs(stats['net_gain_rate']) > 0.05:
+                # More than 5% net loss - potential undercounting bias
+                losers.append({
+                    'label': label,
+                    'net_gain': stats['net_gain'],
+                    'net_gain_rate': stats['net_gain_rate'],
+                    'smoothed_from': stats['smoothed_from'],
+                })
+        
+        # Sort by magnitude of bias
+        gainers.sort(key=lambda x: x['net_gain_rate'], reverse=True)
+        losers.sort(key=lambda x: x['net_gain_rate'])
+        
+        # Find suspicious transitions (one direction dominates)
+        suspicious_transitions = []
+        for label, stats in diagnostics.items():
+            for transition, count in stats.get('top_transitions', {}).items():
+                total = stats['total_events']
+                if total > 0 and count / total > 0.2:
+                    # More than 20% of events for this class transition the same way
+                    suspicious_transitions.append({
+                        'transition': transition,
+                        'count': count,
+                        'rate': count / total,
+                    })
+        
+        # Generate recommendations
+        recommendations = []
+        for gainer in gainers:
+            if gainer['net_gain_rate'] > 0.10:
+                recommendations.append(
+                    f"Consider increasing context_agreement_ratio for '{gainer['label']}' "
+                    f"(current net gain rate: {gainer['net_gain_rate']:.1%})"
+                )
+        
+        for loser in losers:
+            if abs(loser['net_gain_rate']) > 0.10:
+                recommendations.append(
+                    f"Consider decreasing context_agreement_ratio for '{loser['label']}' "
+                    f"(current net loss rate: {abs(loser['net_gain_rate']):.1%})"
+                )
+        
+        return {
+            'gainers': gainers,
+            'losers': losers,
+            'suspicious_transitions': suspicious_transitions,
+            'recommendations': recommendations,
+            'analysis_status': 'complete',
+        }
 
 
 # Module-level singleton for convenience

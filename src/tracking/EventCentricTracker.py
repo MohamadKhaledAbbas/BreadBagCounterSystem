@@ -243,6 +243,31 @@ class EventConfig:
     """Minimum IoU with last committed box to trigger suppression.
     Lower values = more aggressive suppression (reduced from 0.15)."""
     
+    # Size-adaptive suppression (Issue #4 fix: Large bags overcount, small bags undercount)
+    suppression_use_adaptive_distance: bool = True
+    """When True, suppression distance is calculated as multiplier * bag diagonal.
+    This ensures larger bags have larger suppression zones, smaller bags have smaller zones.
+    When False, uses fixed suppression_distance_px for all bags."""
+    
+    suppression_diagonal_multiplier: float = 1.5
+    """Multiplier for bag diagonal when calculating adaptive suppression distance.
+    Effective suppression distance = diagonal * multiplier.
+    Range: 1.0 - 2.5
+    - 1.0: Suppression zone same size as bag diagonal
+    - 1.5: Suppression zone 50% larger than bag diagonal (recommended)
+    - 2.0: Suppression zone twice the bag diagonal
+    Default: 1.5"""
+    
+    suppression_min_distance_px: float = 60.0
+    """Minimum suppression distance in pixels (floor for adaptive calculation).
+    Ensures very small bags still have a reasonable suppression zone.
+    Default: 60.0 pixels"""
+    
+    suppression_max_distance_px: float = 250.0
+    """Maximum suppression distance in pixels (ceiling for adaptive calculation).
+    Prevents very large bags from having unreasonably large suppression zones.
+    Default: 250.0 pixels"""
+    
     # ==========================================================================
     # Temporal Cooldown for New Event Creation
     # ==========================================================================
@@ -2764,10 +2789,20 @@ class EventCentricTracker:
                     events_to_remove.append(event_id)
                     self.stats['events_committed'] += 1
                     
+                    # Calculate bag diagonal for size-adaptive suppression
+                    bag_diagonal = 0.0
+                    if event.last_box is not None:
+                        box = event.last_box
+                        width = box[2] - box[0]
+                        height = box[3] - box[1]
+                        bag_diagonal = math.sqrt(width * width + height * height)
+                    
                     # Add to recently committed (Issue #3: include box for conditional suppression)
+                    # Issue #4: include diagonal for size-adaptive suppression
                     self.recently_committed.append({
                         'centroid': event.last_centroid,
                         'box': event.last_box,
+                        'diagonal': bag_diagonal,
                         'timestamp_ms': timestamp_ms,
                         'event_id': event_id
                     })
@@ -2833,10 +2868,16 @@ class EventCentricTracker:
         
         ISSUE #3 FIX: Conditional suppression using box overlap
         - If suppression_require_box_overlap is True, suppression requires both:
-          1. Centroid proximity (within suppression_distance_px)
+          1. Centroid proximity (within suppression_distance_px or adaptive distance)
           2. Box overlap with last committed box (IoU >= suppression_iou_threshold)
         - This allows new bags to start immediately at the same location if there's
           no box overlap (worker starts new bag after removing the last one)
+        
+        ISSUE #4 FIX: Size-adaptive suppression
+        - If suppression_use_adaptive_distance is True, suppression distance is calculated
+          as diagonal * multiplier instead of fixed suppression_distance_px
+        - This ensures larger bags have larger suppression zones (preventing overcounting)
+          and smaller bags have smaller suppression zones (preventing undercounting)
         
         TEMPORAL COOLDOWN: Hard temporal cooldown zone
         - No new events allowed within temporal_cooldown_distance_px for
@@ -2871,8 +2912,11 @@ class EventCentricTracker:
                     )
                     return True
             
+            # ISSUE #4 FIX: Calculate effective suppression distance (size-adaptive or fixed)
+            effective_suppression_distance = self._calculate_suppression_distance(rc)
+            
             # Check centroid distance for standard suppression
-            if distance >= self.config.suppression_distance_px:
+            if distance >= effective_suppression_distance:
                 # Too far away, no suppression
                 continue
             
@@ -2896,11 +2940,59 @@ class EventCentricTracker:
             logger.debug(
                 f"[EventCentricTracker] Suppressing new event: "
                 f"too close to recently committed {rc['event_id']} "
-                f"(distance={distance:.1f}px < suppression_threshold={self.config.suppression_distance_px}px)"
+                f"(distance={distance:.1f}px < suppression_threshold={effective_suppression_distance:.1f}px)"
             )
             return True
         
         return False
+    
+    def _calculate_suppression_distance(self, recently_committed: Dict[str, Any]) -> float:
+        """
+        Calculate the effective suppression distance for a recently committed event.
+        
+        ISSUE #4 FIX: Size-adaptive suppression
+        Large bags were overcounting (+8-13%) because the fixed suppression zone was
+        too small relative to their size. Small bags were undercounting (-12%) because
+        the fixed suppression zone was too large relative to their size.
+        
+        Solution: Calculate suppression distance as a multiple of the bag diagonal.
+        - Larger bags get larger suppression zones
+        - Smaller bags get smaller suppression zones
+        - Clamped to min/max bounds to handle edge cases
+        
+        Args:
+            recently_committed: Dictionary with 'diagonal', 'box', and other event data
+            
+        Returns:
+            Effective suppression distance in pixels
+        """
+        if not self.config.suppression_use_adaptive_distance:
+            # Use fixed suppression distance (legacy behavior)
+            return self.config.suppression_distance_px
+        
+        # Get bag diagonal (pre-calculated during commit)
+        bag_diagonal = recently_committed.get('diagonal', 0.0)
+        
+        if bag_diagonal <= 0:
+            # Fallback to fixed distance if diagonal is not available
+            return self.config.suppression_distance_px
+        
+        # Calculate adaptive suppression distance: diagonal * multiplier
+        adaptive_distance = bag_diagonal * self.config.suppression_diagonal_multiplier
+        
+        # Clamp to min/max bounds
+        effective_distance = max(
+            self.config.suppression_min_distance_px,
+            min(adaptive_distance, self.config.suppression_max_distance_px)
+        )
+        
+        logger.debug(
+            f"[SizeAdaptiveSuppression] Calculated adaptive distance: "
+            f"diagonal={bag_diagonal:.1f}px * multiplier={self.config.suppression_diagonal_multiplier} "
+            f"= {adaptive_distance:.1f}px, clamped to {effective_distance:.1f}px"
+        )
+        
+        return effective_distance
     
     def _compute_iou_static(self, box1: Tuple[float, float, float, float], 
                            box2: Tuple[float, float, float, float]) -> float:
