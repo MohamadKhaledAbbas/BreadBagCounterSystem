@@ -14,6 +14,7 @@
 <main>
     <header class="stats-header">
         <h1 class="stats-title">لوحة رؤى البيانات</h1>
+        <h3 class="stats-request-time">{{ meta.request_time }} آخر تحديث</h3>
     </header>
 
     {% if meta and meta.start and meta.end %}
@@ -153,7 +154,7 @@
                             <div class="group-meta">
                                 <span class="group-time-window">
                                     <i class="fa-regular fa-clock"></i>
-                                    {{ run.start[11:16] }} &rarr; {{ run.end[11:16] }}
+                                    {{ run.end[11:16] }} &rarr; {{ run.start[11:16] }}
                                 </span>
                             </div>
                         </div>

@@ -58,6 +58,14 @@ main {
     margin: 0;
 }
 
+.stats-request-time {
+    font-size: 1rem;
+    margin-top: 1rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    color: var(--accent-gold);
+}
+
 /* 🕰️ HUGE TIME STAGE (Replaces small capsule) */
 .time-stage-container {
     display: flex;

@@ -299,7 +299,7 @@ class DatabaseManager:
                 FROM bag_events be
                 JOIN bag_types bt ON be.bag_type_id = bt.id
                 WHERE be.timestamp BETWEEN ? AND ?
-                ORDER BY be.timestamp ASC
+                ORDER BY be.timestamp DESC
             """, (start_time, end_time)).fetchall()
             
             return [

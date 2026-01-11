@@ -29,18 +29,31 @@ def parse_datetime(val: Optional[str]):
         raise HTTPException(status_code=500, detail=f"parsing datetime {val} failed")
 
 
-def build_consecutive_runs(ordered_events: List[Dict]) -> List[Dict]:
+def build_consecutive_runs_with_noise(ordered_events: List[Dict]) -> List[Dict]:
     """
     Collapse ordered events into consecutive runs of the same bag_type_id.
     Each run tracks start/end times and total count.
+    Runs with count < 3 are grouped and summed as a single 'noise' run.
     """
     runs = []
+    noise_count = 0
+    noise_threshold = 5
+    noise_start = None
+    noise_end = None
     current = None
 
+    # Step 1: Initial consecutive run grouping and noise tracking
     for ev in ordered_events:
         if current is None or ev["bag_type_id"] != current["bag_type_id"]:
             if current:
-                runs.append(current)
+                if current["count"] >= noise_threshold:
+                    runs.append(current)
+                else:
+                    noise_count += current["count"]
+                    if noise_start is None or current["start"] < noise_start:
+                        noise_start = current["start"]
+                    if noise_end is None or current["end"] > noise_end:
+                        noise_end = current["end"]
             current = {
                 "bag_type_id": ev["bag_type_id"],
                 "class_name": ev["class_name"],
@@ -55,9 +68,47 @@ def build_consecutive_runs(ordered_events: List[Dict]) -> List[Dict]:
             current["end"] = ev["timestamp"]
             current["count"] += 1
 
+    # Handle last run
     if current:
-        runs.append(current)
-    return runs
+        if current["count"] >= noise_threshold:
+            runs.append(current)
+        else:
+            noise_count += current["count"]
+            if noise_start is None or current["start"] < noise_start:
+                noise_start = current["start"]
+            if noise_end is None or current["end"] > noise_end:
+                noise_end = current["end"]
+
+    # Step 2: Merge adjacent/consecutive runs with same bag_type_id
+    merged = []
+    last = None
+    for run in runs:
+        if last is None:
+            last = run
+        elif run["bag_type_id"] == last["bag_type_id"]:
+            # Merge into last
+            last["end"] = run["end"]
+            last["count"] += run["count"]
+        else:
+            merged.append(last)
+            last = run
+    if last:
+        merged.append(last)
+
+    # Step 3: Add noise at the end if it exists
+    if noise_count > 0:
+        merged.append({
+            "bag_type_id": "NOISE",
+            "class_name": "Noise",
+            "arabic_name": "تصنيفات مفلترة غير دقيقة",
+            "thumb": "",
+            "weight": 0,
+            "start": noise_start,
+            "end": noise_end,
+            "count": noise_count,
+        })
+
+    return merged
 
 
 def get_stats(start_time: datetime, end_time: datetime):
@@ -66,7 +117,7 @@ def get_stats(start_time: datetime, end_time: datetime):
     # Get timeline data
     ordered_events = db.get_ordered_bag_events(start_time, end_time)
     per_class_windows = db.get_per_class_time_windows(start_time, end_time)
-    runs = build_consecutive_runs(ordered_events)
+    runs = build_consecutive_runs_with_noise(ordered_events)
 
     return {
         "meta": {
@@ -145,6 +196,7 @@ async def analytics(
         # Adjusting timezone for preview +3
         stats["meta"]["start"] = start_dt + timedelta(hours=3)
         stats["meta"]["end"] = end_dt + timedelta(hours=3)
+        stats["meta"]["request_time"] = datetime.now().strftime("%Y/%m/%d - %H:%M:%S")
 
         logger.info(
             f"[Analytics] Serving analytics: total={stats['data']['total']}, classes={len(stats['data']['classifications'])}")
@@ -175,7 +227,7 @@ async def get_daily_analytics(
 
     # Time (ISO Format), e.g. 2025-11-24T08:00:00
     start_time = start_time.replace(hour=16, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
-    end_time = end_time.replace(hour=11, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
+    end_time = end_time.replace(hour=14, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S")
     return await analytics(request=request, start_time=start_time, end_time=end_time)
 
 # To run: uvicorn server:app --reload
