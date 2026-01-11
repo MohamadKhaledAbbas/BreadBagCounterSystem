@@ -70,18 +70,23 @@ else:
     # Stub for non-RDK development
     class Node:
         def __init__(self, name): pass
+
         def get_logger(self): return logger
+
         def create_subscription(self, *args, **kwargs): pass
+
         def create_publisher(self, *args, **kwargs): return MockPublisher()
+
         def destroy_node(self): pass
-    
+
+
     class MockPublisher:
         def publish(self, msg): pass
 
 
 class ProcessorRunState(Enum):
     """Runtime state of the processor (ACK-free mode).
-    
+
     Note: Named ProcessorRunState to avoid conflict with ProcessorState dataclass
     from spool_utils which is used for persistence.
     """
@@ -113,10 +118,10 @@ DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
 DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 15  # Between 10-25 = normal pace
 DEFAULT_ADAPTIVE_FPS_RELAXED = 20.0  # Healthy state - save resources
 DEFAULT_TARGET_FPS = 25.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
-DEFAULT_ADAPTIVE_FPS_MAX = 28.0  # High lag state - catch up (~28ms intervals)
+DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (~28ms intervals)
 MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
 ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
-MIN_WAITING_FPS = 0.020  # Sleep for 10 ms minimum each time.
+
 
 @dataclass
 class ProcessorConfig:
@@ -151,22 +156,23 @@ def load_default_config() -> ProcessorConfig:
         target_fps=DEFAULT_TARGET_FPS,
     )
 
+
 class SpoolProcessorNode(Node):
     """
     Spool Processor Node - ACK-Free Video Streaming.
-    
+
     Reads H.264 frames from the spool and publishes them to the decoder
     at a controlled rate without waiting for acknowledgments.
-    
+
     ACK-Free Architecture (Production):
     ----------------------------------
     1. Reads frames continuously from spool
     2. Publishes at target_fps rate
     3. Never blocks on consumer feedback
     4. Relies on retention guards for data safety
-    
+
     This aligns with industry-standard streaming architectures.
-    
+
     V7 Features:
     -----------
     - Gap/duplicate detection with anomaly counters
@@ -177,24 +183,24 @@ class SpoolProcessorNode(Node):
     - Retention guard for segment existence
     - Structured logging for machine parsing
     """
-    
+
     def __init__(self, config: Optional[ProcessorConfig] = None):
         super().__init__('spool_processor')
-        
+
         # Load configuration from database if not provided
         self.config = config or load_default_config()
-        
+
         # Generate unique session ID for this run
         self._session_id = generate_session_id()
-        
+
         # Log mode selection
         logger.info(f"[SpoolProcessor] Mode: ACK-FREE (Production)")
-        
+
         logger.info(f"[SpoolProcessor] Initializing with config: "
-                   f"spool_dir={self.config.spool_dir_path}, "
-                   f"target_fps={self.config.target_fps}, "
-                   f"session_id={self._session_id}")
-        
+                    f"spool_dir={self.config.spool_dir_path}, "
+                    f"target_fps={self.config.target_fps}, "
+                    f"session_id={self._session_id}")
+
         # Initialize components
         spool_dir = Path(self.config.spool_dir_path)
         spool_dir.mkdir(parents=True, exist_ok=True)
@@ -207,24 +213,24 @@ class SpoolProcessorNode(Node):
         self._current_frame: Optional[FrameRecord] = None
         self._current_frame_index: int = 0
         self._current_segment: int = -1  # Track current segment for SPS/PPS handling
-        
+
         # Sequence counter for published frames
         self._seq_counter: int = 0
         self._seq_lock = threading.Lock()
-        
+
         # SPS/PPS caching for segment boundary handling
         self._cached_sps: Optional[bytes] = None
         self._cached_pps: Optional[bytes] = None
         self._segment_needs_sps_pps: bool = True  # First frame of segment needs SPS/PPS
-        
+
         # State management
         self._state = ProcessorRunState.IDLE
         self._state_lock = threading.Lock()
-        
+
         # Processing thread
         self._running = False
         self._processor_thread: Optional[threading.Thread] = None
-        
+
         # Statistics
         self._frames_processed = 0
         self._frames_skipped = 0
@@ -233,7 +239,7 @@ class SpoolProcessorNode(Node):
         self._last_stats_time = time.time()
         self._last_detailed_stats_time = time.time()
         self._stats_lock = threading.Lock()
-        
+
         # V7: Robustness counters
         self._last_published_index: int = -1  # For gap/dup detection
         self._last_published_segment: int = -1  # Track which segment last frame came from
@@ -243,7 +249,7 @@ class SpoolProcessorNode(Node):
         self._sps_pps_missing_critical: int = 0  # SPS/PPS unavailable at boundary
         self._current_target_fps: float = self.config.target_fps  # Adaptive pacing
         self._throttle_log_dict = {}  # For throttled logging
-        
+
         # V9: Performance profiling
         self._perf_frame_count: int = 0
         self._perf_time_list_segments: float = 0.0
@@ -251,11 +257,11 @@ class SpoolProcessorNode(Node):
         self._perf_time_publish_frame: float = 0.0
         self._perf_time_total_loop: float = 0.0
         self._last_perf_log_time: float = time.time()
-        
+
         # State file path
         self._state_file_path = os.path.join(self.config.spool_dir_path, self.config.state_file)
         self._allow_next_gap = False
-        
+
         # V8: Initialize retention policy for segment deletion after processing
         if self.config.delete_processed_segments:
             self._retention_policy = RetentionPolicy(
@@ -273,7 +279,7 @@ class SpoolProcessorNode(Node):
             ))
         else:
             self._retention_policy = None
-        
+
         # ROS2 publishers and subscribers
         if IS_RDK:
             # QoS for encoded frames - must match decoder's subscription QoS
@@ -290,18 +296,18 @@ class SpoolProcessorNode(Node):
                 '/spool_image_ch_0',
                 frame_qos
             )
-            
+
             logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
-                       "/spool_image_ch_0 (pub) - Simple, robust architecture")
-    
+                        "/spool_image_ch_0 (pub) - Simple, robust architecture")
+
     def start(self):
         """Start the processor."""
         if self._running:
             return
-        
+
         logger.info("[SpoolProcessor] Starting...")
         self._running = True
-        
+
         # V9: Log startup configuration and constants for runtime observability
         logger.info("=" * 80)
         logger.info("[SpoolProcessor] 🚀 Startup Configuration")
@@ -317,7 +323,8 @@ class SpoolProcessorNode(Node):
         logger.info(f"")
         logger.info(f"  Adaptive Pacing Thresholds:")
         logger.info(f"    - Healthy Threshold: < {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD} segments")
-        logger.info(f"    - Normal Threshold: {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD}-{DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
+        logger.info(
+            f"    - Normal Threshold: {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD}-{DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
         logger.info(f"    - High Lag Threshold: > {DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
         logger.info(f"    - Warn Threshold: {self.config.spool_lag_warn_threshold} segments")
         logger.info(f"    - Error Threshold: {self.config.spool_lag_error_threshold} segments")
@@ -330,7 +337,7 @@ class SpoolProcessorNode(Node):
         if self.config.enable_perf_logging:
             logger.info(f"    - Perf Log Interval: {self.config.perf_log_interval_sec}s")
         logger.info("=" * 80)
-        
+
         # V7: Load persisted state for restart continuity
         loaded_state = load_processor_state(self._state_file_path)
         if loaded_state and loaded_state.last_published_index >= 0:
@@ -342,10 +349,10 @@ class SpoolProcessorNode(Node):
                 last_segment=loaded_state.last_published_segment,
                 prev_session=loaded_state.session_id[:8]
             ))
-        
+
         # Initialize frame generator
         self._init_frame_generator()
-        
+
         # V7.4: Save initial state to let retention policy know we're starting
         # This creates the state file early, reducing the window where retention
         # might delete segments we're about to read
@@ -362,7 +369,7 @@ class SpoolProcessorNode(Node):
                     current_segment=self._current_segment,
                     last_published_index=self._last_published_index
                 ))
-        
+
         # Start processing thread
         self._processor_thread = threading.Thread(
             target=self._processor_loop,
@@ -370,26 +377,27 @@ class SpoolProcessorNode(Node):
             name="SpoolProcessor"
         )
         self._processor_thread.start()
-        
+
         logger.info("[SpoolProcessor] Started")
-    
+
     def stop(self):
         """Stop the processor gracefully."""
         if not self._running:
             return
-        
+
         logger.info("[SpoolProcessor] Stopping...")
         self._running = False
-        
+
         with self._state_lock:
             self._state = ProcessorRunState.STOPPED
-        
+
         # Wait for processor thread
         if self._processor_thread:
             self._processor_thread.join(timeout=5.0)
             if self._processor_thread.is_alive():
-                logger.error("[SpoolProcessor] ⚠ Processor thread did not stop gracefully within timeout - incomplete stop")
-        
+                logger.error(
+                    "[SpoolProcessor] ⚠ Processor thread did not stop gracefully within timeout - incomplete stop")
+
         # V7: Save state before exit
         if self._last_published_index >= 0:
             state = ProcessorState(
@@ -404,14 +412,14 @@ class SpoolProcessorNode(Node):
                     last_index=self._last_published_index,
                     last_segment=self._current_segment
                 ))
-        
+
         # Log final stats with structured format
         with self._stats_lock:
             # V8: Get segments deleted from retention policy
             segments_deleted = 0
             if self._retention_policy is not None:
                 segments_deleted = self._retention_policy.segments_deleted_by_processing
-            
+
             final_msg = format_structured_log(
                 "[SpoolProcessor] Final stats",
                 session=self._session_id[:8],
@@ -425,13 +433,13 @@ class SpoolProcessorNode(Node):
                 anomalies_dup=self._anomalies_dup
             )
             logger.info(final_msg)
-        
+
         logger.info("[SpoolProcessor] Stopped")
-    
+
     def _init_frame_generator(self):
         """
         Initialize the frame generator from oldest segment.
-        
+
         V7: Supports seeking to last published frame + 1 for restart continuity.
         V8.7: Uses read_single_segment() to enable per-segment completion tracking.
         """
@@ -443,7 +451,7 @@ class SpoolProcessorNode(Node):
             # Mark that we need SPS/PPS for the first frame of this segment
             self._segment_needs_sps_pps = True
             self._current_segment = oldest
-            
+
             # V7: If we have persisted state, skip already-published frames
             if self._last_published_index >= 0:
                 target_index = self._last_published_index + 1
@@ -453,18 +461,18 @@ class SpoolProcessorNode(Node):
                     last_published=self._last_published_index,
                     target_index=target_index
                 ))
-                
+
                 try:
                     while True:
                         frame = next(self._frame_generator)
-                        
+
                         # Extract and cache SPS/PPS while seeking
                         sps, pps = extract_sps_pps(frame.data)
                         if sps:
                             self._cached_sps = sps
                         if pps:
                             self._cached_pps = pps
-                        
+
                         if frame.index < target_index:
                             skipped += 1
                             continue
@@ -475,11 +483,11 @@ class SpoolProcessorNode(Node):
                                 skipped_frames=skipped,
                                 next_index=frame.index
                             ))
-                            
+
                             # Use itertools.chain to combine first frame with remaining frames
                             self._frame_generator = itertools.chain([frame], self._frame_generator)
                             break
-                            
+
                 except StopIteration:
                     logger.warning(format_structured_log(
                         "[SpoolProcessor] Reached end of spool while seeking",
@@ -495,11 +503,11 @@ class SpoolProcessorNode(Node):
         else:
             logger.warning("[SpoolProcessor] No segments available")
             self._frame_generator = iter([])
-    
+
     def _prescan_for_sps_pps(self):
         """
         Pre-scan frames to find and cache SPS/PPS NAL units.
-        
+
         V7.1: Simplified to avoid frame skipping. SPS/PPS are now cached during
         normal frame iteration in _get_next_frame(). This eliminates gaps caused
         by complex frame buffering logic that was consuming frames without properly
@@ -508,24 +516,24 @@ class SpoolProcessorNode(Node):
         logger.info("[SpoolProcessor] SPS/PPS will be cached during normal frame iteration")
         # Note: SPS/PPS caching happens in _get_next_frame() during normal processing
         # This avoids the frame skipping issue that occurred with buffered_generator
-    
+
     def _get_next_frame(self) -> Optional[FrameRecord]:
         """
         Get the next frame from the spool.
-        
+
         V7: Includes retention guard - checks if current segment still exists.
         V7.5: When current segment is missing, jumps forward to nearest available
               segment >= current_segment (not oldest) to prevent rewinds.
         """
         if self._frame_generator is None:
             self._init_frame_generator()
-        
+
         # V8.3: Sync _current_segment with reader's actual position
         # This is critical to prevent stale segment tracking that causes rewinds
         reader_segment = self._reader.get_current_segment()
         if reader_segment >= 0:
             self._current_segment = reader_segment
-        
+
         # V7: Retention guard - check if current segment was deleted
         if self._current_segment >= 0:
             segments = self._reader.list_segments()
@@ -562,7 +570,7 @@ class SpoolProcessorNode(Node):
                             missing_segment=self._current_segment,
                             target_segment=target_segment
                         ))
-                    
+
                     self._frame_generator = self._reader.read_frames(start_segment=target_segment)
                     self._current_segment = target_segment
                     self._segment_needs_sps_pps = True
@@ -570,7 +578,7 @@ class SpoolProcessorNode(Node):
                     # No segments at all
                     self._frame_generator = iter([])
                     return None
-        
+
         try:
             frame = next(self._frame_generator)
             # Extract and cache SPS/PPS if present in this frame
@@ -592,11 +600,11 @@ class SpoolProcessorNode(Node):
             if completed_segment < 0:
                 # Fallback to _current_segment if no segment was completed
                 completed_segment = self._current_segment
-            
+
             with self._stats_lock:
                 if completed_segment >= 0:
                     self._segments_processed += 1
-            
+
             # V8: Notify retention policy that segment is fully processed
             # This will trigger immediate segment deletion if enabled
             if self._retention_policy is not None and completed_segment >= 0:
@@ -605,23 +613,24 @@ class SpoolProcessorNode(Node):
                     "[SpoolProcessor] 🗑️ Segment processed and queued for deletion",
                     segment=completed_segment
                 ))
-            
+
             self._segment_needs_sps_pps = True  # New segment will need SPS/PPS
-            
+
             # V7.2: Move to NEXT sequential segment, not oldest
             # This ensures proper sequential processing even when old segments are deleted
             next_segment = completed_segment + 1 if completed_segment >= 0 else None
-            
+
             # Check if next segment exists, or find the nearest available segment after current
             available_segments = self._reader.list_segments()
             target_segment = None
-            
+
             if next_segment is not None and next_segment in available_segments:
                 # Next sequential segment exists
                 target_segment = next_segment
             elif available_segments:
                 # Next segment missing - find nearest segment >= next_segment
-                candidates = [s for s in available_segments if s >= next_segment] if next_segment is not None else available_segments
+                candidates = [s for s in available_segments if
+                              s >= next_segment] if next_segment is not None else available_segments
                 if candidates:
                     target_segment = min(candidates)
                     if completed_segment >= 0:
@@ -634,13 +643,13 @@ class SpoolProcessorNode(Node):
                                 actual=target_segment,
                                 skipped=skipped
                             ))
-            
+
             if target_segment is not None:
                 logger.info(f"[SpoolProcessor] Segment transition: {completed_segment} → {target_segment}")
                 # V8.7: Use read_single_segment() for per-segment completion tracking
                 self._frame_generator = self._reader.read_single_segment(target_segment)
                 self._current_segment = target_segment
-                
+
                 # V7.4: Save state when transitioning segments for cross-process safety
                 # This allows retention policy (in recorder process) to know current position
                 if self._last_published_index >= 0:
@@ -651,7 +660,7 @@ class SpoolProcessorNode(Node):
                         timestamp=time.time()
                     )
                     save_processor_state(self._state_file_path, state)
-                
+
                 try:
                     frame = next(self._frame_generator)
                     # Extract and cache SPS/PPS if present
@@ -674,11 +683,11 @@ class SpoolProcessorNode(Node):
                         throttle_dict=self._throttle_log_dict,
                         min_interval=5.0
                     )
-                    
+
                     # Mark this segment as processed and trigger deletion
                     with self._stats_lock:
                         self._segments_processed += 1
-                    
+
                     # V8.7: Trigger immediate deletion for empty segment
                     if self._retention_policy is not None:
                         self._retention_policy.set_last_processed_segment(target_segment)
@@ -686,7 +695,7 @@ class SpoolProcessorNode(Node):
                             "[SpoolProcessor] Empty segment queued for deletion",
                             segment=target_segment
                         ))
-                    
+
                     # Find next segment > target_segment
                     forward_candidates = [s for s in available_segments if s > target_segment]
                     if forward_candidates:
@@ -700,7 +709,7 @@ class SpoolProcessorNode(Node):
                         self._frame_generator = self._reader.read_single_segment(next_target)
                         self._current_segment = next_target
                         self._segment_needs_sps_pps = True
-                        
+
                         # Try to get frame from next segment
                         try:
                             frame = next(self._frame_generator)
@@ -720,29 +729,29 @@ class SpoolProcessorNode(Node):
                 logger.debug("[SpoolProcessor] No more segments available")
                 self._frame_generator = iter([])
                 return None
-    
+
     def _maybe_prepend_sps_pps(self, data: bytes) -> bytes:
         """
         Prepend cached SPS/PPS to frame data if needed.
-        
+
         V7: Always prepends at segment boundaries if cache exists, regardless of IDR detection.
         If cache is missing, attempts prescan and logs critical warning.
-        
+
         This ensures the decoder can initialize properly at segment boundaries,
         even if the first frame of a segment isn't an IDR frame with SPS/PPS.
-        
+
         Args:
             data: Original frame data
-            
+
         Returns:
             Frame data with SPS/PPS prepended if needed, otherwise original data
         """
         if not self.config.prepend_sps_pps:
             return data
-        
+
         if not self._segment_needs_sps_pps:
             return data
-        
+
         # V7: At segment boundary, ALWAYS prepend cached SPS/PPS if available
         if self._cached_sps and self._cached_pps:
             prepended = bytearray()
@@ -757,14 +766,14 @@ class SpoolProcessorNode(Node):
                 prepended_bytes=len(prepended)
             ))
             return bytes(prepended) + data
-        
+
         # V7: Cache missing at boundary - check if frame has SPS/PPS
         frame_has_idr, frame_has_sps, frame_has_pps = False, False, False
         try:
             frame_has_idr, frame_has_sps, frame_has_pps = detect_frame_type(data)
         except Exception:
             pass
-        
+
         # If frame has SPS/PPS, extract and cache them
         if frame_has_sps and frame_has_pps:
             sps, pps = extract_sps_pps(data)
@@ -775,11 +784,11 @@ class SpoolProcessorNode(Node):
             self._segment_needs_sps_pps = False
             logger.debug("[SpoolProcessor] Extracted and cached SPS/PPS from frame at segment boundary")
             return data
-        
+
         # V7: Critical - no cached SPS/PPS and frame doesn't have them
         with self._stats_lock:
             self._sps_pps_missing_critical += 1
-        
+
         critical_msg = format_structured_log(
             "🔴 CRITICAL: SPS/PPS unavailable at segment boundary",
             segment=self._current_segment,
@@ -795,16 +804,16 @@ class SpoolProcessorNode(Node):
             throttle_dict=self._throttle_log_dict,
             min_interval=5.0
         )
-        
+
         self._segment_needs_sps_pps = False
         return data
-    
+
     def _publish_frame(self, record: FrameRecord) -> bool:
         """
         Publish a frame to the decoder input topic.
-        
+
         V7: Includes gap/dup detection and optional CRC32 checksum logging.
-        
+
         Returns:
             bool: True if publishing succeeded, False otherwise
         """
@@ -820,7 +829,7 @@ class SpoolProcessorNode(Node):
                     expected_index = self._last_published_index + 1
                     if record.index > expected_index:
                         if self._allow_next_gap:
-                            self._allow_next_gap = False # Expected no need to log warning when PPS or SPS
+                            self._allow_next_gap = False  # Expected no need to log warning when PPS or SPS
                         else:
                             gap_size = record.index - expected_index
                             with self._stats_lock:
@@ -847,15 +856,15 @@ class SpoolProcessorNode(Node):
                             total_dups=self._anomalies_dup
                         )
                         logger.warning(f"[SpoolProcessor] {dup_msg}")
-            
+
             # Get next sequence number
             with self._seq_lock:
                 seq = self._seq_counter
                 self._seq_counter += 1
-            
+
             # Prepare frame data with SPS/PPS prepending if needed
             frame_data = self._maybe_prepend_sps_pps(record.data)
-            
+
             # Publish the encoded frame immediately (no delay needed)
             # The FIFO queue in Ros2FrameServer will handle proper correlation
             frame_msg = H26XFrame()
@@ -868,7 +877,7 @@ class SpoolProcessorNode(Node):
             frame_msg.pts = Time()
             frame_msg.pts.sec = record.pts_sec
             frame_msg.pts.nanosec = record.pts_nsec
-            
+
             # Convert encoding string to list of 12 unsigned integers (as expected by H26XFrame)
             # The encoding field in H26XFrame is a sequence of 12 bytes (uint8 array)
             if isinstance(record.encoding, str):
@@ -880,11 +889,11 @@ class SpoolProcessorNode(Node):
             # Pad to exactly 12 bytes
             encoding_padded = list(encoding_bytes) + [0] * (12 - len(encoding_bytes))
             frame_msg.encoding = encoding_padded
-            
+
             # V9: Optimize frame data assignment - avoid expensive list() conversion
             # Try to assign bytes directly, fallback to list if needed for compatibility
             # Note: ROS2 message field 'data' should accept bytes or sequence types.
-            # If the H26XFrame.data field type is defined as 'sequence<uint8>', 
+            # If the H26XFrame.data field type is defined as 'sequence<uint8>',
             # it should accept bytes directly. The fallback ensures compatibility
             # with any message definition that requires a list.
             try:
@@ -895,19 +904,19 @@ class SpoolProcessorNode(Node):
                 # This is the old behavior for compatibility
                 frame_msg.data = list(frame_data)
                 logger.debug("[SpoolProcessor] Using list conversion fallback for frame data")
-            
+
             self._frame_pub.publish(frame_msg)
-            
+
             # V7: Update last published index and segment (for gap/dup detection and state persistence)
             self._last_published_index = record.index
             self._last_published_segment = self._current_segment
             self._last_publish_time = time.time()
-            
+
             # V7: Optional CRC32 logging
             crc32 = None
             if self.config.enable_crc32_logging:
                 crc32 = calculate_crc32(frame_data)
-            
+
             # Structured logging - use debug for regular frames, info for milestones
             if seq % 100 == 0:
                 log_fields = {
@@ -939,54 +948,52 @@ class SpoolProcessorNode(Node):
                     **log_fields
                 )
                 logger.debug(pub_msg)
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"[SpoolProcessor] Error publishing frame: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             return False
-    
-
 
     def _processor_loop(self):
         """
         Main processing loop - ACK-free continuous publishing.
         """
         logger.info("[SpoolProcessor] Processing loop started")
-        
+
         # Call the ACK-free loop directly
         self._processor_loop_ack_free()
-        
+
         logger.info("[SpoolProcessor] Processing loop stopped")
-    
+
     def _processor_loop_ack_free(self):
         """
         V6/V7/V9 ACK-Free Processing Loop (Production-Grade).
-        
+
         This loop processes frames continuously without waiting for ACKs:
         1. Read frame from spool
         2. Publish immediately
         3. Pace to target_fps (adaptive) using tick-based scheduling
         4. Never block
-        
+
         V7 Additions:
         - Spool lag computation and warnings
         - Watchdog for stalled publishing (using monotonic time)
         - Adaptive pacing on high lag (optional)
-        
+
         V9 Improvements:
         - Robust tick-based pacing with next_deadline
         - Performance profiling (optional)
         - Fixed pacing calculation to exclude sleep from processing time
-        
+
         Benefits:
         - No deadlocks (impossible)
         - Maximum throughput
         - Stable latency
         - Production-safe
-        
+
         The consumer processes frames at its own pace. Retention guards
         protect unprocessed data from deletion.
         """
@@ -998,35 +1005,35 @@ class SpoolProcessorNode(Node):
             delete_processed_segments=self.config.delete_processed_segments,
             perf_logging=self.config.enable_perf_logging
         ))
-        
+
         # Use monotonic time for pacing and watchdog
         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
         last_watchdog_check = time.monotonic()
-        
+
         # V9: Tick-based pacing with next_deadline
         next_deadline = time.monotonic() + frame_interval
-        
+
         # V8: Pre-calculate minimum interval (avoid division in tight loop)
         min_interval_sec = self.config.min_frame_interval_ms / 1000.0
-        
+
         with self._state_lock:
             self._state = ProcessorRunState.PUBLISHING
-        
+
         while self._running:
             try:
                 loop_start = time.monotonic()
                 current_monotonic = loop_start
-                
+
                 # V9: Profiling - measure list_segments time
                 t_list_segments_start = time.monotonic()
-                
+
                 # V7: Compute spool lag
                 segments = self._reader.list_segments()
                 newest_segment = max(segments) if segments else None
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
-                
+
                 if self.config.enable_perf_logging:
                     self._perf_time_list_segments += (time.monotonic() - t_list_segments_start) * 1000.0
 
@@ -1034,7 +1041,7 @@ class SpoolProcessorNode(Node):
                 if self.config.enable_adaptive_pacing:
                     old_fps = self._current_target_fps
                     old_interval = frame_interval
-                    
+
                     if spool_lag < DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD:
                         # HEALTHY: < 10 segments - RELAX and save resources
                         target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 15 FPS
@@ -1057,7 +1064,7 @@ class SpoolProcessorNode(Node):
                     if abs(self._current_target_fps - target_fps) > ADAPTIVE_FPS_CHANGE_THRESHOLD:
                         self._current_target_fps = target_fps
                         frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
-                        
+
                         # V9: Reset next_deadline to avoid drift when changing FPS
                         next_deadline = time.monotonic() + frame_interval
 
@@ -1071,7 +1078,7 @@ class SpoolProcessorNode(Node):
                             new_fps=f"{self._current_target_fps:.1f}",
                             new_interval_ms=f"{frame_interval * 1000:.1f}"
                         ))
-                
+
                 # V7: Watchdog - check for stalled publishing (using monotonic time)
                 if current_monotonic - last_watchdog_check > 10.0:  # Check every 10 seconds
                     if self._last_publish_time > 0:
@@ -1091,16 +1098,16 @@ class SpoolProcessorNode(Node):
                                 min_interval=10.0
                             )
                     last_watchdog_check = current_monotonic
-                
+
                 # V9: Profiling - measure get_next_frame time
                 t_get_frame_start = time.monotonic()
-                
+
                 # Get next frame
                 frame = self._get_next_frame()
-                
+
                 if self.config.enable_perf_logging:
                     self._perf_time_get_next_frame += (time.monotonic() - t_get_frame_start) * 1000.0
-                
+
                 if frame is None:
                     # Spool is empty, wait and retry
                     with self._state_lock:
@@ -1112,22 +1119,22 @@ class SpoolProcessorNode(Node):
                     # V9: Reset deadline after long sleep
                     next_deadline = time.monotonic() + frame_interval
                     continue
-                
+
                 self._current_frame = frame
                 self._current_frame_index = frame.index
-                
+
                 # V9: Profiling - measure publish_frame time
                 t_publish_start = time.monotonic()
-                
+
                 # Publish frame (no ACK wait)
                 success = self._publish_frame(frame)
-                
+
                 if self.config.enable_perf_logging:
                     self._perf_time_publish_frame += (time.monotonic() - t_publish_start) * 1000.0
-                
+
                 # V9: Tick-based pacing - calculate sleep time based on deadline
                 publish_end = time.monotonic()
-                
+
                 # Guard against negative or zero intervals
                 if frame_interval <= 0:
                     logger.error(
@@ -1137,10 +1144,10 @@ class SpoolProcessorNode(Node):
                     frame_interval = 0.025
                     self._current_target_fps = 40.0
                     next_deadline = publish_end + frame_interval
-                
+
                 # V9: Calculate sleep time to hit next_deadline
                 time_until_deadline = next_deadline - publish_end
-                
+
                 # Determine target sleep time
                 # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
                 if time_until_deadline <= 0:
@@ -1153,18 +1160,18 @@ class SpoolProcessorNode(Node):
                     # But if that would make us miss deadline, sleep less
                     target_sleep = time_until_deadline
 
-                # Make suret to wait for MIN_WAITING_FPS to prevent CPU overload
-                time.sleep(max(target_sleep, MIN_WAITING_FPS))
-                
+                if target_sleep > 0:
+                    time.sleep(target_sleep)
+
                 # V9: Update next_deadline for next frame (tick-based scheduling)
                 next_deadline += frame_interval
-                
+
                 # V9: If we're significantly behind schedule, reset deadline to current time
                 now = time.monotonic()
                 if now > next_deadline + frame_interval * MAX_FRAMES_BEHIND_BEFORE_RESET:
                     # We're more than MAX_FRAMES_BEHIND_BEFORE_RESET frames behind - reset to avoid buildup
                     next_deadline = now + frame_interval
-                
+
                 if success:
                     with self._stats_lock:
                         self._frames_processed += 1
@@ -1172,20 +1179,20 @@ class SpoolProcessorNode(Node):
                     with self._stats_lock:
                         self._frames_skipped += 1
                     logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
-                
+
                 # V9: Performance profiling
                 if self.config.enable_perf_logging:
                     loop_end = time.monotonic()
                     self._perf_time_total_loop += (loop_end - loop_start) * 1000.0
                     self._perf_frame_count += 1
-                    
+
                     # Log performance metrics periodically
                     if time.time() - self._last_perf_log_time >= self.config.perf_log_interval_sec:
                         self._log_performance_metrics()
-                
+
                 # Log stats periodically
                 self._maybe_log_stats()
-                
+
             except Exception as e:
                 logger.error(f"[SpoolProcessor] Error in ACK-free loop: {e}")
                 import traceback
@@ -1193,34 +1200,32 @@ class SpoolProcessorNode(Node):
                 time.sleep(0.1)
                 # V9: Reset deadline after error
                 next_deadline = time.monotonic() + frame_interval
-    
-
 
     def _log_performance_metrics(self):
         """
         Log performance metrics for profiling (V9).
-        
+
         Logs average timing for:
         - list_segments
         - get_next_frame
         - publish_frame
         - total_loop
-        
+
         Also logs computed effective FPS and current adaptive target.
         """
         if self._perf_frame_count == 0:
             return
-        
+
         # Calculate averages
         avg_list_segments = self._perf_time_list_segments / self._perf_frame_count
         avg_get_next_frame = self._perf_time_get_next_frame / self._perf_frame_count
         avg_publish_frame = self._perf_time_publish_frame / self._perf_frame_count
         avg_total_loop = self._perf_time_total_loop / self._perf_frame_count
-        
+
         # Calculate effective FPS based on actual time elapsed
         time_elapsed = time.time() - self._last_perf_log_time
         effective_fps = self._perf_frame_count / time_elapsed if time_elapsed > 0 else 0.0
-        
+
         # Log performance metrics
         logger.info(format_structured_log(
             "[SpoolProcessor] 📊 Performance Metrics",
@@ -1233,7 +1238,7 @@ class SpoolProcessorNode(Node):
             avg_publish_frame_ms=f"{avg_publish_frame:.2f}",
             avg_total_loop_ms=f"{avg_total_loop:.2f}"
         ))
-        
+
         # Reset counters
         self._perf_frame_count = 0
         self._perf_time_list_segments = 0.0
@@ -1242,11 +1247,10 @@ class SpoolProcessorNode(Node):
         self._perf_time_total_loop = 0.0
         self._last_perf_log_time = time.time()
 
-
     def _maybe_log_stats(self):
         """Log statistics periodically with structured format (V7)."""
         current_time = time.time()
-        
+
         # Regular stats every 10 seconds
         if current_time - self._last_stats_time >= self.config.stats_interval:
             with self._stats_lock:
@@ -1256,12 +1260,12 @@ class SpoolProcessorNode(Node):
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
-                
+
                 # V8: Get segments deleted from retention policy
                 segments_deleted = 0
                 if self._retention_policy is not None:
                     segments_deleted = self._retention_policy.segments_deleted_by_processing
-                
+
                 # V8.2: Get cache statistics for performance monitoring
                 cache_stats = self._reader.get_cache_stats()
 
@@ -1282,7 +1286,7 @@ class SpoolProcessorNode(Node):
                     cache_hit_rate=f"{cache_stats['hit_rate_pct']:.1f}%"
                 )
                 logger.info(stats_msg)
-                
+
                 # Log spool status with lag
                 spool_msg = format_structured_log(
                     "[SpoolProcessor] Spool",
@@ -1292,7 +1296,7 @@ class SpoolProcessorNode(Node):
                     spool_lag=spool_lag,
                 )
                 logger.info(spool_msg)
-                
+
                 # V8.2: Log cache performance (only when cache misses occur to avoid spam)
                 if cache_stats['misses'] > 0:
                     cache_msg = format_structured_log(
@@ -1319,9 +1323,9 @@ class SpoolProcessorNode(Node):
                         threshold=self.config.spool_lag_warn_threshold
                     )
                     logger.warning(f"[SpoolProcessor] {lag_msg}")
-            
+
             self._last_stats_time = current_time
-        
+
         # Detailed stats every 2 minutes (120 seconds)
         if current_time - self._last_detailed_stats_time >= 120.0:
             with self._stats_lock:
@@ -1329,12 +1333,12 @@ class SpoolProcessorNode(Node):
                 segments = self._reader.list_segments()
                 oldest_segment = self._reader.get_oldest_segment()
                 newest_segment = max(segments) if segments else None
-                
+
                 # Calculate spool lag: difference between newest and current segment
                 spool_lag = 0
                 if newest_segment is not None and self._current_segment >= 0:
                     spool_lag = newest_segment - self._current_segment
-                
+
                 # V7.2: Log recorder vs processor lag with RECORDER_LAG keyword (every 2 minutes)
                 if newest_segment is not None and self._current_segment >= 0:
                     # Estimate time lag (assuming ~5s per segment average)
@@ -1361,7 +1365,7 @@ class SpoolProcessorNode(Node):
                             processor_segment=self._current_segment,
                             lag_segments=0
                         ))
-                
+
                 logger.info("=" * 80)
                 logger.info(f"[SpoolProcessor] 📊 Detailed Statistics (2-minute summary)")
                 logger.info(f"  Session: {self._session_id}")
@@ -1375,21 +1379,22 @@ class SpoolProcessorNode(Node):
                 logger.info(f"    - Oldest segment: {oldest_segment}")
                 logger.info(f"    - Newest segment: {newest_segment}")
                 logger.info(f"    - Spool lag: {spool_lag} segments")
-                
+
                 # Warn if spool is falling behind (lag > 10 segments = ~50 seconds at 5s/segment)
                 if spool_lag > 10:
                     logger.warning(f"  ⚠ SPOOL LAG WARNING: Processor is {spool_lag} segments behind!")
                     logger.warning(f"     Recording is ahead by ~{spool_lag * 5}s. Processing too slow!")
-                    logger.warning(f"     Consider: reducing ACK timeout, increasing processing speed, or checking consumer.")
+                    logger.warning(
+                        f"     Consider: reducing ACK timeout, increasing processing speed, or checking consumer.")
                 elif spool_lag > 5:
                     logger.warning(f"  ⚠ SPOOL LAG NOTICE: Processor is {spool_lag} segments behind (borderline)")
                 else:
                     logger.info(f"  ✓ Spool lag is healthy ({spool_lag} segments)")
-                
+
                 logger.info("=" * 80)
-            
+
             self._last_detailed_stats_time = current_time
-    
+
     def get_state(self) -> ProcessorRunState:
         """Get current processor state."""
         with self._state_lock:
@@ -1401,29 +1406,29 @@ def main():
     logger.info("=" * 60)
     logger.info("  Spool Processor Node - Accuracy Mode")
     logger.info("=" * 60)
-    
+
     if not IS_RDK:
         logger.error("[SpoolProcessor] This node requires RDK platform with ROS2")
         logger.info("[SpoolProcessor] Running in stub mode for testing")
-    
+
     # Initialize ROS2
     if IS_RDK:
         rclpy.init()
-    
+
     # Create and start node
     node = SpoolProcessorNode()
     node.start()
-    
+
     # Setup signal handlers for clean shutdown
     shutdown_event = threading.Event()
-    
+
     def signal_handler(signum, frame):
         logger.info(f"[SpoolProcessor] Received signal {signum}, shutting down...")
         shutdown_event.set()
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     # Spin ROS2
     if IS_RDK:
         try:
@@ -1444,7 +1449,7 @@ def main():
             pass
         finally:
             node.stop()
-    
+
     logger.info("[SpoolProcessor] Shutdown complete")
 
 
