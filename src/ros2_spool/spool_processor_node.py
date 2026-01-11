@@ -116,6 +116,7 @@ DEFAULT_TARGET_FPS = 25.0  # V8.1: Increased from 20 to 30 FPS to keep up with r
 DEFAULT_ADAPTIVE_FPS_MAX = 28.0  # High lag state - catch up (~28ms intervals)
 MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
 ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
+MIN_WAITING_FPS = 0.020  # Sleep for 10 ms minimum each time.
 
 @dataclass
 class ProcessorConfig:
@@ -1144,16 +1145,16 @@ class SpoolProcessorNode(Node):
                 # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
                 if time_until_deadline <= 0:
                     # We're behind schedule - don't sleep at all to catch up
-                    target_sleep = 10 # sleep minimum 10 ms to prevent CPU overload.
+                    target_sleep = 0
                 else:
                     # We're ahead of schedule - sleep to hit deadline
                     # Never sleep MORE than time_until_deadline (would miss deadline)
                     # Prefer to sleep at least min_interval_sec (to prevent CPU spinning)
                     # But if that would make us miss deadline, sleep less
                     target_sleep = time_until_deadline
-                
-                if target_sleep > 0:
-                    time.sleep(target_sleep)
+
+                # Make suret to wait for MIN_WAITING_FPS to prevent CPU overload
+                time.sleep(max(target_sleep, MIN_WAITING_FPS))
                 
                 # V9: Update next_deadline for next frame (tick-based scheduling)
                 next_deadline += frame_interval
