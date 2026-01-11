@@ -285,9 +285,12 @@ class BidirectionalSmoother:
         
         # Check if this is an Uncertain or Unknown label (needs special handling)
         is_uncertain = self._is_uncertain_label(center_event.label)
-        
+
+        # NEW: Check if this is a gray zone classification (also needs special handling)
+        is_gray_zone = center_event.event_data.get('metadata', {}).get('is_gray_zone', False)
+
         # High confidence - bypass context check (EXCEPT for Uncertain/Unknown)
-        if center_event.confidence >= self.confidence_threshold and not is_uncertain:
+        if center_event.confidence >= self.confidence_threshold and not is_uncertain and not is_gray_zone:
             center_event.validated = True
             center_event.smoothing_reason = "high_confidence_trusted"
             self._stats['validated_events'] += 1
@@ -303,10 +306,17 @@ class BidirectionalSmoother:
         # Low confidence - use context to validate
         prev_context = [self._buffer[i] for i in range(self.center_index)]
         next_context = [self._buffer[i] for i in range(self.center_index + 1, len(self._buffer))]
-        
+
+        if is_gray_zone:
+            logger.debug(
+                f"[BidirectionalSmoother] Event {center_event.event_id}:  Gray zone classification "
+                f"({center_event.label}, conf={center_event.confidence:.3f}) → forcing context check"
+            )
+
         # Analyze context (with special handling for Uncertain/Unknown)
+        force_override = is_uncertain or is_gray_zone  # NEW: Gray zone also forces context check
         smoothed_label, smoothing_reason, agreement_ratio = self._analyze_context(
-            center_event, prev_context, next_context, force_override_uncertain=is_uncertain
+            center_event, prev_context, next_context, force_override_uncertain=force_override
         )
         
         was_smoothed = smoothed_label and smoothed_label != center_event.label

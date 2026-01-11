@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 20
+    commit_idle_frames: int = 12
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -1101,7 +1101,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    suppression_duration_frames: int = 20
+    suppression_duration_frames: int = 10
     """
     Frames to suppress new events after a commit (frame-based threshold).
     
@@ -1190,7 +1190,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.5)
+    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.0)
     """
     Multiplier for bag diagonal when calculating adaptive suppression distance.
     
@@ -1245,7 +1245,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 14
+    temporal_cooldown_frames: int = 8
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
@@ -1749,6 +1749,35 @@ class TrackingConfig:
     Only applies to CLOSED state ROIs.
     
     Default: 11000.0 (pixels²) - UPDATED from 8500.0 based on production logs
+    """
+
+    # === Gray Zone Confidence Penalties ===
+
+    disambiguation_gray_zone_penalty_homography: float = 0.75
+    """
+    Confidence penalty for gray zone classifications with homography. 
+
+    Gray zone indicates ambiguous size.  Penalty ensures confidence is low enough
+    to trigger bidirectional smoother's batch-context resolution. 
+
+    Range: 0.6-0.85
+    - Lower: More aggressive, ensures context override
+    - Higher: More conservative, trusts size measurement more
+
+    Default: 0.75 (25% penalty)
+    """
+
+    disambiguation_gray_zone_penalty_pixel: float = 0.65
+    """
+    Confidence penalty for gray zone classifications with pixel fallback. 
+
+    Pixel measurements are less reliable than homography, so penalty is more aggressive.
+
+    Range: 0.5-0.75
+    - Lower: More aggressive batch-context influence
+    - Higher: More trust in pixel-based size
+
+    Default: 0.65 (35% penalty)
     """
 
     penalty_for_roi_in_gray_zone: float = 0.3
@@ -3141,6 +3170,8 @@ def get_event_config():
         disambiguation_small_threshold=tracking_config.disambiguation_small_threshold,
         disambiguation_regular_threshold=tracking_config.disambiguation_regular_threshold,
         penalty_for_roi_in_gray_zone=tracking_config.penalty_for_roi_in_gray_zone,
+        disambiguation_gray_zone_penalty_homography=tracking_config.disambiguation_gray_zone_penalty_homography,
+        disambiguation_gray_zone_penalty_pixel=tracking_config.disambiguation_gray_zone_penalty_pixel,
         
         # Classification voting
         min_voting_agreement_pct=tracking_config.voting_agreement_threshold_pct,

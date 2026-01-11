@@ -113,7 +113,7 @@ DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
 DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 15  # Between 10-25 = normal pace
 DEFAULT_ADAPTIVE_FPS_RELAXED = 20.0  # Healthy state - save resources
 DEFAULT_TARGET_FPS = 25.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
-DEFAULT_ADAPTIVE_FPS_MAX = 35.0  # High lag state - catch up (~28ms intervals)
+DEFAULT_ADAPTIVE_FPS_MAX = 28.0  # High lag state - catch up (~28ms intervals)
 MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
 ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
 
@@ -1144,7 +1144,7 @@ class SpoolProcessorNode(Node):
                 # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
                 if time_until_deadline <= 0:
                     # We're behind schedule - don't sleep at all to catch up
-                    target_sleep = 0
+                    target_sleep = 10 # sleep minimum 10 ms to prevent CPU overload.
                 else:
                     # We're ahead of schedule - sleep to hit deadline
                     # Never sleep MORE than time_until_deadline (would miss deadline)

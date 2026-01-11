@@ -341,6 +341,8 @@ class EventConfig:
     disambiguation_small_threshold: float = 8200
     disambiguation_regular_threshold: float = 10_000
     penalty_for_roi_in_gray_zone: float = 0.2
+    disambiguation_gray_zone_penalty_homography: float = 0.75
+    disambiguation_gray_zone_penalty_pixel: float =0.65
 
     # ==========================================================================
     # Classification Voting Parameters

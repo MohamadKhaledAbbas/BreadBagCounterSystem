@@ -471,10 +471,38 @@ def disambiguate_v2(
             original_label, size_metadata, target_classes, homography_used
         )
         confidence_tier = 'low'  # Gray zone is always low confidence
+
+        # NEW: Mark as gray zone for bidirectional smoother
+        metadata['is_gray_zone'] = True
+        metadata['gray_zone_original_confidence'] = confidence
     
     # Step 6: Apply minimal confidence penalty only for pixel fallback + gray zone
     final_confidence = confidence
-    if not homography_used and size_bin == 'gray_zone':
+
+    if size_bin == 'gray_zone':
+        # NEW: Gray zone should ALWAYS trigger bidirectional smoother's batch context
+        # Use aggressive penalty to ensure confidence < 0.90 (bidirectional threshold)
+
+        if homography_used:
+            # Homography gray zone:  moderate penalty (homography is more reliable)
+            penalty_factor = getattr(config, 'disambiguation_gray_zone_penalty_homography', 0.75)
+        else:
+            # Pixel gray zone: aggressive penalty (less reliable)
+            penalty_factor = getattr(config, 'disambiguation_gray_zone_penalty_pixel', 0.65)
+
+        final_confidence = confidence * penalty_factor
+
+        # Safety cap:  ensure below bidirectional threshold
+        bidirectional_threshold = getattr(config, 'bidirectional_confidence_threshold', 0.90)
+        safety_margin = 0.05
+        final_confidence = min(final_confidence, bidirectional_threshold - safety_margin)
+
+        logger.debug(
+            f"[Disambiguation V2] Gray zone confidence adjusted:  "
+            f"{confidence:.3f} → {final_confidence:.3f} (penalty={penalty_factor}, "
+            f"bidirectional_threshold={bidirectional_threshold})"
+        )
+    elif not homography_used and size_bin != 'gray_zone':
         # Only apply penalty when using pixel fallback in gray zone
         penalty_factor = getattr(config, 'disambiguation_confidence_penalty', 0.9)
         final_confidence = confidence * penalty_factor
