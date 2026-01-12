@@ -1190,7 +1190,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.0)
+    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.5)
     """
     Multiplier for bag diagonal when calculating adaptive suppression distance.
     
@@ -1245,7 +1245,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 8
+    temporal_cooldown_frames: int = 12
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
@@ -1303,7 +1303,7 @@ class TrackingConfig:
     Default: 60.0
     """
     
-    active_event_exclusion_iou: float = 0.25
+    active_event_exclusion_iou: float = 0.4
     """
     IoU threshold for active event spatial exclusion.
     
@@ -1450,7 +1450,7 @@ class TrackingConfig:
     Default: 3
     """
     
-    min_closed_evidence_count: int = 2
+    min_closed_evidence_count: int = 3
     """
     Minimum closed detections required for CLOSED state.
     
