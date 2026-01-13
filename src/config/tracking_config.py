@@ -307,6 +307,21 @@ class TrackingConfig:
     Default: 0.5
     """
     
+    min_total_evidence_score: float = 0.3
+    """
+    DEPRECATED: This parameter is unused in the current implementation.
+    
+    Evidence accumulation uses margin-based decision (winner vs runner-up margin)
+    rather than absolute evidence score threshold.Log-evidence scores are negative,
+    making this positive threshold meaningless.
+    
+    See stability_margin_threshold for the actual decision threshold used.
+    
+    Kept for backward compatibility. Will be removed in future version.
+    
+    Default: 0.3 (unused)
+    """
+
     evidence_ratio_threshold: float = 1.5
     """
     Minimum ratio of winner score to runner-up score for acceptance.
@@ -952,6 +967,15 @@ class TrackingConfig:
     # Ghost Event Parameters (G from requirements)
     # --------------------------------------------------------------------------
     
+    ghost_timeout_ms: Optional[float] = None
+    """
+    G: Time (milliseconds) to keep event alive without detections (DEPRECATED - use ghost_timeout_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     ghost_timeout_frames: int = 40
     """
     G: Frames to keep event alive without detections (frame-based threshold).
@@ -1068,6 +1092,15 @@ class TrackingConfig:
     Default: 120.0 (reduced from 150.0 for tighter suppression zone)
     """
     
+    suppression_duration_ms: Optional[float] = None
+    """
+    Duration (milliseconds) to suppress new events after a commit (DEPRECATED - use suppression_duration_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     suppression_duration_frames: int = 10
     """
     Frames to suppress new events after a commit (frame-based threshold).
@@ -1203,6 +1236,15 @@ class TrackingConfig:
     # Temporal Cooldown for New Event Creation
     # --------------------------------------------------------------------------
     
+    min_event_creation_interval_ms: Optional[float] = None
+    """
+    Minimum time (milliseconds) before allowing new event creation at same location (DEPRECATED - use temporal_cooldown_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     temporal_cooldown_frames: int = 10
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
@@ -1302,7 +1344,16 @@ class TrackingConfig:
     # --------------------------------------------------------------------------
     # State Transition Temporal Stability
     # --------------------------------------------------------------------------
-    
+
+    open_to_closing_time_ms: Optional[float] = None
+    """
+    Minimum time (milliseconds) in OPEN state before transitioning to CLOSING (DEPRECATED - use open_to_closing_frames).
+
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+
+    Default: None (use frame-based threshold instead)
+    """
+
     min_open_duration_ms: float = 500.0
     """
     Minimum duration (milliseconds) an event must remain in OPEN state before transitioning to CLOSING.
@@ -1332,6 +1383,15 @@ class TrackingConfig:
     Default: 3 frames @ 25fps = 120ms
     """
     
+    closing_stability_time_ms: Optional[float] = None
+    """
+    Time (milliseconds) closed detections must persist for CLOSED state (DEPRECATED - use closing_stability_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     closing_stability_frames: int = 4
     """
     Frames closed detections must persist for CLOSED state (frame-based threshold).
@@ -1342,6 +1402,15 @@ class TrackingConfig:
     Default: 4 frames @ 25fps = 160ms
     """
     
+    closed_stability_time_ms: Optional[float] = None
+    """
+    Minimum time (milliseconds) in CLOSED state before COMMIT is eligible (DEPRECATED - use closed_stability_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     closed_stability_frames: int = 5
     """
     Minimum frames in CLOSED state before COMMIT is eligible (frame-based threshold).
@@ -1414,6 +1483,15 @@ class TrackingConfig:
     # Max Event Lifetime (Force Expiration)
     # --------------------------------------------------------------------------
     
+    max_event_lifetime_ms: Optional[float] = None
+    """
+    Maximum lifetime for an event in milliseconds (DEPRECATED - use max_event_lifetime_frames).
+    
+    For migration compatibility only. If provided, will be converted to frames using target_fps.
+    
+    Default: None (use frame-based threshold instead)
+    """
+
     max_event_lifetime_frames: int = 250
     """
     Maximum lifetime for an event in frames (frame-based threshold).
@@ -3041,10 +3119,12 @@ def get_event_config():
         require_centroid_proximity_for_expanded_iou=tracking_config.require_centroid_proximity_for_expanded_iou,
         max_centroid_distance_for_expanded_iou=tracking_config.max_centroid_distance_for_expanded_iou,
         
-        # Ghost (G) - frame-based
+        # Ghost (G) - frame-based with ms migration
+        ghost_timeout_ms=tracking_config.ghost_timeout_ms,
         ghost_timeout_frames=tracking_config.ghost_timeout_frames,
         
-        # Max event lifetime - frame-based
+        # Max event lifetime - frame-based with ms migration
+        max_event_lifetime_ms=tracking_config.max_event_lifetime_ms,
         max_event_lifetime_frames=tracking_config.max_event_lifetime_frames,
         max_open_state_frames=tracking_config.max_open_state_frames,
         max_closing_state_frames=tracking_config.max_closing_state_frames,
@@ -3056,6 +3136,7 @@ def get_event_config():
         
         # Anti-double-counting suppression - frame-based
         suppression_distance_px=tracking_config.suppression_distance_px,
+        suppression_duration_ms=tracking_config.suppression_duration_ms,
         suppression_duration_frames=tracking_config.suppression_duration_frames,
         suppression_require_box_overlap=tracking_config.suppression_require_box_overlap,
         suppression_iou_threshold=tracking_config.suppression_iou_threshold,
@@ -3065,7 +3146,8 @@ def get_event_config():
         suppression_min_distance_px=tracking_config.suppression_min_distance_px,
         suppression_max_distance_px=tracking_config.suppression_max_distance_px,
         
-        # Temporal cooldown for new event creation - frame-based
+        # Temporal cooldown for new event creation - frame-based with ms migration
+        min_event_creation_interval_ms=tracking_config.min_event_creation_interval_ms,
         temporal_cooldown_frames=tracking_config.temporal_cooldown_frames,
         temporal_cooldown_distance_px=tracking_config.temporal_cooldown_distance_px,
         
@@ -3078,8 +3160,11 @@ def get_event_config():
         
         # State transition timing - frame-based with new min_open_duration_ms
         min_open_duration_ms=tracking_config.min_open_duration_ms,
+        open_to_closing_time_ms=tracking_config.open_to_closing_time_ms,
         open_to_closing_frames=tracking_config.open_to_closing_frames,
+        closing_stability_time_ms=tracking_config.closing_stability_time_ms,
         closing_stability_frames=tracking_config.closing_stability_frames,
+        closed_stability_time_ms=tracking_config.closed_stability_time_ms,
         closed_stability_frames=tracking_config.closed_stability_frames,
         centroid_stability_px=tracking_config.centroid_stability_px,
         

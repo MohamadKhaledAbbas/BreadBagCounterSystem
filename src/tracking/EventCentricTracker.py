@@ -214,6 +214,7 @@ class EventConfig:
     # ==========================================================================
     # Ghost Event Parameters (G from requirements)
     # ==========================================================================
+    ghost_timeout_ms: Optional[float] = None  # G: Keep event alive without detections (deprecated - use frames)
     ghost_timeout_frames: int = 25  # Frame-based ghost timeout (default 25 frames @ 25fps = 1000ms)
     
     # ==========================================================================
@@ -230,6 +231,7 @@ class EventConfig:
     # These parameters prevent new events from being created for a bag that was
     # temporarily lost then re-detected after commitment.
     suppression_distance_px: float = 100.0   # Distance within which new events are suppressed (reduced from 150.0)
+    suppression_duration_ms: Optional[float] = None  # Duration to suppress (deprecated - use frames)
     suppression_duration_frames: int = 38  # Frame-based suppression duration (38 frames @ 25fps = 1500ms)
     
     # Conditional suppression (Issue #3 fix)
@@ -270,6 +272,7 @@ class EventConfig:
     # Temporal Cooldown for New Event Creation
     # ==========================================================================
     # Prevents rapid event creation at the same location after commitment
+    min_event_creation_interval_ms: Optional[float] = None  # Deprecated - use frames
     temporal_cooldown_frames: int = 10  # Frame-based cooldown (10 frames @ 25fps = 400ms)
     """Minimum frames before allowing new event creation at same location after commit."""
     
@@ -296,9 +299,12 @@ class EventConfig:
     # ==========================================================================
     # State Transition Parameters (temporal stability)
     # ==========================================================================
+    open_to_closing_time_ms: Optional[float] = None  # Deprecated - use frames
     min_open_duration_ms: float = 500.0  # Min duration in OPEN before allowing CLOSING (500ms = human-scale)
     open_to_closing_frames: int = 3  # Min frames in OPEN before CLOSING (3 frames @ 25fps = 120ms)
+    closing_stability_time_ms: Optional[float] = None  # Deprecated - use frames
     closing_stability_frames: int = 4  # Closed detections must persist (4 frames @ 25fps = 160ms)
+    closed_stability_time_ms: Optional[float] = None  # Deprecated - use frames
     closed_stability_frames: int = 5  # Min frames in CLOSED before COMMIT eligible (5 frames @ 25fps = 200ms)
     
     # Geometric stability thresholds
@@ -353,6 +359,7 @@ class EventConfig:
     # ==========================================================================
     # Max Event Lifetime (Force Expiration) - Stuck Event Fail-safe
     # ==========================================================================
+    max_event_lifetime_ms: Optional[float] = None  # Deprecated - use frames
     max_event_lifetime_frames: int = 250  # Max frames event can exist (250 @ 25fps = 10 seconds)
     """
     Maximum lifetime for an event in frames.
@@ -526,20 +533,78 @@ class EventConfig:
     
     def __post_init__(self):
         """
-        Post-initialization validation.
+        Post-initialization to handle migration compatibility.
         
-        Since deprecated _ms parameters have been removed, this now only performs
-        basic validation of the configuration.
+        1. If any _ms parameters are provided (not None), convert them to frame-based
+           equivalents and log the conversion for transparency.
+        2. If any _ms parameters are None (deprecated), compute them from frame-based
+           equivalents to ensure all code paths have valid values.
         """
-        # Basic validation
-        if self.target_fps <= 0:
-            raise ValueError(f"target_fps must be positive, got {self.target_fps}")
+        ms_per_frame = 1000.0 / self.target_fps
+        conversions = []
+
+        # Ghost timeout conversion (bidirectional)
+        if self.ghost_timeout_ms is not None:
+            frames = int(round(self.ghost_timeout_ms / ms_per_frame))
+            self.ghost_timeout_frames = frames
+            conversions.append(f"ghost_timeout: {self.ghost_timeout_ms}ms → {frames} frames")
+        else:
+            # Compute ms from frames (for backward compatibility)
+            self.ghost_timeout_ms = self.ghost_timeout_frames * ms_per_frame
+
+        # Suppression duration conversion (bidirectional)
+        if self.suppression_duration_ms is not None:
+            frames = int(round(self.suppression_duration_ms / ms_per_frame))
+            self.suppression_duration_frames = frames
+            conversions.append(f"suppression_duration: {self.suppression_duration_ms}ms → {frames} frames")
+        else:
+            self.suppression_duration_ms = self.suppression_duration_frames * ms_per_frame
+
+        # Temporal cooldown conversion (bidirectional)
+        if self.min_event_creation_interval_ms is not None:
+            frames = int(round(self.min_event_creation_interval_ms / ms_per_frame))
+            self.temporal_cooldown_frames = frames
+            conversions.append(f"temporal_cooldown: {self.min_event_creation_interval_ms}ms → {frames} frames")
+        else:
+            self.min_event_creation_interval_ms = self.temporal_cooldown_frames * ms_per_frame
         
-        # Log configuration for debugging
-        logger.info(
-            f"[EventConfig] Initialized with target_fps={self.target_fps}, "
-            f"min_open_duration_ms={self.min_open_duration_ms}ms"
-        )
+        # State transition timeouts (bidirectional)
+        if self.open_to_closing_time_ms is not None:
+            frames = int(round(self.open_to_closing_time_ms / ms_per_frame))
+            self.open_to_closing_frames = frames
+            conversions.append(f"open_to_closing: {self.open_to_closing_time_ms}ms → {frames} frames")
+        else:
+            self.open_to_closing_time_ms = self.open_to_closing_frames * ms_per_frame
+
+        if self.closing_stability_time_ms is not None:
+            frames = int(round(self.closing_stability_time_ms / ms_per_frame))
+            self.closing_stability_frames = frames
+            conversions.append(f"closing_stability: {self.closing_stability_time_ms}ms → {frames} frames")
+        else:
+            self.closing_stability_time_ms = self.closing_stability_frames * ms_per_frame
+
+        if self.closed_stability_time_ms is not None:
+            frames = int(round(self.closed_stability_time_ms / ms_per_frame))
+            self.closed_stability_frames = frames
+            conversions.append(f"closed_stability: {self.closed_stability_time_ms}ms → {frames} frames")
+        else:
+            self.closed_stability_time_ms = self.closed_stability_frames * ms_per_frame
+
+        # Max event lifetime conversion (bidirectional)
+        if self.max_event_lifetime_ms is not None:
+            frames = int(round(self.max_event_lifetime_ms / ms_per_frame))
+            self.max_event_lifetime_frames = frames
+            conversions.append(f"max_event_lifetime: {self.max_event_lifetime_ms}ms → {frames} frames")
+        else:
+            self.max_event_lifetime_ms = self.max_event_lifetime_frames * ms_per_frame
+
+        # Log conversions if any were performed
+        if conversions:
+            logger.info(
+                f"[EventConfig] Converted time-based thresholds to frame-based (target_fps={self.target_fps}):"
+            )
+            for conv in conversions:
+                logger.info(f"  - {conv}")
 
 
 @dataclass
@@ -2382,26 +2447,47 @@ class EventCentricTracker:
         the tracker. The scaled values ensure that timing logic behaves equivalently
         in testing mode (slower processing) and production mode (real-time).
         
-        For frame-based parameters, we derive the ms value using target_fps and then
-        apply scaling. This ensures consistent behavior regardless of processing speed.
+        For deprecated *_ms parameters that may be None, we derive the ms value
+        from frame-based parameters using target_fps.
         """
         scale = self._time_scale_factor
         ms_per_frame = 1000.0 / self.config.target_fps
         
+        # Helper to get ms value: use provided ms if not None, else derive from frames
+        def get_ms_value(ms_value, frame_value):
+            if ms_value is not None:
+                return ms_value * scale
+            return frame_value * ms_per_frame * scale
+
         # Association and ghost timeouts
         self._scaled_association_time_ms = self.config.association_time_ms * scale
-        self._scaled_ghost_timeout_ms = self.config.ghost_timeout_frames * ms_per_frame * scale
-        self._scaled_max_event_lifetime_ms = self.config.max_event_lifetime_frames * ms_per_frame * scale
+        self._scaled_ghost_timeout_ms = get_ms_value(
+            self.config.ghost_timeout_ms, self.config.ghost_timeout_frames
+        )
+        self._scaled_max_event_lifetime_ms = get_ms_value(
+            self.config.max_event_lifetime_ms, self.config.max_event_lifetime_frames
+        )
         
-        # Suppression and cooldown - derive from frames
-        self._scaled_suppression_duration_ms = self.config.suppression_duration_frames * ms_per_frame * scale
-        self._scaled_min_event_creation_interval_ms = self.config.temporal_cooldown_frames * ms_per_frame * scale
+        # Suppression and cooldown
+        self._scaled_suppression_duration_ms = get_ms_value(
+            self.config.suppression_duration_ms, self.config.suppression_duration_frames
+        )
+        self._scaled_min_event_creation_interval_ms = get_ms_value(
+            self.config.min_event_creation_interval_ms, self.config.temporal_cooldown_frames
+        )
         
         # State transition timing - derive from frames, plus new min_open_duration_ms
         self._scaled_min_open_duration_ms = self.config.min_open_duration_ms * scale
-        self._scaled_open_to_closing_time_ms = self.config.open_to_closing_frames * ms_per_frame * scale
-        self._scaled_closing_stability_time_ms = self.config.closing_stability_frames * ms_per_frame * scale
-        self._scaled_closed_stability_time_ms = self.config.closed_stability_frames * ms_per_frame * scale
+        # State transition timing
+        self._scaled_open_to_closing_time_ms = get_ms_value(
+            self.config.open_to_closing_time_ms, self.config.open_to_closing_frames
+        )
+        self._scaled_closing_stability_time_ms = get_ms_value(
+            self.config.closing_stability_time_ms, self.config.closing_stability_frames
+        )
+        self._scaled_closed_stability_time_ms = get_ms_value(
+            self.config.closed_stability_time_ms, self.config.closed_stability_frames
+        )
         
         # Velocity and prediction (max_prediction_time_ms is always set, not deprecated)
         self._scaled_max_prediction_time_ms = self.config.max_prediction_time_ms * scale
@@ -2429,7 +2515,13 @@ class EventCentricTracker:
         return replace(
             self.config,
             association_time_ms=self._scaled_association_time_ms,
-            min_open_duration_ms=self._scaled_min_open_duration_ms,
+            ghost_timeout_ms=self._scaled_ghost_timeout_ms,
+            max_event_lifetime_ms=self._scaled_max_event_lifetime_ms,
+            suppression_duration_ms=self._scaled_suppression_duration_ms,
+            min_event_creation_interval_ms=self._scaled_min_event_creation_interval_ms,
+            open_to_closing_time_ms=self._scaled_open_to_closing_time_ms,
+            closing_stability_time_ms=self._scaled_closing_stability_time_ms,
+            closed_stability_time_ms=self._scaled_closed_stability_time_ms,
             max_prediction_time_ms=self._scaled_max_prediction_time_ms,
             min_gap_duration_for_logging_ms=self._scaled_min_gap_duration_for_logging_ms,
         )
