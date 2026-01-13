@@ -1245,7 +1245,7 @@ class TrackingConfig:
     Default: None (use frame-based threshold instead)
     """
     
-    temporal_cooldown_frames: int = 12
+    temporal_cooldown_frames: int = 10
     """
     Minimum frames before allowing new event creation at same location (frame-based threshold).
     
@@ -1303,7 +1303,7 @@ class TrackingConfig:
     Default: 60.0
     """
     
-    active_event_exclusion_iou: float = 0.4
+    active_event_exclusion_iou: float = 0.20
     """
     IoU threshold for active event spatial exclusion.
     
