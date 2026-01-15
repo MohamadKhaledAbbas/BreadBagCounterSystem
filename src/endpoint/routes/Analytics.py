@@ -37,7 +37,7 @@ def build_consecutive_runs_with_noise(ordered_events: List[Dict]) -> List[Dict]:
     """
     runs = []
     noise_count = 0
-    noise_threshold = 5
+    noise_threshold = 10
     noise_start = None
     noise_end = None
     current = None

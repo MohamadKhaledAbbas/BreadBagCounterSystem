@@ -3012,7 +3012,7 @@ class TrackingConfig:
     # These parameters control saving all ROI candidates with metadata for
     # post-analysis, model improvement, and debugging.
     
-    save_roi_candidates: bool = _parse_bool_env("SAVE_ROI_CANDIDATES", True)
+    save_roi_candidates: bool = _parse_bool_env("SAVE_ROI_CANDIDATES", False)
     """
     Enable/disable saving all ROI candidates with metadata.
     
