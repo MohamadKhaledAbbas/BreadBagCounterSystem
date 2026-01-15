@@ -79,8 +79,8 @@ class AppConfig:
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
     detection_model: str = os.getenv(
         "DETECTION_MODEL",
-        "data/model/detect_yolo_small_v8_bayese_640x640_nv12.bin" if IS_RDK
-        else "data/model/detect_yolo_small_v8.pt"
+        "data/model/detect_yolo_small_v9_bayese_640x640_nv12.bin" if IS_RDK
+        else "data/model/detect_yolo_small_v9.pt"
     )
     classification_model: str = os.getenv(
         "CLASS_MODEL",
