@@ -44,6 +44,9 @@ class FrameServer(Node, FrameSource):
             topic,
             self.listener_callback,
             qos_profile_sensor_data)
+        
+        # Initialize ACK publisher for flow control
+        self.ack_publisher = self.create_publisher(String, '/spool_ack', 10)
 
         # Buffer more frames to reduce frame drops
         # V3 Performance: Increased from 10 to 30 for better burst handling (1.2s buffer @ 25fps)
@@ -135,9 +138,10 @@ class FrameServer(Node, FrameSource):
             nv12_data = nv12_img.copy()  # Copy to ensure data persists after message is released
             t_nv12_copy_end = time.perf_counter()
             
-            # Still convert to BGR for visualization, classification, and other components
+            # V7 Performance: Defer BGR conversion to logic thread to unblock subscriber
+            # This prevents blocking the ROS 2 callback, avoiding frame drops on "Best Effort" QoS
             t_bgr_start = time.perf_counter()
-            bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
+            bgr = None  # Deferred to main application thread
             t_bgr_end = time.perf_counter()
         except Exception as e:
             self.get_logger().error(f"Frame conversion error: {e}")
@@ -177,13 +181,22 @@ class FrameServer(Node, FrameSource):
                 pass
         
         # Enqueue new frame
-        spool_frame_index = 0
+        # V7: Extract frame index from message, fallback to frames_received
+        spool_frame_index = getattr(msg, 'index', self.frames_received)
         
         # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
         # Frame format: (bgr, latency_ms, spool_frame_index, nv12_data, (height, width))
         # Attach spool_frame_index to frame data - it travels through pipeline with this frame
         frame_size = (msg.height, msg.width)
         self.frame_queue.put((bgr, latency_ms, spool_frame_index, nv12_data, frame_size))
+        
+        # V7: Publish ACK to enable flow control from spool processor
+        try:
+            ack_msg = String()
+            ack_msg.data = str(spool_frame_index)
+            self.ack_publisher.publish(ack_msg)
+        except Exception as e:
+            logger.warning(f"[Ros2FrameServer] Failed to publish ACK: {e}")
 
     def frames(self):
         """

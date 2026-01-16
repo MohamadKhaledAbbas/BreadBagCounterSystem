@@ -1250,6 +1250,12 @@ class BagCounterApp:
                     nv12_data = None
                     frame_size = None
                 
+                # V7 Performance: Deferred BGR conversion
+                # Handle frames where BGR conversion was deferred from ROS 2 subscriber
+                # to avoid blocking the callback thread
+                if frame is None and nv12_data is not None:
+                    frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                
                 t_extract_end = time.perf_counter()
                 
                 frame_count += 1
