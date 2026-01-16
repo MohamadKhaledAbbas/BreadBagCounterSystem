@@ -66,6 +66,7 @@ if IS_RDK:
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
     from img_msgs.msg import H26XFrame
     from builtin_interfaces.msg import Time
+    from std_msgs.msg import Int32  # V10: For ACK messages
 else:
     # Stub for non-RDK development
     class Node:
@@ -154,13 +155,15 @@ class ProcessorConfig:
 
 def load_default_config() -> ProcessorConfig:
     """Load spool processor configuration from database config table."""
-    from src.config.tracking_config import tracking_config
+    # Import tracking_config here to avoid circular import
+    # This module is imported by tracking_config indirectly via spool utilities
+    from src.config.tracking_config import tracking_config as tc
     
     return ProcessorConfig(
         spool_dir_path=DEFAULT_SPOOL_DIR,
         target_fps=DEFAULT_TARGET_FPS,
-        ack_mode_enabled=tracking_config.spool_ack_mode_enabled,
-        ack_timeout_ms=tracking_config.spool_ack_timeout_ms,
+        ack_mode_enabled=tc.spool_ack_mode_enabled,
+        ack_timeout_ms=tc.spool_ack_timeout_ms,
     )
 
 
@@ -310,8 +313,6 @@ class SpoolProcessorNode(Node):
 
             # V10: ACK mode - subscribe to ACK topic
             if self.config.ack_mode_enabled:
-                from std_msgs.msg import Int32
-                
                 # ACK QoS - reliable for guaranteed delivery
                 ack_qos = QoSProfile(
                     reliability=QoSReliabilityPolicy.RELIABLE,

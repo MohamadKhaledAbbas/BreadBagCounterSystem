@@ -90,7 +90,10 @@ class BpuDetector(BaseDetector):
         elif frame is not None:
             orig_shape = frame.shape
         else:
-            raise ValueError("Either frame or (nv12_data, frame_size) must be provided")
+            raise ValueError(
+                "Either provide 'frame' parameter, or both 'nv12_data' and 'frame_size' parameters. "
+                "When using NV12 optimization, frame_size must be a tuple of (height, width)."
+            )
         
         # 1. Preprocess (Resize + optionally skip BGR2NV12 if NV12 provided)
         t_preprocess_start = cv2.getTickCount()

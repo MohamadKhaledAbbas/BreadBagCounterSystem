@@ -1240,10 +1240,12 @@ class BagCounterApp:
                 
                 # V7 Optimization: Extract NV12 data and optional BGR frame from packet
                 # BGR conversion is done lazily only when needed for visualization or classification
+                spool_frame_index = None  # V10: For ACK correlation
                 if isinstance(frame_packet, dict):
                     nv12_data = frame_packet.get('nv12_data')
                     bgr_frame = frame_packet.get('bgr_frame')  # May be None (V7 format)
                     frame_size = frame_packet.get('frame_size')
+                    spool_frame_index = frame_packet.get('spool_frame_index')  # V10: For ACK
                     
                     # Legacy support: check for 'frame' key (old format)
                     if bgr_frame is None and 'frame' in frame_packet:
@@ -1258,8 +1260,13 @@ class BagCounterApp:
                 def get_bgr_frame():
                     nonlocal bgr_frame
                     if bgr_frame is None and nv12_data is not None and frame_size is not None:
-                        # Convert NV12 to BGR on-demand
-                        bgr_frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                        try:
+                            # Convert NV12 to BGR on-demand
+                            bgr_frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                        except cv2.error as e:
+                            logger.error(f"[BagCounterApp] Failed to convert NV12 to BGR: {e}")
+                            # Return None to signal conversion failure
+                            return None
                     return bgr_frame
                 
                 # For detection, we use NV12 directly if available, otherwise BGR
@@ -1639,8 +1646,10 @@ class BagCounterApp:
                         
                         # V10: Publish ACK after monitor update (frame is fully processed)
                         # This signals to the spool processor that it can publish the next frame
+                        # Use spool_frame_index if available for proper correlation, otherwise fallback to frame_count
                         if hasattr(self.frame_source, 'publish_frame_ack'):
-                            self.frame_source.publish_frame_ack(frame_count)
+                            ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                            self.frame_source.publish_frame_ack(ack_index)
                         
                         # Track frames processed in degraded mode for statistics
                         if in_degraded_mode:
@@ -1968,7 +1977,8 @@ class BagCounterApp:
                     frame_packet = {
                         'nv12_data': nv12_data,
                         'bgr_frame': bgr_frame,  # May be None (V7 format) or pre-computed (legacy)
-                        'frame_size': frame_size
+                        'frame_size': frame_size,
+                        'spool_frame_index': spool_frame_index  # V10: For ACK correlation
                     }
                     try:
                         self.input_queue.put_nowait(frame_packet)
