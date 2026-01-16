@@ -880,8 +880,9 @@ class SpoolProcessorNode(Node):
         # Clear the event before waiting
         self._ack_received.clear()
         
-        # Wait for ACK with timeout
-        ack_received = self._ack_received.wait(timeout=self.config.ack_timeout_ms / 1000.0)
+        # Wait for ACK with timeout (convert ms to seconds for Event.wait())
+        timeout_sec = self.config.ack_timeout_ms / 1000.0
+        ack_received = self._ack_received.wait(timeout=timeout_sec)
         
         if not ack_received:
             self._ack_timeout_count += 1

@@ -3072,7 +3072,7 @@ class TrackingConfig:
     """
     
     # ==========================================================================
-    # V7 Spool Processor ACK Mode Configuration
+    # V10 Spool Processor ACK Mode Configuration
     # ==========================================================================
     
     spool_ack_mode_enabled: bool = _parse_bool_env("SPOOL_ACK_MODE_ENABLED", False)
