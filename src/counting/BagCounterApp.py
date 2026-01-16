@@ -1254,7 +1254,16 @@ class BagCounterApp:
                 # Handle frames where BGR conversion was deferred from ROS 2 subscriber
                 # to avoid blocking the callback thread
                 if frame is None and nv12_data is not None:
-                    frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                    try:
+                        frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                    except Exception as e:
+                        logger.error(f"[BagCounterApp] Failed to convert NV12 to BGR: {e}")
+                        continue
+                
+                # Validate that we have a valid frame to process
+                if frame is None:
+                    logger.warning("[BagCounterApp] Received frame packet with no valid frame data, skipping")
+                    continue
                 
                 t_extract_end = time.perf_counter()
                 

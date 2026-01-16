@@ -182,6 +182,8 @@ class FrameServer(Node, FrameSource):
         
         # Enqueue new frame
         # V7: Extract frame index from message, fallback to frames_received
+        # Note: msg.index is expected when using spool processor for frame publishing.
+        # If not present (e.g., direct camera feed), we use frames_received as fallback.
         spool_frame_index = getattr(msg, 'index', self.frames_received)
         
         # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
@@ -196,7 +198,7 @@ class FrameServer(Node, FrameSource):
             ack_msg.data = str(spool_frame_index)
             self.ack_publisher.publish(ack_msg)
         except Exception as e:
-            logger.warning(f"[Ros2FrameServer] Failed to publish ACK: {e}")
+            logger.warning(f"[Ros2FrameServer] Failed to publish ACK for frame {spool_frame_index}: {e}")
 
     def frames(self):
         """
