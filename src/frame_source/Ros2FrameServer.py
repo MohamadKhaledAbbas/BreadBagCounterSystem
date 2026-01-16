@@ -12,7 +12,6 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy,
 from std_msgs.msg import String, Int32
 
 from src.config.settings import AppConfig
-from src.config.tracking_config import tracking_config
 from src.frame_source.FrameSource import FrameSource
 from src.logging.Database import DatabaseManager
 from src import constants
@@ -55,6 +54,8 @@ class FrameServer(Node, FrameSource):
         self.target_fps = target_fps
         
         # V10: ACK mode configuration and publisher
+        # Import tracking_config locally to avoid circular import issues
+        from src.config.tracking_config import tracking_config
         self.ack_mode_enabled = tracking_config.spool_ack_mode_enabled
         self._ack_publisher = None
         if self.ack_mode_enabled:

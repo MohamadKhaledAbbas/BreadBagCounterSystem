@@ -1430,6 +1430,10 @@ class BagCounterApp:
                     # V7: Ensure we have BGR frame for batch inference
                     if frame is None and nv12_data is not None:
                         frame = get_bgr_frame()
+                        if frame is None:
+                            # BGR conversion failed - skip this frame
+                            logger.warning(f"[BagCounterApp] Skipping frame {frame_count}: BGR conversion failed for batch inference")
+                            continue
                     
                     self._frame_batch.append(frame)
                     self._batch_frame_data.append((frame, frame_count))
@@ -1554,6 +1558,11 @@ class BagCounterApp:
                     # This is deferred until AFTER detection to optimize the hot path
                     if frame is None and nv12_data is not None:
                         frame = get_bgr_frame()
+                        if frame is None:
+                            # BGR conversion failed - skip this frame (detection already done)
+                            # Log and continue to next frame
+                            logger.warning(f"[BagCounterApp] Skipping frame {frame_count} post-detection: BGR conversion failed")
+                            continue
                     
                     # V6: Accumulate timing stats
                     _logic_timing_stats['queue_dequeue'] += (t_dequeue_end - t_dequeue_start) * 1000
