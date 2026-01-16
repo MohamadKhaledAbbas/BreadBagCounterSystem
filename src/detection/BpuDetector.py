@@ -66,10 +66,11 @@ class BpuDetector(BaseDetector):
         """
         Predict detections on a frame.
         
-        V5 Optimization: Accepts optional NV12 data to skip BGR→NV12 conversion.
+        V7 Optimization: Now supports NV12-only input (no BGR required for detection).
+        When nv12_data and frame_size are provided, frame can be None.
         
         Args:
-            frame: BGR numpy array (required for postprocessing with original shape)
+            frame: BGR numpy array (optional if nv12_data and frame_size provided)
             nv12_data: Optional raw NV12 numpy array for direct BPU input (skips color conversion)
             frame_size: Optional tuple (height, width) of original frame (required if nv12_data provided)
         
@@ -81,6 +82,15 @@ class BpuDetector(BaseDetector):
 
         # Phase 3: Add detailed timing logs for CPU operations
         t_start = cv2.getTickCount()
+        
+        # V7: Determine original frame shape for postprocessing
+        if nv12_data is not None and frame_size is not None:
+            # Use provided frame_size (height, width)
+            orig_shape = (frame_size[0], frame_size[1], 3)  # (height, width, channels)
+        elif frame is not None:
+            orig_shape = frame.shape
+        else:
+            raise ValueError("Either frame or (nv12_data, frame_size) must be provided")
         
         # 1. Preprocess (Resize + optionally skip BGR2NV12 if NV12 provided)
         t_preprocess_start = cv2.getTickCount()
@@ -104,9 +114,9 @@ class BpuDetector(BaseDetector):
         # 3. Convert to Numpy
         output_arrays = [out.buffer for out in outputs]
 
-        # 4. Post-Process (Decode)
+        # 4. Post-Process (Decode) - V7: Use orig_shape instead of frame.shape
         t_postprocess_start = cv2.getTickCount()
-        results = self._postprocess(output_arrays, x_scale, y_scale, x_shift, y_shift, frame.shape)
+        results = self._postprocess(output_arrays, x_scale, y_scale, x_shift, y_shift, orig_shape)
         t_postprocess_end = cv2.getTickCount()
         postprocess_time_ms = (t_postprocess_end - t_postprocess_start) * 1000 / cv2.getTickFrequency()
         
