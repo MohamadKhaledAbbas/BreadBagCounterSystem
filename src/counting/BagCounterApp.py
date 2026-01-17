@@ -1128,15 +1128,6 @@ class BagCounterApp:
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
                 
-                # V10/V11: Publish ACK after monitor update (legacy mode)
-                # Only publish here if spool_ack_on_input_queue is False
-                # When spool_ack_on_input_queue is True, ACK is published in run() method
-                # immediately after frame is enqueued
-                if not tracking_config.spool_ack_on_input_queue:
-                    if hasattr(self.frame_source, 'publish_frame_ack'):
-                        ack_index = spool_frame_index if spool_frame_index is not None else frame_count
-                        self.frame_source.publish_frame_ack(ack_index)
-                
                 # Track degraded mode state for ROI saving
                 in_degraded_mode = self._degraded_mode_active
                 
@@ -1810,15 +1801,6 @@ class BagCounterApp:
                         monitor_end = time.perf_counter()
                         monitor_time = (monitor_end - monitor_start) * 1000
                         
-                        # V10/V11: Publish ACK after monitor update (legacy mode)
-                        # Only publish here if spool_ack_on_input_queue is False
-                        # When spool_ack_on_input_queue is True, ACK is published in run() method
-                        # immediately after frame is enqueued
-                        if not tracking_config.spool_ack_on_input_queue:
-                            if hasattr(self.frame_source, 'publish_frame_ack'):
-                                ack_index = spool_frame_index if spool_frame_index is not None else frame_count
-                                self.frame_source.publish_frame_ack(ack_index)
-                        
                         # Track frames processed in degraded mode for statistics
                         if in_degraded_mode:
                             self._frames_processed_in_degraded += 1
@@ -2189,13 +2171,6 @@ class BagCounterApp:
                                     f"[BagCounterApp] Frame {frame_count} dropped: "
                                     f"queue refilled by another thread (total drops: {drops})"
                                 )
-                    
-                    # V11: Publish ACK immediately after frame is put in input queue
-                    # This provides faster ACK response to spool processor while
-                    # still guaranteeing the frame is safely buffered
-                    if frame_enqueued and tracking_config.spool_ack_on_input_queue:
-                        if hasattr(self.frame_source, 'publish_frame_ack') and spool_frame_index is not None:
-                            self.frame_source.publish_frame_ack(spool_frame_index)
                     
                     current_time = time.perf_counter()
                     if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:

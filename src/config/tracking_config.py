@@ -3325,79 +3325,6 @@ class TrackingConfig:
     Default: False
     """
     
-    # --------------------------------------------------------------------------
-    # Spool ACK Mode Configuration
-    # --------------------------------------------------------------------------
-    
-    spool_ack_mode_enabled: bool = _parse_bool_env("SPOOL_ACK_MODE_ENABLED", False)
-    """
-    Enable ACK-based frame publishing mode for spool processor.
-    
-    When True: Spool processor waits for ACK from logic thread before publishing next frame
-    When False: ACK-free mode - publish at adaptive rate without waiting (default)
-    
-    ACK-based mode provides:
-    - Guaranteed frame processing (no frame drops)
-    - Flow control between spool processor and consumer
-    - Better for debugging and accuracy testing
-    
-    ACK-free mode provides:
-    - Higher throughput
-    - Lower latency
-    - Better for production with high FPS requirements
-    
-    Environment: SPOOL_ACK_MODE_ENABLED=false
-    Default: False (ACK-free mode for production)
-    """
-    
-    spool_ack_timeout_ms: float = _parse_float_env("SPOOL_ACK_TIMEOUT_MS", 1000.0)
-    """
-    Timeout in milliseconds to wait for ACK before publishing next frame.
-    
-    Only used when spool_ack_mode_enabled is True.
-    If no ACK is received within this timeout, the processor will:
-    1. Log a warning
-    2. Continue to next frame (to avoid deadlock)
-    
-    Range: 100 - 5000
-    Default: 1000 (1 second)
-    """
-    
-    spool_ack_window_size: int = _parse_int_env("SPOOL_ACK_WINDOW_SIZE", 10)
-    """
-    Number of frames allowed in-flight before blocking for ACK (windowed ACK mode).
-    
-    This implements a sliding window protocol similar to TCP:
-    - Processor can publish up to this many frames ahead without ACK
-    - Once window is full, processor waits for ACK before publishing more
-    - Provides pipelined processing with flow control
-    
-    Higher values: Better throughput, more latency tolerance, more memory usage
-    Lower values: Stricter flow control, better for slow consumers
-    
-    Recommended values:
-    - 1: Strict mode (wait for each frame - slowest but guaranteed order)
-    - 5-10: Balanced mode (good throughput with flow control)
-    - 20+: High throughput mode (minimizes blocking)
-    
-    Range: 1 - 50
-    Default: 10 (balanced mode - allows ~10 frames in decoder pipeline)
-    """
-    
-    spool_ack_pacing_fps: float = _parse_float_env("SPOOL_ACK_PACING_FPS", 0.0)
-    """
-    Target FPS for ACK-based pacing (optional rate limiting).
-    
-    When > 0: Pace frame publishing to this FPS even in ACK mode
-    When 0: No pacing - publish as fast as window allows (backpressure only)
-    
-    This combines ACK-based flow control with rate limiting for smoother processing.
-    Set to match or slightly exceed expected consumer processing rate.
-    
-    Range: 0 (disabled), or 10.0 - 60.0 FPS
-    Default: 0.0 (disabled - pure backpressure mode)
-    """
-    
     # ==========================================================================
     # V11 Spool-Aware Degraded Mode Configuration
     # ==========================================================================
@@ -3452,24 +3379,6 @@ class TrackingConfig:
     
     Range: 1.0 - 30.0 seconds
     Default: 5.0 seconds (typical segment duration)
-    """
-    
-    spool_ack_on_input_queue: bool = _parse_bool_env("SPOOL_ACK_ON_INPUT_QUEUE", True)
-    """
-    Publish ACK immediately after frame is put in input queue (not after processing).
-    
-    When True: ACK is published as soon as frame is successfully enqueued
-               This allows spool processor to continue publishing at a higher rate
-    When False: ACK is published after monitor thread processes the frame (legacy)
-               This provides flow control based on actual processing capacity
-    
-    Enterprise-grade recommendation: True
-    - Faster ACK response reduces spool processor waiting
-    - Queue provides natural backpressure
-    - Frames are safely buffered in input queue
-    
-    Environment: SPOOL_ACK_ON_INPUT_QUEUE=true
-    Default: True
     """
 
 
