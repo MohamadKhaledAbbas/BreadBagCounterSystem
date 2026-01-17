@@ -64,8 +64,6 @@ if IS_RDK:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-    from rclpy.executors import MultiThreadedExecutor
-    from rclpy.callback_groups import ReentrantCallbackGroup
     from img_msgs.msg import H26XFrame
     from builtin_interfaces.msg import Time
     from std_msgs.msg import Int32  # V10: For ACK messages
@@ -79,15 +77,6 @@ else:
         def create_subscription(self, *args, **kwargs): pass
 
         def create_publisher(self, *args, **kwargs): return MockPublisher()
-    
-    class MultiThreadedExecutor:
-        def __init__(self, num_threads=2): pass
-        def add_node(self, node): pass
-        def spin(self): pass
-        def shutdown(self): pass
-    
-    class ReentrantCallbackGroup:
-        pass
 
         def destroy_node(self): pass
 
@@ -337,17 +326,12 @@ class SpoolProcessorNode(Node):
                 self._ack_timeout_count = 0
                 self._ack_success_count = 0
                 
-                # V10: Use ReentrantCallbackGroup to allow ACK callbacks to be processed
-                # even when other callbacks are running. This requires MultiThreadedExecutor.
-                self._ack_callback_group = ReentrantCallbackGroup() if IS_RDK else None
-                
                 # Subscribe to ACK topic from logic thread
                 self._ack_sub = self.create_subscription(
                     Int32,
                     '/frame_ack',
                     self._ack_callback,
-                    ack_qos,
-                    callback_group=self._ack_callback_group
+                    ack_qos
                 )
                 
                 logger.info("[SpoolProcessor] ROS2 topics configured (ACK-BASED MODE): "
@@ -1335,15 +1319,8 @@ class SpoolProcessorNode(Node):
         3. Wait for ACK (with timeout)
         4. Repeat
         
-        Benefits:
-        - Guaranteed frame processing (no drops due to consumer lag)
-        - Flow control between producer and consumer
-        - Better for debugging and accuracy testing
-        
-        Drawbacks:
-        - Lower throughput than ACK-free mode
-        - Higher latency
-        - Potential for deadlock if consumer crashes (timeout prevents this)
+        The spool processor publishes at the rate the consumer can process -
+        pure backpressure-based flow control without adaptive pacing.
         """
         logger.info(format_structured_log(
             "[SpoolProcessor] ACK-BASED mode active",
@@ -1351,43 +1328,11 @@ class SpoolProcessorNode(Node):
             delete_processed_segments=self.config.delete_processed_segments
         ))
 
-        # Use monotonic time for watchdog
-        last_watchdog_check = time.monotonic()
-
         with self._state_lock:
             self._state = ProcessorRunState.PUBLISHING
 
         while self._running:
             try:
-                loop_start = time.monotonic()
-                current_monotonic = loop_start
-
-                # Compute spool lag
-                segments = self._reader.list_segments()
-                newest_segment = max(segments) if segments else None
-                spool_lag = 0
-                if newest_segment is not None and self._current_segment >= 0:
-                    spool_lag = newest_segment - self._current_segment
-
-                # Watchdog check
-                if current_monotonic - last_watchdog_check > 10.0:
-                    if self._last_publish_time > 0:
-                        stalled_time = time.time() - self._last_publish_time
-                        if stalled_time > self.config.watchdog_timeout:
-                            watchdog_msg = format_structured_log(
-                                "🔴 WATCHDOG: No frames published recently",
-                                stalled_seconds=f"{stalled_time:.1f}",
-                                threshold=self.config.watchdog_timeout
-                            )
-                            throttled_log(
-                                logger.error,
-                                f"[SpoolProcessor] {watchdog_msg}",
-                                key="watchdog",
-                                throttle_dict=self._throttle_log_dict,
-                                min_interval=10.0
-                            )
-                    last_watchdog_check = current_monotonic
-
                 # Get next frame
                 frame = self._get_next_frame()
 
@@ -1411,7 +1356,8 @@ class SpoolProcessorNode(Node):
                     with self._stats_lock:
                         self._frames_processed += 1
                     
-                    # V10: Wait for ACK before publishing next frame
+                    # Wait for ACK before publishing next frame
+                    # This provides backpressure - spool processor publishes at consumer speed
                     ack_received = self._wait_for_ack(frame.index)
                     if not ack_received:
                         logger.debug(f"[SpoolProcessor] ACK timeout for frame {frame.index}, continuing")
@@ -1659,28 +1605,13 @@ def main():
 
     # Spin ROS2
     if IS_RDK:
-        # V10: Use MultiThreadedExecutor for ACK-based mode to allow callbacks
-        # to be processed while the processor thread is waiting for ACK
-        executor = MultiThreadedExecutor(num_threads=2)
-        executor.add_node(node)
-        
-        spin_thread = None
         try:
-            # Spin in a separate thread so we can check shutdown_event
-            spin_thread = threading.Thread(target=executor.spin, daemon=True)
-            spin_thread.start()
-            
-            # Wait for shutdown signal
             while not shutdown_event.is_set():
-                time.sleep(0.1)
-                
+                # Short timeout for responsive ACK processing
+                rclpy.spin_once(node, timeout_sec=0.01)
         except KeyboardInterrupt:
             pass
         finally:
-            executor.shutdown()
-            # Wait for spin thread to complete gracefully
-            if spin_thread is not None and spin_thread.is_alive():
-                spin_thread.join(timeout=2.0)
             node.stop()
             node.destroy_node()
             rclpy.shutdown()
