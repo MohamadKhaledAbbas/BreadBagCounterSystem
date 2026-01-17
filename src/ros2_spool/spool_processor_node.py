@@ -64,6 +64,8 @@ if IS_RDK:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.callback_groups import ReentrantCallbackGroup
     from img_msgs.msg import H26XFrame
     from builtin_interfaces.msg import Time
     from std_msgs.msg import Int32  # V10: For ACK messages
@@ -77,6 +79,15 @@ else:
         def create_subscription(self, *args, **kwargs): pass
 
         def create_publisher(self, *args, **kwargs): return MockPublisher()
+    
+    class MultiThreadedExecutor:
+        def __init__(self, num_threads=2): pass
+        def add_node(self, node): pass
+        def spin(self): pass
+        def shutdown(self): pass
+    
+    class ReentrantCallbackGroup:
+        pass
 
         def destroy_node(self): pass
 
@@ -320,18 +331,23 @@ class SpoolProcessorNode(Node):
                     depth=5
                 )
                 
-                # ACK tracking
-                self._ack_received = threading.Event()
+                # ACK tracking using threading.Condition for proper synchronization
+                self._ack_condition = threading.Condition()
                 self._last_ack_frame_index = -1
-                self._ack_lock = threading.Lock()
                 self._ack_timeout_count = 0
+                self._ack_success_count = 0
+                
+                # V10: Use ReentrantCallbackGroup to allow ACK callbacks to be processed
+                # even when other callbacks are running. This requires MultiThreadedExecutor.
+                self._ack_callback_group = ReentrantCallbackGroup() if IS_RDK else None
                 
                 # Subscribe to ACK topic from logic thread
                 self._ack_sub = self.create_subscription(
                     Int32,
                     '/frame_ack',
                     self._ack_callback,
-                    ack_qos
+                    ack_qos,
+                    callback_group=self._ack_callback_group
                 )
                 
                 logger.info("[SpoolProcessor] ROS2 topics configured (ACK-BASED MODE): "
@@ -855,12 +871,15 @@ class SpoolProcessorNode(Node):
         Called when the logic thread signals that it has processed a frame.
         This allows the spool processor to publish the next frame.
         
+        Uses threading.Condition for proper thread synchronization.
+        
         Args:
             msg: Int32 message containing the acknowledged frame index
         """
-        with self._ack_lock:
+        with self._ack_condition:
             self._last_ack_frame_index = msg.data
-            self._ack_received.set()
+            self._ack_success_count += 1
+            self._ack_condition.notify_all()
         
         logger.debug(f"[SpoolProcessor] Received ACK for frame index {msg.data}")
 
@@ -868,9 +887,8 @@ class SpoolProcessorNode(Node):
         """
         V10: Wait for ACK from logic thread before publishing next frame.
         
-        Note: The ACK event should be cleared BEFORE publishing the frame
-        (in _processor_loop_ack_based), not here. This prevents a race condition
-        where the ACK arrives between publish and clear.
+        Uses threading.Condition for proper synchronization between the
+        processor thread (waiting) and the callback thread (signaling).
         
         Args:
             published_frame_index: Index of the frame we just published
@@ -881,9 +899,12 @@ class SpoolProcessorNode(Node):
         if not self.config.ack_mode_enabled:
             return True
         
-        # Wait for ACK with timeout (convert ms to seconds for Event.wait())
         timeout_sec = self.config.ack_timeout_ms / 1000.0
-        ack_received = self._ack_received.wait(timeout=timeout_sec)
+        
+        with self._ack_condition:
+            # Wait for ACK with timeout
+            # The condition will be notified by _ack_callback when ACK arrives
+            ack_received = self._ack_condition.wait(timeout=timeout_sec)
         
         if not ack_received:
             self._ack_timeout_count += 1
@@ -893,7 +914,8 @@ class SpoolProcessorNode(Node):
                     "[SpoolProcessor] ⚠ ACK timeout - continuing without ACK",
                     published_frame_index=published_frame_index,
                     timeout_ms=self.config.ack_timeout_ms,
-                    timeout_count=self._ack_timeout_count
+                    timeout_count=self._ack_timeout_count,
+                    success_count=self._ack_success_count
                 ),
                 key="ack_timeout",
                 throttle_dict=self._throttle_log_dict,
@@ -1382,11 +1404,6 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
 
-                # V10 Fix: Clear ACK event BEFORE publishing to avoid race condition
-                # If we clear after publish, the ACK might arrive between publish and clear,
-                # causing us to lose the ACK signal
-                self._ack_received.clear()
-
                 # Publish frame
                 success = self._publish_frame(frame)
 
@@ -1642,12 +1659,28 @@ def main():
 
     # Spin ROS2
     if IS_RDK:
+        # V10: Use MultiThreadedExecutor for ACK-based mode to allow callbacks
+        # to be processed while the processor thread is waiting for ACK
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        
+        spin_thread = None
         try:
+            # Spin in a separate thread so we can check shutdown_event
+            spin_thread = threading.Thread(target=executor.spin, daemon=True)
+            spin_thread.start()
+            
+            # Wait for shutdown signal
             while not shutdown_event.is_set():
-                rclpy.spin_once(node, timeout_sec=0.1)
+                time.sleep(0.1)
+                
         except KeyboardInterrupt:
             pass
         finally:
+            executor.shutdown()
+            # Wait for spin thread to complete gracefully
+            if spin_thread is not None and spin_thread.is_alive():
+                spin_thread.join(timeout=2.0)
             node.stop()
             node.destroy_node()
             rclpy.shutdown()
