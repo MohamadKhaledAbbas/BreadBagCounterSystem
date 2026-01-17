@@ -151,17 +151,59 @@ class ProcessorConfig:
     # V10: ACK-based mode
     ack_mode_enabled: bool = False  # When True, wait for ACK before publishing next frame
     ack_timeout_ms: float = 1000.0  # Timeout for ACK in milliseconds
+    # V11: Adaptive pacing thresholds (from tracking_config)
+    adaptive_fps_relaxed: float = DEFAULT_ADAPTIVE_FPS_RELAXED
+    adaptive_fps_max: float = DEFAULT_ADAPTIVE_FPS_MAX
+    spool_lag_healthy_threshold: int = DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD
+    spool_lag_normal_threshold: int = DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD
 
 
 def load_default_config() -> ProcessorConfig:
-    """Load spool processor configuration from database config table."""
+    """Load spool processor configuration from centralized tracking_config."""
     # Import tracking_config here to avoid circular import
-    # This module is imported by tracking_config indirectly via spool utilities
     from src.config.tracking_config import tracking_config as tc
     
     return ProcessorConfig(
-        spool_dir_path=DEFAULT_SPOOL_DIR,
-        target_fps=DEFAULT_TARGET_FPS,
+        # Directory and state
+        spool_dir_path=tc.spool_dir,
+        state_file=DEFAULT_STATE_FILE,
+        
+        # Pacing and FPS
+        target_fps=tc.spool_processor_target_fps,
+        poll_interval=tc.spool_processor_poll_interval,
+        stats_interval=tc.spool_processor_stats_interval,
+        min_frame_interval_ms=tc.spool_processor_min_frame_interval_ms,
+        
+        # SPS/PPS handling
+        prepend_sps_pps=tc.spool_processor_prepend_sps_pps,
+        
+        # Adaptive pacing
+        enable_adaptive_pacing=tc.spool_processor_enable_adaptive_pacing,
+        adaptive_fps_min=tc.spool_processor_adaptive_fps_min,
+        adaptive_fps_relaxed=tc.spool_processor_adaptive_fps_relaxed,
+        adaptive_fps_max=tc.spool_processor_adaptive_fps_max,
+        
+        # Lag thresholds
+        spool_lag_warn_threshold=tc.spool_lag_warn_threshold,
+        spool_lag_error_threshold=tc.spool_lag_error_threshold,
+        spool_lag_healthy_threshold=tc.spool_lag_healthy_threshold,
+        spool_lag_normal_threshold=tc.spool_lag_normal_threshold,
+        
+        # Watchdog
+        watchdog_timeout=tc.spool_processor_watchdog_timeout,
+        
+        # Segment deletion
+        delete_processed_segments=tc.spool_processor_delete_processed_segments,
+        
+        # Caching
+        segment_list_cache_interval=tc.spool_processor_segment_list_cache_interval,
+        
+        # Performance logging
+        enable_perf_logging=tc.spool_processor_enable_perf_logging,
+        perf_log_interval_sec=tc.spool_processor_perf_log_interval_sec,
+        enable_crc32_logging=tc.spool_processor_enable_crc32_logging,
+        
+        # ACK mode
         ack_mode_enabled=tc.spool_ack_mode_enabled,
         ack_timeout_ms=tc.spool_ack_timeout_ms,
     )
@@ -1150,21 +1192,21 @@ class SpoolProcessorNode(Node):
                     old_fps = self._current_target_fps
                     old_interval = frame_interval
 
-                    if spool_lag < DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD:
-                        # HEALTHY: < 10 segments - RELAX and save resources
-                        target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 15 FPS
+                    if spool_lag < self.config.spool_lag_healthy_threshold:
+                        # HEALTHY: System is caught up - RELAX and save resources
+                        target_fps = self.config.adaptive_fps_relaxed
                         mode_emoji = "😌"
                         mode_text = "RELAXED - System healthy, conserving resources"
 
-                    elif spool_lag <= DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD:
-                        # NORMAL: 10-25 segments - maintain default pace
-                        target_fps = DEFAULT_TARGET_FPS  # 30 FPS
+                    elif spool_lag <= self.config.spool_lag_normal_threshold:
+                        # NORMAL: Moderate lag - maintain default pace
+                        target_fps = self.config.target_fps
                         mode_emoji = "✅"
                         mode_text = "NORMAL - Maintaining default pace"
 
                     else:
-                        # HIGH LAG: > 25 segments - SPEED UP to catch up
-                        target_fps = DEFAULT_ADAPTIVE_FPS_MAX  # 35 FPS (~28ms intervals)
+                        # HIGH LAG: Falling behind - SPEED UP to catch up
+                        target_fps = self.config.adaptive_fps_max
                         mode_emoji = "🚀"
                         mode_text = "CATCHING UP - High lag detected"
 
@@ -1177,7 +1219,7 @@ class SpoolProcessorNode(Node):
                         next_deadline = time.monotonic() + frame_interval
 
                         # Choose appropriate log level based on mode
-                        log_func = logger.info if spool_lag < DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD else logger.warning
+                        log_func = logger.info if spool_lag < self.config.spool_lag_normal_threshold else logger.warning
 
                         log_func(format_structured_log(
                             f"[SpoolProcessor] {mode_emoji} Adaptive pacing: {mode_text}",

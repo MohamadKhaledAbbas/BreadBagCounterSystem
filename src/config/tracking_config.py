@@ -3072,8 +3072,262 @@ class TrackingConfig:
     """
     
     # ==========================================================================
-    # V10 Spool Processor ACK Mode Configuration
+    # V10/V11 Unified Spool Configuration
     # ==========================================================================
+    # These parameters control both spool_processor_node and spool_recorder_node.
+    # All spool-related configuration is centralized here for consistency.
+    
+    # --------------------------------------------------------------------------
+    # Common Spool Settings (used by both processor and recorder)
+    # --------------------------------------------------------------------------
+    
+    spool_dir: str = _parse_str_env(
+        "SPOOL_DIR",
+        "/home/sunrise/BreadCounting/data/spool" if IS_WINDOWS is False else "data/spool"
+    )
+    """
+    Directory for spool segment files.
+    
+    Both spool_processor and spool_recorder use this directory for:
+    - Storing recorded H.264 segment files
+    - Reading segments for playback
+    - Processor state file persistence
+    
+    Environment: SPOOL_DIR=/path/to/spool
+    Default: /home/sunrise/BreadCounting/data/spool (RDK) or data/spool (Windows)
+    """
+    
+    # --------------------------------------------------------------------------
+    # Spool Recorder Configuration
+    # --------------------------------------------------------------------------
+    
+    spool_segment_duration: float = _parse_float_env("SPOOL_SEGMENT_DURATION", 5.0)
+    """
+    Target segment duration in seconds for spool recorder.
+    
+    The recorder rotates to a new segment file after approximately this duration.
+    Actual duration may vary slightly due to IDR frame alignment.
+    
+    Range: 1.0 - 30.0 seconds
+    Default: 5.0 seconds
+    """
+    
+    spool_max_segment_duration: float = _parse_float_env("SPOOL_MAX_SEGMENT_DURATION", 10.0)
+    """
+    Maximum segment duration in seconds before forced rotation.
+    
+    If no IDR frame arrives within this time, the recorder forces segment rotation.
+    Should be larger than spool_segment_duration.
+    
+    Range: 5.0 - 60.0 seconds
+    Default: 10.0 seconds
+    """
+    
+    spool_retention_seconds: float = _parse_float_env("SPOOL_RETENTION_SECONDS", 180.0)
+    """
+    Maximum age of spool segments before automatic deletion.
+    
+    The retention policy deletes segments older than this threshold.
+    Should be long enough to handle processing delays but not waste disk space.
+    
+    Range: 60 - 3600 seconds (1 minute to 1 hour)
+    Default: 180.0 seconds (3 minutes)
+    """
+    
+    spool_recorder_queue_size: int = _parse_int_env("SPOOL_RECORDER_QUEUE_SIZE", 100)
+    """
+    Maximum size of the recorder's internal frame queue.
+    
+    Frames are buffered here before being written to disk.
+    Larger values handle burst loads better but use more memory.
+    
+    Range: 50 - 500
+    Default: 100
+    """
+    
+    spool_recorder_stats_interval: float = _parse_float_env("SPOOL_RECORDER_STATS_INTERVAL", 10.0)
+    """
+    Interval in seconds between recorder statistics log messages.
+    
+    Range: 5.0 - 60.0 seconds
+    Default: 10.0 seconds
+    """
+    
+    # --------------------------------------------------------------------------
+    # Spool Processor Configuration
+    # --------------------------------------------------------------------------
+    
+    spool_processor_target_fps: float = _parse_float_env("SPOOL_PROCESSOR_TARGET_FPS", 20.0)
+    """
+    Target frames per second for spool processor publishing.
+    
+    In ACK-free mode, the processor publishes at this rate.
+    Adaptive pacing may adjust this based on spool lag.
+    
+    Range: 10.0 - 60.0 FPS
+    Default: 20.0 FPS
+    """
+    
+    spool_processor_poll_interval: float = _parse_float_env("SPOOL_PROCESSOR_POLL_INTERVAL", 1.0)
+    """
+    Interval in seconds to poll for new segments when spool is empty.
+    
+    Range: 0.1 - 5.0 seconds
+    Default: 1.0 seconds
+    """
+    
+    spool_processor_stats_interval: float = _parse_float_env("SPOOL_PROCESSOR_STATS_INTERVAL", 10.0)
+    """
+    Interval in seconds between processor statistics log messages.
+    
+    Range: 5.0 - 60.0 seconds
+    Default: 10.0 seconds
+    """
+    
+    spool_processor_prepend_sps_pps: bool = _parse_bool_env("SPOOL_PROCESSOR_PREPEND_SPS_PPS", True)
+    """
+    Prepend cached SPS/PPS to first frame of each segment.
+    
+    This ensures decoder can initialize properly at segment boundaries.
+    
+    Default: True
+    """
+    
+    spool_processor_enable_adaptive_pacing: bool = _parse_bool_env("SPOOL_PROCESSOR_ENABLE_ADAPTIVE_PACING", True)
+    """
+    Enable adaptive FPS adjustment based on spool lag.
+    
+    When True: FPS adjusts automatically (relaxed when healthy, faster when behind)
+    When False: Fixed FPS mode
+    
+    Default: True
+    """
+    
+    spool_processor_adaptive_fps_min: float = _parse_float_env("SPOOL_PROCESSOR_ADAPTIVE_FPS_MIN", 20.0)
+    """
+    Minimum FPS for adaptive pacing (floor value).
+    
+    Range: 10.0 - 30.0 FPS
+    Default: 20.0 FPS
+    """
+    
+    spool_processor_adaptive_fps_relaxed: float = _parse_float_env("SPOOL_PROCESSOR_ADAPTIVE_FPS_RELAXED", 15.0)
+    """
+    Relaxed FPS when spool lag is healthy (conserve resources).
+    
+    Range: 10.0 - 25.0 FPS
+    Default: 15.0 FPS
+    """
+    
+    spool_processor_adaptive_fps_max: float = _parse_float_env("SPOOL_PROCESSOR_ADAPTIVE_FPS_MAX", 25.0)
+    """
+    Maximum FPS for adaptive pacing (catching up).
+    
+    Range: 20.0 - 60.0 FPS
+    Default: 25.0 FPS
+    """
+    
+    spool_processor_min_frame_interval_ms: float = _parse_float_env("SPOOL_PROCESSOR_MIN_FRAME_INTERVAL_MS", 25.0)
+    """
+    Minimum interval between frames in milliseconds.
+    
+    Prevents the processor from publishing too fast and overwhelming the consumer.
+    
+    Range: 10.0 - 100.0 ms
+    Default: 25.0 ms (40 FPS max)
+    """
+    
+    spool_processor_delete_processed_segments: bool = _parse_bool_env("SPOOL_PROCESSOR_DELETE_PROCESSED_SEGMENTS", True)
+    """
+    Delete segments immediately after processing to save disk space.
+    
+    When True: Segments are deleted right after all frames are published
+    When False: Rely on retention policy for cleanup
+    
+    Default: True
+    """
+    
+    spool_processor_watchdog_timeout: float = _parse_float_env("SPOOL_PROCESSOR_WATCHDOG_TIMEOUT", 30.0)
+    """
+    Timeout in seconds without publishing before alerting (watchdog).
+    
+    Range: 10.0 - 120.0 seconds
+    Default: 30.0 seconds
+    """
+    
+    spool_lag_warn_threshold: int = _parse_int_env("SPOOL_LAG_WARN_THRESHOLD", 5)
+    """
+    Spool lag threshold (in segments) to trigger warning.
+    
+    Range: 3 - 20 segments
+    Default: 5 segments
+    """
+    
+    spool_lag_error_threshold: int = _parse_int_env("SPOOL_LAG_ERROR_THRESHOLD", 10)
+    """
+    Spool lag threshold (in segments) to trigger error.
+    
+    Range: 5 - 50 segments
+    Default: 10 segments
+    """
+    
+    spool_lag_healthy_threshold: int = _parse_int_env("SPOOL_LAG_HEALTHY_THRESHOLD", 5)
+    """
+    Spool lag below which system is considered healthy (relax FPS).
+    
+    Range: 1 - 10 segments
+    Default: 5 segments
+    """
+    
+    spool_lag_normal_threshold: int = _parse_int_env("SPOOL_LAG_NORMAL_THRESHOLD", 10)
+    """
+    Spool lag threshold between healthy and high lag states.
+    
+    Range: 5 - 30 segments
+    Default: 10 segments
+    """
+    
+    spool_processor_enable_perf_logging: bool = _parse_bool_env("SPOOL_PROCESSOR_ENABLE_PERF_LOGGING", False)
+    """
+    Enable performance profiling logs for spool processor.
+    
+    Logs timing metrics for list_segments, get_next_frame, publish_frame.
+    
+    Default: False
+    """
+    
+    spool_processor_perf_log_interval_sec: float = _parse_float_env("SPOOL_PROCESSOR_PERF_LOG_INTERVAL_SEC", 2.0)
+    """
+    Interval in seconds between performance metric logs.
+    
+    Only used when spool_processor_enable_perf_logging is True.
+    
+    Range: 1.0 - 30.0 seconds
+    Default: 2.0 seconds
+    """
+    
+    spool_processor_segment_list_cache_interval: float = _parse_float_env("SPOOL_PROCESSOR_SEGMENT_LIST_CACHE_INTERVAL", 1.0)
+    """
+    Interval in seconds to cache segment list for performance.
+    
+    Reduces disk I/O by caching the segment list.
+    
+    Range: 0.5 - 5.0 seconds
+    Default: 1.0 seconds
+    """
+    
+    spool_processor_enable_crc32_logging: bool = _parse_bool_env("SPOOL_PROCESSOR_ENABLE_CRC32_LOGGING", False)
+    """
+    Include CRC32 checksums in frame publish logs for debugging.
+    
+    Useful for data integrity verification but adds CPU overhead.
+    
+    Default: False
+    """
+    
+    # --------------------------------------------------------------------------
+    # Spool ACK Mode Configuration
+    # --------------------------------------------------------------------------
     
     spool_ack_mode_enabled: bool = _parse_bool_env("SPOOL_ACK_MODE_ENABLED", False)
     """
