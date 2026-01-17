@@ -972,7 +972,13 @@ class BagCounterApp:
             
             try:
                 # Unpack detection result
-                current_frame_detections, frame_count, frame, detect_time = detection_result
+                # V10: Added spool_frame_index for ACK publishing
+                if len(detection_result) == 5:
+                    current_frame_detections, frame_count, frame, detect_time, spool_frame_index = detection_result
+                else:
+                    # Backward compatibility: old format without spool_frame_index
+                    current_frame_detections, frame_count, frame, detect_time = detection_result
+                    spool_frame_index = None
                 
                 # Process through monitor
                 monitor_start = time.perf_counter()
@@ -980,6 +986,12 @@ class BagCounterApp:
                                                    {"frame_count": frame_count, "frame": frame})
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
+                
+                # V10: Publish ACK after monitor update (frame is fully processed)
+                # This signals to the spool processor that it can publish the next frame
+                if hasattr(self.frame_source, 'publish_frame_ack'):
+                    ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                    self.frame_source.publish_frame_ack(ack_index)
                 
                 # Track degraded mode state for ROI saving
                 in_degraded_mode = self._degraded_mode_active
@@ -1621,7 +1633,8 @@ class BagCounterApp:
                     # V4 Phase 1: Enqueue detection result or process inline
                     if self.detection_queue_enabled:
                         # Enqueue detection result for monitor thread
-                        detection_result = (current_frame_detections, frame_count, frame, detect_time)
+                        # V10: Include spool_frame_index for ACK publishing
+                        detection_result = (current_frame_detections, frame_count, frame, detect_time, spool_frame_index)
                         try:
                             self.detection_queue.put_nowait(detection_result)
                         except queue.Full:
