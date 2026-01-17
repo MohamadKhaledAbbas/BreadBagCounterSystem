@@ -55,7 +55,7 @@ from src.spool.retention import RetentionPolicy  # V8: For segment deletion afte
 from src.logging.Database import DatabaseManager
 from src import constants
 
-# Import message definitions
+# Import utility functions from messages module
 from src.ros2_spool.messages import (
     generate_session_id
 )
