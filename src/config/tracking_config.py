@@ -3108,6 +3108,80 @@ class TrackingConfig:
     Range: 100 - 5000
     Default: 1000 (1 second)
     """
+    
+    # ==========================================================================
+    # V11 Spool-Aware Degraded Mode Configuration
+    # ==========================================================================
+    # These parameters control the spool-aware degraded mode that leverages
+    # disk-spooled segments instead of aggressively skipping frames during
+    # temporary overload.
+    
+    spool_aware_degraded_mode_enabled: bool = _parse_bool_env("SPOOL_AWARE_DEGRADED_MODE_ENABLED", True)
+    """
+    Enable spool-aware degraded mode that benefits from disk-spooled segments.
+    
+    When True: System leverages spooled segments on disk during overload,
+               only skipping frames if we are far behind (> spool_lag_threshold_seconds)
+    When False: Use legacy smart skipping that skips frames during queue pressure
+    
+    Benefits:
+    - No frame loss during temporary overload (frames are on disk)
+    - Processing catches up naturally when load decreases
+    - Only skip if truly far behind to prevent unbounded growth
+    
+    Environment: SPOOL_AWARE_DEGRADED_MODE_ENABLED=true
+    Default: True
+    """
+    
+    spool_lag_threshold_seconds: float = _parse_float_env("SPOOL_LAG_THRESHOLD_SECONDS", 300.0)
+    """
+    Maximum acceptable lag (in seconds) before triggering frame skipping.
+    
+    When spool_aware_degraded_mode_enabled is True:
+    - If spool lag < this threshold: Don't skip frames, let system catch up
+    - If spool lag >= this threshold: Trigger smart skipping to prevent unbounded growth
+    
+    The lag is calculated as: (current_segment_being_recorded - current_segment_being_processed) * segment_duration
+    
+    Range: 60 - 600 seconds (1-10 minutes)
+    - 60s: Aggressive, skip quickly if behind
+    - 300s: Balanced, 5 minute buffer (default)
+    - 600s: Conservative, allow up to 10 minutes of lag
+    
+    Environment: SPOOL_LAG_THRESHOLD_SECONDS=300.0
+    Default: 300.0 (5 minutes)
+    """
+    
+    spool_segment_duration_seconds: float = _parse_float_env("SPOOL_SEGMENT_DURATION_SECONDS", 5.0)
+    """
+    Average duration of a spool segment in seconds.
+    
+    Used to convert segment count lag to time-based lag:
+        lag_seconds = segment_lag * spool_segment_duration_seconds
+    
+    This should match the actual segment duration configured in the spool recorder.
+    
+    Range: 1.0 - 30.0 seconds
+    Default: 5.0 seconds (typical segment duration)
+    """
+    
+    spool_ack_on_input_queue: bool = _parse_bool_env("SPOOL_ACK_ON_INPUT_QUEUE", True)
+    """
+    Publish ACK immediately after frame is put in input queue (not after processing).
+    
+    When True: ACK is published as soon as frame is successfully enqueued
+               This allows spool processor to continue publishing at a higher rate
+    When False: ACK is published after monitor thread processes the frame (legacy)
+               This provides flow control based on actual processing capacity
+    
+    Enterprise-grade recommendation: True
+    - Faster ACK response reduces spool processor waiting
+    - Queue provides natural backpressure
+    - Frames are safely buffered in input queue
+    
+    Environment: SPOOL_ACK_ON_INPUT_QUEUE=true
+    Default: True
+    """
 
 
 # Global configuration instance

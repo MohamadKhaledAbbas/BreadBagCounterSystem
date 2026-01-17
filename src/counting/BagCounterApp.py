@@ -250,6 +250,13 @@ class BagCounterApp:
         self._frames_processed_in_degraded = 0  # Frames processed while in degraded mode
         self._frames_skipped_by_pattern = 0  # Frames skipped by smart pattern
         self._event_frame_counts: Dict[int, int] = {}  # Track frames per event: {event_id: frame_count}
+        
+        # V11: Spool-aware degraded mode state
+        self._spool_lag_seconds = 0.0  # Current spool lag in seconds
+        self._last_spool_lag_check = time.perf_counter()
+        self._spool_lag_check_interval = 5.0  # Check spool lag every 5 seconds
+        self._current_processing_segment = -1  # Track current segment being processed
+        self._current_recording_segment = -1  # Track newest segment from recorder
 
         names = self.detector.class_names
         logger.info(f"[BagCounterApp] Detector class names: {names}")
@@ -495,6 +502,10 @@ class BagCounterApp:
         """
         Check if system should enter degraded mode based on load metrics.
         
+        V11: Spool-aware degraded mode that benefits from disk-spooled segments.
+        When spool_aware_degraded_mode_enabled is True, the system only enters
+        degraded mode (with frame skipping) if spool lag exceeds the threshold.
+        
         Degraded mode reduces non-critical work to maintain tracking reliability.
         
         Args:
@@ -523,15 +534,45 @@ class BagCounterApp:
             avg_delay_ms = sum(self._recent_queue_delays) / len(self._recent_queue_delays)
             delay_overload = avg_delay_ms > tracking_config.degraded_mode_delay_threshold_ms
         
-        # Activate degraded mode if either condition is met
-        should_activate = queue_overload or delay_overload
+        # Base condition: queue overload or delay overload
+        base_overload = queue_overload or delay_overload
+        
+        # V11: Spool-aware degraded mode
+        # Only activate degraded mode (with frame skipping) if spool lag exceeds threshold
+        should_activate = False
+        spool_lag_info = ""
+        
+        if tracking_config.spool_aware_degraded_mode_enabled:
+            # Check spool lag periodically
+            if current_time - self._last_spool_lag_check >= self._spool_lag_check_interval:
+                self._update_spool_lag()
+                self._last_spool_lag_check = current_time
+            
+            # Only skip frames if we're far behind (spool lag exceeds threshold)
+            spool_lag_exceeded = self._spool_lag_seconds >= tracking_config.spool_lag_threshold_seconds
+            
+            # Degraded mode activates only when BOTH conditions are met:
+            # 1. System is under load (queue overload or delay overload)
+            # 2. Spool lag exceeds threshold (we're too far behind to catch up naturally)
+            should_activate = base_overload and spool_lag_exceeded
+            
+            spool_lag_info = (
+                f", spool_lag={self._spool_lag_seconds:.1f}s "
+                f"(threshold={tracking_config.spool_lag_threshold_seconds:.0f}s, "
+                f"lag_exceeded={spool_lag_exceeded})"
+            )
+        else:
+            # Legacy behavior: activate based on queue/delay overload only
+            should_activate = base_overload
         
         # Log state transitions
         if should_activate and not self._degraded_mode_active:
+            avg_delay = sum(self._recent_queue_delays) / len(self._recent_queue_delays) if self._recent_queue_delays else 0
             logger.warning(
                 f"[BagCounterApp] ENTERING DEGRADED MODE: "
                 f"queue_util={queue_utilization:.1%}, "
-                f"avg_delay={sum(self._recent_queue_delays) / len(self._recent_queue_delays) if self._recent_queue_delays else 0:.1f}ms"
+                f"avg_delay={avg_delay:.1f}ms"
+                f"{spool_lag_info}"
             )
             structured_logger.pipeline_error(
                 component="BagCounterApp",
@@ -541,22 +582,99 @@ class BagCounterApp:
                 affected_ids=None,
                 context={
                     "queue_utilization": queue_utilization,
-                    "avg_queue_delay_ms": sum(self._recent_queue_delays) / len(self._recent_queue_delays) if self._recent_queue_delays else 0,
+                    "avg_queue_delay_ms": avg_delay,
                     "queue_threshold": tracking_config.degraded_mode_queue_threshold,
-                    "delay_threshold_ms": tracking_config.degraded_mode_delay_threshold_ms
+                    "delay_threshold_ms": tracking_config.degraded_mode_delay_threshold_ms,
+                    "spool_lag_seconds": self._spool_lag_seconds,
+                    "spool_lag_threshold_seconds": tracking_config.spool_lag_threshold_seconds,
+                    "spool_aware_mode": tracking_config.spool_aware_degraded_mode_enabled
                 }
             )
         elif not should_activate and self._degraded_mode_active:
             logger.info(
                 f"[BagCounterApp] EXITING DEGRADED MODE: "
                 f"queue_util={queue_utilization:.1%}, system recovered"
+                f"{spool_lag_info}"
             )
             # Reset smart skip counters when exiting degraded mode
             if tracking_config.degraded_mode_smart_skip_enabled:
                 self._smart_skip_frame_counter = 0
+        elif base_overload and not should_activate and tracking_config.spool_aware_degraded_mode_enabled:
+            # Log when we're under load but NOT skipping due to spool-aware mode
+            # This indicates the system is benefiting from spooled segments
+            if self._frames_processed_in_degraded % 100 == 0:  # Log every 100 frames
+                logger.info(
+                    f"[BagCounterApp] SPOOL-AWARE: Under load but NOT skipping "
+                    f"(spool_lag={self._spool_lag_seconds:.1f}s < threshold={tracking_config.spool_lag_threshold_seconds:.0f}s). "
+                    f"Benefiting from disk-spooled segments."
+                )
         
         self._degraded_mode_active = should_activate
         return self._degraded_mode_active
+    
+    def _update_spool_lag(self):
+        """
+        V11: Update the current spool lag by checking processor state file.
+        
+        Spool lag = (newest_segment - processing_segment) * segment_duration
+        
+        This method reads the processor state to determine how far behind
+        the processing is compared to the recording.
+        """
+        try:
+            # Import spool utilities lazily to avoid circular imports
+            from src.spool.spool_utils import load_processor_state
+            from src.spool.segment_io import SegmentReader
+            from src.config.settings import AppConfig
+            
+            # Get spool directory from app config or use default
+            spool_dir = getattr(AppConfig, 'spool_dir', '/home/sunrise/BreadCounting/data/spool')
+            state_file_path = os.path.join(spool_dir, 'processor_state.json')
+            
+            # Load processor state
+            processor_state = load_processor_state(state_file_path)
+            
+            if processor_state is not None and processor_state.last_published_segment >= 0:
+                self._current_processing_segment = processor_state.last_published_segment
+                
+                # Get newest segment from spool directory
+                try:
+                    reader = SegmentReader(spool_dir, cache_refresh_interval=1.0)
+                    segments = reader.list_segments()
+                    if segments:
+                        self._current_recording_segment = max(segments)
+                        
+                        # Calculate lag in segments
+                        segment_lag = self._current_recording_segment - self._current_processing_segment
+                        segment_lag = max(0, segment_lag)  # Ensure non-negative
+                        
+                        # Convert to seconds
+                        self._spool_lag_seconds = segment_lag * tracking_config.spool_segment_duration_seconds
+                        
+                        # Log periodically (every 30 seconds)
+                        if hasattr(self, '_last_spool_lag_log') and time.perf_counter() - self._last_spool_lag_log < 30.0:
+                            return
+                        self._last_spool_lag_log = time.perf_counter()
+                        
+                        logger.debug(
+                            f"[BagCounterApp] Spool lag: {segment_lag} segments "
+                            f"({self._spool_lag_seconds:.1f}s), "
+                            f"processing_segment={self._current_processing_segment}, "
+                            f"recording_segment={self._current_recording_segment}"
+                        )
+                except Exception as e:
+                    logger.debug(f"[BagCounterApp] Could not read spool segments: {e}")
+            else:
+                # No processor state available, assume no lag
+                self._spool_lag_seconds = 0.0
+                
+        except ImportError as e:
+            # Spool utilities not available (non-RDK environment)
+            logger.debug(f"[BagCounterApp] Spool utilities not available: {e}")
+            self._spool_lag_seconds = 0.0
+        except Exception as e:
+            logger.debug(f"[BagCounterApp] Error updating spool lag: {e}")
+            self._spool_lag_seconds = 0.0
     
     def _should_smart_skip_frame(self, queue_utilization: float, active_events: list) -> Tuple[bool, str]:
         """
@@ -987,11 +1105,14 @@ class BagCounterApp:
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
                 
-                # V10: Publish ACK after monitor update (frame is fully processed)
-                # This signals to the spool processor that it can publish the next frame
-                if hasattr(self.frame_source, 'publish_frame_ack'):
-                    ack_index = spool_frame_index if spool_frame_index is not None else frame_count
-                    self.frame_source.publish_frame_ack(ack_index)
+                # V10/V11: Publish ACK after monitor update (legacy mode)
+                # Only publish here if spool_ack_on_input_queue is False
+                # When spool_ack_on_input_queue is True, ACK is published in run() method
+                # immediately after frame is enqueued
+                if not tracking_config.spool_ack_on_input_queue:
+                    if hasattr(self.frame_source, 'publish_frame_ack'):
+                        ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                        self.frame_source.publish_frame_ack(ack_index)
                 
                 # Track degraded mode state for ROI saving
                 in_degraded_mode = self._degraded_mode_active
@@ -1666,12 +1787,14 @@ class BagCounterApp:
                         monitor_end = time.perf_counter()
                         monitor_time = (monitor_end - monitor_start) * 1000
                         
-                        # V10: Publish ACK after monitor update (frame is fully processed)
-                        # This signals to the spool processor that it can publish the next frame
-                        # Use spool_frame_index if available for proper correlation, otherwise fallback to frame_count
-                        if hasattr(self.frame_source, 'publish_frame_ack'):
-                            ack_index = spool_frame_index if spool_frame_index is not None else frame_count
-                            self.frame_source.publish_frame_ack(ack_index)
+                        # V10/V11: Publish ACK after monitor update (legacy mode)
+                        # Only publish here if spool_ack_on_input_queue is False
+                        # When spool_ack_on_input_queue is True, ACK is published in run() method
+                        # immediately after frame is enqueued
+                        if not tracking_config.spool_ack_on_input_queue:
+                            if hasattr(self.frame_source, 'publish_frame_ack'):
+                                ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                                self.frame_source.publish_frame_ack(ack_index)
                         
                         # Track frames processed in degraded mode for statistics
                         if in_degraded_mode:
@@ -2002,8 +2125,13 @@ class BagCounterApp:
                         'frame_size': frame_size,
                         'spool_frame_index': spool_frame_index  # V10: For ACK correlation
                     }
+                    
+                    # Track if frame was successfully enqueued (for ACK)
+                    frame_enqueued = False
+                    
                     try:
                         self.input_queue.put_nowait(frame_packet)
+                        frame_enqueued = True
                     except queue.Full:
                         frame_dropped = False
                         try:
@@ -2011,6 +2139,7 @@ class BagCounterApp:
                             frame_dropped = True
                             try:
                                 self.input_queue.put_nowait(frame_packet)
+                                frame_enqueued = True
                             except queue.Full:
                                 frame_dropped = True
                                 logger.debug(
@@ -2028,6 +2157,7 @@ class BagCounterApp:
                         except queue.Empty:
                             try:
                                 self.input_queue.put_nowait(frame_packet)
+                                frame_enqueued = True
                             except queue.Full:
                                 with self.stats_lock:
                                     self.input_queue_drops += 1
@@ -2036,6 +2166,14 @@ class BagCounterApp:
                                     f"[BagCounterApp] Frame {frame_count} dropped: "
                                     f"queue refilled by another thread (total drops: {drops})"
                                 )
+                    
+                    # V11: Publish ACK immediately after frame is put in input queue
+                    # This provides faster ACK response to spool processor while
+                    # still guaranteeing the frame is safely buffered
+                    if frame_enqueued and tracking_config.spool_ack_on_input_queue:
+                        if hasattr(self.frame_source, 'publish_frame_ack') and spool_frame_index is not None:
+                            self.frame_source.publish_frame_ack(spool_frame_index)
+                    
                     current_time = time.perf_counter()
                     if current_time - last_queue_stats_time >= self.STATS_LOG_INTERVAL:
                         # Phase 2 Optimization: Collect stats efficiently
