@@ -868,6 +868,10 @@ class SpoolProcessorNode(Node):
         """
         V10: Wait for ACK from logic thread before publishing next frame.
         
+        Note: The ACK event should be cleared BEFORE publishing the frame
+        (in _processor_loop_ack_based), not here. This prevents a race condition
+        where the ACK arrives between publish and clear.
+        
         Args:
             published_frame_index: Index of the frame we just published
             
@@ -876,9 +880,6 @@ class SpoolProcessorNode(Node):
         """
         if not self.config.ack_mode_enabled:
             return True
-        
-        # Clear the event before waiting
-        self._ack_received.clear()
         
         # Wait for ACK with timeout (convert ms to seconds for Event.wait())
         timeout_sec = self.config.ack_timeout_ms / 1000.0
@@ -1380,6 +1381,11 @@ class SpoolProcessorNode(Node):
 
                 self._current_frame = frame
                 self._current_frame_index = frame.index
+
+                # V10 Fix: Clear ACK event BEFORE publishing to avoid race condition
+                # If we clear after publish, the ACK might arrive between publish and clear,
+                # causing us to lose the ACK signal
+                self._ack_received.clear()
 
                 # Publish frame
                 success = self._publish_frame(frame)
