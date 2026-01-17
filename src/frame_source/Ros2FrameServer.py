@@ -6,9 +6,10 @@ import time
 import cv2
 import numpy as np
 import rclpy
-from hbm_img_msgs.msg import HbmMsg1080P
+from sensor_msgs.msg.Image import Image
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
 
 from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
@@ -40,12 +41,19 @@ class FrameServer(Node, FrameSource):
                 logger.info(f"[Ros2FrameServer] Using ROS_TARGET_FPS from environment: {target_fps}")
             except ValueError:
                 logger.warning(f"[Ros2FrameServer] Invalid ROS_TARGET_FPS value '{env_fps}', using default {target_fps}")
-        
+
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=50,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
         self.subscription = self.create_subscription(
-            HbmMsg1080P,
+            Image,
             topic,
             self.listener_callback,
-            qos_profile_sensor_data)
+            qos)
 
         # Buffer more frames to reduce frame drops
         # V3 Performance: Increased from 10 to 30 for better burst handling (1.2s buffer @ 25fps)
@@ -124,7 +132,12 @@ class FrameServer(Node, FrameSource):
         
         # V7: Time each operation
         t_reshape_start = time.perf_counter()
-        img = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
+
+        expected = msg.height * msg.width * 3 // 2
+        img = np.frombuffer(msg.data, dtype=np.uint8)
+        if img.size < expected:
+            self.get_logger().error(f"Frame size mismatch: got {img.size}, expected {expected}")
+            return
         try:
             # NV12 conversion logic - reshape to NV12 format
             nv12_img = img.reshape((msg.height * 3 // 2, msg.width))

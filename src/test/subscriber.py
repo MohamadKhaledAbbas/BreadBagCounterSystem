@@ -2,23 +2,31 @@ import numpy as np
 import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from hbm_img_msgs.msg import HbmMsg1080P
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image
 
 class FrameSubscriber(Node):
     def __init__(self, topic_name="/nv12_images", save_video=False, video_filename="output.mp4", fps=30):
         super().__init__('frame_subscriber_node')
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=50,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
         self.subscription = self.create_subscription(
-            HbmMsg1080P,
+            Image,
             topic_name,
             self.listener_callback,
-            qos_profile_sensor_data
+            qos
         )
         self.latest_frame = None
         self.frame_counter = 0
         self.winname = "ROS2 FrameSubscriber"
         cv2.namedWindow(self.winname, cv2.WINDOW_NORMAL)
-        self.get_logger().info(f"Subscribed to topic '{topic_name}' as HbmMsg1080P.")
+
+        self.get_logger().info(f"Subscribed to topic '{topic_name}' as sensor_msgs/msg/Image.")
         # Saving options
         self.save_video = save_video
         self.video_filename = video_filename
@@ -30,8 +38,14 @@ class FrameSubscriber(Node):
         h = msg.height
         w = msg.width
         # Convert NV12 data to BGR
-        img_data = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
-        nv12_img = img_data.reshape((h * 3 // 2, w))
+        # img_data = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
+        expected = msg.height * msg.width * 3 // 2
+        img_data = np.frombuffer(msg.data, dtype=np.uint8)
+        if img_data.size != expected:
+            self.get_logger().error(f"Bad NV12 size: got {img_data.size}, expected {expected}")
+            return
+        nv12_img = img_data.reshape((msg.height * 3 // 2, msg.width))
+
         bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
 
         # Resize for display, keep original for saving

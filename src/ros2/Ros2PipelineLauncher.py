@@ -67,7 +67,7 @@ def generate_launch_description():
         parameters=[
             {
                  'in_format': 'h264',
-                 'out_mode': 'shared_mem',
+                 'out_mode': 'ros',
                  'out_format': 'nv12',
                  'sub_topic': '/spool_image_ch_0',
                  'dump_output': False,
