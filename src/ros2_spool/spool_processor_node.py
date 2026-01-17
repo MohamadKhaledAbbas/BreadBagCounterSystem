@@ -148,9 +148,11 @@ class ProcessorConfig:
     # V9: Performance profiling
     enable_perf_logging: bool = False  # Enable performance profiling
     perf_log_interval_sec: float = 2.0  # Log performance metrics every 2 seconds
-    # V10: ACK-based mode
-    ack_mode_enabled: bool = False  # When True, wait for ACK before publishing next frame
+    # V10/V11: ACK-based mode with windowed support
+    ack_mode_enabled: bool = False  # When True, use ACK-based flow control
     ack_timeout_ms: float = 1000.0  # Timeout for ACK in milliseconds
+    ack_window_size: int = 10  # V11: Frames allowed in-flight before blocking (windowed ACK)
+    ack_pacing_fps: float = 0.0  # V11: Optional rate limiting in ACK mode (0=disabled)
     # V11: Adaptive pacing thresholds (from tracking_config)
     adaptive_fps_relaxed: float = DEFAULT_ADAPTIVE_FPS_RELAXED
     adaptive_fps_max: float = DEFAULT_ADAPTIVE_FPS_MAX
@@ -203,9 +205,11 @@ def load_default_config() -> ProcessorConfig:
         perf_log_interval_sec=tc.spool_processor_perf_log_interval_sec,
         enable_crc32_logging=tc.spool_processor_enable_crc32_logging,
         
-        # ACK mode
+        # ACK mode (V11: windowed support)
         ack_mode_enabled=tc.spool_ack_mode_enabled,
         ack_timeout_ms=tc.spool_ack_timeout_ms,
+        ack_window_size=tc.spool_ack_window_size,
+        ack_pacing_fps=tc.spool_ack_pacing_fps,
     )
 
 
@@ -353,7 +357,7 @@ class SpoolProcessorNode(Node):
                 frame_qos
             )
 
-            # V10: ACK mode - subscribe to ACK topic
+            # V10/V11: ACK mode - subscribe to ACK topic
             if self.config.ack_mode_enabled:
                 # ACK QoS - reliable for guaranteed delivery
                 ack_qos = QoSProfile(
@@ -362,11 +366,15 @@ class SpoolProcessorNode(Node):
                     depth=5
                 )
                 
-                # ACK tracking using threading.Condition for proper synchronization
+                # V11: Windowed ACK tracking
+                # Uses a sliding window protocol for pipelined processing
+                # Track in-flight frame indices to handle duplicate/out-of-order ACKs properly
                 self._ack_condition = threading.Condition()
                 self._last_ack_frame_index = -1
                 self._ack_timeout_count = 0
                 self._ack_success_count = 0
+                self._in_flight_frames = set()  # V11: Set of frame indices in-flight (thread-safe with lock)
+                self._in_flight_lock = threading.Lock()  # V11: Protect in_flight set
                 
                 # Subscribe to ACK topic from logic thread
                 self._ack_sub = self.create_subscription(
@@ -376,8 +384,11 @@ class SpoolProcessorNode(Node):
                     ack_qos
                 )
                 
-                logger.info("[SpoolProcessor] ROS2 topics configured (ACK-BASED MODE): "
-                            "/spool_image_ch_0 (pub), /frame_ack (sub)")
+                window_mode = "WINDOWED" if self.config.ack_window_size > 1 else "STRICT"
+                pacing_info = f", pacing={self.config.ack_pacing_fps}fps" if self.config.ack_pacing_fps > 0 else ""
+                logger.info(f"[SpoolProcessor] ROS2 topics configured (ACK-BASED {window_mode} MODE): "
+                            f"/spool_image_ch_0 (pub), /frame_ack (sub), "
+                            f"window_size={self.config.ack_window_size}{pacing_info}")
             else:
                 logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
                             "/spool_image_ch_0 (pub) - Simple, robust architecture")
@@ -892,26 +903,93 @@ class SpoolProcessorNode(Node):
 
     def _ack_callback(self, msg):
         """
-        V10: Callback for ACK messages from logic thread.
+        V10/V11: Callback for ACK messages from logic thread.
         
         Called when the logic thread signals that it has processed a frame.
-        This allows the spool processor to publish the next frame.
+        V11: Removes frame from in-flight set (handles duplicates/out-of-order safely).
         
         Uses threading.Condition for proper thread synchronization.
         
         Args:
             msg: Int32 message containing the acknowledged frame index
         """
+        frame_index = msg.data
+        
+        # V11: Remove from in-flight set (safe for duplicates - discard() doesn't raise)
+        with self._in_flight_lock:
+            was_in_flight = frame_index in self._in_flight_frames
+            self._in_flight_frames.discard(frame_index)
+            in_flight_count = len(self._in_flight_frames)
+        
         with self._ack_condition:
-            self._last_ack_frame_index = msg.data
-            self._ack_success_count += 1
+            self._last_ack_frame_index = frame_index
+            if was_in_flight:
+                self._ack_success_count += 1
             self._ack_condition.notify_all()
         
-        logger.debug(f"[SpoolProcessor] Received ACK for frame index {msg.data}")
+        logger.debug(f"[SpoolProcessor] Received ACK for frame {frame_index}, "
+                     f"in_flight={in_flight_count}, was_tracked={was_in_flight}")
+
+    def _wait_for_window_slot(self) -> bool:
+        """
+        V11: Wait for a slot in the ACK window before publishing.
+        
+        Implements sliding window protocol:
+        - If len(in_flight_frames) < window_size: Return immediately (slot available)
+        - If len(in_flight_frames) >= window_size: Wait for ACK to free a slot
+        
+        Returns:
+            True if slot available or ACK received, False if timeout
+        """
+        if not self.config.ack_mode_enabled:
+            return True
+        
+        # Check if window has available slots
+        with self._in_flight_lock:
+            if len(self._in_flight_frames) < self.config.ack_window_size:
+                return True
+        
+        # Window full - wait for ACK
+        timeout_sec = self.config.ack_timeout_ms / 1000.0
+        
+        with self._ack_condition:
+            # Wait for any ACK to free a slot
+            start_time = time.monotonic()
+            while True:
+                with self._in_flight_lock:
+                    if len(self._in_flight_frames) < self.config.ack_window_size:
+                        return True
+                
+                # Calculate remaining timeout
+                elapsed = time.monotonic() - start_time
+                remaining_timeout = timeout_sec - elapsed
+                if remaining_timeout <= 0:
+                    # Timeout - log and return false
+                    self._ack_timeout_count += 1
+                    with self._in_flight_lock:
+                        in_flight_count = len(self._in_flight_frames)
+                    throttled_log(
+                        logger.warning,
+                        format_structured_log(
+                            "[SpoolProcessor] ⚠ Window ACK timeout - window full",
+                            window_size=self.config.ack_window_size,
+                            in_flight=in_flight_count,
+                            timeout_ms=self.config.ack_timeout_ms,
+                            timeout_count=self._ack_timeout_count
+                        ),
+                        key="window_ack_timeout",
+                        throttle_dict=self._throttle_log_dict,
+                        min_interval=5.0
+                    )
+                    return False
+                
+                # Wait for ACK notification
+                self._ack_condition.wait(timeout=remaining_timeout)
 
     def _wait_for_ack(self, published_frame_index: int) -> bool:
         """
         V10: Wait for ACK from logic thread before publishing next frame.
+        (Legacy strict mode - waits for specific frame ACK)
         
         Uses threading.Condition for proper synchronization between the
         processor thread (waiting) and the callback thread (signaling).
@@ -926,30 +1004,38 @@ class SpoolProcessorNode(Node):
             return True
         
         timeout_sec = self.config.ack_timeout_ms / 1000.0
+        start_time = time.monotonic()
         
         with self._ack_condition:
-            # Wait for ACK with timeout
-            # The condition will be notified by _ack_callback when ACK arrives
-            ack_received = self._ack_condition.wait(timeout=timeout_sec)
-        
-        if not ack_received:
-            self._ack_timeout_count += 1
-            throttled_log(
-                logger.warning,
-                format_structured_log(
-                    "[SpoolProcessor] ⚠ ACK timeout - continuing without ACK",
-                    published_frame_index=published_frame_index,
-                    timeout_ms=self.config.ack_timeout_ms,
-                    timeout_count=self._ack_timeout_count,
-                    success_count=self._ack_success_count
-                ),
-                key="ack_timeout",
-                throttle_dict=self._throttle_log_dict,
-                min_interval=5.0
-            )
-            return False
-        
-        return True
+            # Wait for specific frame ACK with timeout
+            while True:
+                # Check if frame is no longer in-flight (ACK received)
+                with self._in_flight_lock:
+                    if published_frame_index not in self._in_flight_frames:
+                        return True
+                
+                # Calculate remaining timeout
+                elapsed = time.monotonic() - start_time
+                remaining_timeout = timeout_sec - elapsed
+                if remaining_timeout <= 0:
+                    self._ack_timeout_count += 1
+                    throttled_log(
+                        logger.warning,
+                        format_structured_log(
+                            "[SpoolProcessor] ⚠ ACK timeout - continuing without ACK",
+                            published_frame_index=published_frame_index,
+                            timeout_ms=self.config.ack_timeout_ms,
+                            timeout_count=self._ack_timeout_count,
+                            success_count=self._ack_success_count
+                        ),
+                        key="ack_timeout",
+                        throttle_dict=self._throttle_log_dict,
+                        min_interval=5.0
+                    )
+                    return False
+                
+                # Wait for ACK notification
+                self._ack_condition.wait(timeout=remaining_timeout)
 
     def _publish_frame(self, record: FrameRecord) -> bool:
         """
@@ -1353,28 +1439,57 @@ class SpoolProcessorNode(Node):
 
     def _processor_loop_ack_based(self):
         """
-        V10: ACK-Based Processing Loop.
+        V10/V11: ACK-Based Processing Loop with Windowed Support.
         
-        This loop waits for ACK from logic thread before publishing next frame:
-        1. Read frame from spool
-        2. Publish frame
-        3. Wait for ACK (with timeout)
-        4. Repeat
+        V10 (strict mode, window_size=1):
+            1. Read frame from spool
+            2. Publish frame + add to in-flight set
+            3. Wait for ACK (with timeout)
+            4. Repeat
         
-        The spool processor publishes at the rate the consumer can process -
-        pure backpressure-based flow control without adaptive pacing.
+        V11 (windowed mode, window_size>1):
+            1. Wait for window slot (if window full)
+            2. Read frame from spool
+            3. Publish frame + add to in-flight set
+            4. Optional: pace to target FPS
+            5. Repeat (no blocking unless window full)
+        
+        The spool processor publishes at the rate the consumer can process,
+        with optional pipelining for higher throughput.
         """
+        window_size = self.config.ack_window_size
+        pacing_fps = self.config.ack_pacing_fps
+        
+        mode_str = "WINDOWED" if window_size > 1 else "STRICT"
         logger.info(format_structured_log(
-            "[SpoolProcessor] ACK-BASED mode active",
+            f"[SpoolProcessor] ACK-BASED {mode_str} mode active",
+            window_size=window_size,
+            pacing_fps=pacing_fps if pacing_fps > 0 else "disabled",
             ack_timeout_ms=self.config.ack_timeout_ms,
             delete_processed_segments=self.config.delete_processed_segments
         ))
+
+        # V11: Pacing support for windowed mode
+        frame_interval = 1.0 / pacing_fps if pacing_fps > 0 else 0
+        next_publish_time = time.monotonic() if pacing_fps > 0 else 0
 
         with self._state_lock:
             self._state = ProcessorRunState.PUBLISHING
 
         while self._running:
             try:
+                # V11: Wait for window slot (applies to both strict and windowed mode)
+                # This ensures we don't overflow the window regardless of mode
+                slot_available = self._wait_for_window_slot()
+                if not slot_available:
+                    # Timeout - oldest frame in window may be stuck
+                    # Clear oldest from in-flight to prevent permanent blocking
+                    with self._in_flight_lock:
+                        if self._in_flight_frames:
+                            oldest = min(self._in_flight_frames)
+                            self._in_flight_frames.discard(oldest)
+                            logger.warning(f"[SpoolProcessor] Cleared stale in-flight frame {oldest} due to timeout")
+                
                 # Get next frame
                 frame = self._get_next_frame()
 
@@ -1391,6 +1506,19 @@ class SpoolProcessorNode(Node):
                 self._current_frame = frame
                 self._current_frame_index = frame.index
 
+                # V11: Optional pacing (rate limiting) even in ACK mode
+                if pacing_fps > 0:
+                    now = time.monotonic()
+                    sleep_time = next_publish_time - now
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    next_publish_time = time.monotonic() + frame_interval
+
+                # V11: Add to in-flight set BEFORE publishing
+                # This ensures window enforcement even if publish is fast
+                with self._in_flight_lock:
+                    self._in_flight_frames.add(frame.index)
+
                 # Publish frame
                 success = self._publish_frame(frame)
 
@@ -1398,14 +1526,21 @@ class SpoolProcessorNode(Node):
                     with self._stats_lock:
                         self._frames_processed += 1
                     
-                    # Wait for ACK before publishing next frame
-                    # This provides backpressure - spool processor publishes at consumer speed
-                    ack_received = self._wait_for_ack(frame.index)
-                    if not ack_received:
-                        logger.debug(f"[SpoolProcessor] ACK timeout for frame {frame.index}, continuing")
+                    # V11: In strict mode (window_size=1), wait for ACK immediately
+                    # In windowed mode, we don't wait here - window check at loop start handles it
+                    if window_size <= 1:
+                        ack_received = self._wait_for_ack(frame.index)
+                        if not ack_received:
+                            logger.debug(f"[SpoolProcessor] ACK timeout for frame {frame.index}, continuing")
+                            # Remove from in-flight since we're not waiting anymore
+                            with self._in_flight_lock:
+                                self._in_flight_frames.discard(frame.index)
                 else:
                     with self._stats_lock:
                         self._frames_skipped += 1
+                    # Remove from in-flight since publish failed
+                    with self._in_flight_lock:
+                        self._in_flight_frames.discard(frame.index)
                     logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
 
                 # Log stats periodically

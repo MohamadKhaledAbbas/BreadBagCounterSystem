@@ -3363,6 +3363,41 @@ class TrackingConfig:
     Default: 1000 (1 second)
     """
     
+    spool_ack_window_size: int = _parse_int_env("SPOOL_ACK_WINDOW_SIZE", 10)
+    """
+    Number of frames allowed in-flight before blocking for ACK (windowed ACK mode).
+    
+    This implements a sliding window protocol similar to TCP:
+    - Processor can publish up to this many frames ahead without ACK
+    - Once window is full, processor waits for ACK before publishing more
+    - Provides pipelined processing with flow control
+    
+    Higher values: Better throughput, more latency tolerance, more memory usage
+    Lower values: Stricter flow control, better for slow consumers
+    
+    Recommended values:
+    - 1: Strict mode (wait for each frame - slowest but guaranteed order)
+    - 5-10: Balanced mode (good throughput with flow control)
+    - 20+: High throughput mode (minimizes blocking)
+    
+    Range: 1 - 50
+    Default: 10 (balanced mode - allows ~10 frames in decoder pipeline)
+    """
+    
+    spool_ack_pacing_fps: float = _parse_float_env("SPOOL_ACK_PACING_FPS", 0.0)
+    """
+    Target FPS for ACK-based pacing (optional rate limiting).
+    
+    When > 0: Pace frame publishing to this FPS even in ACK mode
+    When 0: No pacing - publish as fast as window allows (backpressure only)
+    
+    This combines ACK-based flow control with rate limiting for smoother processing.
+    Set to match or slightly exceed expected consumer processing rate.
+    
+    Range: 0 (disabled), or 10.0 - 60.0 FPS
+    Default: 0.0 (disabled - pure backpressure mode)
+    """
+    
     # ==========================================================================
     # V11 Spool-Aware Degraded Mode Configuration
     # ==========================================================================
