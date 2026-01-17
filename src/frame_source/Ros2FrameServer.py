@@ -8,8 +8,7 @@ import numpy as np
 import rclpy
 from hbm_img_msgs.msg import HbmMsg1080P
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import String, Int32
+from rclpy.qos import qos_profile_sensor_data
 
 from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
@@ -24,6 +23,9 @@ class FrameServer(Node, FrameSource):
     ROS 2 Subscriber that listens for incoming frames and buffers the latest
     frame for consumption by the main logic thread. This node is designed
     to be added to an external SingleThreadedExecutor.
+    
+    V11: ACK-free mode only - simplified architecture for production reliability.
+    Frames are buffered in input_queue and smart degraded mode handles overload.
     """
 
     def __init__(self, topic='/nv12_images', target_fps=20.0):
@@ -53,19 +55,6 @@ class FrameServer(Node, FrameSource):
         # Store target_fps for logging only
         self.target_fps = target_fps
         
-        # V10: ACK mode configuration and publisher
-        # Import tracking_config locally to avoid circular import issues
-        from src.config.tracking_config import tracking_config
-        self.ack_mode_enabled = tracking_config.spool_ack_mode_enabled
-        self._ack_publisher = None
-        if self.ack_mode_enabled:
-            ack_qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=5
-            )
-            self._ack_publisher = self.create_publisher(Int32, '/frame_ack', ack_qos)
-            logger.info("[Ros2FrameServer] ACK mode enabled - will publish to /frame_ack")
         # V3 Performance: Proactive drop threshold (80% of queue size)
         self.proactive_drop_threshold = int(self.frame_queue.maxsize * 0.8)  # 24 frames for size=30
         
@@ -76,7 +65,7 @@ class FrameServer(Node, FrameSource):
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
         
-        logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only)")
+        logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only, ACK-free mode)")
 
         # --- REMOVED ---
         # Removed the internal _ros_spin_thread logic.
@@ -244,22 +233,3 @@ class FrameServer(Node, FrameSource):
             logger.debug(f"[Ros2FrameServer] destroy_node() raised (ignored): {e}")
 
         logger.info("[Ros2FrameServer] cleanup finished")
-
-    def publish_frame_ack(self, frame_index: int):
-        """
-        V10: Publish ACK for a processed frame.
-        
-        Called by the logic thread after a frame has been fully processed
-        (detection + monitor update). This signals to the spool processor
-        that it can publish the next frame.
-        
-        Args:
-            frame_index: Index of the frame that was processed
-        """
-        if not self.ack_mode_enabled or self._ack_publisher is None:
-            return
-        
-        msg = Int32()
-        msg.data = frame_index
-        self._ack_publisher.publish(msg)
-        logger.debug(f"[Ros2FrameServer] Published ACK for frame index {frame_index}")

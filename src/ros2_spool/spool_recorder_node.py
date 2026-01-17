@@ -85,11 +85,19 @@ class SpoolConfig:
 
 
 def load_default_config() -> SpoolConfig:
-    """Load spool configuration from database config table."""
+    """Load spool recorder configuration from centralized tracking_config."""
+    # Import tracking_config here to avoid circular import
+    from src.config.tracking_config import tracking_config as tc
+    
     return SpoolConfig(
-        spool_dir_path=DEFAULT_SPOOL_DIR,
-        segment_duration=DEFAULT_SEGMENT_DURATION,
-        retention_seconds=DEFAULT_RETENTION_SECONDS,
+        spool_dir_path=tc.spool_dir,
+        segment_duration=tc.spool_segment_duration,
+        max_segment_duration=tc.spool_max_segment_duration,
+        retention_seconds=tc.spool_retention_seconds,
+        queue_size=tc.spool_recorder_queue_size,
+        stats_interval=tc.spool_recorder_stats_interval,
+        drop_log_throttle=DEFAULT_DROP_LOG_THROTTLE,
+        enable_backpressure_hook=False,  # Future feature
     )
 
 

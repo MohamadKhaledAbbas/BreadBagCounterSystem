@@ -5,12 +5,13 @@ Spool Processor Node for ACK-Free Video Processing.
 This node reads H.264 frames from the spool and publishes them to the decoder
 at a controlled rate without waiting for acknowledgments.
 
-ACK-Free Architecture:
----------------------
+V11: ACK-Free Architecture Only (Production-Grade)
+-------------------------------------------------
 1. Reads frames continuously from spool
-2. Publishes at a controlled rate (target_fps)
+2. Publishes at a controlled rate (target_fps) with adaptive pacing
 3. Never blocks on consumer feedback
 4. Relies on retention guards to protect unprocessed data
+5. Smart degraded mode handles overload via spool-aware lag detection
 
 This aligns with industry-standard streaming architectures (Kafka, GStreamer, DeepStream).
 
@@ -54,7 +55,7 @@ from src.spool.retention import RetentionPolicy  # V8: For segment deletion afte
 from src.logging.Database import DatabaseManager
 from src import constants
 
-# Import message definitions (minimal - only what we need for ACK-free mode)
+# Import utility functions from messages module
 from src.ros2_spool.messages import (
     generate_session_id
 )
@@ -66,7 +67,6 @@ if IS_RDK:
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
     from img_msgs.msg import H26XFrame
     from builtin_interfaces.msg import Time
-    from std_msgs.msg import Int32  # V10: For ACK messages
 else:
     # Stub for non-RDK development
     class Node:
@@ -86,8 +86,9 @@ else:
 
 
 class ProcessorRunState(Enum):
-    """Runtime state of the processor (ACK-free mode).
+    """Runtime state of the processor (ACK-free mode only).
 
+    V11: Simplified state machine - ACK-free architecture for production reliability.
     Note: Named ProcessorRunState to avoid conflict with ProcessorState dataclass
     from spool_utils which is used for persistence.
     """
@@ -126,7 +127,11 @@ ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
 
 @dataclass
 class ProcessorConfig:
-    """Configuration for the spool processor (supports both ACK-free and ACK-based modes)."""
+    """Configuration for the spool processor (ACK-free mode only).
+    
+    V11: Simplified configuration - removed ACK-based parameters.
+    The system uses adaptive pacing and smart degraded mode for flow control.
+    """
     spool_dir_path: str = DEFAULT_SPOOL_DIR
     poll_interval: float = DEFAULT_POLL_INTERVAL
     stats_interval: float = DEFAULT_STATS_INTERVAL
@@ -148,22 +153,60 @@ class ProcessorConfig:
     # V9: Performance profiling
     enable_perf_logging: bool = False  # Enable performance profiling
     perf_log_interval_sec: float = 2.0  # Log performance metrics every 2 seconds
-    # V10: ACK-based mode
-    ack_mode_enabled: bool = False  # When True, wait for ACK before publishing next frame
-    ack_timeout_ms: float = 1000.0  # Timeout for ACK in milliseconds
+    # V11: Adaptive pacing thresholds (from tracking_config)
+    adaptive_fps_relaxed: float = DEFAULT_ADAPTIVE_FPS_RELAXED
+    adaptive_fps_max: float = DEFAULT_ADAPTIVE_FPS_MAX
+    spool_lag_healthy_threshold: int = DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD
+    spool_lag_normal_threshold: int = DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD
 
 
 def load_default_config() -> ProcessorConfig:
-    """Load spool processor configuration from database config table."""
+    """Load spool processor configuration from centralized tracking_config.
+    
+    V11: Removed ACK-based parameters - using ACK-free mode only.
+    """
     # Import tracking_config here to avoid circular import
-    # This module is imported by tracking_config indirectly via spool utilities
     from src.config.tracking_config import tracking_config as tc
     
     return ProcessorConfig(
-        spool_dir_path=DEFAULT_SPOOL_DIR,
-        target_fps=DEFAULT_TARGET_FPS,
-        ack_mode_enabled=tc.spool_ack_mode_enabled,
-        ack_timeout_ms=tc.spool_ack_timeout_ms,
+        # Directory and state
+        spool_dir_path=tc.spool_dir,
+        state_file=DEFAULT_STATE_FILE,
+        
+        # Pacing and FPS
+        target_fps=tc.spool_processor_target_fps,
+        poll_interval=tc.spool_processor_poll_interval,
+        stats_interval=tc.spool_processor_stats_interval,
+        min_frame_interval_ms=tc.spool_processor_min_frame_interval_ms,
+        
+        # SPS/PPS handling
+        prepend_sps_pps=tc.spool_processor_prepend_sps_pps,
+        
+        # Adaptive pacing
+        enable_adaptive_pacing=tc.spool_processor_enable_adaptive_pacing,
+        adaptive_fps_min=tc.spool_processor_adaptive_fps_min,
+        adaptive_fps_relaxed=tc.spool_processor_adaptive_fps_relaxed,
+        adaptive_fps_max=tc.spool_processor_adaptive_fps_max,
+        
+        # Lag thresholds
+        spool_lag_warn_threshold=tc.spool_lag_warn_threshold,
+        spool_lag_error_threshold=tc.spool_lag_error_threshold,
+        spool_lag_healthy_threshold=tc.spool_lag_healthy_threshold,
+        spool_lag_normal_threshold=tc.spool_lag_normal_threshold,
+        
+        # Watchdog
+        watchdog_timeout=tc.spool_processor_watchdog_timeout,
+        
+        # Segment deletion
+        delete_processed_segments=tc.spool_processor_delete_processed_segments,
+        
+        # Caching
+        segment_list_cache_interval=tc.spool_processor_segment_list_cache_interval,
+        
+        # Performance logging
+        enable_perf_logging=tc.spool_processor_enable_perf_logging,
+        perf_log_interval_sec=tc.spool_processor_perf_log_interval_sec,
+        enable_crc32_logging=tc.spool_processor_enable_crc32_logging,
     )
 
 
@@ -171,6 +214,8 @@ class SpoolProcessorNode(Node):
     """
     Spool Processor Node - ACK-Free Video Streaming.
 
+    V11: ACK-Free architecture only for production reliability.
+    
     Reads H.264 frames from the spool and publishes them to the decoder
     at a controlled rate without waiting for acknowledgments.
 
@@ -203,16 +248,11 @@ class SpoolProcessorNode(Node):
         # Generate unique session ID for this run
         self._session_id = generate_session_id()
 
-        # V10: Log mode selection based on ACK configuration
-        mode_str = "ACK-BASED" if self.config.ack_mode_enabled else "ACK-FREE"
-        logger.info(f"[SpoolProcessor] Mode: {mode_str}")
-        if self.config.ack_mode_enabled:
-            logger.info(f"[SpoolProcessor] ACK timeout: {self.config.ack_timeout_ms}ms")
-
+        # V11: ACK-free mode only
+        logger.info(f"[SpoolProcessor] Mode: ACK-FREE (production)")
         logger.info(f"[SpoolProcessor] Initializing with config: "
                     f"spool_dir={self.config.spool_dir_path}, "
                     f"target_fps={self.config.target_fps}, "
-                    f"ack_mode={self.config.ack_mode_enabled}, "
                     f"session_id={self._session_id}")
 
         # Initialize components
@@ -311,34 +351,9 @@ class SpoolProcessorNode(Node):
                 frame_qos
             )
 
-            # V10: ACK mode - subscribe to ACK topic
-            if self.config.ack_mode_enabled:
-                # ACK QoS - reliable for guaranteed delivery
-                ack_qos = QoSProfile(
-                    reliability=QoSReliabilityPolicy.RELIABLE,
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    depth=5
-                )
-                
-                # ACK tracking using threading.Condition for proper synchronization
-                self._ack_condition = threading.Condition()
-                self._last_ack_frame_index = -1
-                self._ack_timeout_count = 0
-                self._ack_success_count = 0
-                
-                # Subscribe to ACK topic from logic thread
-                self._ack_sub = self.create_subscription(
-                    Int32,
-                    '/frame_ack',
-                    self._ack_callback,
-                    ack_qos
-                )
-                
-                logger.info("[SpoolProcessor] ROS2 topics configured (ACK-BASED MODE): "
-                            "/spool_image_ch_0 (pub), /frame_ack (sub)")
-            else:
-                logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
-                            "/spool_image_ch_0 (pub) - Simple, robust architecture")
+            # V11: ACK-free mode only - simple, robust architecture
+            logger.info("[SpoolProcessor] ROS2 topics configured (ACK-FREE MODE): "
+                        "/spool_image_ch_0 (pub) - Simple, robust architecture")
 
     def start(self):
         """Start the processor."""
@@ -352,7 +367,7 @@ class SpoolProcessorNode(Node):
         logger.info("=" * 80)
         logger.info("[SpoolProcessor] 🚀 Startup Configuration")
         logger.info(f"  Module: {__file__}")
-        logger.info(f"  Version: V9 (Production ACK-Free with Adaptive Pacing)")
+        logger.info(f"  Version: V11 (Production ACK-Free with Adaptive Pacing)")
         logger.info(f"  Session ID: {self._session_id}")
         logger.info(f"")
         logger.info(f"  Target FPS Configuration:")
@@ -848,67 +863,6 @@ class SpoolProcessorNode(Node):
         self._segment_needs_sps_pps = False
         return data
 
-    def _ack_callback(self, msg):
-        """
-        V10: Callback for ACK messages from logic thread.
-        
-        Called when the logic thread signals that it has processed a frame.
-        This allows the spool processor to publish the next frame.
-        
-        Uses threading.Condition for proper thread synchronization.
-        
-        Args:
-            msg: Int32 message containing the acknowledged frame index
-        """
-        with self._ack_condition:
-            self._last_ack_frame_index = msg.data
-            self._ack_success_count += 1
-            self._ack_condition.notify_all()
-        
-        logger.debug(f"[SpoolProcessor] Received ACK for frame index {msg.data}")
-
-    def _wait_for_ack(self, published_frame_index: int) -> bool:
-        """
-        V10: Wait for ACK from logic thread before publishing next frame.
-        
-        Uses threading.Condition for proper synchronization between the
-        processor thread (waiting) and the callback thread (signaling).
-        
-        Args:
-            published_frame_index: Index of the frame we just published
-            
-        Returns:
-            True if ACK received within timeout, False if timeout occurred
-        """
-        if not self.config.ack_mode_enabled:
-            return True
-        
-        timeout_sec = self.config.ack_timeout_ms / 1000.0
-        
-        with self._ack_condition:
-            # Wait for ACK with timeout
-            # The condition will be notified by _ack_callback when ACK arrives
-            ack_received = self._ack_condition.wait(timeout=timeout_sec)
-        
-        if not ack_received:
-            self._ack_timeout_count += 1
-            throttled_log(
-                logger.warning,
-                format_structured_log(
-                    "[SpoolProcessor] ⚠ ACK timeout - continuing without ACK",
-                    published_frame_index=published_frame_index,
-                    timeout_ms=self.config.ack_timeout_ms,
-                    timeout_count=self._ack_timeout_count,
-                    success_count=self._ack_success_count
-                ),
-                key="ack_timeout",
-                throttle_dict=self._throttle_log_dict,
-                min_interval=5.0
-            )
-            return False
-        
-        return True
-
     def _publish_frame(self, record: FrameRecord) -> bool:
         """
         Publish a frame to the decoder input topic.
@@ -1060,20 +1014,12 @@ class SpoolProcessorNode(Node):
 
     def _processor_loop(self):
         """
-        Main processing loop - selects between ACK-free and ACK-based modes.
+        Main processing loop (V11: ACK-free mode only).
         
-        V10: Added ACK-based mode for flow control when enabled.
+        V11: Simplified to ACK-free mode only for production reliability.
         """
-        logger.info("[SpoolProcessor] Processing loop started")
-
-        # V10: Select loop based on ACK mode configuration
-        if self.config.ack_mode_enabled:
-            logger.info("[SpoolProcessor] Running ACK-BASED loop")
-            self._processor_loop_ack_based()
-        else:
-            logger.info("[SpoolProcessor] Running ACK-FREE loop")
-            self._processor_loop_ack_free()
-
+        logger.info("[SpoolProcessor] Processing loop started (ACK-FREE mode)")
+        self._processor_loop_ack_free()
         logger.info("[SpoolProcessor] Processing loop stopped")
 
     def _processor_loop_ack_free(self):
@@ -1150,21 +1096,21 @@ class SpoolProcessorNode(Node):
                     old_fps = self._current_target_fps
                     old_interval = frame_interval
 
-                    if spool_lag < DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD:
-                        # HEALTHY: < 10 segments - RELAX and save resources
-                        target_fps = DEFAULT_ADAPTIVE_FPS_RELAXED  # 15 FPS
+                    if spool_lag < self.config.spool_lag_healthy_threshold:
+                        # HEALTHY: System is caught up - RELAX and save resources
+                        target_fps = self.config.adaptive_fps_relaxed
                         mode_emoji = "😌"
                         mode_text = "RELAXED - System healthy, conserving resources"
 
-                    elif spool_lag <= DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD:
-                        # NORMAL: 10-25 segments - maintain default pace
-                        target_fps = DEFAULT_TARGET_FPS  # 30 FPS
+                    elif spool_lag <= self.config.spool_lag_normal_threshold:
+                        # NORMAL: Moderate lag - maintain default pace
+                        target_fps = self.config.target_fps
                         mode_emoji = "✅"
                         mode_text = "NORMAL - Maintaining default pace"
 
                     else:
-                        # HIGH LAG: > 25 segments - SPEED UP to catch up
-                        target_fps = DEFAULT_ADAPTIVE_FPS_MAX  # 35 FPS (~28ms intervals)
+                        # HIGH LAG: Falling behind - SPEED UP to catch up
+                        target_fps = self.config.adaptive_fps_max
                         mode_emoji = "🚀"
                         mode_text = "CATCHING UP - High lag detected"
 
@@ -1177,7 +1123,7 @@ class SpoolProcessorNode(Node):
                         next_deadline = time.monotonic() + frame_interval
 
                         # Choose appropriate log level based on mode
-                        log_func = logger.info if spool_lag < DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD else logger.warning
+                        log_func = logger.info if spool_lag < self.config.spool_lag_normal_threshold else logger.warning
 
                         log_func(format_structured_log(
                             f"[SpoolProcessor] {mode_emoji} Adaptive pacing: {mode_text}",
@@ -1308,72 +1254,6 @@ class SpoolProcessorNode(Node):
                 time.sleep(0.1)
                 # V9: Reset deadline after error
                 next_deadline = time.monotonic() + frame_interval
-
-    def _processor_loop_ack_based(self):
-        """
-        V10: ACK-Based Processing Loop.
-        
-        This loop waits for ACK from logic thread before publishing next frame:
-        1. Read frame from spool
-        2. Publish frame
-        3. Wait for ACK (with timeout)
-        4. Repeat
-        
-        The spool processor publishes at the rate the consumer can process -
-        pure backpressure-based flow control without adaptive pacing.
-        """
-        logger.info(format_structured_log(
-            "[SpoolProcessor] ACK-BASED mode active",
-            ack_timeout_ms=self.config.ack_timeout_ms,
-            delete_processed_segments=self.config.delete_processed_segments
-        ))
-
-        with self._state_lock:
-            self._state = ProcessorRunState.PUBLISHING
-
-        while self._running:
-            try:
-                # Get next frame
-                frame = self._get_next_frame()
-
-                if frame is None:
-                    # Spool is empty, wait and retry
-                    with self._state_lock:
-                        self._state = ProcessorRunState.SPOOL_EMPTY
-                    logger.debug("[SpoolProcessor] Spool empty, waiting for new frames...")
-                    time.sleep(self.config.poll_interval)
-                    with self._state_lock:
-                        self._state = ProcessorRunState.PUBLISHING
-                    continue
-
-                self._current_frame = frame
-                self._current_frame_index = frame.index
-
-                # Publish frame
-                success = self._publish_frame(frame)
-
-                if success:
-                    with self._stats_lock:
-                        self._frames_processed += 1
-                    
-                    # Wait for ACK before publishing next frame
-                    # This provides backpressure - spool processor publishes at consumer speed
-                    ack_received = self._wait_for_ack(frame.index)
-                    if not ack_received:
-                        logger.debug(f"[SpoolProcessor] ACK timeout for frame {frame.index}, continuing")
-                else:
-                    with self._stats_lock:
-                        self._frames_skipped += 1
-                    logger.warning(f"[SpoolProcessor] Frame {frame.index} publish failed")
-
-                # Log stats periodically
-                self._maybe_log_stats()
-
-            except Exception as e:
-                logger.error(f"[SpoolProcessor] Error in ACK-based loop: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-                time.sleep(0.1)
 
     def _log_performance_metrics(self):
         """
