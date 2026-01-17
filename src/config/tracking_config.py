@@ -3070,6 +3070,44 @@ class TrackingConfig:
     Range: 5 - 50
     Default: 20
     """
+    
+    # ==========================================================================
+    # V10 Spool Processor ACK Mode Configuration
+    # ==========================================================================
+    
+    spool_ack_mode_enabled: bool = _parse_bool_env("SPOOL_ACK_MODE_ENABLED", False)
+    """
+    Enable ACK-based frame publishing mode for spool processor.
+    
+    When True: Spool processor waits for ACK from logic thread before publishing next frame
+    When False: ACK-free mode - publish at adaptive rate without waiting (default)
+    
+    ACK-based mode provides:
+    - Guaranteed frame processing (no frame drops)
+    - Flow control between spool processor and consumer
+    - Better for debugging and accuracy testing
+    
+    ACK-free mode provides:
+    - Higher throughput
+    - Lower latency
+    - Better for production with high FPS requirements
+    
+    Environment: SPOOL_ACK_MODE_ENABLED=false
+    Default: False (ACK-free mode for production)
+    """
+    
+    spool_ack_timeout_ms: float = _parse_float_env("SPOOL_ACK_TIMEOUT_MS", 1000.0)
+    """
+    Timeout in milliseconds to wait for ACK before publishing next frame.
+    
+    Only used when spool_ack_mode_enabled is True.
+    If no ACK is received within this timeout, the processor will:
+    1. Log a warning
+    2. Continue to next frame (to avoid deadlock)
+    
+    Range: 100 - 5000
+    Default: 1000 (1 second)
+    """
 
 
 # Global configuration instance

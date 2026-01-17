@@ -9,7 +9,7 @@ import rclpy
 from hbm_img_msgs.msg import HbmMsg1080P
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32
 
 from src.config.settings import AppConfig
 from src.frame_source.FrameSource import FrameSource
@@ -53,6 +53,19 @@ class FrameServer(Node, FrameSource):
         # Store target_fps for logging only
         self.target_fps = target_fps
         
+        # V10: ACK mode configuration and publisher
+        # Import tracking_config locally to avoid circular import issues
+        from src.config.tracking_config import tracking_config
+        self.ack_mode_enabled = tracking_config.spool_ack_mode_enabled
+        self._ack_publisher = None
+        if self.ack_mode_enabled:
+            ack_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5
+            )
+            self._ack_publisher = self.create_publisher(Int32, '/frame_ack', ack_qos)
+            logger.info("[Ros2FrameServer] ACK mode enabled - will publish to /frame_ack")
         # V3 Performance: Proactive drop threshold (80% of queue size)
         self.proactive_drop_threshold = int(self.frame_queue.maxsize * 0.8)  # 24 frames for size=30
         
@@ -73,6 +86,7 @@ class FrameServer(Node, FrameSource):
     def _get_timing_stats_string(self) -> str:
         """
         V6: Get formatted timing stats string and reset counters.
+        V7: Removed BGR conversion timing (now done lazily in logic thread).
         
         Returns:
             Formatted string with timing stats, or empty string if no data
@@ -84,11 +98,10 @@ class FrameServer(Node, FrameSource):
         stats_str = (
             f", avg_callback={self._timing_stats['callback'] / count:.2f}ms"
             f" (reshape={self._timing_stats['reshape'] / count:.2f}ms"
-            f", nv12_copy={self._timing_stats['nv12_copy'] / count:.2f}ms"
-            f", bgr_cvt={self._timing_stats['bgr_convert'] / count:.2f}ms)"
+            f", nv12_copy={self._timing_stats['nv12_copy'] / count:.2f}ms)"
         )
         # Reset timing stats
-        self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
+        self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'count': 0}
         return stats_str
 
 
@@ -96,7 +109,7 @@ class FrameServer(Node, FrameSource):
         now = time.time()
         self.frames_received += 1
         
-        # V6: Detailed timing metrics for performance analysis
+        # V7: Detailed timing metrics for performance analysis
         t_callback_start = time.perf_counter()
         
         # No time-based frame skipping - rely only on leaky queue
@@ -120,38 +133,35 @@ class FrameServer(Node, FrameSource):
             logger.info(stats_msg)
             self.last_stats_log_time = now
         
-        # V6: Time each operation
+        # V7: Time each operation
         t_reshape_start = time.perf_counter()
         img = np.frombuffer(msg.data, dtype=np.uint8)[:msg.data_size]
         try:
-            # NV12 conversion logic
+            # NV12 conversion logic - reshape to NV12 format
             nv12_img = img.reshape((msg.height * 3 // 2, msg.width))
             t_reshape_end = time.perf_counter()
             
-            # V5 Optimization: Store raw NV12 data to avoid redundant conversions
-            # The BPU expects NV12 format, so we can skip BGR→NV12 conversion in detector
-            # by passing raw NV12 directly
+            # V7 Optimization: Store raw NV12 data ONLY - skip BGR conversion
+            # BGR conversion is now done lazily in logic_thread when needed for:
+            # - Visualization (if publishing is enabled)
+            # - Classification (classifier needs BGR)
+            # Detection uses NV12 directly via _preprocess_nv12
             t_nv12_copy_start = time.perf_counter()
             nv12_data = nv12_img.copy()  # Copy to ensure data persists after message is released
             t_nv12_copy_end = time.perf_counter()
             
-            # Still convert to BGR for visualization, classification, and other components
-            t_bgr_start = time.perf_counter()
-            bgr = cv2.cvtColor(nv12_img, cv2.COLOR_YUV2BGR_NV12)
-            t_bgr_end = time.perf_counter()
         except Exception as e:
             self.get_logger().error(f"Frame conversion error: {e}")
             return
         
-        # V6: Accumulate timing stats
+        # V7: Accumulate timing stats (removed BGR conversion timing)
         if not hasattr(self, '_timing_stats'):
-            self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'bgr_convert': 0, 'count': 0}
+            self._timing_stats = {'callback': 0, 'reshape': 0, 'nv12_copy': 0, 'count': 0}
         
         t_callback_end = time.perf_counter()
         self._timing_stats['callback'] += (t_callback_end - t_callback_start) * 1000
         self._timing_stats['reshape'] += (t_reshape_end - t_reshape_start) * 1000
         self._timing_stats['nv12_copy'] += (t_nv12_copy_end - t_nv12_copy_start) * 1000
-        self._timing_stats['bgr_convert'] += (t_bgr_end - t_bgr_start) * 1000
         self._timing_stats['count'] += 1
 
         latency_ms = (now - self.last_frame_time) * 1000
@@ -179,27 +189,27 @@ class FrameServer(Node, FrameSource):
         # Enqueue new frame
         spool_frame_index = 0
         
-        # V5 Optimization: Include raw NV12 data in frame tuple for direct BPU input
-        # Frame format: (bgr, latency_ms, spool_frame_index, nv12_data, (height, width))
+        # V7 Optimization: Include ONLY raw NV12 data in frame tuple (no BGR)
+        # Frame format: (nv12_data, latency_ms, spool_frame_index, (height, width))
+        # BGR conversion is done lazily in logic_thread when needed
         # Attach spool_frame_index to frame data - it travels through pipeline with this frame
         frame_size = (msg.height, msg.width)
-        self.frame_queue.put((bgr, latency_ms, spool_frame_index, nv12_data, frame_size))
+        self.frame_queue.put((nv12_data, latency_ms, spool_frame_index, frame_size))
 
     def frames(self):
         """
         Yield frames from the queue.
         
-        V5 Optimization: Now yields NV12 data alongside BGR frame.
+        V7 Optimization: Now yields only NV12 data (no BGR).
+        BGR conversion is done lazily in the consumer when needed.
         
         Yields:
-            Tuple of (frame, latency_ms, spool_frame_index, nv12_data, frame_size) - full format
-            Tuple of (frame, latency_ms) - normal mode (backward compatible)
+            Tuple of (nv12_data, latency_ms, spool_frame_index, frame_size)
             
         Where:
-            - frame: BGR numpy array for visualization/classification
+            - nv12_data: Raw NV12 numpy array for detection and lazy BGR conversion
             - latency_ms: Frame latency in milliseconds
             - spool_frame_index: Frame index for ACK correlation
-            - nv12_data: Raw NV12 numpy array for direct BPU inference (avoids BGR→NV12 conversion)
             - frame_size: Tuple (height, width) of the original frame
         """
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
@@ -207,14 +217,19 @@ class FrameServer(Node, FrameSource):
             try:
                 item = self.frame_queue.get(timeout=1)
                 
-                # V5: Handle new format with NV12 data (5 elements)
-                if len(item) == 5:
-                    frame, latency_ms, spool_frame_index, nv12_data, frame_size = item
-                    # V5: Yield full frame data including NV12
-                    yield frame, latency_ms, spool_frame_index, nv12_data, frame_size
-                else:
+                # V7: New format with NV12 only (4 elements)
+                if len(item) == 4:
+                    nv12_data, latency_ms, spool_frame_index, frame_size = item
+                    yield nv12_data, latency_ms, spool_frame_index, frame_size
+                elif len(item) == 5:
+                    # Backward compatibility: old format (bgr, latency_ms, spool_frame_index, nv12_data, frame_size)
+                    # Skip BGR, yield NV12 data
+                    _bgr, latency_ms, spool_frame_index, nv12_data, frame_size = item
+                    yield nv12_data, latency_ms, spool_frame_index, frame_size
+                elif len(item) == 2:
+                    # Legacy format (frame, latency_ms) - convert to NV12-only format with placeholder
                     frame, latency_ms = item
-                    yield frame, latency_ms
+                    yield frame, latency_ms, 0, frame.shape[:2] if hasattr(frame, 'shape') else (720, 1280)
             except queue.Empty:
                 continue
 
@@ -229,3 +244,22 @@ class FrameServer(Node, FrameSource):
             logger.debug(f"[Ros2FrameServer] destroy_node() raised (ignored): {e}")
 
         logger.info("[Ros2FrameServer] cleanup finished")
+
+    def publish_frame_ack(self, frame_index: int):
+        """
+        V10: Publish ACK for a processed frame.
+        
+        Called by the logic thread after a frame has been fully processed
+        (detection + monitor update). This signals to the spool processor
+        that it can publish the next frame.
+        
+        Args:
+            frame_index: Index of the frame that was processed
+        """
+        if not self.ack_mode_enabled or self._ack_publisher is None:
+            return
+        
+        msg = Int32()
+        msg.data = frame_index
+        self._ack_publisher.publish(msg)
+        logger.debug(f"[Ros2FrameServer] Published ACK for frame index {frame_index}")

@@ -972,7 +972,13 @@ class BagCounterApp:
             
             try:
                 # Unpack detection result
-                current_frame_detections, frame_count, frame, detect_time = detection_result
+                # V10: Added spool_frame_index for ACK publishing
+                if len(detection_result) == 5:
+                    current_frame_detections, frame_count, frame, detect_time, spool_frame_index = detection_result
+                else:
+                    # Backward compatibility: old format without spool_frame_index
+                    current_frame_detections, frame_count, frame, detect_time = detection_result
+                    spool_frame_index = None
                 
                 # Process through monitor
                 monitor_start = time.perf_counter()
@@ -980,6 +986,12 @@ class BagCounterApp:
                                                    {"frame_count": frame_count, "frame": frame})
                 monitor_end = time.perf_counter()
                 monitor_time = (monitor_end - monitor_start) * 1000
+                
+                # V10: Publish ACK after monitor update (frame is fully processed)
+                # This signals to the spool processor that it can publish the next frame
+                if hasattr(self.frame_source, 'publish_frame_ack'):
+                    ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                    self.frame_source.publish_frame_ack(ack_index)
                 
                 # Track degraded mode state for ROI saving
                 in_degraded_mode = self._degraded_mode_active
@@ -1238,17 +1250,47 @@ class BagCounterApp:
             try:
                 t_extract_start = time.perf_counter()
                 
-                # V5 Optimization: Extract frame and optional NV12 data from packet
-                # Supports both dict format (V5) and direct frame (backward compatible)
+                # V7 Optimization: Extract NV12 data and optional BGR frame from packet
+                # BGR conversion is done lazily only when needed for visualization or classification
+                spool_frame_index = None  # V10: For ACK correlation
                 if isinstance(frame_packet, dict):
-                    frame = frame_packet['frame']
                     nv12_data = frame_packet.get('nv12_data')
+                    bgr_frame = frame_packet.get('bgr_frame')  # May be None (V7 format)
                     frame_size = frame_packet.get('frame_size')
+                    spool_frame_index = frame_packet.get('spool_frame_index')  # V10: For ACK
+                    
+                    # Legacy support: check for 'frame' key (old format)
+                    if bgr_frame is None and 'frame' in frame_packet:
+                        bgr_frame = frame_packet['frame']
                 else:
                     # Backward compatible: direct frame (old format)
-                    frame = frame_packet
+                    bgr_frame = frame_packet
                     nv12_data = None
                     frame_size = None
+                
+                # V7: Lazy BGR conversion function - only called when needed
+                def get_bgr_frame():
+                    nonlocal bgr_frame
+                    if bgr_frame is None and nv12_data is not None and frame_size is not None:
+                        try:
+                            # Convert NV12 to BGR on-demand
+                            bgr_frame = cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12)
+                        except cv2.error as e:
+                            logger.error(f"[BagCounterApp] Failed to convert NV12 to BGR: {e}")
+                            # Return None to signal conversion failure
+                            return None
+                    return bgr_frame
+                
+                # For detection, we use NV12 directly if available, otherwise BGR
+                # frame variable points to what detection will use for postprocessing (original shape)
+                if nv12_data is not None and frame_size is not None:
+                    # Detection will use NV12 directly via _preprocess_nv12
+                    # We need BGR frame for monitor.update() context and potential visualization
+                    # But we defer the conversion until it's actually needed
+                    frame = None  # Will be computed lazily
+                else:
+                    # No NV12 data, use BGR directly
+                    frame = bgr_frame
                 
                 t_extract_end = time.perf_counter()
                 
@@ -1395,7 +1437,16 @@ class BagCounterApp:
                 detect_start = time.perf_counter()
                 
                 # V4 Phase 2: Batch inference
+                # Note: Batch inference still requires BGR frames (NV12 optimization not yet supported for batch)
                 if self.batch_inference_enabled:
+                    # V7: Ensure we have BGR frame for batch inference
+                    if frame is None and nv12_data is not None:
+                        frame = get_bgr_frame()
+                        if frame is None:
+                            # BGR conversion failed - skip this frame
+                            logger.warning(f"[BagCounterApp] Skipping frame {frame_count}: BGR conversion failed for batch inference")
+                            continue
+                    
                     self._frame_batch.append(frame)
                     self._batch_frame_data.append((frame, frame_count))
                     
@@ -1509,10 +1560,21 @@ class BagCounterApp:
                     
                 else:
                     # V3: Single-frame detection (legacy)
-                    # V5 Optimization: Pass NV12 data to avoid redundant color conversion
+                    # V7 Optimization: Pass NV12 data and frame_size, frame can be None
+                    # Detection uses NV12 directly, BGR is converted lazily only when needed
                     detections = self.detector.predict(frame, nv12_data=nv12_data, frame_size=frame_size)
                     detect_end = time.perf_counter()
                     detect_time = (detect_end - detect_start) * 1000
+                    
+                    # V7: Now convert NV12 to BGR lazily for monitor/visualization/classification
+                    # This is deferred until AFTER detection to optimize the hot path
+                    if frame is None and nv12_data is not None:
+                        frame = get_bgr_frame()
+                        if frame is None:
+                            # BGR conversion failed - skip this frame (detection already done)
+                            # Log and continue to next frame
+                            logger.warning(f"[BagCounterApp] Skipping frame {frame_count} post-detection: BGR conversion failed")
+                            continue
                     
                     # V6: Accumulate timing stats
                     _logic_timing_stats['queue_dequeue'] += (t_dequeue_end - t_dequeue_start) * 1000
@@ -1571,7 +1633,8 @@ class BagCounterApp:
                     # V4 Phase 1: Enqueue detection result or process inline
                     if self.detection_queue_enabled:
                         # Enqueue detection result for monitor thread
-                        detection_result = (current_frame_detections, frame_count, frame, detect_time)
+                        # V10: Include spool_frame_index for ACK publishing
+                        detection_result = (current_frame_detections, frame_count, frame, detect_time, spool_frame_index)
                         try:
                             self.detection_queue.put_nowait(detection_result)
                         except queue.Full:
@@ -1602,6 +1665,13 @@ class BagCounterApp:
                                                            {"frame_count": frame_count, "frame": frame})
                         monitor_end = time.perf_counter()
                         monitor_time = (monitor_end - monitor_start) * 1000
+                        
+                        # V10: Publish ACK after monitor update (frame is fully processed)
+                        # This signals to the spool processor that it can publish the next frame
+                        # Use spool_frame_index if available for proper correlation, otherwise fallback to frame_count
+                        if hasattr(self.frame_source, 'publish_frame_ack'):
+                            ack_index = spool_frame_index if spool_frame_index is not None else frame_count
+                            self.frame_source.publish_frame_ack(ack_index)
                         
                         # Track frames processed in degraded mode for statistics
                         if in_degraded_mode:
@@ -1852,21 +1922,26 @@ class BagCounterApp:
                 for frame_data in self.frame_source.frames():
                     frame_count += 1
                     
-                    # V5 Optimization: Extract frame, NV12 data, and metadata from tuple
-                    # Format can be:
-                    # - (frame, latency, index, nv12_data, frame_size) - V5 with NV12
-                    # - (frame, latency, index) - accuracy mode
-                    # - (frame, latency) - normal mode (backward compatible)
+                    # V7 Optimization: Extract NV12 data and metadata from tuple
+                    # New format (V7): (nv12_data, latency, index, frame_size) - NV12 only
+                    # Legacy formats are handled for backward compatibility
                     nv12_data = None
                     frame_size = None
                     spool_frame_index = None
+                    bgr_frame = None  # BGR is now computed lazily when needed
                     
-                    if len(frame_data) == 5:
-                        frame, latencyMs, spool_frame_index, nv12_data, frame_size = frame_data
+                    if len(frame_data) == 4:
+                        # V7 new format: (nv12_data, latency, index, frame_size)
+                        nv12_data, latencyMs, spool_frame_index, frame_size = frame_data
+                    elif len(frame_data) == 5:
+                        # V5 old format: (bgr, latency, index, nv12_data, frame_size)
+                        bgr_frame, latencyMs, spool_frame_index, nv12_data, frame_size = frame_data
                     elif len(frame_data) == 3:
-                        frame, latencyMs, spool_frame_index = frame_data
+                        # Accuracy mode: (frame, latency, index)
+                        bgr_frame, latencyMs, spool_frame_index = frame_data
                     else:
-                        frame, latencyMs = frame_data
+                        # Legacy format: (frame, latency)
+                        bgr_frame, latencyMs = frame_data
                     
                     current_time = time.perf_counter()
                     if last_frame_time is not None:
@@ -1898,7 +1973,7 @@ class BagCounterApp:
                             # Add hysteresis to prevent oscillating between states
                             bottleneck = "source" if avg_interval > (avg_detect_time / 1000.0 + BOTTLENECK_HYSTERESIS_SEC) else "detection"
                             
-                            # V6: Include NV12 path indicator
+                            # V7: Include NV12 path indicator
                             nv12_indicator = "yes" if nv12_data is not None else "no"
                             
                             logger.info(
@@ -1917,12 +1992,15 @@ class BagCounterApp:
                         frame_interval_sum = 0.0
                         frame_interval_count = 0
                     
-                    # V5 Optimization: Enqueue frame with NV12 data as a dict for efficient passing
-                    # This avoids redundant BGR→NV12 conversion in detector
+                    # V7 Optimization: Enqueue frame with NV12 data only
+                    # BGR conversion is done lazily in logic thread when needed for:
+                    # - Visualization (when is_publishing=True)
+                    # - Classification (classifier needs BGR)
                     frame_packet = {
-                        'frame': frame,
                         'nv12_data': nv12_data,
-                        'frame_size': frame_size
+                        'bgr_frame': bgr_frame,  # May be None (V7 format) or pre-computed (legacy)
+                        'frame_size': frame_size,
+                        'spool_frame_index': spool_frame_index  # V10: For ACK correlation
                     }
                     try:
                         self.input_queue.put_nowait(frame_packet)
