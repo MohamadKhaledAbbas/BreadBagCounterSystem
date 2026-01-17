@@ -602,7 +602,11 @@ class BagCounterApp:
         elif base_overload and not should_activate and tracking_config.spool_aware_degraded_mode_enabled:
             # Log when we're under load but NOT skipping due to spool-aware mode
             # This indicates the system is benefiting from spooled segments
-            if self._frames_processed_in_degraded % 100 == 0:  # Log every 100 frames
+            # Track a counter for this log to avoid modulo by zero
+            if not hasattr(self, '_spool_aware_log_counter'):
+                self._spool_aware_log_counter = 0
+            self._spool_aware_log_counter += 1
+            if self._spool_aware_log_counter % 100 == 0:  # Log every 100 occurrences
                 logger.info(
                     f"[BagCounterApp] SPOOL-AWARE: Under load but NOT skipping "
                     f"(spool_lag={self._spool_lag_seconds:.1f}s < threshold={tracking_config.spool_lag_threshold_seconds:.0f}s). "
@@ -625,11 +629,27 @@ class BagCounterApp:
             # Import spool utilities lazily to avoid circular imports
             from src.spool.spool_utils import load_processor_state
             from src.spool.segment_io import SegmentReader
-            from src.config.settings import AppConfig
             
-            # Get spool directory from app config or use default
-            spool_dir = getattr(AppConfig, 'spool_dir', '/home/sunrise/BreadCounting/data/spool')
+            # Get spool directory from environment or use sensible defaults
+            # Check environment variable first, then platform-specific defaults
+            spool_dir = os.getenv('SPOOL_DIR')
+            if not spool_dir:
+                # Platform-specific defaults
+                from src.utils.platform import IS_RDK
+                if IS_RDK:
+                    spool_dir = '/home/sunrise/BreadCounting/data/spool'
+                else:
+                    # Use relative path for non-RDK (development/testing)
+                    spool_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'spool')
+                    spool_dir = os.path.abspath(spool_dir)
+            
             state_file_path = os.path.join(spool_dir, 'processor_state.json')
+            
+            # Check if spool directory exists before attempting to read
+            if not os.path.exists(spool_dir):
+                logger.debug(f"[BagCounterApp] Spool directory does not exist: {spool_dir}")
+                self._spool_lag_seconds = 0.0
+                return
             
             # Load processor state
             processor_state = load_processor_state(state_file_path)
@@ -652,16 +672,19 @@ class BagCounterApp:
                         self._spool_lag_seconds = segment_lag * tracking_config.spool_segment_duration_seconds
                         
                         # Log periodically (every 30 seconds)
-                        if hasattr(self, '_last_spool_lag_log') and time.perf_counter() - self._last_spool_lag_log < 30.0:
-                            return
-                        self._last_spool_lag_log = time.perf_counter()
+                        # Initialize _last_spool_lag_log if not present
+                        current_time = time.perf_counter()
+                        if not hasattr(self, '_last_spool_lag_log'):
+                            self._last_spool_lag_log = 0.0
                         
-                        logger.debug(
-                            f"[BagCounterApp] Spool lag: {segment_lag} segments "
-                            f"({self._spool_lag_seconds:.1f}s), "
-                            f"processing_segment={self._current_processing_segment}, "
-                            f"recording_segment={self._current_recording_segment}"
-                        )
+                        if current_time - self._last_spool_lag_log >= 30.0:
+                            self._last_spool_lag_log = current_time
+                            logger.debug(
+                                f"[BagCounterApp] Spool lag: {segment_lag} segments "
+                                f"({self._spool_lag_seconds:.1f}s), "
+                                f"processing_segment={self._current_processing_segment}, "
+                                f"recording_segment={self._current_recording_segment}"
+                            )
                 except Exception as e:
                     logger.debug(f"[BagCounterApp] Could not read spool segments: {e}")
             else:
