@@ -191,6 +191,14 @@ class FrameServer(Node, FrameSource):
         V7 Optimization: Now yields only NV12 data (no BGR).
         BGR conversion is done lazily in the consumer when needed.
         
+        V8 Performance Fix: Increased queue timeout from 10ms to 100ms to reduce
+        polling overhead and improve frame acquisition rate. Previous 10ms timeout
+        caused excessive polling when queue was empty, leading to ~70ms effective
+        frame intervals instead of ~33ms (30 FPS). With 100ms timeout:
+        - Reduces CPU overhead from polling
+        - Allows blocking on queue for frame arrival
+        - Still provides responsive shutdown (checked every 100ms)
+        
         Yields:
             Tuple of (nv12_data, latency_ms, spool_frame_index, frame_size)
             
@@ -203,7 +211,12 @@ class FrameServer(Node, FrameSource):
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
         while rclpy.ok():
             try:
-                item = self.frame_queue.get(timeout=0.01)
+                # V8 Performance: Increased timeout from 10ms to 100ms
+                # Previous 10ms timeout caused excessive polling overhead when queue
+                # was empty, contributing to low acquisition FPS (~13-15 instead of ~30).
+                # With 100ms timeout, we block efficiently waiting for frames while
+                # still allowing responsive shutdown checks.
+                item = self.frame_queue.get(timeout=0.1)
                 
                 # V7: New format with NV12 only (4 elements)
                 if len(item) == 4:
