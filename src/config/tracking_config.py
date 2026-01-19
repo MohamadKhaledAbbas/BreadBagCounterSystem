@@ -3227,7 +3227,7 @@ class TrackingConfig:
     Default: 25.0 FPS
     """
     
-    spool_processor_min_frame_interval_ms: float = _parse_float_env("SPOOL_PROCESSOR_MIN_FRAME_INTERVAL_MS", 25.0)
+    spool_processor_min_frame_interval_ms: float = _parse_float_env("SPOOL_PROCESSOR_MIN_FRAME_INTERVAL_MS", 5.0)
     """
     Minimum interval between frames in milliseconds.
     
