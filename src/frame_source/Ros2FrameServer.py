@@ -6,7 +6,7 @@ import time
 import cv2
 import numpy as np
 import rclpy
-from sensor_msgs.msg.Image import Image
+from sensor_msgs.msg import Image
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
@@ -29,22 +29,13 @@ class FrameServer(Node, FrameSource):
     Frames are buffered in input_queue and smart degraded mode handles overload.
     """
 
-    def __init__(self, topic='/nv12_images', target_fps=20.0):
+    def __init__(self, topic='/nv12_images'):
         # IMPORTANT: rclpy.init() must be called externally before this class is instantiated.
         super().__init__('frame_server')
-        
-        # Support ROS_TARGET_FPS environment variable override
-        env_fps = os.getenv('ROS_TARGET_FPS')
-        if env_fps:
-            try:
-                target_fps = float(env_fps)
-                logger.info(f"[Ros2FrameServer] Using ROS_TARGET_FPS from environment: {target_fps}")
-            except ValueError:
-                logger.warning(f"[Ros2FrameServer] Invalid ROS_TARGET_FPS value '{env_fps}', using default {target_fps}")
 
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=50,
+            depth=30,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE
         )
@@ -60,9 +51,6 @@ class FrameServer(Node, FrameSource):
         self.frame_queue = queue.Queue(maxsize=30)
         self.last_frame_time = time.time()
         
-        # Store target_fps for logging only
-        self.target_fps = target_fps
-        
         # V3 Performance: Proactive drop threshold (80% of queue size)
         self.proactive_drop_threshold = int(self.frame_queue.maxsize * 0.8)  # 24 frames for size=30
         
@@ -72,8 +60,6 @@ class FrameServer(Node, FrameSource):
         self.frames_dropped = 0  # Track dropped frames
         self.last_stats_log_time = time.time()
         self.stats_log_interval = 5.0  # Log stats every 5 seconds
-        
-        logger.info(f"[Ros2FrameServer] Initialized with queue_size=30, target_fps={target_fps} (for stats logging only, ACK-free mode)")
 
         # --- REMOVED ---
         # Removed the internal _ros_spin_thread logic.
@@ -217,7 +203,7 @@ class FrameServer(Node, FrameSource):
         # We check rclpy.ok() to ensure we stop if the ROS context shuts down
         while rclpy.ok():
             try:
-                item = self.frame_queue.get(timeout=1)
+                item = self.frame_queue.get(timeout=0.01)
                 
                 # V7: New format with NV12 only (4 elements)
                 if len(item) == 4:

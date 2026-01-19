@@ -113,16 +113,8 @@ DEFAULT_ENABLE_CRC32_LOGGING = False  # Add CRC32 checksums to logs
 ADAPTIVE_FPS_REDUCTION_FACTOR = 0.9  # V8.1: Less aggressive reduction (was 0.8)
 # V8: Segment deletion and pacing control
 DEFAULT_DELETE_PROCESSED_SEGMENTS = True  # Delete segments after processing to save disk space
-DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
-
-# V9: Pacing and adaptive thresholds
-DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
-DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 10  # Between 10-25 = normal pace
-DEFAULT_ADAPTIVE_FPS_RELAXED = 15.0  # Healthy state - save resources
-DEFAULT_TARGET_FPS = 20.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
-DEFAULT_ADAPTIVE_FPS_MAX = 25.0  # High lag state - catch up (~28ms intervals)
-MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
-ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
+DEFAULT_MIN_FRAME_INTERVAL_MS = 10.0  # V8.1: Reduced from 30ms to 10ms - 30ms was too slow
+DEFAULT_TARGET_FPS = 25.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
 
 
 @dataclass
@@ -153,11 +145,6 @@ class ProcessorConfig:
     # V9: Performance profiling
     enable_perf_logging: bool = False  # Enable performance profiling
     perf_log_interval_sec: float = 2.0  # Log performance metrics every 2 seconds
-    # V11: Adaptive pacing thresholds (from tracking_config)
-    adaptive_fps_relaxed: float = DEFAULT_ADAPTIVE_FPS_RELAXED
-    adaptive_fps_max: float = DEFAULT_ADAPTIVE_FPS_MAX
-    spool_lag_healthy_threshold: int = DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD
-    spool_lag_normal_threshold: int = DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD
 
 
 def load_default_config() -> ProcessorConfig:
@@ -181,19 +168,12 @@ def load_default_config() -> ProcessorConfig:
         
         # SPS/PPS handling
         prepend_sps_pps=tc.spool_processor_prepend_sps_pps,
-        
-        # Adaptive pacing
-        enable_adaptive_pacing=tc.spool_processor_enable_adaptive_pacing,
-        adaptive_fps_min=tc.spool_processor_adaptive_fps_min,
-        adaptive_fps_relaxed=tc.spool_processor_adaptive_fps_relaxed,
-        adaptive_fps_max=tc.spool_processor_adaptive_fps_max,
+
         
         # Lag thresholds
         spool_lag_warn_threshold=tc.spool_lag_warn_threshold,
         spool_lag_error_threshold=tc.spool_lag_error_threshold,
-        spool_lag_healthy_threshold=tc.spool_lag_healthy_threshold,
-        spool_lag_normal_threshold=tc.spool_lag_normal_threshold,
-        
+
         # Watchdog
         watchdog_timeout=tc.spool_processor_watchdog_timeout,
         
@@ -372,17 +352,6 @@ class SpoolProcessorNode(Node):
         logger.info(f"")
         logger.info(f"  Target FPS Configuration:")
         logger.info(f"    - Default Target FPS: {DEFAULT_TARGET_FPS}")
-        logger.info(f"    - Adaptive FPS Relaxed: {DEFAULT_ADAPTIVE_FPS_RELAXED} (healthy mode)")
-        logger.info(f"    - Adaptive FPS Max: {DEFAULT_ADAPTIVE_FPS_MAX} (high lag catchup)")
-        logger.info(f"    - Min Frame Interval: {self.config.min_frame_interval_ms}ms")
-        logger.info(f"")
-        logger.info(f"  Adaptive Pacing Thresholds:")
-        logger.info(f"    - Healthy Threshold: < {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD} segments")
-        logger.info(
-            f"    - Normal Threshold: {DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD}-{DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
-        logger.info(f"    - High Lag Threshold: > {DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD} segments")
-        logger.info(f"    - Warn Threshold: {self.config.spool_lag_warn_threshold} segments")
-        logger.info(f"    - Error Threshold: {self.config.spool_lag_error_threshold} segments")
         logger.info(f"")
         logger.info(f"  Performance Settings:")
         logger.info(f"    - Segment List Cache Interval: {self.config.segment_list_cache_interval}s")
@@ -1081,57 +1050,8 @@ class SpoolProcessorNode(Node):
                 # V9: Profiling - measure list_segments time
                 t_list_segments_start = time.monotonic()
 
-                # V7: Compute spool lag
-                segments = self._reader.list_segments()
-                newest_segment = max(segments) if segments else None
-                spool_lag = 0
-                if newest_segment is not None and self._current_segment >= 0:
-                    spool_lag = newest_segment - self._current_segment
-
                 if self.config.enable_perf_logging:
                     self._perf_time_list_segments += (time.monotonic() - t_list_segments_start) * 1000.0
-
-                # V7: Check lag thresholds and adaptive pacing (3-tier system)
-                if self.config.enable_adaptive_pacing:
-                    old_fps = self._current_target_fps
-                    old_interval = frame_interval
-
-                    if spool_lag < self.config.spool_lag_healthy_threshold:
-                        # HEALTHY: System is caught up - RELAX and save resources
-                        target_fps = self.config.adaptive_fps_relaxed
-                        mode_emoji = "😌"
-                        mode_text = "RELAXED - System healthy, conserving resources"
-
-                    elif spool_lag <= self.config.spool_lag_normal_threshold:
-                        # NORMAL: Moderate lag - maintain default pace
-                        target_fps = self.config.target_fps
-                        mode_emoji = "✅"
-                        mode_text = "NORMAL - Maintaining default pace"
-
-                    else:
-                        # HIGH LAG: Falling behind - SPEED UP to catch up
-                        target_fps = self.config.adaptive_fps_max
-                        mode_emoji = "🚀"
-                        mode_text = "CATCHING UP - High lag detected"
-
-                    # Only update if significant change
-                    if abs(self._current_target_fps - target_fps) > ADAPTIVE_FPS_CHANGE_THRESHOLD:
-                        self._current_target_fps = target_fps
-                        frame_interval = 1.0 / self._current_target_fps if self._current_target_fps > 0 else 0.025
-
-                        # V9: Reset next_deadline to avoid drift when changing FPS
-                        next_deadline = time.monotonic() + frame_interval
-
-                        # Choose appropriate log level based on mode
-                        log_func = logger.info if spool_lag < self.config.spool_lag_normal_threshold else logger.warning
-
-                        log_func(format_structured_log(
-                            f"[SpoolProcessor] {mode_emoji} Adaptive pacing: {mode_text}",
-                            spool_lag=spool_lag,
-                            old_fps=f"{old_fps:.1f}",
-                            new_fps=f"{self._current_target_fps:.1f}",
-                            new_interval_ms=f"{frame_interval * 1000:.1f}"
-                        ))
 
                 # V7: Watchdog - check for stalled publishing (using monotonic time)
                 if current_monotonic - last_watchdog_check > 10.0:  # Check every 10 seconds
@@ -1170,8 +1090,6 @@ class SpoolProcessorNode(Node):
                     time.sleep(self.config.poll_interval)
                     with self._state_lock:
                         self._state = ProcessorRunState.PUBLISHING
-                    # V9: Reset deadline after long sleep
-                    next_deadline = time.monotonic() + frame_interval
                     continue
 
                 self._current_frame = frame
@@ -1189,42 +1107,10 @@ class SpoolProcessorNode(Node):
                 # V9: Tick-based pacing - calculate sleep time based on deadline
                 publish_end = time.monotonic()
 
-                # Guard against negative or zero intervals
-                if frame_interval <= 0:
-                    logger.error(
-                        f"[SpoolProcessor] Invalid frame_interval: {frame_interval}, "
-                        f"resetting to 25ms (40fps)"
-                    )
-                    frame_interval = 0.025
-                    self._current_target_fps = 40.0
-                    next_deadline = publish_end + frame_interval
 
-                # V9: Calculate sleep time to hit next_deadline
-                time_until_deadline = next_deadline - publish_end
+                if min_interval_sec > 0:
+                    time.sleep(min_interval_sec)
 
-                # Determine target sleep time
-                # Goal: Hit the deadline to achieve target FPS, while respecting minimum interval
-                if time_until_deadline <= 0:
-                    # We're behind schedule - don't sleep at all to catch up
-                    target_sleep = 0
-                else:
-                    # We're ahead of schedule - sleep to hit deadline
-                    # Never sleep MORE than time_until_deadline (would miss deadline)
-                    # Prefer to sleep at least min_interval_sec (to prevent CPU spinning)
-                    # But if that would make us miss deadline, sleep less
-                    target_sleep = time_until_deadline
-
-                if target_sleep > 0:
-                    time.sleep(target_sleep)
-
-                # V9: Update next_deadline for next frame (tick-based scheduling)
-                next_deadline += frame_interval
-
-                # V9: If we're significantly behind schedule, reset deadline to current time
-                now = time.monotonic()
-                if now > next_deadline + frame_interval * MAX_FRAMES_BEHIND_BEFORE_RESET:
-                    # We're more than MAX_FRAMES_BEHIND_BEFORE_RESET frames behind - reset to avoid buildup
-                    next_deadline = now + frame_interval
 
                 if success:
                     with self._stats_lock:
