@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 12
+    commit_idle_frames: int = 9
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -1141,7 +1141,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_iou_threshold: float = 0.20
+    suppression_iou_threshold: float = 0.25
     """
     ISSUE #3 FIX: Minimum IoU with last committed box to trigger suppression.
     
@@ -1190,7 +1190,7 @@ class TrackingConfig:
     Default: True
     """
     
-    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.5)
+    suppression_diagonal_multiplier: float = _parse_float_env("SUPPRESSION_DIAGONAL_MULTIPLIER", 1.2)
     """
     Multiplier for bag diagonal when calculating adaptive suppression distance.
     
@@ -1299,6 +1299,7 @@ class TrackingConfig:
     
     Should be smaller than association_distance_px since we only want to block
     very close duplicates, not all nearby bags.
+    
     
     Default: 60.0
     """
@@ -1508,7 +1509,7 @@ class TrackingConfig:
     """
     
     # State-specific maximum lifetimes (stuck event fail-safes)
-    max_open_state_frames: int = 150
+    max_open_state_frames: int = 100
     """
     Maximum frames an event can stay in OPEN state before forced transition.
     
@@ -2993,7 +2994,7 @@ class TrackingConfig:
     Default: 100.0 cm² (approximately 10cm x 10cm)
     """
     
-    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 6500.0)
+    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 7500.0)
     """
     Area threshold (cm²) above which a bag is classified as "Large/Regular".
     

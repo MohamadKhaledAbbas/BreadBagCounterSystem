@@ -118,8 +118,8 @@ DEFAULT_MIN_FRAME_INTERVAL_MS = 25.0  # V8.1: Reduced from 30ms to 10ms - 30ms w
 # V9: Pacing and adaptive thresholds
 DEFAULT_SPOOL_LAG_HEALTHY_THRESHOLD = 5  # Less than this = healthy, relax
 DEFAULT_SPOOL_LAG_NORMAL_THRESHOLD = 10  # Between 10-25 = normal pace
-DEFAULT_ADAPTIVE_FPS_RELAXED = 25.0  # Healthy state - save resources
-DEFAULT_TARGET_FPS = 30.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
+DEFAULT_ADAPTIVE_FPS_RELAXED = 30.0  # Healthy state - save resources
+DEFAULT_TARGET_FPS = 35.0  # V8.1: Increased from 20 to 30 FPS to keep up with recorder
 DEFAULT_ADAPTIVE_FPS_MAX = 40.0  # High lag state - catch up (~28ms intervals)
 MAX_FRAMES_BEHIND_BEFORE_RESET = 2  # Reset deadline if more than this many frames behind
 ADAPTIVE_FPS_CHANGE_THRESHOLD = 0.1  # Only update FPS if change > this value
