@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 9
+    commit_idle_frames: int = 6
     """
     Number of frames without detection before committing (counting) a bag.
     
@@ -2438,7 +2438,7 @@ class TrackingConfig:
     Default: True
     """
     
-    bidirectional_inactivity_timeout_ms: float = _parse_float_env("BIDIRECTIONAL_INACTIVITY_TIMEOUT_MS", 5000.0)
+    bidirectional_inactivity_timeout_ms: float = _parse_float_env("BIDIRECTIONAL_INACTIVITY_TIMEOUT_MS", 300_000.0)
     """
     Time in milliseconds after which buffered events are committed if no new events arrive.
     

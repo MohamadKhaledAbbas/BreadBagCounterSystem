@@ -1039,6 +1039,11 @@ class BagCounterApp:
             except queue.Empty:
                 if not self._classification_running:
                     break
+                # Inactivity flush (no detections arriving)
+                flushed = self.bidirectional_smoother.check_inactivity_timeout()
+                for event in flushed:
+                    self._commit_classification_event(event)
+
                 continue
             except Exception as e:
                 structured_logger.pipeline_error(
