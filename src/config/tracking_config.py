@@ -1049,7 +1049,7 @@ class TrackingConfig:
     # NOTE: Commitment is based exclusively on timeout (idle time without detection).
     # Exit boundary logic has been removed for simplicity and robustness.
     
-    commit_idle_frames: int = 9
+    commit_idle_frames: int = 6
     """
     Number of frames without detection before committing (counting) a bag.
     
