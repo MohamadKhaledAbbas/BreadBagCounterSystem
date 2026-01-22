@@ -71,9 +71,9 @@ class AppConfig:
     Application configuration with V2 model version tracking.
     """
 
-    APP_VERSION: str = "2026-01-21-v2.12.0"
+    APP_VERSION: str = "2026-01-22-v2.13.0"
 
-    video_path: str = os.getenv("VIDEO_PATH", "C:\\Users\\Khaled\\Downloads\\21_01_2026\\file4.mp4")
+    video_path: str = os.getenv("VIDEO_PATH", "C:\\Users\\Khaled\\Downloads\\21_01_2026\\file9.mp4")
 
     # Platform-specific model paths
     # RDK uses .bin models optimized for BPU, Windows/other platforms use .pt or .onnx models
