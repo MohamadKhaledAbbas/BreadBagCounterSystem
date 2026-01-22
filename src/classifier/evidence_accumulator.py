@@ -15,7 +15,7 @@ Algorithm Overview:
         Score(c) = Σᵢ wᵢ × log(pᵢ(c) + ε)
     
     Where:
-    - wᵢ is trust score for ROI i
+    - wᵢ is trust score for ROI i (computed from sharpness, state, size)
     - pᵢ(c) is probability of class c from classifier
     - ε prevents log(0)
 
@@ -24,6 +24,22 @@ Log-evidence provides mathematical containment:
 - Rewards repeated consistent evidence
 - Suppresses noisy ambiguous frames
 - Contains overconfident misclassifications
+
+TRUST-BASED WEIGHTING vs LEGACY CLAMPED CONTRIBUTION:
+    
+    This module uses TRUST-BASED weighting for evidence accumulation:
+    - Trust score (0-1) computed from: sharpness, ROI state (open/closed), size deviation
+    - Weighted contribution = trust × log(probability)
+    - Natural containment through logarithmic scaling
+    - No artificial clamping needed
+    
+    The legacy path (ClassifierService._accumulate_evidence) uses CLAMPED CONTRIBUTION:
+    - Raw contribution = confidence × sharpness_weight × temporal_weight
+    - Clamped contribution = min(raw_contribution, max_single_weight)
+    - Requires explicit capping to prevent domination
+    
+    Both approaches aim to prevent single-ROI dominance, but trust-based log-evidence
+    provides superior mathematical properties and more nuanced quality scoring.
 
 DECISION LOGIC (Margin-Based):
     The final classification uses MARGIN-BASED decision, not absolute threshold:
@@ -38,6 +54,11 @@ DECISION LOGIC (Margin-Based):
     The min_total_evidence_score parameter is DEPRECATED and unused because
     log-evidence scores are negative (e.g., -3.5, -4.2), making a positive
     threshold meaningless. The margin-based approach is more robust.
+
+ROI STATE HANDLING:
+    - Median ROI size is computed from CLOSED state ROIs only
+    - This prevents open state ROIs (with potentially incorrect boundaries) from biasing trust scores
+    - Track-level disambiguation also uses only closed ROIs for size-based decisions
 
 Usage:
     from src.classifier.evidence_accumulator import EvidenceAccumulator

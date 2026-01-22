@@ -872,6 +872,15 @@ class ClassifierService:
 
     def _accumulate_evidence(self, classifications: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
+        DEPRECATED: Legacy ratio-based evidence accumulation using clamped contributions.
+        
+        This method is deprecated in favor of trust-weighted log-evidence accumulation
+        provided by EvidenceAccumulator class (evidence_accumulator.py). The new approach
+        provides better noise resistance, temporal consistency, and mathematical containment.
+        
+        This method is maintained for backward compatibility but should not be used in
+        new code. Enable evidence_accumulation_enabled=True to use the new approach.
+        
         Accumulate evidence across all classified candidates.
         
         For each classified candidate:
@@ -959,6 +968,15 @@ class ClassifierService:
     def _finalize_classification(self, evidence: Dict[str, Dict[str, Any]], 
                                  event_stats: Dict[str, Any]) -> Tuple[str, float, str, Dict[str, Any]]:
         """
+        DEPRECATED: Legacy finalization using ratio-based decision rules.
+        
+        This method is deprecated in favor of the margin-based stability gate approach
+        in EvidenceAccumulator.finalize(). The new approach provides better robustness
+        against ambiguous classifications.
+        
+        This method is maintained for backward compatibility. Enable 
+        evidence_accumulation_enabled=True to use the new approach.
+        
         Finalize classification using evidence accumulation and ratio thresholds.
         
         Decision Rules:
@@ -1109,11 +1127,14 @@ class ClassifierService:
             # Step 1: Classify each candidate
             classifications = []
             
-            # V7: Compute median ROI size for trust calculation
+            # V8 FIX: Compute median ROI size from CLOSED state ROIs only for trust calculation
+            # This prevents open-state ROIs (which may have incorrect/incomplete boundaries)
+            # from biasing the median size used for trust scoring and disambiguation
             roi_sizes = []
             for cand in candidates:
                 roi = cand.get('roi')
-                if roi is not None and hasattr(roi, 'shape'):
+                # Only use closed-state ROIs for median calculation
+                if roi is not None and hasattr(roi, 'shape') and cand.get('state') != 'open':
                     h, w = roi.shape[:2]
                     roi_sizes.append((w, h))
             
@@ -1122,108 +1143,55 @@ class ClassifierService:
                 median_w = sorted([s[0] for s in roi_sizes])[len(roi_sizes) // 2]
                 median_h = sorted([s[1] for s in roi_sizes])[len(roi_sizes) // 2]
                 median_size = (median_w, median_h)
-            
-            for idx, cand in enumerate(candidates):
-                roi = cand['roi']
-                label, conf = self._classify_single(roi, idx)
-
-                # For testing only, can uncomment for testing.
-                # self._save_roi_for_test(roi, label)
-
-                # REFACTORED: NO per-ROI disambiguation - preserve raw classifier labels
-                # Disambiguation will be applied at track level after aggregation
-                bbox = cand.get('bbox')  # May be None if not available
-                is_open = cand.get('state') == 'open'
-                
-                # Calculate contribution for this candidate
-                sharpness = cand.get('sharpness', 0)
-                relative_time = cand.get('relative_time', 0.5)
-                sharpness_weight = self._compute_sharpness_weight(sharpness)
-                temporal_weight = self._compute_temporal_weight(relative_time)
-                raw_contribution = conf * sharpness_weight * temporal_weight
-                clamped_contribution = min(raw_contribution, self.max_single_weight)
-                
-                # V7: Compute trust score for this ROI
-                is_open = cand.get('state') == 'open'
-                roi_size = median_size or (100, 100)
-                if roi is not None and hasattr(roi, 'shape'):
-                    h, w = roi.shape[:2]
-                    roi_size = (w, h)
-                trust = self._compute_roi_trust(
-                    sharpness=sharpness,
-                    is_open=is_open,
-                    roi_size=roi_size,
-                    median_size=median_size
+                logger.debug(
+                    f"[ClassifierService] Track {track_id}: Computed median size from {len(roi_sizes)} closed ROIs: "
+                    f"{median_w}x{median_h}px"
                 )
-                
-                # Structured logging for candidate classification
-                structured_logger.classification_candidate(
-                    track_id=track_id,
-                    candidate_idx=idx,
-                    label=label,
-                    confidence=conf,
-                    sharpness=sharpness,
-                    relative_time=relative_time,
-                    contribution=clamped_contribution,
-                    frame_index=cand.get('frame_index', 0),
-                    bbox=bbox,
+            else:
+                logger.warning(
+                    f"[ClassifierService] Track {track_id}: No closed ROI sizes available for median calculation, "
+                    f"trust scoring may be less accurate"
                 )
-                
-                classifications.append({
-                    'label': label,
-                    'confidence': conf,
-                    'roi': roi,
-                    'sharpness': sharpness,
-                    'frame_index': cand.get('frame_index', 0),
-                    'relative_time': relative_time,
-                    'trust': trust,  # V7: Include trust score
-                    'is_open': is_open,
-                    'bbox': bbox,  # Store bbox for potential track-level disambiguation
-                })
             
-            classify_time = (time.perf_counter() - batch_start) * 1000
-            
-            # Initialize track-level disambiguation flag
-            track_disambiguation_applied = False
-            
-            # Step 2: Accumulate evidence
-            # V7: Choose between evidence accumulation path or legacy ratio-based path
+            # V8 FIX: Avoid double classification by branching early
+            # Choose path based on evidence_accumulation_enabled flag
             if self.evidence_accumulation_enabled:
-                # NEW PATH: Trust-weighted log-evidence accumulation
+                # NEW PATH: Trust-weighted log-evidence accumulation with full probability distributions
                 logger.info(f"[ClassifierService] Track {track_id}: Using trust-weighted evidence accumulation")
                 
-                # Re-classify with probs for evidence accumulation
                 classifications_with_probs = []
-                prob_adjustment_count = 0
                 
                 for idx, cand in enumerate(candidates):
                     roi = cand['roi']
                     logger.info(f"[ClassifierService] Track {track_id}: STEP classify cand {idx} (roi_present={roi is not None})")
+                    
+                    # Classify with full probability distribution for evidence accumulation
                     label, conf, probs = self._classify_single_with_probs(roi, idx)
                     logger.debug(f"[ClassifierService] Track {track_id}: cand {idx} raw label={label}, conf={conf:.3f}")
                     
                     # Store original label (no per-ROI disambiguation)
                     original_label = label
                     
-                    # REFACTORED: NO per-ROI disambiguation in evidence accumulation path
-                    # Store raw labels and apply disambiguation at track level after voting
+                    # Get metadata
                     bbox = cand.get('bbox')
                     is_open = cand.get('state') == 'open'
-                    
-                    # Compute trust
                     sharpness = cand.get('sharpness', 0)
-                    is_open = cand.get('state') == 'open'
+                    relative_time = cand.get('relative_time', 0.5)
+                    
+                    # Compute ROI size
                     roi_size = median_size or (100, 100)
                     if roi is not None and hasattr(roi, 'shape'):
                         h, w = roi.shape[:2]
                         roi_size = (w, h)
+                    
+                    # Compute trust score
                     trust = self._compute_roi_trust(
                         sharpness=sharpness,
                         is_open=is_open,
                         roi_size=roi_size,
                         median_size=median_size
                     )
-
+                    
                     logger.info(
                         f"[ClassifierService] Track {track_id}: cand {idx} trust={trust:.3f}, sharpness={sharpness}, "
                         f"roi_size={roi_size}, state={'open' if is_open else 'closed'}"
@@ -1241,12 +1209,87 @@ class ClassifierService:
                         'roi': roi,
                         'sharpness': sharpness,
                         'frame_index': cand.get('frame_index', 0),
-                        'relative_time': cand.get('relative_time', 0.5),
+                        'relative_time': relative_time,
                         'is_open': is_open,
-                        'bbox': bbox,  # Store bbox for track-level disambiguation
-                        'original_label': original_label,  # Track original for metadata
+                        'bbox': bbox,
+                        'original_label': original_label,
                     })
+            else:
+                # LEGACY PATH: Ratio-based evidence accumulation (DEPRECATED)
+                # This path is maintained for backward compatibility but is deprecated
+                # in favor of trust-weighted log-evidence accumulation above
+                logger.warning(
+                    f"[ClassifierService] Track {track_id}: Using DEPRECATED legacy ratio-based evidence accumulation. "
+                    f"Consider enabling evidence_accumulation for improved robustness."
+                )
                 
+                for idx, cand in enumerate(candidates):
+                    roi = cand['roi']
+                    label, conf = self._classify_single(roi, idx)
+
+                    # For testing only, can uncomment for testing.
+                    # self._save_roi_for_test(roi, label)
+
+                    # REFACTORED: NO per-ROI disambiguation - preserve raw classifier labels
+                    # Disambiguation will be applied at track level after aggregation
+                    bbox = cand.get('bbox')
+                    is_open = cand.get('state') == 'open'
+                    
+                    # Calculate contribution for this candidate (legacy path)
+                    sharpness = cand.get('sharpness', 0)
+                    relative_time = cand.get('relative_time', 0.5)
+                    sharpness_weight = self._compute_sharpness_weight(sharpness)
+                    temporal_weight = self._compute_temporal_weight(relative_time)
+                    raw_contribution = conf * sharpness_weight * temporal_weight
+                    clamped_contribution = min(raw_contribution, self.max_single_weight)
+                    
+                    # Compute ROI size
+                    roi_size = median_size or (100, 100)
+                    if roi is not None and hasattr(roi, 'shape'):
+                        h, w = roi.shape[:2]
+                        roi_size = (w, h)
+                    
+                    # Compute trust score for this ROI (legacy path also uses trust)
+                    trust = self._compute_roi_trust(
+                        sharpness=sharpness,
+                        is_open=is_open,
+                        roi_size=roi_size,
+                        median_size=median_size
+                    )
+                    
+                    # Structured logging for candidate classification
+                    structured_logger.classification_candidate(
+                        track_id=track_id,
+                        candidate_idx=idx,
+                        label=label,
+                        confidence=conf,
+                        sharpness=sharpness,
+                        relative_time=relative_time,
+                        contribution=clamped_contribution,
+                        frame_index=cand.get('frame_index', 0),
+                        bbox=bbox,
+                    )
+                    
+                    classifications.append({
+                        'label': label,
+                        'confidence': conf,
+                        'roi': roi,
+                        'sharpness': sharpness,
+                        'frame_index': cand.get('frame_index', 0),
+                        'relative_time': relative_time,
+                        'trust': trust,
+                        'is_open': is_open,
+                        'bbox': bbox,
+                    })
+            
+            classify_time = (time.perf_counter() - batch_start) * 1000
+            
+            # Initialize track-level disambiguation flag
+            track_disambiguation_applied = False
+            
+            # Step 2: Accumulate evidence
+            # V8: Branch on evidence_accumulation_enabled (already done above)
+            if self.evidence_accumulation_enabled:
                 # Use accumulate_track_evidence convenience function
                 accumulator_result = accumulate_track_evidence(classifications_with_probs, tracking_config)
 
@@ -1316,8 +1359,13 @@ class ClassifierService:
                 # Probability adjustments are no longer needed with track-level disambiguation
                 
             else:
-                # LEGACY PATH: Ratio-based evidence accumulation
-                logger.info(f"[ClassifierService] Track {track_id}: Using legacy ratio-based evidence accumulation")
+                # LEGACY PATH: Ratio-based evidence accumulation (DEPRECATED)
+                # This matches the deprecation warning logged earlier
+                logger.warning(
+                    f"[ClassifierService] Track {track_id}: DEPRECATED legacy path - processing evidence via "
+                    f"_accumulate_evidence(). This path uses ratio-based scoring instead of trust-weighted "
+                    f"log-evidence and may be removed in future versions."
+                )
                 evidence = self._accumulate_evidence(classifications)
                 
                 # Step 3: Finalize classification
