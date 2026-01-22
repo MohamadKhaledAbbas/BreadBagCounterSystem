@@ -89,6 +89,8 @@ class TestClosedROIFiltering:
         assert len(closed_only) == 3, "Should have exactly 3 closed ROIs"
         
         # Compute median from closed ROIs
+        # Note: For simplicity in this documentation test, using middle element
+        # In production, median of even-sized list should average two middle elements
         closed_sizes = []
         for c in closed_only:
             roi = c['roi']
@@ -97,8 +99,11 @@ class TestClosedROIFiltering:
                 h, w = shape[:2]
                 closed_sizes.append((w, h))
         
-        median_w = sorted([s[0] for s in closed_sizes])[len(closed_sizes) // 2]
-        median_h = sorted([s[1] for s in closed_sizes])[len(closed_sizes) // 2]
+        # For odd-sized list (3 elements here), median is the middle element
+        sorted_widths = sorted([s[0] for s in closed_sizes])
+        sorted_heights = sorted([s[1] for s in closed_sizes])
+        median_w = sorted_widths[len(sorted_widths) // 2]
+        median_h = sorted_heights[len(sorted_heights) // 2]
         actual_median = (median_w, median_h)
         
         assert actual_median == expected_median, \
@@ -147,9 +152,13 @@ class TestEvidenceAccumulatorStateHandling:
     
     def test_reject_labels_not_in_evidence(self, default_config):
         """
-        Test that reject labels (Rejected, Unknown, Uncertain) don't contribute evidence.
+        Test that reject labels don't contribute evidence.
         
-        This ensures that classifications marked as rejected don't bias the final decision.
+        The EvidenceAccumulator filters out these labels from evidence:
+        - Explicitly configured reject labels (e.g., 'Rejected')
+        - Always-rejected labels: 'Unknown' and 'Uncertain'
+        
+        This ensures classifications marked as rejected don't bias the final decision.
         """
         accumulator = EvidenceAccumulator(default_config)
         
