@@ -2981,7 +2981,7 @@ class TrackingConfig:
     Default: 60.0 cm
     """
     
-    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 5500.0)
+    homography_small_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_SMALL_THRESHOLD_CM2", 4500.0)
     """
     Area threshold (cm²) below which a bag is classified as "Small".
     
@@ -2994,7 +2994,7 @@ class TrackingConfig:
     Default: 100.0 cm² (approximately 10cm x 10cm)
     """
     
-    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 7500.0)
+    homography_large_threshold_cm2: float = _parse_float_env("HOMOGRAPHY_LARGE_THRESHOLD_CM2", 7000.0)
     """
     Area threshold (cm²) above which a bag is classified as "Large/Regular".
     
